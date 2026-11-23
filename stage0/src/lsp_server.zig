@@ -813,6 +813,8 @@ pub const LspSession = struct {
     file_id_to_client_uri: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
     /// Aggregate byte footprint of owned URI strings stored in `file_id_to_client_uri`.
     client_uri_total_bytes: usize = 0,
+    /// Open `FileId`s awaiting deferred push diagnostics once interactive requests in the batch finish.
+    pending_push_diag_files: std.ArrayListUnmanaged(FileId) = .empty,
     /// Optional diagnostic/trace writer (`stderr` or test log sink; never `stdout`).
     log_writer: ?*std.Io.Writer = null,
 
@@ -836,12 +838,15 @@ pub const LspSession = struct {
         var sem_cache = try SemanticTokensCache.init(allocator);
         errdefer sem_cache.deinit();
 
+        var vfs = VfsSourceMap.init(allocator, &db.interner);
+        vfs.allow_mutable_mmap = (@import("builtin").os.tag != .windows);
+
         return .{
             .allocator = allocator,
             .io = io,
             .environ_map = environ_map,
             .options = options,
-            .vfs = VfsSourceMap.init(allocator, &db.interner),
+            .vfs = vfs,
             .db = db,
             .turn_arena = BumpArena.init(allocator),
             .outbound_buf = std.Io.Writer.Allocating.init(allocator),
@@ -864,6 +869,7 @@ pub const LspSession = struct {
         }
         self.file_id_to_client_uri.deinit(self.allocator);
         self.client_uri_total_bytes = 0;
+        self.pending_push_diag_files.deinit(self.allocator);
         self.open_doc_versions.deinit(self.allocator);
         self.mounted_file_set.deinit(self.allocator);
         self.mounted_files.deinit(self.allocator);
@@ -1329,7 +1335,7 @@ const BUILTIN_ATTR_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
         "derive",
         HoverDocSpec{
             .signature = "@derive(Trait1, Trait2, …)",
-            .summary = "Synthesizes canonical compile-time trait implementations (`Copy`, `Clone`, `Eq`, `Ord`, `Hash`, `Debug`, `Default`).",
+            .summary = "Synthesizes compile-time trait impls (`Copy`, `Clone`, `Equatable`, `Comparable`, `Hash`, `Debug`, `Default`, `From`).",
         },
     },
     .{
@@ -1628,7 +1634,186 @@ const BUILTIN_ATTR_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
     },
 });
 
-/// $O(1)$ hover documentation catalog for all 36 canonical compiler `@intrinsic` operations.
+/// $O(1)$ hover documentation catalog for built-in primitive types and Constrained Type Groups.
+const BUILTIN_PRIM_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
+    .{
+        "Float",
+        HoverDocSpec{
+            .signature = "type_group Float = f32 | f64",
+            .summary = "Bind-Once Constrained Type Group matching IEEE-754 floating-point scalars (`f32`, `f64`).",
+        },
+    },
+    .{
+        "Integer",
+        HoverDocSpec{
+            .signature = "type_group Integer = SignedInt | UnsignedInt",
+            .summary = "Bind-Once Constrained Type Group matching all signed and unsigned integer scalars.",
+        },
+    },
+    .{
+        "Number",
+        HoverDocSpec{
+            .signature = "type_group Number = Integer | Float",
+            .summary = "Bind-Once Constrained Type Group matching all numeric scalar primitives.",
+        },
+    },
+    .{
+        "SignedInt",
+        HoverDocSpec{
+            .signature = "type_group SignedInt = i8 | i16 | i32 | i64 | i128 | isize",
+            .summary = "Bind-Once Constrained Type Group matching two's-complement signed integers.",
+        },
+    },
+    .{
+        "UnsignedInt",
+        HoverDocSpec{
+            .signature = "type_group UnsignedInt = u8 | u16 | u32 | u64 | u128 | usize",
+            .summary = "Bind-Once Constrained Type Group matching unsigned integer scalars.",
+        },
+    },
+    .{
+        "bool",
+        HoverDocSpec{
+            .signature = "bool",
+            .summary = "1-byte boolean scalar (`false` = `0`, `true` = `1`) with niche-optimized `bool?` layout (`1` byte).",
+        },
+    },
+    .{
+        "char",
+        HoverDocSpec{
+            .signature = "char",
+            .summary = "4-byte Unicode scalar value (`U+0000..=U+D7FF` or `U+E000..=U+10FFFF`), excluding surrogates.",
+        },
+    },
+    .{
+        "f32",
+        HoverDocSpec{
+            .signature = "f32",
+            .summary = "32-bit IEEE-754 binary32 floating-point scalar (`4` bytes).",
+        },
+    },
+    .{
+        "f64",
+        HoverDocSpec{
+            .signature = "f64",
+            .summary = "64-bit IEEE-754 binary64 floating-point scalar (`8` bytes).",
+        },
+    },
+    .{
+        "i128",
+        HoverDocSpec{
+            .signature = "i128",
+            .summary = "128-bit two's-complement signed integer (`16` bytes).",
+        },
+    },
+    .{
+        "i16",
+        HoverDocSpec{
+            .signature = "i16",
+            .summary = "16-bit two's-complement signed integer (`2` bytes, range `-32_768..=32_767`).",
+        },
+    },
+    .{
+        "i32",
+        HoverDocSpec{
+            .signature = "i32",
+            .summary = "32-bit two's-complement signed integer (`4` bytes, range `-2_147_483_648..=2_147_483_647`).",
+        },
+    },
+    .{
+        "i64",
+        HoverDocSpec{
+            .signature = "i64",
+            .summary = "64-bit two's-complement signed integer (`8` bytes).",
+        },
+    },
+    .{
+        "i8",
+        HoverDocSpec{
+            .signature = "i8",
+            .summary = "8-bit two's-complement signed integer (`1` byte, range `-128..=127`).",
+        },
+    },
+    .{
+        "isize",
+        HoverDocSpec{
+            .signature = "isize",
+            .summary = "Pointer-sized two's-complement signed integer (`8` bytes on 64-bit targets, `4` bytes on `wasm32`).",
+        },
+    },
+    .{
+        "never",
+        HoverDocSpec{
+            .signature = "never",
+            .summary = "Uninhabited bottom type (`0` bytes) returned by diverging expressions (`return`, `break`, `panic`).",
+        },
+    },
+    .{
+        "opaque",
+        HoverDocSpec{
+            .signature = "opaque",
+            .summary = "Unsized type-erased pointee (`*opaque` / `*mut opaque`) replacing C `void*`; never instantiated by value.",
+        },
+    },
+    .{
+        "str",
+        HoverDocSpec{
+            .signature = "str",
+            .summary = "Immutable borrowed UTF-8 string slice (`Copy`, `{ ptr: *u8, len: usize }`, `16` bytes on 64-bit targets).",
+        },
+    },
+    .{
+        "u128",
+        HoverDocSpec{
+            .signature = "u128",
+            .summary = "128-bit unsigned integer (`16` bytes).",
+        },
+    },
+    .{
+        "u16",
+        HoverDocSpec{
+            .signature = "u16",
+            .summary = "16-bit unsigned integer (`2` bytes, range `0..=65_535`).",
+        },
+    },
+    .{
+        "u32",
+        HoverDocSpec{
+            .signature = "u32",
+            .summary = "32-bit unsigned integer (`4` bytes, range `0..=4_294_967_295`).",
+        },
+    },
+    .{
+        "u64",
+        HoverDocSpec{
+            .signature = "u64",
+            .summary = "64-bit unsigned integer (`8` bytes, range `0..=18_446_744_073_709_551_615`).",
+        },
+    },
+    .{
+        "u8",
+        HoverDocSpec{
+            .signature = "u8",
+            .summary = "8-bit unsigned byte scalar (`1` byte, range `0..=255`).",
+        },
+    },
+    .{
+        "unit",
+        HoverDocSpec{
+            .signature = "unit",
+            .summary = "Zero-sized unit type (`0` bytes) of statements and functions without an explicit `-> ReturnType`.",
+        },
+    },
+    .{
+        "usize",
+        HoverDocSpec{
+            .signature = "usize",
+            .summary = "Pointer-sized unsigned integer (`8` bytes on 64-bit, `4` bytes on `wasm32`) for lengths and indices.",
+        },
+    },
+});
+
+/// $O(1)$ hover documentation catalog for all 71 canonical compiler `@intrinsic` operations.
 const INTRINSIC_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
     .{
         "align_of",
@@ -1729,10 +1914,24 @@ const INTRINSIC_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
         },
     },
     .{
+        "ctx_next_rng_seed",
+        HoverDocSpec{
+            .signature = "@ctx_next_rng_seed() -> u64",
+            .summary = "Deterministically advances `context.rng_seed` in place via WyRand and returns the next 64-bit seed.",
+        },
+    },
+    .{
         "default_init",
         HoverDocSpec{
             .signature = "@default_init[T]() -> T",
             .summary = "Constructs the canonical zero/default representation of scalar, pointer, or default-initializable type `T`.",
+        },
+    },
+    .{
+        "drop_in_place",
+        HoverDocSpec{
+            .signature = "@drop_in_place[T](ptr: *mut T)",
+            .summary = "Runs the destructor glue of `T` in place at `ptr` without deallocating backing storage. Requires `unsafe`.",
         },
     },
     .{
@@ -1764,10 +1963,38 @@ const INTRINSIC_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
         },
     },
     .{
+        "fmt_write",
+        HoverDocSpec{
+            .signature = "@fmt_write(out: &mut FmtWriter, args: FmtArgs) -> unit!FmtError",
+            .summary = "Streams formatted `FmtArgs` pieces and typed arguments directly into `FmtWriter` with zero heap allocation.",
+        },
+    },
+    .{
+        "forget",
+        HoverDocSpec{
+            .signature = "@forget[T](val: own T)",
+            .summary = "Takes ownership of `val` without running its destructor (`AutoDrop`).",
+        },
+    },
+    .{
+        "from_be_bytes",
+        HoverDocSpec{
+            .signature = "@from_be_bytes[T](bytes: [u8; @size_of[T]()]) -> T",
+            .summary = "Decodes scalar `T` from big-endian byte array `bytes`.",
+        },
+    },
+    .{
         "from_bytes",
         HoverDocSpec{
             .signature = "@from_bytes[T](bytes: &[u8]) -> T",
             .summary = "Reads a `FromBytes`-verified value `T` from `bytes` with compile-time/checked size validation.",
+        },
+    },
+    .{
+        "from_le_bytes",
+        HoverDocSpec{
+            .signature = "@from_le_bytes[T](bytes: [u8; @size_of[T]()]) -> T",
+            .summary = "Decodes scalar `T` from little-endian byte array `bytes`.",
         },
     },
     .{
@@ -1785,6 +2012,27 @@ const INTRINSIC_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
         },
     },
     .{
+        "memcpy",
+        HoverDocSpec{
+            .signature = "@memcpy(dst: *mut u8, src: *u8, byte_len: usize)",
+            .summary = "Copies `byte_len` non-overlapping bytes from `src` to `dst`. Requires `unsafe`.",
+        },
+    },
+    .{
+        "memmove",
+        HoverDocSpec{
+            .signature = "@memmove(dst: *mut u8, src: *u8, byte_len: usize)",
+            .summary = "Copies `byte_len` potentially overlapping bytes from `src` to `dst`. Requires `unsafe`.",
+        },
+    },
+    .{
+        "memset",
+        HoverDocSpec{
+            .signature = "@memset(dst: *mut u8, byte_val: u8, byte_len: usize)",
+            .summary = "Fills `byte_len` bytes starting at `dst` with `byte_val`. Requires `unsafe`.",
+        },
+    },
+    .{
         "panic",
         HoverDocSpec{
             .signature = "@panic(msg: str) -> never",
@@ -1799,10 +2047,80 @@ const INTRINSIC_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
         },
     },
     .{
+        "ptr_copy",
+        HoverDocSpec{
+            .signature = "@ptr_copy[T](src: *T, dst: *mut T, count: usize)",
+            .summary = "Copies `count` potentially overlapping elements of `T` from `src` to `dst`. Requires `unsafe`.",
+        },
+    },
+    .{
+        "ptr_copy_nonoverlapping",
+        HoverDocSpec{
+            .signature = "@ptr_copy_nonoverlapping[T](src: *T, dst: *mut T, count: usize)",
+            .summary = "Copies `count` non-overlapping elements of `T` from `src` to `dst`. Requires `unsafe`.",
+        },
+    },
+    .{
+        "ptr_read",
+        HoverDocSpec{
+            .signature = "@ptr_read[T](ptr: *T) -> T",
+            .summary = "Bitwise-reads a value of `T` from `ptr` without moving out of safe references. Requires `unsafe`.",
+        },
+    },
+    .{
+        "ptr_write",
+        HoverDocSpec{
+            .signature = "@ptr_write[T](ptr: *mut T, val: own T)",
+            .summary = "Bitwise-writes `val` into uninitialized memory at `ptr` without dropping old contents. Requires `unsafe`.",
+        },
+    },
+    .{
         "simd_add",
         HoverDocSpec{
             .signature = "@simd_add[T, const N: usize](lhs: Simd[T, N], rhs: Simd[T, N]) -> Simd[T, N]",
             .summary = "Performs lane-wise hardware SIMD addition across `N` lanes of `T`.",
+        },
+    },
+    .{
+        "simd_and",
+        HoverDocSpec{
+            .signature = "@simd_and(lhs: [u8; 16], rhs: [u8; 16]) -> [u8; 16]",
+            .summary = "Performs 128-bit lane-wise bitwise AND across 16 byte lanes.",
+        },
+    },
+    .{
+        "simd_bitmask",
+        HoverDocSpec{
+            .signature = "@simd_bitmask(vec: [u8; 16]) -> u16",
+            .summary = "Extracts the most-significant bit of each of the 16 byte lanes into a 16-bit mask.",
+        },
+    },
+    .{
+        "simd_eq",
+        HoverDocSpec{
+            .signature = "@simd_eq(lhs: [u8; 16], rhs: [u8; 16]) -> [u8; 16]",
+            .summary = "Compares 16 byte lanes for equality (`0xFF` where equal, `0x00` otherwise).",
+        },
+    },
+    .{
+        "simd_gt_s8",
+        HoverDocSpec{
+            .signature = "@simd_gt_s8(lhs: [u8; 16], rhs: [u8; 16]) -> [u8; 16]",
+            .summary = "Compares 16 signed `i8` lanes for `>` (`0xFF` where greater, `0x00` otherwise).",
+        },
+    },
+    .{
+        "simd_load_unaligned",
+        HoverDocSpec{
+            .signature = "@simd_load_unaligned[Vec](ptr: *u8) -> Vec",
+            .summary = "Loads an unaligned SIMD vector `Vec` from `ptr`. Requires `unsafe`.",
+        },
+    },
+    .{
+        "simd_lt_s8",
+        HoverDocSpec{
+            .signature = "@simd_lt_s8(lhs: [u8; 16], rhs: [u8; 16]) -> [u8; 16]",
+            .summary = "Compares 16 signed `i8` lanes for `<` (`0xFF` where less, `0x00` otherwise).",
         },
     },
     .{
@@ -1813,10 +2131,31 @@ const INTRINSIC_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
         },
     },
     .{
+        "simd_or",
+        HoverDocSpec{
+            .signature = "@simd_or(lhs: [u8; 16], rhs: [u8; 16]) -> [u8; 16]",
+            .summary = "Performs 128-bit lane-wise bitwise OR across 16 byte lanes.",
+        },
+    },
+    .{
         "simd_reduce_add",
         HoverDocSpec{
             .signature = "@simd_reduce_add[T, const N: usize](vec: Simd[T, N]) -> T",
             .summary = "Horizontally sums all `N` lanes of `vec` into a single scalar `T`.",
+        },
+    },
+    .{
+        "simd_shl_u8",
+        HoverDocSpec{
+            .signature = "@simd_shl_u8(vec: [u8; 16], shift: u32) -> [u8; 16]",
+            .summary = "Shifts each of the 16 unsigned byte lanes left by `shift` bits.",
+        },
+    },
+    .{
+        "simd_shr_u8",
+        HoverDocSpec{
+            .signature = "@simd_shr_u8(vec: [u8; 16], shift: u32) -> [u8; 16]",
+            .summary = "Shifts each of the 16 unsigned byte lanes logically right by `shift` bits.",
         },
     },
     .{
@@ -1834,10 +2173,52 @@ const INTRINSIC_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
         },
     },
     .{
+        "simd_swizzle",
+        HoverDocSpec{
+            .signature = "@simd_swizzle(table: [u8; 16], indices: [u8; 16]) -> [u8; 16]",
+            .summary = "Byte-wise table lookup (`pshufb` / `tbl` / `i8x16.swizzle`), yielding `0` when index `>= 16`.",
+        },
+    },
+    .{
+        "simd_xor",
+        HoverDocSpec{
+            .signature = "@simd_xor(lhs: [u8; 16], rhs: [u8; 16]) -> [u8; 16]",
+            .summary = "Performs 128-bit lane-wise bitwise XOR across 16 byte lanes.",
+        },
+    },
+    .{
         "size_of",
         HoverDocSpec{
             .signature = "@size_of[T]() -> usize",
             .summary = "Returns the compile-time stride size in bytes of type `T`.",
+        },
+    },
+    .{
+        "slice_from_raw_parts",
+        HoverDocSpec{
+            .signature = "@slice_from_raw_parts[T](ptr: *T, len: usize) -> &[T]",
+            .summary = "Constructs an immutable slice view over `len` initialized elements at `ptr`. Requires `unsafe`.",
+        },
+    },
+    .{
+        "slice_from_raw_parts_mut",
+        HoverDocSpec{
+            .signature = "@slice_from_raw_parts_mut[T](ptr: *mut T, len: usize) -> &mut [T]",
+            .summary = "Constructs an exclusive mutable slice view over `len` initialized elements at `ptr`. Requires `unsafe`.",
+        },
+    },
+    .{
+        "sqrt",
+        HoverDocSpec{
+            .signature = "@sqrt(val: Float) -> Float",
+            .summary = "Computes the IEEE-754 hardware square root of `f32` or `f64` value `val`.",
+        },
+    },
+    .{
+        "str_from_utf8_unchecked",
+        HoverDocSpec{
+            .signature = "@str_from_utf8_unchecked(bytes: &[u8]) -> str",
+            .summary = "Reinterprets pre-validated UTF-8 `bytes` as `str` in O(1) time. Requires `unsafe`.",
         },
     },
     .{
@@ -1848,10 +2229,52 @@ const INTRINSIC_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
         },
     },
     .{
+        "sys_mmap",
+        HoverDocSpec{
+            .signature = "@sys_mmap(byte_len: usize) -> *mut u8",
+            .summary = "Requests page-aligned anonymous virtual memory from the OS (`VirtualAlloc` / `mmap`), or null on failure.",
+        },
+    },
+    .{
+        "sys_munmap",
+        HoverDocSpec{
+            .signature = "@sys_munmap(ptr: *mut u8, byte_len: usize)",
+            .summary = "Releases anonymous virtual pages previously mapped via `@sys_mmap`. Requires `unsafe`.",
+        },
+    },
+    .{
         "sys_write",
         HoverDocSpec{
             .signature = "@sys_write(fd: i32, ptr: *u8, len: usize) -> isize",
             .summary = "Writes `len` bytes from `ptr` to file descriptor `fd` via low-level target syscall.",
+        },
+    },
+    .{
+        "tls_alloc_state",
+        HoverDocSpec{
+            .signature = "@tls_alloc_state() -> *mut opaque",
+            .summary = "Returns the zero-initialized 256-byte thread-local `System` allocator bin state pointer.",
+        },
+    },
+    .{
+        "tls_scratch_ptr",
+        HoverDocSpec{
+            .signature = "@tls_scratch_ptr() -> *mut opaque",
+            .summary = "Returns the zero-initialized 64-byte thread-local `[Arena; 2]` dual-scratch backing pointer.",
+        },
+    },
+    .{
+        "to_be_bytes",
+        HoverDocSpec{
+            .signature = "@to_be_bytes[T](val: T) -> [u8; @size_of[T]()]",
+            .summary = "Encodes scalar `val` into its big-endian fixed-size byte array representation.",
+        },
+    },
+    .{
+        "to_le_bytes",
+        HoverDocSpec{
+            .signature = "@to_le_bytes[T](val: T) -> [u8; @size_of[T]()]",
+            .summary = "Encodes scalar `val` into its little-endian fixed-size byte array representation.",
         },
     },
     .{
@@ -1880,6 +2303,13 @@ const INTRINSIC_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
         HoverDocSpec{
             .signature = "@view_bytes[T](ptr: *T, byte_len: usize) -> &[u8]",
             .summary = "Constructs a bounded read-only byte slice view over `byte_len` bytes starting at `ptr`. Requires `unsafe`.",
+        },
+    },
+    .{
+        "wasm_memory_grow",
+        HoverDocSpec{
+            .signature = "@wasm_memory_grow(mem_idx: u32, delta_pages: usize) -> usize",
+            .summary = "Grows WebAssembly linear memory `mem_idx` by `delta_pages` 64-KiB pages (`usize.MAX` on failure).",
         },
     },
 });
@@ -2988,44 +3418,64 @@ fn mountCxTreeSubmodulesShallow(
     }
 }
 
-/// Lazily mounts `core/root.cx` (`PackageId.std_core`) at `.medium` under `--internal-core`, else `.high`.
+/// Lazily mounts `core/root.cx` and optional `stdlib/cx/mod.cx` (`PackageId.std_core`) in `session`.
 fn mountWorkspaceCoreStdlibLazy(
     session: *LspSession,
     visited_fids: *std.AutoHashMapUnmanaged(u32, void),
 ) !void {
     const core_durability: Durability = if (session.options.is_internal_core) .medium else .high;
-    var ws_core_path_opt: ?[]u8 = null;
-    defer if (ws_core_path_opt) |owned_p| session.allocator.free(owned_p);
+    var prefix_opt: ?[]u8 = null;
+    defer if (prefix_opt) |owned_p| session.allocator.free(owned_p);
+    var core_path_opt: ?[]u8 = null;
+    defer if (core_path_opt) |owned_c| session.allocator.free(owned_c);
 
+    var core_fid: FileId = .none;
     if (session.workspace_root_dir) |ws_root| {
-        ws_core_path_opt = try std.fmt.allocPrint(
-            session.allocator,
-            "{s}/core/root.cx",
-            .{std.mem.trimEnd(u8, ws_root, "/")},
-        );
+        const trimmed = std.mem.trimEnd(u8, ws_root, "/");
+        const ws_prefix = try std.fmt.allocPrint(session.allocator, "{s}/", .{trimmed});
+        const ws_core = try std.fmt.allocPrint(session.allocator, "{s}core/root.cx", .{ws_prefix});
+        if (session.vfs.resolveOrCreatePath(session.io, ws_core, .std_core)) |fid| {
+            prefix_opt = ws_prefix;
+            core_path_opt = ws_core;
+            core_fid = fid;
+        } else |_| {
+            session.allocator.free(ws_core);
+            session.allocator.free(ws_prefix);
+        }
     }
 
-    const chosen_core_path: []const u8 = if (ws_core_path_opt) |ws_core| blk: {
-        if (session.vfs.resolveOrCreatePath(session.io, ws_core, .std_core)) |core_fid| {
-            _ = session.vfs.getLineIndex(core_fid) catch {};
-            try mountExternalSubmodulesShallow(
-                session,
-                core_fid,
-                ws_core,
-                core_durability,
-                .std_core,
-                visited_fids,
-                0,
-            );
-            try session.db.registerRootModule("core", core_fid);
-            try session.db.registerRootModule("cx", core_fid);
-            _ = session.db.resolveSignatures(core_fid) catch {};
-            return;
+    if (core_fid.isNone()) {
+        if (session.vfs.resolveOrCreatePath(session.io, "core/root.cx", .std_core)) |fid| {
+            prefix_opt = try session.allocator.dupe(u8, "");
+            core_path_opt = try session.allocator.dupe(u8, "core/root.cx");
+            core_fid = fid;
         } else |_| {}
-        break :blk "core/root.cx";
-    } else "core/root.cx";
+    }
 
-    const core_fid = session.vfs.resolveOrCreatePath(session.io, chosen_core_path, .std_core) catch return;
+    if (core_fid.isNone()) {
+        if (std.process.executableDirPathAlloc(session.io, session.allocator)) |exe_dir| {
+            defer session.allocator.free(exe_dir);
+            const rel_parents = [_][]const u8{ "..", "../..", "../../.." };
+            for (rel_parents) |rel_up| {
+                const cand_prefix = try std.fmt.allocPrint(session.allocator, "{s}/{s}/", .{ exe_dir, rel_up });
+                const cand_core = try std.fmt.allocPrint(session.allocator, "{s}core/root.cx", .{cand_prefix});
+                if (session.vfs.resolveOrCreatePath(session.io, cand_core, .std_core)) |fid| {
+                    prefix_opt = cand_prefix;
+                    core_path_opt = cand_core;
+                    core_fid = fid;
+                    break;
+                } else |_| {
+                    session.allocator.free(cand_core);
+                    session.allocator.free(cand_prefix);
+                }
+            }
+        } else |_| {}
+    }
+
+    if (core_fid.isNone()) return;
+    const active_prefix = prefix_opt.?;
+    const chosen_core_path = core_path_opt.?;
+
     _ = session.vfs.getLineIndex(core_fid) catch {};
     try mountExternalSubmodulesShallow(
         session,
@@ -3037,8 +3487,26 @@ fn mountWorkspaceCoreStdlibLazy(
         0,
     );
     try session.db.registerRootModule("core", core_fid);
-    try session.db.registerRootModule("cx", core_fid);
-    _ = session.db.resolveSignatures(core_fid) catch {};
+
+    const cx_mod_path = try std.fmt.allocPrint(session.allocator, "{s}stdlib/cx/mod.cx", .{active_prefix});
+    defer session.allocator.free(cx_mod_path);
+    if (session.vfs.resolveOrCreatePath(session.io, cx_mod_path, .std_core)) |cx_fid| {
+        _ = session.vfs.getLineIndex(cx_fid) catch {};
+        try mountExternalSubmodulesShallow(
+            session,
+            cx_fid,
+            cx_mod_path,
+            core_durability,
+            .std_core,
+            visited_fids,
+            0,
+        );
+        try session.db.registerCxStdlibPreludeRoot(cx_fid);
+        _ = session.db.resolveSignatures(core_fid) catch {};
+    } else |_| {
+        try session.db.registerRootModule("cx", core_fid);
+        _ = session.db.resolveSignatures(core_fid) catch {};
+    }
 }
 
 /// Walks `<dir_path>` and mounts any additional `.cx` files at `Durability.medium` without typechecking bodies.
@@ -3453,12 +3921,20 @@ fn resolveDocumentFileId(
     return .none;
 }
 
-/// Handles `textDocument/didOpen`: installs `Durability.low` overlay, binds submodules, and pushes diagnostics.
+/// Enqueues `fid` onto `pending_push_diag_files` (deduplicated) when push diagnostics are active.
+fn queuePushDiagnostics(session: *LspSession, fid: FileId) !void {
+    if (session.is_pull_diagnostics_enabled) return;
+    for (session.pending_push_diag_files.items) |queued_fid| {
+        if (queued_fid == fid) return;
+    }
+    try session.pending_push_diag_files.append(session.allocator, fid);
+}
+
+/// Handles `textDocument/didOpen`: installs `Durability.low` overlay, binds submodules, and queues diagnostics.
 fn handleDidOpenNotification(
     session: *LspSession,
     arena_alloc: std.mem.Allocator,
     params: JsonValue,
-    out_writer: *std.Io.Writer,
 ) !void {
     const raw_uri = extractValidatedNotificationUri(params) orelse return;
     const td_obj = params.getField("textDocument") orelse return;
@@ -3488,9 +3964,7 @@ fn handleDidOpenNotification(
     defer visited.deinit(session.allocator);
     try mountExternalSubmodulesShallow(session, fid, canonical_vpath, .low, pkg_id, &visited, 0);
 
-    if (!session.is_pull_diagnostics_enabled) {
-        try publishDiagnosticsNotification(session, arena_alloc, fid, out_writer);
-    }
+    try queuePushDiagnostics(session, fid);
 }
 
 /// Applies one or more `TextDocumentContentChangeEvent` batches onto `fid` using `S_k` `LineIndex` + `coalesceEditRanges`.
@@ -3498,7 +3972,6 @@ fn handleDidChangeNotificationBatch(
     session: *LspSession,
     arena_alloc: std.mem.Allocator,
     change_params_batch: []const JsonValue,
-    out_writer: *std.Io.Writer,
 ) !void {
     if (change_params_batch.len == 0) return;
     const raw_uri = extractValidatedNotificationUri(change_params_batch[0]) orelse return;
@@ -3567,9 +4040,7 @@ fn handleDidChangeNotificationBatch(
                 };
                 _ = session.vfs.setEditorOverlay(session.io, overlay_path, spliced, pkg_id, true) catch return;
                 _ = try session.db.setInputWithEdit(fid, spliced, .low, edit_range);
-                if (!session.is_pull_diagnostics_enabled) {
-                    try publishDiagnosticsNotification(session, arena_alloc, fid, out_writer);
-                }
+                try queuePushDiagnostics(session, fid);
                 return;
             }
         }
@@ -3577,9 +4048,7 @@ fn handleDidChangeNotificationBatch(
         if (repl_text.len > vfs_sourcemap.MAX_OPEN_OVERLAY_BYTES) return;
         _ = session.vfs.setEditorOverlay(session.io, overlay_path, repl_text, pkg_id, true) catch return;
         _ = try session.db.setInput(fid, repl_text, .low);
-        if (!session.is_pull_diagnostics_enabled) {
-            try publishDiagnosticsNotification(session, arena_alloc, fid, out_writer);
-        }
+        try queuePushDiagnostics(session, fid);
         return;
     }
 
@@ -3661,17 +4130,14 @@ fn handleDidChangeNotificationBatch(
     } else {
         _ = try session.db.setInput(fid, working_src, .low);
     }
-    if (!session.is_pull_diagnostics_enabled) {
-        try publishDiagnosticsNotification(session, arena_alloc, fid, out_writer);
-    }
+    try queuePushDiagnostics(session, fid);
 }
 
-/// Handles `textDocument/didSave`: syncs optional `text`, binds new submodules, and pushes diagnostics.
+/// Handles `textDocument/didSave`: syncs optional `text`, binds new submodules, and queues diagnostics.
 fn handleDidSaveNotification(
     session: *LspSession,
     arena_alloc: std.mem.Allocator,
     params: JsonValue,
-    out_writer: *std.Io.Writer,
 ) !void {
     const raw_uri = extractValidatedNotificationUri(params) orelse return;
     const norm_path = try decodeFileUriToNormalizedPath(arena_alloc, raw_uri);
@@ -3692,9 +4158,7 @@ fn handleDidSaveNotification(
     defer visited.deinit(session.allocator);
     try mountExternalSubmodulesShallow(session, fid, overlay_path, .low, pkg_id, &visited, 0);
 
-    if (!session.is_pull_diagnostics_enabled) {
-        try publishDiagnosticsNotification(session, arena_alloc, fid, out_writer);
-    }
+    try queuePushDiagnostics(session, fid);
 }
 
 /// Handles `textDocument/didClose`: reverts overlay to disk (`Durability.medium`) or clears virtual squiggles.
@@ -3710,25 +4174,32 @@ fn handleDidCloseNotification(
     const pkg_id = session.db.symbol_table.getFilePackageId(fid);
 
     _ = session.open_doc_versions.remove(fid.asInt());
-    session.semantic_tokens_cache.removeFile(fid);
+    {
+        var q_idx: usize = 0;
+        while (q_idx < session.pending_push_diag_files.items.len) {
+            if (session.pending_push_diag_files.items[q_idx] == fid) {
+                _ = session.pending_push_diag_files.orderedRemove(q_idx);
+            } else {
+                q_idx += 1;
+            }
+        }
+    }
 
     if (session.vfs.closeOverlay(session.io, fid) catch false) {
         const disk_src = session.vfs.getFileSource(fid) orelse "";
         const demoted_dur: Durability = if (pkg_id == .root) .medium else .high;
         _ = try session.db.setInput(fid, disk_src, demoted_dur);
-        if (!session.is_pull_diagnostics_enabled) {
-            try publishDiagnosticsNotification(session, arena_alloc, fid, out_writer);
-        }
     } else {
+        session.semantic_tokens_cache.removeFile(fid);
         _ = try session.db.setInput(fid, "", .medium);
-        if (!session.is_pull_diagnostics_enabled) {
-            session.outbound_buf.clearRetainingCapacity();
-            const body_writer = &session.outbound_buf.writer;
-            try body_writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":");
-            try writeJsonString(body_writer, raw_uri);
-            try body_writer.writeAll(",\"diagnostics\":[]}}");
-            try flushOutboundJsonFrame(out_writer, session.outbound_buf.written());
-        }
+    }
+    if (!session.is_pull_diagnostics_enabled) {
+        session.outbound_buf.clearRetainingCapacity();
+        const body_writer = &session.outbound_buf.writer;
+        try body_writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":");
+        try writeJsonString(body_writer, raw_uri);
+        try body_writer.writeAll(",\"diagnostics\":[]}}");
+        try flushOutboundJsonFrame(out_writer, session.outbound_buf.written());
     }
 
     session.removeClientUri(fid);
@@ -3961,7 +4432,11 @@ fn writeSingleLspDiagnosticJson(
         var full_msg: std.ArrayListUnmanaged(u8) = .empty;
         try full_msg.appendSlice(arena_alloc, diag_item.message);
         for (diag_item.notes) |note_line| {
-            try full_msg.appendSlice(arena_alloc, "\n• ");
+            if (std.mem.startsWith(u8, note_line, "help:") or std.mem.startsWith(u8, note_line, "note:")) {
+                try full_msg.appendSlice(arena_alloc, "\n");
+            } else {
+                try full_msg.appendSlice(arena_alloc, "\n• ");
+            }
             try full_msg.appendSlice(arena_alloc, note_line);
         }
         try writeJsonString(writer, full_msg.items);
@@ -4139,7 +4614,12 @@ fn classifySymbolSemanticStyle(
 ) struct { tok_type: u32, mod_bits: u32 } {
     const sym = session.db.symbol_table.getSymbol(sym_idx).*;
     var mods: u32 = if (is_decl_site) (SEM_MOD_DECLARATION | SEM_MOD_DEFINITION) else 0;
-    if (sym.flags.is_builtin or session.db.symbol_table.getFilePackageId(sym.decl_span.file_id) == .std_core) {
+    const is_local_or_param = (sym.kind == .local_let_sym or
+        sym.kind == .local_var_sym or
+        sym.kind == .param_sym);
+    if (!is_local_or_param and
+        (sym.flags.is_builtin or session.db.symbol_table.getFilePackageId(sym.decl_span.file_id) == .std_core))
+    {
         mods |= SEM_MOD_DEFAULT_LIB;
     }
     if (sym.extra_flags.is_deprecated or session.db.symbol_table.getDeprecatedMeta(sym_idx) != null) {
@@ -4160,13 +4640,10 @@ fn classifySymbolSemanticStyle(
         .type_alias_sym, .distinct_type_sym, .refined_type_sym => SEM_TOK_TYPE,
         .type_param_sym => SEM_TOK_TYPE_PARAM,
         .param_sym => blk: {
-            mods |= if (sym.flags.is_mut) SEM_MOD_MUTABLE else SEM_MOD_READONLY;
+            if (sym.flags.is_mut) mods |= SEM_MOD_MUTABLE;
             break :blk SEM_TOK_PARAMETER;
         },
-        .local_let_sym => blk: {
-            mods |= SEM_MOD_READONLY;
-            break :blk SEM_TOK_VARIABLE;
-        },
+        .local_let_sym => SEM_TOK_VARIABLE,
         .local_var_sym => blk: {
             mods |= SEM_MOD_MUTABLE;
             break :blk SEM_TOK_VARIABLE;
@@ -4301,13 +4778,15 @@ fn appendCommentTriviaSemanticSpans(
     if ((piece.flags & syntax_arenas.TRIVIA_FLAG_COALESCED) == 0) {
         switch (piece.kind) {
             .doc_comment, .module_doc_comment => {
+                // Scope only the `///` / `//!` marker so TextMate Markdown scopes inside docstrings stay intact:
+                const marker_end: u32 = @intCast(@min(piece_start + 3, piece_end));
                 try appendSplitSemanticSpan(
                     arena_alloc,
                     src,
                     line_idx,
                     encoding,
                     piece.byte_offset,
-                    @intCast(piece_end),
+                    marker_end,
                     SEM_TOK_COMMENT,
                     SEM_MOD_DOCUMENTATION,
                     range_filter,
@@ -4348,13 +4827,14 @@ fn appendCommentTriviaSemanticSpans(
                         (src[cursor + 2] == '/' and (cursor + 3 >= piece_end or src[cursor + 3] != '/')));
                 cursor += 2;
                 while (cursor < piece_end and src[cursor] != '\n' and src[cursor] != '\r') : (cursor += 1) {}
+                const emit_end: usize = if (is_doc) @min(com_start + 3, cursor) else cursor;
                 try appendSplitSemanticSpan(
                     arena_alloc,
                     src,
                     line_idx,
                     encoding,
                     @intCast(com_start),
-                    @intCast(cursor),
+                    @intCast(emit_end),
                     SEM_TOK_COMMENT,
                     if (is_doc) SEM_MOD_DOCUMENTATION else 0,
                     range_filter,
@@ -4643,9 +5123,8 @@ fn computeSemanticTokensData(
             .kw_pub, .kw_comptime => .{ .tok_type = SEM_TOK_MODIFIER, .mod_bits = 0 },
             .kw_async, .kw_await => .{ .tok_type = SEM_TOK_KEYWORD, .mod_bits = SEM_MOD_ASYNC },
             .kw_unsafe, .kw_extern => .{ .tok_type = SEM_TOK_KEYWORD, .mod_bits = SEM_MOD_UNSAFE },
-            .kw_true, .kw_false => null,
+            .kw_true, .kw_false, .string_lit, .char_lit, .byte_lit, .byte_string_lit => null,
             .int_lit, .float_lit => .{ .tok_type = SEM_TOK_NUMBER, .mod_bits = 0 },
-            .string_lit, .char_lit, .byte_lit, .byte_string_lit => .{ .tok_type = SEM_TOK_STRING, .mod_bits = 0 },
             else => if (@backingInt(tok_rec.kind) <= @backingInt(TokenKind.kw_not))
                 .{ .tok_type = SEM_TOK_KEYWORD, .mod_bits = 0 }
             else
@@ -4958,6 +5437,7 @@ fn unwrapTypeToNominalSymbol(
             .soa_slice_ty,
             .array_ty,
             .soa_array_ty,
+            .soa_vec_ty,
             .optional_ty,
             .future_ty,
             .dyn_trait_ty,
@@ -5087,8 +5567,29 @@ fn resolveCursorTarget(
     const item_tree = try session.db.extractItemTree(file_id);
     var parsed_art = session.db.parsed_artifacts.getPtr(file_id.asInt()) orelse return result;
 
-    const tok_idx = findTokenAtCursorByte(&parsed_art.token_buffer, cursor_byte);
+    var tok_idx = findTokenAtCursorByte(&parsed_art.token_buffer, cursor_byte);
     if (tok_idx.isNone()) return result;
+    // Normalize `&self` / `&mut self` / `own self` receiver prefix clicks onto the adjacent `self` token:
+    {
+        const raw_idx = tok_idx.asInt();
+        const total_toks = parsed_art.token_buffer.countTokens();
+        const init_kind = parsed_art.token_buffer.getToken(tok_idx).kind;
+        if (init_kind == .amp and raw_idx + 1 < total_toks) {
+            const next_one = TokenIndex.fromInt(raw_idx + 1);
+            const next_kind = parsed_art.token_buffer.getToken(next_one).kind;
+            if (next_kind == .kw_self_val) {
+                tok_idx = next_one;
+            } else if (next_kind == .kw_mut and raw_idx + 2 < total_toks and
+                parsed_art.token_buffer.getToken(TokenIndex.fromInt(raw_idx + 2)).kind == .kw_self_val)
+            {
+                tok_idx = TokenIndex.fromInt(raw_idx + 2);
+            }
+        } else if ((init_kind == .kw_mut or init_kind == .kw_own) and raw_idx + 1 < total_toks and
+            parsed_art.token_buffer.getToken(TokenIndex.fromInt(raw_idx + 1)).kind == .kw_self_val)
+        {
+            tok_idx = TokenIndex.fromInt(raw_idx + 1);
+        }
+    }
     result.token_index = tok_idx;
     result.token_span = parsed_art.token_buffer.getTokenSpan(file_id, tok_idx);
     const tok_rec = parsed_art.token_buffer.getToken(tok_idx);
@@ -5164,6 +5665,53 @@ fn resolveCursorTarget(
                         result.symbol_index = explicit_field;
                         result.type_id = session.db.symbol_table.getSymbol(explicit_field).type_id;
                         return result;
+                    }
+                }
+
+                // Match live parameter symbols (including `&self` / `&mut self` / `own self` in method headers)
+                // and `Self` inside `impl` / `trait` items:
+                var live_param_syms: std.ArrayListUnmanaged(SymbolIndex) = .empty;
+                try collectEntryLiveScopeParamSymbols(
+                    session,
+                    session.turn_arena.asAllocator(),
+                    enc_entry.*,
+                    &live_param_syms,
+                );
+                parsed_art = session.db.parsed_artifacts.getPtr(file_id.asInt()) orelse return result;
+                for (live_param_syms.items) |param_sym_idx| {
+                    if (param_sym_idx.isNone() or param_sym_idx.asInt() >= session.db.symbol_table.countSymbols()) {
+                        continue;
+                    }
+                    const param_sym = session.db.symbol_table.getSymbol(param_sym_idx).*;
+                    if (!std.mem.eql(u8, param_sym.name_text, tok_lex)) continue;
+                    const param_span = session.db.resolveLiveSymbolDeclSpan(param_sym_idx) catch param_sym.decl_span;
+                    parsed_art = session.db.parsed_artifacts.getPtr(file_id.asInt()) orelse return result;
+                    if (param_span.file_id == file_id and
+                        param_span.start_byte <= result.token_span.start_byte and
+                        result.token_span.end_byte <= param_span.end_byte)
+                    {
+                        result.symbol_index = param_sym_idx;
+                        result.type_id = param_sym.type_id;
+                        return result;
+                    }
+                }
+                if (tok_rec.kind == .kw_self_type or tok_rec.kind == .kw_self_val) {
+                    for (live_param_syms.items) |param_sym_idx| {
+                        if (param_sym_idx.isNone() or param_sym_idx.asInt() >= session.db.symbol_table.countSymbols()) {
+                            continue;
+                        }
+                        const param_sym = session.db.symbol_table.getSymbol(param_sym_idx).*;
+                        if (!std.mem.eql(u8, param_sym.name_text, "self")) continue;
+                        const nom_sym_idx = unwrapTypeToNominalSymbol(
+                            &session.db.type_pool,
+                            &session.db.symbol_table,
+                            param_sym.type_id,
+                        );
+                        if (tok_rec.kind == .kw_self_type and !nom_sym_idx.isNone()) {
+                            result.symbol_index = nom_sym_idx;
+                            result.type_id = session.db.symbol_table.getSymbol(nom_sym_idx).type_id;
+                            return result;
+                        }
                     }
                 }
             }
@@ -5791,7 +6339,7 @@ fn writeFormattedFnSignature(
     }
 }
 
-/// Appends the 4 monochrome `DR-17` §4.4 contract, capability, stack, and provenance bullets for `sym_idx`.
+/// Appends the compact CommonMark `DR-17` §4.4 contract, capability, stack, and non-trivial provenance footer.
 fn appendFnHoverContractBullets(
     session: *LspSession,
     sym_idx: SymbolIndex,
@@ -5809,39 +6357,37 @@ fn appendFnHoverContractBullets(
     const inferred_eff = summary.inferredEffects();
     const eff_bits = inferred_eff.asBits();
 
-    // [1] Format `• contracts` bullet:
+    // [1] Format compact contract & capability badge line:
     const alloc_status: []const u8 = if (sym.contract_flags.is_no_alloc)
-        "✓ @no_alloc (verified)"
+        "✓ `@no_alloc` (verified)"
     else if (!inferred_eff.alloc)
-        "✓ @no_alloc-eligible"
+        "✓ `@no_alloc`"
     else
-        "✗ allocates";
+        "⚠ allocates";
 
     const panic_status: []const u8 = if (sym.contract_flags.is_no_panic)
-        "✓ @no_panic (verified)"
+        "✓ `@no_panic` (verified)"
     else if (!inferred_eff.may_panic)
-        "✓ @no_panic-eligible"
+        "✓ `@no_panic`"
     else
         "⚠ may panic";
 
     const block_status: []const u8 = if (sym.contract_flags.is_no_block)
-        "✓ @no_block (verified)"
+        "✓ `@no_block` (verified)"
     else if (!inferred_eff.hasAnyBits(EffectCapabilityMask.BLOCKING_BITS))
-        "✓ @no_block-eligible"
+        "✓ `@no_block`"
     else
         "⚠ may block";
 
     try md_writer.print(
-        "\n\n• contracts: {s} • {s} • {s}",
+        "\n\n---\n\n{s} · {s} · {s} · ",
         .{ alloc_status, panic_status, block_status },
     );
 
-    // [2] Format `• capabilities` bullet (strictly using `"unsafe_op"`):
-    try md_writer.writeAll("\n• capabilities: ");
     if (eff_bits == 0) {
-        try md_writer.writeAll("none (pure)");
+        try md_writer.writeAll("**caps:** none (pure)");
     } else {
-        try md_writer.writeByte('[');
+        try md_writer.writeAll("**caps:** `[");
         var cap_written: usize = 0;
         for (CAPABILITY_DISPLAY_TABLE) |cap_entry| {
             if ((eff_bits & cap_entry.bit) != 0) {
@@ -5850,20 +6396,20 @@ fn appendFnHoverContractBullets(
                 cap_written += 1;
             }
         }
-        try md_writer.writeByte(']');
+        try md_writer.writeAll("]`");
     }
 
-    // [3] Format `• stack` bullet:
+    // [2] Format compact stack & non-trivial provenance line:
     if (summary.max_subtree_bytes == FnRegionSummary.STACK_UNBOUNDED or
         summary.contractsScratch().is_scc_recursive)
     {
         try md_writer.print(
-            "\n• stack: {d} B own • unbounded (recursive cycle)",
+            "\n\n**stack:** `{d} B` own · unbounded (recursive)",
             .{summary.own_frame_bytes},
         );
     } else {
         try md_writer.print(
-            "\n• stack: {d} B own • {d} B max subtree",
+            "\n\n**stack:** `{d} B` own · `{d} B` max",
             .{ summary.own_frame_bytes, summary.max_subtree_bytes },
         );
         if (sym.contract_flags.has_max_stack) {
@@ -5871,30 +6417,23 @@ fn appendFnHoverContractBullets(
         }
     }
 
-    // [4] Format `• provenance` bullet:
-    try md_writer.writeAll("\n• provenance: ");
-    if (summary.ret_provenance_mask == 0 and summary.consumed_param_mask == 0) {
-        try md_writer.writeAll("independent return – no consumed parameters");
-    } else {
-        var has_prov_part = false;
+    if (summary.ret_provenance_mask != 0 or summary.consumed_param_mask != 0) {
         if (summary.ret_provenance_mask != 0) {
-            try md_writer.writeAll("return borrows param");
+            try md_writer.writeAll(" · **borrows:** param");
             var bit_i: u6 = 0;
             while (true) : (bit_i += 1) {
                 if ((summary.ret_provenance_mask & (@as(u64, 1) << bit_i)) != 0) {
-                    try md_writer.print(" #{d}", .{bit_i});
+                    try md_writer.print(" `#{d}`", .{bit_i});
                 }
                 if (bit_i == 63) break;
             }
-            has_prov_part = true;
         }
         if (summary.consumed_param_mask != 0) {
-            if (has_prov_part) try md_writer.writeAll(" • ");
-            try md_writer.writeAll("consumes own param");
+            try md_writer.writeAll(" · **consumes:** param");
             var bit_j: u6 = 0;
             while (bit_j < 32) : (bit_j += 1) {
                 if ((summary.consumed_param_mask & (@as(u32, 1) << @intCast(bit_j))) != 0) {
-                    try md_writer.print(" #{d}", .{bit_j});
+                    try md_writer.print(" `#{d}`", .{bit_j});
                 }
             }
         }
@@ -5956,7 +6495,8 @@ fn handleHoverRequest(
         return writeNullResultFrame(session, out_writer, rpc_id);
     }
 
-    // [1] Built-in `@attribute` and `@intrinsic` hover lookup (on `@` or the immediately following name):
+    // [1] Literal suppression, `&self`/`&mut self`/`own self` redirect, and `@attribute`/`@intrinsic` hover:
+    var receiver_prefix_span: ?Span = null;
     if (getLiveDocumentSource(session, fid)) |live_src| {
         const parsed_cst = try session.db.parseCst(fid);
         const cursor_byte = lspPositionToByteOffset(session, fid, pos);
@@ -5964,6 +6504,56 @@ fn handleHoverRequest(
         const tok_count = parsed_cst.token_buffer.countTokens();
         if (!raw_tok.isNone() and raw_tok.asInt() < tok_count) {
             const cur_rec = parsed_cst.token_buffer.getToken(raw_tok);
+            switch (cur_rec.kind) {
+                .int_lit,
+                .float_lit,
+                .string_lit,
+                .char_lit,
+                .byte_lit,
+                .byte_string_lit,
+                .kw_true,
+                .kw_false,
+                => return writeNullResultFrame(session, out_writer, rpc_id),
+                .amp, .kw_mut, .kw_own => {
+                    var scan_i: usize = raw_tok.asInt();
+                    var start_i: usize = scan_i;
+                    if (cur_rec.kind == .kw_mut and start_i > 0 and
+                        parsed_cst.token_buffer.getToken(TokenIndex.fromInt(@intCast(start_i - 1))).kind == .amp)
+                    {
+                        start_i -= 1;
+                    }
+                    while (scan_i + 1 < tok_count) : (scan_i += 1) {
+                        const nxt_k = parsed_cst.token_buffer.getToken(TokenIndex.fromInt(@intCast(scan_i + 1))).kind;
+                        if (nxt_k == .kw_mut) continue;
+                        if (nxt_k == .kw_self_val) {
+                            const self_tok_id = TokenIndex.fromInt(@intCast(scan_i + 1));
+                            const start_rec = parsed_cst.token_buffer.getToken(TokenIndex.fromInt(@intCast(start_i)));
+                            const self_rec = parsed_cst.token_buffer.getToken(self_tok_id);
+                            receiver_prefix_span = Span.init(
+                                fid,
+                                start_rec.byte_offset,
+                                self_rec.byte_offset +| self_rec.byte_len,
+                            );
+                            pos = byteOffsetToLspPosition(session, fid, self_rec.byte_offset);
+                        }
+                        break;
+                    }
+                },
+                .prim_type => {
+                    const prim_lex = symbol_resolver.extractTokenSlice(live_src, &parsed_cst.token_buffer, raw_tok);
+                    if (BUILTIN_PRIM_HOVER_MAP.get(prim_lex)) |prim_spec| {
+                        const prim_md = try std.fmt.allocPrint(
+                            arena_alloc,
+                            "```corex\n{s}\n```\n\n{s}",
+                            .{ prim_spec.signature, prim_spec.summary },
+                        );
+                        const prim_span = parsed_cst.token_buffer.getTokenSpan(fid, raw_tok);
+                        return writeMarkdownHoverFrame(session, fid, prim_span, prim_md, out_writer, rpc_id);
+                    }
+                },
+                else => {},
+            }
+
             var at_tok: TokenIndex = .none;
             var name_tok: TokenIndex = .none;
             if (cur_rec.kind == .at and raw_tok.asInt() + 1 < tok_count) {
@@ -5987,7 +6577,7 @@ fn handleHoverRequest(
                 if (INTRINSIC_HOVER_MAP.get(name_lex) orelse BUILTIN_ATTR_HOVER_MAP.get(name_lex)) |doc_spec| {
                     const doc_md = try std.fmt.allocPrint(
                         arena_alloc,
-                        "```corex\n{s}\n```\n\n---\n\n{s}",
+                        "```corex\n{s}\n```\n\n{s}",
                         .{ doc_spec.signature, doc_spec.summary },
                     );
                     const full_at_span = Span.init(fid, at_rec.byte_offset, name_rec.byte_offset +| name_rec.byte_len);
@@ -6000,9 +6590,76 @@ fn handleHoverRequest(
         }
     }
 
-    const target = try resolveCursorTarget(session, fid, pos);
+    var target = try resolveCursorTarget(session, fid, pos);
+    if (receiver_prefix_span) |full_recv_span| {
+        target.token_span = full_recv_span;
+    }
     if (target.token_index.isNone()) {
         return writeNullResultFrame(session, out_writer, rpc_id);
+    }
+
+    // [1b] `self` / `&self` / `&mut self` / `own self` signature parameter & `Self` fallback:
+    if (target.symbol_index.isNone() and !target.enclosing_def_id.isNone()) {
+        if (session.db.parsed_artifacts.getPtr(fid.asInt())) |parsed_art| {
+            const tok_rec = parsed_art.token_buffer.getToken(target.token_index);
+            if (tok_rec.kind == .kw_self_val or tok_rec.kind == .kw_self_type) {
+                if (session.db.symbol_table.def_to_symbol.get(target.enclosing_def_id.asInt())) |enc_sym_idx| {
+                    const enc_sym = session.db.symbol_table.getSymbol(enc_sym_idx).*;
+                    if (!enc_sym.owner_def_id.isNone()) {
+                        if (session.db.symbol_table.def_to_symbol.get(enc_sym.owner_def_id.asInt())) |owner_idx| {
+                            const owner_sym = session.db.symbol_table.getSymbol(owner_idx).*;
+                            if (tok_rec.kind == .kw_self_val and !enc_sym.type_id.isPrimitiveOrSentinel()) {
+                                if (session.db.type_pool.getFnSignatureView(enc_sym.type_id)) |sig_v| {
+                                    if (sig_v.paramCount() > 0) {
+                                        var recv_buf: [256]u8 = undefined;
+                                        const recv_ty_str = session.db.type_pool.formatType(
+                                            sig_v.getParamType(0),
+                                            &session.db.symbol_table,
+                                            &recv_buf,
+                                        );
+                                        const p_specs = session.db.symbol_table.getFnParamSpecs(enc_sym_idx);
+                                        const var_prefix: []const u8 = if (p_specs.len > 0 and p_specs[0].is_local_var)
+                                            "var "
+                                        else
+                                            "";
+                                        const nom_span = session.db.resolveLiveSymbolDeclSpan(owner_idx) catch owner_sym.decl_span;
+                                        const owner_doc = try extractDeclarationDocComments(
+                                            session,
+                                            arena_alloc,
+                                            nom_span,
+                                            owner_sym.def_id,
+                                            owner_sym.cst_node,
+                                        );
+                                        const self_md = if (owner_doc.len > 0)
+                                            try std.fmt.allocPrint(
+                                                arena_alloc,
+                                                "```corex\n{s}self: {s}\n```\n\n{s}",
+                                                .{ var_prefix, recv_ty_str, owner_doc },
+                                            )
+                                        else
+                                            try std.fmt.allocPrint(
+                                                arena_alloc,
+                                                "```corex\n{s}self: {s}\n```",
+                                                .{ var_prefix, recv_ty_str },
+                                            );
+                                        return writeMarkdownHoverFrame(
+                                            session,
+                                            fid,
+                                            target.token_span,
+                                            self_md,
+                                            out_writer,
+                                            rpc_id,
+                                        );
+                                    }
+                                }
+                            }
+                            target.symbol_index = owner_idx;
+                            target.type_id = owner_sym.type_id;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // [2] Built-in prelude `Option[T]` / `Result[T, E]` variant hover (`.Some`, `.None`, `.Ok`, `.Err`):
@@ -6112,6 +6769,16 @@ fn handleHoverRequest(
 
     if (!sym_idx.isNone() and sym_idx.asInt() < session.db.symbol_table.countSymbols()) {
         const sym = session.db.symbol_table.getSymbol(sym_idx).*;
+        if (sym.flags.is_builtin) {
+            if (BUILTIN_PRIM_HOVER_MAP.get(sym.name_text)) |prim_spec| {
+                const prim_md = try std.fmt.allocPrint(
+                    arena_alloc,
+                    "```corex\n{s}\n```\n\n{s}",
+                    .{ prim_spec.signature, prim_spec.summary },
+                );
+                return writeMarkdownHoverFrame(session, fid, target.token_span, prim_md, out_writer, rpc_id);
+            }
+        }
         try mw.writeAll("```corex\n");
         switch (sym.kind) {
             .fn_sym => {
@@ -6156,7 +6823,11 @@ fn handleHoverRequest(
             .type_alias_sym, .distinct_type_sym, .refined_type_sym, .type_group_sym => {
                 const eff_ty = if (!target.type_id.isError()) target.type_id else sym.type_id;
                 const ty_str = session.db.type_pool.formatType(eff_ty, &session.db.symbol_table, &type_buf);
-                try mw.print("type {s} = {s}", .{ sym.name_text, ty_str });
+                if (std.mem.eql(u8, sym.name_text, ty_str)) {
+                    try mw.print("type {s}", .{sym.name_text});
+                } else {
+                    try mw.print("type {s} = {s}", .{ sym.name_text, ty_str });
+                }
             },
             .const_sym, .const_param_sym => {
                 const eff_ty = if (!target.type_id.isError()) target.type_id else sym.type_id;
@@ -6232,10 +6903,6 @@ fn handleHoverRequest(
         }
         try mw.writeAll("\n```");
 
-        if (sym.kind == .fn_sym) {
-            try appendFnHoverContractBullets(session, sym_idx, sym, mw);
-        }
-
         if (session.db.symbol_table.getDeprecatedMeta(sym_idx)) |dep_meta| {
             if (dep_meta.is_deprecated) {
                 try mw.writeAll("\n\n⚠ **Deprecated**");
@@ -6252,7 +6919,7 @@ fn handleHoverRequest(
         }
 
         const live_decl_span = session.db.resolveLiveSymbolDeclSpan(sym_idx) catch sym.decl_span;
-        const doc_md = if (sym.kind == .module_sym) blk_mod_doc: {
+        var doc_md = if (sym.kind == .module_sym) blk_mod_doc: {
             const mod_fid = resolveModuleBackingFileId(session, target, sym);
             if (!mod_fid.isNone()) {
                 break :blk_mod_doc try extractFileModuleDocComments(session, arena_alloc, mod_fid);
@@ -6271,13 +6938,39 @@ fn handleHoverRequest(
             sym.def_id,
             sym.cst_node,
         );
+
+        // Enrich `self` / `&self` / `&mut self` / `own self` receiver hovers with enclosing nominal type docs:
+        if (doc_md.len == 0 and sym.kind == .param_sym and std.mem.eql(u8, sym.name_text, "self")) {
+            const recv_ty = if (!target.type_id.isError()) target.type_id else sym.type_id;
+            const nom_sym_idx = unwrapTypeToNominalSymbol(&session.db.type_pool, &session.db.symbol_table, recv_ty);
+            if (!nom_sym_idx.isNone() and nom_sym_idx.asInt() < session.db.symbol_table.countSymbols()) {
+                const nom_sym = session.db.symbol_table.getSymbol(nom_sym_idx).*;
+                const nom_span = session.db.resolveLiveSymbolDeclSpan(nom_sym_idx) catch nom_sym.decl_span;
+                doc_md = try extractDeclarationDocComments(
+                    session,
+                    arena_alloc,
+                    nom_span,
+                    nom_sym.def_id,
+                    nom_sym.cst_node,
+                );
+            }
+        }
+
         if (doc_md.len > 0) {
-            try mw.writeAll("\n\n---\n\n");
+            try mw.writeAll("\n\n");
             try mw.writeAll(doc_md);
+        }
+
+        if (sym.kind == .fn_sym) {
+            try appendFnHoverContractBullets(session, sym_idx, sym, mw);
         }
     } else {
         const ty_str = session.db.type_pool.formatType(target.type_id, &session.db.symbol_table, &type_buf);
-        try mw.print("```corex\n{s}\n```", .{ty_str});
+        if (BUILTIN_PRIM_HOVER_MAP.get(ty_str)) |prim_spec| {
+            try mw.print("```corex\n{s}\n```\n\n{s}", .{ prim_spec.signature, prim_spec.summary });
+        } else {
+            try mw.print("```corex\n{s}\n```", .{ty_str});
+        }
     }
 
     return writeMarkdownHoverFrame(session, fid, target.token_span, md_alloc.written(), out_writer, rpc_id);
@@ -6347,7 +7040,22 @@ fn handleDefinitionOrTypeDefinition(
         return writeNullResultFrame(session, out_writer, rpc_id);
     }
 
-    const live_span = try session.db.resolveLiveSymbolDeclSpan(target_sym);
+    var live_span = try session.db.resolveLiveSymbolDeclSpan(target_sym);
+    // When invoking `definition` directly on `&self` in a method signature, jump to the nominal `impl` type:
+    if (!is_type_def and live_span.file_id == fid and
+        live_span.start_byte <= target.token_span.start_byte and
+        target.token_span.end_byte <= live_span.end_byte)
+    {
+        const cur_sym = session.db.symbol_table.getSymbol(target_sym).*;
+        if (cur_sym.kind == .param_sym and std.mem.eql(u8, cur_sym.name_text, "self")) {
+            const recv_ty = if (!target.type_id.isError()) target.type_id else cur_sym.type_id;
+            const nom_idx = unwrapTypeToNominalSymbol(&session.db.type_pool, &session.db.symbol_table, recv_ty);
+            if (!nom_idx.isNone() and nom_idx.asInt() < session.db.symbol_table.countSymbols()) {
+                target_sym = nom_idx;
+                live_span = try session.db.resolveLiveSymbolDeclSpan(target_sym);
+            }
+        }
+    }
     if (live_span.file_id.isNone() or !session.db.source_inputs.contains(live_span.file_id.asInt())) {
         return writeNullResultFrame(session, out_writer, rpc_id);
     }
@@ -7752,7 +8460,7 @@ fn populateDotTargetCompletions(
                             .sort_tier = 1,
                         });
                     },
-                    .soa_slice_ty, .soa_array_ty => {
+                    .soa_slice_ty, .soa_array_ty, .soa_vec_ty => {
                         try appendUniqueCompletion(arena_alloc, seen_labels, out_items, prefix, .{
                             .label = "len",
                             .kind = 2,
@@ -7924,12 +8632,20 @@ fn populateDotTargetCompletions(
                 }
             }
 
-            // `@derive(Eq, Hash, Debug, Clone)` synthesized methods:
-            if (nom_sym.derive_mask.has_eq) {
+            // `@derive(Equatable, Comparable, Hash, Debug, Clone)` synthesized methods:
+            if (nom_sym.derive_mask.has_equatable) {
                 try appendUniqueCompletion(arena_alloc, seen_labels, out_items, prefix, .{
                     .label = "eq",
                     .kind = 2,
                     .detail = "fn(&self, other: &Self) -> bool",
+                    .sort_tier = 1,
+                });
+            }
+            if (nom_sym.derive_mask.has_comparable) {
+                try appendUniqueCompletion(arena_alloc, seen_labels, out_items, prefix, .{
+                    .label = "cmp",
+                    .kind = 2,
+                    .detail = "fn(&self, other: &Self) -> Ordering",
                     .sort_tier = 1,
                 });
             }
@@ -9891,6 +10607,24 @@ const ParsedBatchSlot = struct {
     is_consumed: bool = false,
 };
 
+/// Flushes deferred `didOpen` push diagnostics once interactive requests in the active batch complete.
+fn flushPendingPushDiagnostics(
+    session: *LspSession,
+    arena_alloc: std.mem.Allocator,
+    out_writer: *std.Io.Writer,
+) !void {
+    if (session.is_pull_diagnostics_enabled or session.pending_push_diag_files.items.len == 0) {
+        session.pending_push_diag_files.clearRetainingCapacity();
+        return;
+    }
+    const pending_copy = try arena_alloc.dupe(FileId, session.pending_push_diag_files.items);
+    session.pending_push_diag_files.clearRetainingCapacity();
+    for (pending_copy) |fid| {
+        if (!session.open_doc_versions.contains(fid.asInt())) continue;
+        try publishDiagnosticsNotification(session, arena_alloc, fid, out_writer);
+    }
+}
+
 /// Dispatches a single validated JSON-RPC request or notification onto `session`.
 fn dispatchSingleJsonMessage(
     session: *LspSession,
@@ -9980,6 +10714,7 @@ fn dispatchSingleJsonMessage(
         },
         .initialized => {},
         .shutdown => blk: {
+            try flushPendingPushDiagnostics(session, arena_alloc, out_writer);
             session.state = .shutting_down;
             break :blk writeNullResultFrame(session, out_writer, rpc_id);
         },
@@ -10000,10 +10735,16 @@ fn dispatchSingleJsonMessage(
                 session.canceled_ring.insert(cancel_id);
             }
         },
-        .did_open => handleDidOpenNotification(session, arena_alloc, params, out_writer),
-        .did_change => handleDidChangeNotificationBatch(session, arena_alloc, &.{params}, out_writer),
-        .did_save => handleDidSaveNotification(session, arena_alloc, params, out_writer),
-        .did_close => handleDidCloseNotification(session, arena_alloc, params, out_writer),
+        .did_open => handleDidOpenNotification(session, arena_alloc, params),
+        .did_change => blk_dc: {
+            try flushPendingPushDiagnostics(session, arena_alloc, out_writer);
+            break :blk_dc handleDidChangeNotificationBatch(session, arena_alloc, &.{params});
+        },
+        .did_save => handleDidSaveNotification(session, arena_alloc, params),
+        .did_close => blk_cl: {
+            try flushPendingPushDiagnostics(session, arena_alloc, out_writer);
+            break :blk_cl handleDidCloseNotification(session, arena_alloc, params, out_writer);
+        },
         .did_change_watched_files => handleDidChangeWatchedFilesNotification(session, arena_alloc, params),
         .document_diagnostic => handlePullDiagnosticRequest(session, arena_alloc, params, out_writer, rpc_id),
         .semantic_tokens_full => handleSemanticTokensFullOrRange(
@@ -10033,7 +10774,10 @@ fn dispatchSingleJsonMessage(
         .completion => handleCompletionRequest(session, arena_alloc, params, out_writer, rpc_id),
         .signature_help => handleSignatureHelpRequest(session, arena_alloc, params, out_writer, rpc_id),
         .inlay_hint => handleInlayHintRequest(session, arena_alloc, params, out_writer, rpc_id),
-        .code_action => handleCodeActionRequest(session, arena_alloc, params, out_writer, rpc_id),
+        .code_action => blk_ca: {
+            try flushPendingPushDiagnostics(session, arena_alloc, out_writer);
+            break :blk_ca handleCodeActionRequest(session, arena_alloc, params, out_writer, rpc_id);
+        },
         .formatting => handleFormattingRequest(session, arena_alloc, params, false, out_writer, rpc_id),
         .range_formatting => handleFormattingRequest(session, arena_alloc, params, true, out_writer, rpc_id),
         .prepare_rename => handlePrepareRenameRequest(session, arena_alloc, params, out_writer, rpc_id),
@@ -10210,7 +10954,8 @@ fn drainAndDispatchInboundTurn(
                     batch[look_idx].is_consumed = true;
                 }
 
-                try handleDidChangeNotificationBatch(session, arena_alloc, coalesced_params.items, out_writer);
+                try flushPendingPushDiagnostics(session, arena_alloc, out_writer);
+                try handleDidChangeNotificationBatch(session, arena_alloc, coalesced_params.items);
                 continue;
             }
         }
@@ -10227,6 +10972,7 @@ fn drainAndDispatchInboundTurn(
         if (exit_code_out.* != null) return false;
     }
 
+    try flushPendingPushDiagnostics(session, arena_alloc, out_writer);
     return true;
 }
 
@@ -10754,10 +11500,14 @@ test "test_lsp_hover_dr17_bullets_doc_trivia_and_dot_completion" {
 
     const hover_resp = frames[1];
     try std.testing.expect(std.mem.indexOf(u8, hover_resp, "fn sum_point") != null);
-    try std.testing.expect(std.mem.indexOf(u8, hover_resp, "• contracts:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, hover_resp, "• capabilities: none (pure)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, hover_resp, "• stack:") != null);
     try std.testing.expect(std.mem.indexOf(u8, hover_resp, "Computes doubled coordinate sum.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hover_resp, "`@no_alloc`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hover_resp, "**caps:** none (pure)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hover_resp, "**stack:**") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, hover_resp, "Computes doubled coordinate sum.").? <
+            std.mem.indexOf(u8, hover_resp, "**stack:**").?,
+    );
     // Trailing comment on `PREV_ITEM` line must NOT bleed into `sum_point`'s hover:
     try std.testing.expect(std.mem.indexOf(u8, hover_resp, "trailing comment on previous item") == null);
 

@@ -1,0 +1,5029 @@
+//! Contiguous, Generational, and SwissTable Collections (`cx.col`)
+//!
+//! Provides cache-optimal dynamic containers (`Vec[T]`, `SmallVec[T, N]`, `Deque[T]`, `SlotKey[V]`,
+//! `SlotMap[K, V]`, `WyHasher`, `Map[K, V, H]`, and `Set[T, H]`) alongside pattern-defeating `ipnsort`,
+//! adaptive `Powersort`, `Quickselect`, and branchless slice search algorithms (`STD-01` §1.3, §2.2, §2.3).
+//!
+//! Core headers standardize on `24 B` on 64-bit targets (`16 B` on `wasm32`, or `32 B`/`24 B` with `Map`
+//! per-fiber `seed: u64`) paired with LSB-tagged `AllocatorHandle` for zero-instruction `Arena` drop elision,
+//! while `RawTableInner` erases key/value types across `@noinline` probing routines for linker ICF folding.
+
+use cx.math.widening_mul_u64;
+use cx.mem.{AllocError, AllocatorHandle, Arena, Layout, with_scratch};
+
+// ---------------------------------------- TYPES ----------------------------------------
+// --------------- Contiguous & Inline Containers ---------------
+/// 24-byte contiguous growable array (`16 B` on `wasm32`; zero-instruction drop when `T: TrivialDrop` in `Arena`).
+@repr(C)
+pub struct Vec[T] {
+    /// Non-null buffer pointer (`dangling_ptr[T]()` when `cap == 0` or `@size_of[T]() == 0`).
+    ptr: *mut T,
+    /// Number of initialized live elements in `0..elem_len`.
+    elem_len: u32,
+    /// Allocated element capacity (`u32.MAX` sentinel when `@size_of[T]() == 0`).
+    cap: u32,
+    /// Backing heap or arena allocator handle.
+    alloc: AllocatorHandle,
+}
+
+/// Heap representation stored inside `SmallVecStorage[T, N]` when spilled (`len_and_flag` bit 31 set).
+@repr(C)
+@derive(Copy)
+struct SmallVecHeap[T] {
+    /// Non-null heap allocation pointer (`dangling_ptr[T]()` when `heap_cap == 0` or ZST).
+    ptr: *mut T,
+    /// Backing heap or arena allocator handle preserved across growth.
+    alloc: AllocatorHandle,
+}
+
+/// Backing storage union for `SmallVec[T, N]` overlaying inline `[T; N]` with spilled `(ptr, alloc)`.
+@repr(C)
+union SmallVecStorage[T, const N: usize] {
+    /// Active when `(len_and_flag & SMALLVEC_SPILL_FLAG) != 0`.
+    heap: SmallVecHeap[T],
+    /// Active when `(len_and_flag & SMALLVEC_SPILL_FLAG) == 0` (`0..len` initialized).
+    inline_buf: [T; N],
+}
+
+/// Inline-first growable vector storing up to `N` elements on the stack before spilling (`24 B` when `N * sizeof(T) <= 16`).
+@repr(C)
+pub struct SmallVec[T, const N: usize = 8] {
+    /// Bit 31 (`0x8000_0000`) = spilled heap flag; bits `30..0` = live element count.
+    len_and_flag: u32,
+    /// Allocated heap capacity when spilled (`0` when inline, `u32.MAX` when ZST).
+    heap_cap: u32,
+    /// Inline `[T; N]` or heap `(ptr, alloc)` union payload.
+    storage: SmallVecStorage[T, N],
+}
+
+// ------------------ Power-of-Two Ring Deque -------------------
+/// Packed 32-bit ring-buffer head index and power-of-two capacity exponent (`ADR-22D`).
+@derive(Copy, Equatable)
+bit_field DequeHeadExp: u32 {
+    /// Ring start index in `0 .. (1 << 27) - 1`.
+    pub head: u32 | 27,
+    /// `0` when unallocated (`cap == 0`); `1..=28` encodes `cap = 1 << (exp_plus_1 - 1)`.
+    pub exp_plus_1: u8 | 5,
+}
+
+/// Exact 24-byte power-of-two double-ended ring buffer (`16 B` on `wasm32`).
+@repr(C)
+pub struct Deque[T] {
+    /// Non-null ring base pointer (`dangling_ptr[T]()` when unallocated or ZST).
+    ptr: *mut T,
+    /// Packed 27-bit `head` offset and 5-bit `exp_plus_1` capacity exponent.
+    head_exp: DequeHeadExp,
+    /// Number of initialized live elements in the ring.
+    elem_len: u32,
+    /// Backing heap or arena allocator handle.
+    alloc: AllocatorHandle,
+}
+
+// --------------- Generational SlotKey & SlotMap ---------------
+/// 64-bit generational slot key (`generation` refined `1..=u32.MAX` so `0` forms the `SlotKey[V]?` niche).
+@repr(C)
+@derive(Copy, Equatable, Comparable, Debug)
+pub struct SlotKey[V] {
+    /// Physical slot index inside `SlotMap`.
+    pub index: u32,
+    /// Non-zero odd generation tag incremented on allocation and removal.
+    pub generation: u32 is 1..=u32.MAX,
+}
+
+/// Unrefined 8-byte `(index, generation)` mirror for generic `SlotMap[K, V]` key projection.
+@repr(C)
+@derive(Copy, Equatable)
+struct RawSlotKey {
+    /// Physical slot index inside `SlotMap`.
+    index: u32,
+    /// Raw 32-bit generation counter (odd when occupied, even when free).
+    generation: u32,
+}
+
+/// Per-slot payload union overlaying a live `V` value with an intrusive freelist `next_free` index.
+@repr(C)
+union SlotUnion[V] {
+    /// Next free slot index (`SLOT_FREE_NONE` at freelist tail) when generation is even.
+    next_free: u32,
+    /// Live occupied value when generation is odd.
+    value: V,
+}
+
+/// Generational arena (`32 B` on 64-bit, `20 B` on `wasm32`) with $O(1)$ insert, lookup, and ABA-safe removal.
+@repr(C)
+pub struct SlotMap[K, V] {
+    /// Base pointer to single combined `[generations: [u32; cap] | pad | slots: [SlotUnion[V]; cap]]` slab.
+    base_ptr: *mut u8,
+    /// Number of live occupied values.
+    live_len: u32,
+    /// Total allocated slot count.
+    cap: u32,
+    /// Intrusive freelist head index (`SLOT_FREE_NONE` when empty).
+    free_head: u32,
+    /// Explicit alignment padding on 64-bit targets keeping header layout deterministic.
+    @cfg(target.ptr_width == 64)
+    _pad: u32 = 0,
+    /// Backing heap or arena allocator handle.
+    alloc: AllocatorHandle,
+}
+
+// ------------- WyHasher & Type-Erased SwissTable --------------
+/// Seeded 64-bit `Wyhash` state (`Context.rng_seed`-seeded in `Map` for `--sim` determinism per `Fix-18A`).
+@repr(C)
+@derive(Copy, Equatable)
+pub struct WyHasher {
+    /// Running 64-bit mixed accumulator state.
+    state: u64 = 0xA076_1D64_78BD_642F_u64,
+    /// Secondary 64-bit stream seed mixed across stripes.
+    seed: u64 = 0xE703_7ED1_A0B4_28DB_u64,
+}
+
+/// 16-lane control-byte match bitmask on `x86_64` and `aarch64` (`1` bit per matched byte lane).
+@cfg(target.arch == "x86_64" or target.arch == "aarch64")
+@derive(Copy, Equatable)
+struct SimdGroupBitMask {
+    /// Packed 16-bit lane mask produced by `@simd_bitmask`.
+    bits: u16,
+}
+
+/// 8-lane SWAR control-byte match bitmask on `wasm32` and non-128-bit freestanding targets (`0x80` MSB per matched byte).
+@cfg(not (target.arch == "x86_64" or target.arch == "aarch64"))
+@derive(Copy, Equatable)
+struct SwarGroupBitMask {
+    /// Packed 64-bit SWAR mask with bit 7 (`0x80`) set on each matching byte lane.
+    bits: u64,
+}
+
+/// Active target control-byte match bitmask alias (`SimdGroupBitMask` on 128-bit SIMD targets, `SwarGroupBitMask` on `wasm32`).
+@cfg(target.arch == "x86_64" or target.arch == "aarch64")
+type GroupBitMask = SimdGroupBitMask;
+
+/// Active target control-byte match bitmask alias (`SwarGroupBitMask` on `wasm32` and portable targets).
+@cfg(not (target.arch == "x86_64" or target.arch == "aarch64"))
+type GroupBitMask = SwarGroupBitMask;
+
+/// 16-byte SIMD SwissTable control group on `x86_64` and `aarch64`.
+@cfg(target.arch == "x86_64" or target.arch == "aarch64")
+@derive(Copy)
+struct SimdProbeGroup {
+    /// Unaligned 16-byte control window `[ctrl[pos] .. ctrl[pos + 16])`.
+    lanes: [u8; 16],
+}
+
+/// 8-byte branchless `u64` SWAR SwissTable control group on `wasm32` and portable targets.
+@cfg(not (target.arch == "x86_64" or target.arch == "aarch64"))
+@derive(Copy)
+struct SwarProbeGroup {
+    /// Little-endian 8-byte control word `[ctrl[pos] .. ctrl[pos + 8])`.
+    word: u64,
+}
+
+/// Active target SwissTable probe group alias (`16 B` SIMD on `x86_64`/`aarch64`).
+@cfg(target.arch == "x86_64" or target.arch == "aarch64")
+type ProbeGroup = SimdProbeGroup;
+
+/// Active target SwissTable probe group alias (`8 B` SWAR on `wasm32`).
+@cfg(not (target.arch == "x86_64" or target.arch == "aarch64"))
+type ProbeGroup = SwarProbeGroup;
+
+/// 24-byte (`16 B` on `wasm32`) type-erased SwissTable engine (`growth_left` stored at `ctrl.sub(8)` when allocated).
+@repr(C)
+pub(pkg) struct RawTableInner {
+    /// Points to `EMPTY_CTRL_GROUP` when `bucket_mask == 0`, else `alloc_base.add(8)`.
+    pub ctrl: *mut u8,
+    /// `buckets - 1` (`0` when unallocated).
+    pub bucket_mask: u32,
+    /// Number of live `FULL` entries (`ctrl[i] < 0x80`).
+    pub items: u32,
+    /// Backing heap or arena allocator handle.
+    pub alloc: AllocatorHandle,
+}
+
+/// Contiguous key-value bucket record stored inside `Map[K, V, H]`.
+@repr(C)
+struct MapBucket[K, V] {
+    /// Stored entry key.
+    key: K,
+    /// Stored entry value.
+    val: V,
+}
+
+/// Open-addressed SIMD/SWAR SwissTable hash map (`87.5%` max load factor; `32 B` on 64-bit, `24 B` on `wasm32`).
+@repr(C)
+pub struct Map[K: Equatable + Hash, V, H: Hasher = WyHasher] {
+    /// Type-erased SwissTable control and bucket storage.
+    raw: RawTableInner,
+    /// Per-table deterministic `Context.rng_seed` hash seed (`Fix-18A`).
+    seed: u64,
+}
+
+/// Borrowed `(key, value)` iterator over live entries of `Map[K, V, H]`.
+@repr(C)
+pub struct MapIter[K, V] {
+    /// Control byte array pointer.
+    ctrl: *u8,
+    /// First bucket byte pointer (`dangling` when `remaining == 0`).
+    buckets_base: *u8,
+    /// Current scan index in `0..=bucket_mask`.
+    index: usize,
+    /// Remaining live items to yield.
+    remaining: usize,
+}
+
+/// Borrowed `&K` key iterator over live entries of `Map[K, V, H]`.
+@repr(C)
+pub struct MapKeysIter[K, V] {
+    /// Underlying `(key, value)` entry iterator.
+    inner: MapIter[K, V],
+}
+
+/// Borrowed `&V` value iterator over live entries of `Map[K, V, H]`.
+@repr(C)
+pub struct MapValuesIter[K, V] {
+    /// Underlying `(key, value)` entry iterator.
+    inner: MapIter[K, V],
+}
+
+/// Open-addressed SIMD/SWAR SwissTable hash set (`32 B` on 64-bit, `24 B` on `wasm32`) wrapping `Map[T, unit, H]`.
+@repr(C)
+pub struct Set[T: Equatable + Hash, H: Hasher = WyHasher] {
+    /// Underlying zero-value-overhead `Map[T, unit, H]`.
+    inner: Map[T, unit, H],
+}
+
+/// Borrowed `&T` element iterator over live entries of `Set[T, H]`.
+@repr(C)
+pub struct SetIter[T] {
+    /// Underlying `Map[T, unit]` entry iterator.
+    inner: MapIter[T, unit],
+}
+
+// -------------- Sorting & Slice Window Iterators --------------
+/// Pending natural run descriptor on `Powersort`'s bounded merge stack.
+@repr(C)
+@derive(Copy)
+struct PowersortRun {
+    /// Start index of the run in the target slice.
+    start: usize = 0,
+    /// End index (exclusive) of the run in the target slice.
+    end: usize = 0,
+    /// Munro–Wild separator node power relative to the preceding run.
+    power: u8 = 0,
+}
+
+/// Zero-allocation sliding-window iterator returned by `cx.col.windows`.
+@repr(C)
+pub struct WindowsIter[T] {
+    /// Remaining slice tail.
+    slice: &[T],
+    /// Non-zero window length (`>= 1`).
+    width: usize,
+}
+
+/// Zero-allocation contiguous-chunk iterator returned by `cx.col.chunks`.
+@repr(C)
+pub struct ChunksIter[T] {
+    /// Remaining slice tail.
+    slice: &[T],
+    /// Non-zero maximum chunk length (`>= 1`).
+    chunk_size: usize,
+}
+
+/// Unconstrained generic pointer, slice, and sorting kernel carrier.
+struct SliceOps[T] {}
+
+// --------------------------------------- CONSTS ----------------------------------------
+/// Bit 31 flag in `SmallVec.len_and_flag` marking heap-spilled storage.
+const SMALLVEC_SPILL_FLAG: u32 = 0x8000_0000_u32;
+
+/// Mask extracting the 31-bit element length from `SmallVec.len_and_flag`.
+const SMALLVEC_LEN_MASK: u32 = 0x7FFF_FFFF_u32;
+
+/// Sentinel marking the end of `SlotMap`'s intrusive free list.
+const SLOT_FREE_NONE: u32 = 0xFFFF_FFFF_u32;
+
+/// Primary `Wyhash` secret constant `P0`.
+const WY_P0: u64 = 0xA076_1D64_78BD_642F_u64;
+
+/// Secondary `Wyhash` secret constant `P1`.
+const WY_P1: u64 = 0xE703_7ED1_A0B4_28DB_u64;
+
+/// Tertiary `Wyhash` secret constant `P2`.
+const WY_P2: u64 = 0x8EBC_6AF0_9C88_C6E3_u64;
+
+/// Quaternary `Wyhash` secret constant `P3`.
+const WY_P3: u64 = 0x5899_65CC_7537_4CC3_u64;
+
+/// SwissTable control byte marking an unoccupied slot (`0b1111_1111`).
+pub(pkg) const CTRL_EMPTY: u8 = 0xFF_u8;
+
+/// SwissTable control byte marking a tombstone slot (`0b1000_0000`).
+pub(pkg) const CTRL_DELETED: u8 = 0x80_u8;
+
+/// SwissTable SIMD probe group width (`16` bytes) on `x86_64` and `aarch64`.
+@cfg(target.arch == "x86_64" or target.arch == "aarch64")
+const GROUP_WIDTH: usize = 16;
+
+/// SwissTable SWAR probe group width (`8` bytes) on `wasm32` and portable targets.
+@cfg(not (target.arch == "x86_64" or target.arch == "aarch64"))
+const GROUP_WIDTH: usize = 8;
+
+/// SWAR byte-broadcast `0x01` multiplier for portable 8-byte control probing.
+@cfg(not (target.arch == "x86_64" or target.arch == "aarch64"))
+const SWAR_REP_01: u64 = 0x0101_0101_0101_0101_u64;
+
+/// SWAR low-7-bit lane mask `0x7F` for portable 8-byte control probing.
+@cfg(not (target.arch == "x86_64" or target.arch == "aarch64"))
+const SWAR_REP_7F: u64 = 0x7F7F_7F7F_7F7F_7F7F_u64;
+
+/// SWAR MSB lane mask `0x80` for portable 8-byte control probing.
+@cfg(not (target.arch == "x86_64" or target.arch == "aarch64"))
+const SWAR_REP_80: u64 = 0x8080_8080_8080_8080_u64;
+
+/// Shared static `.rodata` control group allowing unallocated `Map`/`Set` lookups with zero branches.
+const EMPTY_CTRL_GROUP: &[u8] = b"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF";
+
+/// Insertion-sort cutoff (`<= 24` elements) shared by `ipnsort`, `Powersort`, and `Quickselect`.
+const SMALL_SORT_THRESHOLD: usize = 24;
+
+/// Static `.rodata` allocator handle (`tag = 2`, never freed).
+const COL_STATIC_RODATA: AllocatorHandle = AllocatorHandle { raw_tagged_ptr: 2_usize };
+
+// -------------------------------------- INTERNALS --------------------------------------
+// -------------- Pointer, Alignment & Growth Math --------------
+/// Returns a well-aligned non-null sentinel pointer `@align_of[T]()` for empty or ZST containers.
+@inline @no_alloc @no_panic
+fn dangling_ptr[T]() -> *mut T {
+    return @align_of[T]() as *mut T;
+}
+
+/// Rounds `offset` upward to power-of-two `alignment` using trap-free wrapping arithmetic (`@no_panic`).
+@inline @no_alloc @no_panic
+fn align_up_wrapping(offset: usize, alignment: usize, /) -> usize {
+    if alignment <= 1 {
+        return offset;
+    }
+    let mask: usize = alignment -% 1;
+    return (offset +% mask) & ~mask;
+}
+
+/// Rounds `offset` upward to power-of-two `alignment`, returning `.None` on `usize` overflow.
+@inline @no_alloc @no_panic
+fn checked_align_up(offset: usize, alignment: usize, /) -> usize? {
+    if alignment <= 1 {
+        return .Some(offset);
+    }
+    let mask: usize = alignment -% 1;
+    if offset > usize.MAX -% mask {
+        return .None;
+    }
+    return .Some((offset +% mask) & ~mask);
+}
+
+/// Returns the smaller of `lhs` and `rhs` (`usize`).
+@inline @no_alloc @no_panic
+fn min_usize_local(lhs: usize, rhs: usize, /) -> usize {
+    return if lhs < rhs {
+        lhs
+    } else {
+        rhs
+    };
+}
+
+/// Returns the larger of `lhs` and `rhs` (`usize`).
+@inline @no_alloc @no_panic
+fn max_usize_local(lhs: usize, rhs: usize, /) -> usize {
+    return if lhs > rhs {
+        lhs
+    } else {
+        rhs
+    };
+}
+
+/// Computes the next amortized capacity (`2x` up to `64`, `1.5x` above `64`, bounded by `u32.MAX` & `isize.MAX`).
+@inline @no_alloc @no_panic
+fn next_amortized_cap[T](cur_cap: usize, required_cap: usize, /) -> usize!AllocError {
+    let elem_size: usize = @size_of[T]();
+    let max_by_bytes: usize = if elem_size == 0 {
+        u32.MAX as usize
+    } else {
+        (isize.MAX as usize) / elem_size
+    };
+    let max_cap: usize = min_usize_local(u32.MAX as usize, max_by_bytes);
+    if required_cap > max_cap {
+        return .Err(.OutOfMemory);
+    }
+    let min_init: usize = if elem_size == 1 {
+        8
+    } else if elem_size <= 1024 {
+        4
+    } else {
+        1
+    };
+    let grown: usize = if cur_cap == 0 {
+        min_init
+    } else if cur_cap < 64 {
+        cur_cap << 1_usize
+    } else {
+        cur_cap +% (cur_cap >> 1_usize)
+    };
+    return .Ok(min_usize_local(max_usize_local(grown, required_cap), max_cap));
+}
+
+// ------------------ 64-Bit Wyhash Primitives ------------------
+/// Folded 128-bit multiply-XOR mixer (`low ^ high`) at the core of `Wyhash`.
+@inline @no_alloc @no_panic
+fn wy_mix(lhs: u64, rhs: u64, /) -> u64 {
+    let (lo, hi) = widening_mul_u64(lhs, rhs);
+    return lo ^ hi;
+}
+
+/// Reads an unaligned little-endian `u64` from `ptr` safely across all architectures.
+@std_cap_boundary(clears: [unsafe_op])
+@inline @no_alloc @no_panic
+fn wy_read_u64_le(ptr: *u8, /) -> u64 {
+    var raw: [u8; 8] = [0_u8; 8];
+    unsafe {
+        @memcpy(&raw mut raw[0] as *mut opaque, ptr as *opaque, 8);
+    }
+    return @from_le_bytes[u64](raw);
+}
+
+/// Reads an unaligned little-endian `u32` (zero-extended to `u64`) from `ptr`.
+@std_cap_boundary(clears: [unsafe_op])
+@inline @no_alloc @no_panic
+fn wy_read_u32_le(ptr: *u8, /) -> u64 {
+    var raw: [u8; 4] = [0_u8; 4];
+    unsafe {
+        @memcpy(&raw mut raw[0] as *mut opaque, ptr as *opaque, 4);
+    }
+    return @from_le_bytes[u32](raw) as u64;
+}
+
+// ---------------- SlotMap Layout & Key Helpers ----------------
+/// Projects generic 8-byte `SlotKey`-shaped handle `K` into `RawSlotKey`.
+@std_cap_boundary(clears: [unsafe_op, may_panic])
+@inline @no_alloc @no_panic
+fn unpack_slot_key[K](key: &K, /) -> RawSlotKey {
+    @compile_assert(@size_of[K]() == 8, "SlotMap key K must be an 8-byte SlotKey handle");
+    return unsafe {
+        @ptr_read(&raw key.* as *RawSlotKey)
+    };
+}
+
+/// Reconstructs generic 8-byte `SlotKey`-shaped handle `K` from `(index, odd_generation)`.
+@std_cap_boundary(clears: [unsafe_op, may_panic])
+@inline @no_alloc @no_panic
+fn pack_slot_key[K](index: u32, generation: u32, /) -> K {
+    @compile_assert(@size_of[K]() == 8, "SlotMap key K must be an 8-byte SlotKey handle");
+    let raw_key = RawSlotKey {
+        index: index,
+        generation: generation,
+    };
+    return unsafe {
+        @ptr_read(&raw raw_key as *K)
+    };
+}
+
+/// Computes `(slots_byte_offset, total_Layout)` for a `SlotMap` slab of `cap` entries.
+@inline @no_alloc @no_panic
+fn slot_map_slab_layout[V](cap: usize, /) -> (usize, Layout)!AllocError {
+    let slot_align: usize = @align_of[SlotUnion[V]]();
+    let slab_align: usize = max_usize_local(4, slot_align);
+    if cap > (isize.MAX as usize) / 4 {
+        return .Err(.OutOfMemory);
+    }
+    let gens_bytes: usize = cap *% 4;
+    let slots_off: usize = checked_align_up(gens_bytes, slot_align) orelse return .Err(.OutOfMemory);
+    let slot_stride: usize = @size_of[SlotUnion[V]]();
+    if slot_stride != 0 and cap > ((isize.MAX as usize) -% slots_off) / slot_stride {
+        return .Err(.OutOfMemory);
+    }
+    let total_bytes: usize = slots_off +% (cap *% slot_stride);
+    return .Ok((slots_off, Layout { size: total_bytes, alignment: slab_align }));
+}
+
+// -------------- SwissTable Group & RawTableInner --------------
+@cfg(target.arch == "x86_64" or target.arch == "aarch64")
+impl SimdGroupBitMask {
+    /// Returns `true` if at least one lane matched.
+    @inline @no_alloc @no_panic
+    fn has_any(self) -> bool {
+        return self.bits != 0_u16;
+    }
+
+    /// Returns the index (`0..=16`) of the lowest set match bit.
+    @inline @no_alloc @no_panic
+    fn trailing_zeros(self) -> usize {
+        return self.bits.trailing_zeros() as usize;
+    }
+
+    /// Returns the count (`0..=16`) of leading clear lanes from the top of the 16-byte group.
+    @inline @no_alloc @no_panic
+    fn leading_zeros(self) -> usize {
+        return self.bits.leading_zeros() as usize;
+    }
+
+    /// Clears and returns the lowest matching lane index (`0..15`), or `.None` when empty.
+    @inline @no_alloc @no_panic
+    fn next_index(&mut self) -> usize? {
+        let old_bits: u16 = self.bits;
+        if old_bits == 0_u16 {
+            return .None;
+        }
+        self.bits = old_bits & (old_bits -% 1_u16);
+        return .Some(old_bits.trailing_zeros() as usize);
+    }
+}
+
+@cfg(not (target.arch == "x86_64" or target.arch == "aarch64"))
+impl SwarGroupBitMask {
+    /// Returns `true` if at least one byte lane matched.
+    @inline @no_alloc @no_panic
+    fn has_any(self) -> bool {
+        return self.bits != 0_u64;
+    }
+
+    /// Returns the byte lane index (`0..=8`) of the lowest set MSB.
+    @inline @no_alloc @no_panic
+    fn trailing_zeros(self) -> usize {
+        return (self.bits.trailing_zeros() >> 3_u32) as usize;
+    }
+
+    /// Returns the byte lane count (`0..=8`) of leading clear MSBs from byte 7 downward.
+    @inline @no_alloc @no_panic
+    fn leading_zeros(self) -> usize {
+        return (self.bits.leading_zeros() >> 3_u32) as usize;
+    }
+
+    /// Clears and returns the lowest matching byte lane (`0..7`), or `.None` when empty.
+    @inline @no_alloc @no_panic
+    fn next_index(&mut self) -> usize? {
+        let old_bits: u64 = self.bits;
+        if old_bits == 0_u64 {
+            return .None;
+        }
+        self.bits = old_bits & (old_bits -% 1_u64);
+        return .Some((old_bits.trailing_zeros() >> 3_u32) as usize);
+    }
+}
+
+@cfg(target.arch == "x86_64" or target.arch == "aarch64")
+impl SimdProbeGroup {
+    /// Loads 16 control bytes starting at `ptr` (unaligned).
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    fn load(ptr: *u8, /) -> Self {
+        return Self {
+            lanes: unsafe {
+                @simd_load_unaligned[[u8; 16]](ptr)
+            },
+        };
+    }
+
+    /// Matches 7-bit fingerprint `h2` (`0..127`) across all 16 control lanes in parallel.
+    @inline @no_alloc @no_panic
+    fn match_h2(self, h2: u8, /) -> GroupBitMask {
+        return GroupBitMask {
+            bits: @simd_bitmask(@simd_eq(self.lanes, @simd_splat[[u8; 16]](h2))),
+        };
+    }
+
+    /// Matches `CTRL_EMPTY` (`0xFF`) across all 16 control lanes.
+    @inline @no_alloc @no_panic
+    fn match_empty(self) -> GroupBitMask {
+        return GroupBitMask {
+            bits: @simd_bitmask(@simd_eq(self.lanes, @simd_splat[[u8; 16]](CTRL_EMPTY))),
+        };
+    }
+
+    /// Matches `CTRL_EMPTY` (`0xFF`) or `CTRL_DELETED` (`0x80`) via lane sign bits.
+    @inline @no_alloc @no_panic
+    fn match_empty_or_deleted(self) -> GroupBitMask {
+        return GroupBitMask {
+            bits: @simd_bitmask(self.lanes),
+        };
+    }
+}
+
+@cfg(not (target.arch == "x86_64" or target.arch == "aarch64"))
+impl SwarProbeGroup {
+    /// Loads 8 control bytes starting at `ptr` in little-endian lane order.
+    @inline @no_alloc @no_panic
+    fn load(ptr: *u8, /) -> Self {
+        return Self {
+            word: wy_read_u64_le(ptr),
+        };
+    }
+
+    /// Exact branchless 8-byte SWAR `h2` match (`0` false positives, `5` scalar ALU ops).
+    @inline @no_alloc @no_panic
+    fn match_h2(self, h2: u8, /) -> GroupBitMask {
+        let diff: u64 = self.word ^ ((h2 as u64) *% SWAR_REP_01);
+        let non_zero: u64 = (diff & SWAR_REP_7F) +% SWAR_REP_7F;
+        return GroupBitMask {
+            bits: ~(non_zero | diff) & SWAR_REP_80,
+        };
+    }
+
+    /// Exact branchless `CTRL_EMPTY` (`0xFF`, bits 7 & 6 both `1`) match in 3 ALU ops.
+    @inline @no_alloc @no_panic
+    fn match_empty(self) -> GroupBitMask {
+        return GroupBitMask {
+            bits: (self.word & (self.word << 1_u64)) & SWAR_REP_80,
+        };
+    }
+
+    /// Matches `CTRL_EMPTY` (`0xFF`) or `CTRL_DELETED` (`0x80`) via bit 7.
+    @inline @no_alloc @no_panic
+    fn match_empty_or_deleted(self) -> GroupBitMask {
+        return GroupBitMask {
+            bits: self.word & SWAR_REP_80,
+        };
+    }
+}
+
+/// Maps logical `Deque` index `idx` onto physical slot `0..cap` using power-of-two mask wrap.
+@inline @no_alloc @no_panic
+fn deque_phys_slot(head_exp: DequeHeadExp, cap: usize, idx: usize, /) -> usize {
+    let mask: usize = cap -% 1_usize;
+    return ((head_exp.head as usize) +% idx) & mask;
+}
+
+/// Computes `87.5%` (`7 / 8`) usable SwissTable capacity for power-of-two `buckets`.
+@inline @no_alloc @no_panic
+fn bucket_usable_capacity(buckets: usize, /) -> usize {
+    return buckets -% (buckets >> 3_usize);
+}
+
+/// Computes `(entries_off_from_alloc_base, Layout)` for `buckets` SwissTable slots.
+@inline @no_alloc @no_panic
+fn raw_table_slab_layout(buckets: usize, elem_size: usize, elem_align: usize, /) -> (usize, Layout)!AllocError {
+    let slab_align: usize = max_usize_local(8, max_usize_local(GROUP_WIDTH, elem_align));
+    let header_and_ctrl: usize = 8_usize +% buckets +% GROUP_WIDTH;
+    let entries_off: usize = checked_align_up(header_and_ctrl, elem_align)
+        orelse return .Err(.OutOfMemory);
+    if elem_size != 0 and buckets > ((isize.MAX as usize) -% entries_off) / elem_size {
+        return .Err(.OutOfMemory);
+    }
+    let total_bytes: usize = entries_off +% (buckets *% elem_size);
+    return .Ok((entries_off, Layout { size: total_bytes, alignment: slab_align }));
+}
+
+/// Swaps `elem_size` bytes between non-overlapping `slot_a` and `slot_b` in 64-byte stack chunks.
+@std_cap_boundary(clears: [unsafe_op])
+@no_alloc @no_panic
+fn swap_raw_bytes(slot_a: *mut u8, slot_b: *mut u8, elem_size: usize, /) {
+    var chunk: [u8; 64] = [0_u8; 64];
+    var offset: usize = 0;
+    while offset < elem_size {
+        let step: usize = min_usize_local(64, elem_size -% offset);
+        unsafe {
+            let ptr_a: *mut u8 = slot_a.add(offset);
+            let ptr_b: *mut u8 = slot_b.add(offset);
+            @memcpy(&raw mut chunk[0] as *mut opaque, ptr_a as *opaque, step);
+            @memcpy(ptr_a as *mut opaque, ptr_b as *opaque, step);
+            @memcpy(ptr_b as *mut opaque, &raw chunk[0] as *opaque, step);
+        }
+        offset = offset +% step;
+    }
+}
+
+impl RawTableInner {
+    /// Constructs an unallocated `RawTableInner` pointing at static `.rodata` `EMPTY_CTRL_GROUP`.
+    @inline @no_alloc @no_panic
+    pub(pkg) fn empty(alloc: AllocatorHandle, /) -> Self {
+        return Self {
+            ctrl: EMPTY_CTRL_GROUP.as_ptr() as *mut u8,
+            bucket_mask: 0,
+            items: 0,
+            alloc: alloc,
+        };
+    }
+
+    /// Computes bucket `idx` address relative to `alloc_base = self.ctrl.sub(8)` so `>= 16B` alignments never misalign.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub(pkg) fn bucket_ptr(&self, idx: usize, elem_size: usize, elem_align: usize, /) -> *mut u8 {
+        if elem_size == 0 or self.bucket_mask == 0 {
+            return elem_align as *mut u8;
+        }
+        let buckets: usize = (self.bucket_mask as usize) +% 1;
+        let entries_off: usize = align_up_wrapping(8_usize +% buckets +% GROUP_WIDTH, elem_align);
+        return unsafe {
+            self.ctrl.sub(8_usize).add(entries_off +% (idx *% elem_size))
+        };
+    }
+
+    /// Returns a mutable reference to `growth_left: u32` stored at `alloc_base` (`self.ctrl.sub(8)`).
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    fn growth_left_mut(&mut self) -> &mut u32 {
+        return (SliceOps[u32] {}).ptr_mut(
+            unsafe {
+                self.ctrl.sub(8_usize) as *mut u32
+            },
+        );
+    }
+
+    /// Reads `growth_left: u32` at `alloc_base` (`0` when unallocated).
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    fn growth_left(&self) -> u32 {
+        if self.bucket_mask == 0 {
+            return 0;
+        }
+        return unsafe {
+            (self.ctrl.sub(8_usize) as *u32).read()
+        };
+    }
+
+    /// Updates `ctrl[idx]` and mirrors indices `0..GROUP_WIDTH` at `ctrl[buckets + idx]` branchlessly.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub(pkg) fn set_ctrl(&mut self, idx: usize, ctrl_byte: u8, /) {
+        let mask: usize = self.bucket_mask as usize;
+        let mirror_idx: usize = ((idx -% GROUP_WIDTH) & mask) +% GROUP_WIDTH;
+        unsafe {
+            self.ctrl.add(idx).write(ctrl_byte);
+            self.ctrl.add(mirror_idx).write(ctrl_byte);
+        }
+    }
+
+    /// Type-erased `@noinline` SwissTable lookup shared across `Map`/`Set` instantiations via linker ICF.
+    @std_cap_boundary(clears: [unsafe_op, alloc, may_panic])
+    @no_alloc @no_panic @noinline
+    pub(pkg) fn find_raw(
+        &self,
+        hash_val: u64,
+        elem_size: usize,
+        elem_align: usize,
+        eq_bucket: |*u8| -> bool,
+        /,
+    ) -> usize? {
+        if self.items == 0 {
+            return .None;
+        }
+        let h2: u8 = (hash_val & 0x7F_u64) as u8;
+        let mask: usize = self.bucket_mask as usize;
+        var pos: usize = ((hash_val >> 7_u64) as usize) & mask;
+        var stride: usize = 0;
+
+        while true {
+            let grp: ProbeGroup = ProbeGroup.load(
+                unsafe {
+                    self.ctrl.add(pos)
+                } as *u8,
+            );
+            var matches: GroupBitMask = grp.match_h2(h2);
+            while matches.next_index() is .Some(lane) {
+                let idx: usize = (pos +% lane) & mask;
+                if eq_bucket(self.bucket_ptr(idx, elem_size, elem_align) as *u8) {
+                    return .Some(idx);
+                }
+            }
+            if grp.match_empty().has_any() {
+                return .None;
+            }
+            stride = stride +% GROUP_WIDTH;
+            pos = (pos +% stride) & mask;
+        }
+        return .None;
+    }
+
+    /// Finds the first `EMPTY` or `DELETED` slot for `hash_val` when key absence is already known.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    fn find_first_avail_slot(&self, hash_val: u64, /) -> usize {
+        let mask: usize = self.bucket_mask as usize;
+        var pos: usize = ((hash_val >> 7_u64) as usize) & mask;
+        var stride: usize = 0;
+        while true {
+            let avail: GroupBitMask = ProbeGroup
+                .load(
+                    unsafe {
+                        self.ctrl.add(pos)
+                    } as *u8,
+                )
+                .match_empty_or_deleted();
+            if avail.has_any() {
+                return (pos +% avail.trailing_zeros()) & mask;
+            }
+            stride = stride +% GROUP_WIDTH;
+            pos = (pos +% stride) & mask;
+        }
+        return 0;
+    }
+
+    /// Type-erased `@noinline` SwissTable find-or-insert slot preparation returning `(slot_idx, found_existing)`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @noinline
+    pub(pkg) fn find_or_prepare_insert_raw(
+        &mut self,
+        hash_val: u64,
+        seed: u64,
+        elem_size: usize,
+        elem_align: usize,
+        eq_bucket: |*u8| -> bool,
+        hash_bucket: |u64, *u8| -> u64,
+        /,
+    ) -> (usize, bool)!AllocError {
+        if self.bucket_mask != 0 {
+            let h2: u8 = (hash_val & 0x7F_u64) as u8;
+            let mask: usize = self.bucket_mask as usize;
+            var pos: usize = ((hash_val >> 7_u64) as usize) & mask;
+            var stride: usize = 0;
+            var first_avail: usize? = .None;
+
+            while true {
+                let grp: ProbeGroup = ProbeGroup.load(
+                    unsafe {
+                        self.ctrl.add(pos)
+                    } as *u8,
+                );
+                var matches: GroupBitMask = grp.match_h2(h2);
+                while matches.next_index() is .Some(lane) {
+                    let idx: usize = (pos +% lane) & mask;
+                    if eq_bucket(self.bucket_ptr(idx, elem_size, elem_align) as *u8) {
+                        return .Ok((idx, true));
+                    }
+                }
+                if first_avail is .None {
+                    let avail: GroupBitMask = grp.match_empty_or_deleted();
+                    if avail.has_any() {
+                        first_avail = .Some((pos +% avail.trailing_zeros()) & mask);
+                    }
+                }
+                if grp.match_empty().has_any() {
+                    if first_avail is .Some(slot) {
+                        let was_empty: bool = unsafe {
+                            self.ctrl.add(slot).read()
+                        } == CTRL_EMPTY;
+                        if not (was_empty and self.growth_left() == 0) {
+                            if was_empty {
+                                self.growth_left_mut().* -= 1;
+                            }
+                            self.set_ctrl(slot, h2);
+                            self.items += 1;
+                            return .Ok((slot, false));
+                        }
+                    }
+                    break;
+                }
+                stride = stride +% GROUP_WIDTH;
+                pos = (pos +% stride) & mask;
+            }
+        }
+
+        self.rehash_or_grow_raw(seed, elem_size, elem_align, hash_bucket)?;
+        let slot: usize = self.find_first_avail_slot(hash_val);
+        if unsafe {
+            self.ctrl.add(slot).read()
+        } == CTRL_EMPTY {
+            self.growth_left_mut().* -= 1;
+        }
+        self.set_ctrl(slot, (hash_val & 0x7F_u64) as u8);
+        self.items += 1;
+        return .Ok((slot, false));
+    }
+
+    /// Adaptive tombstone erasure marking `idx` `CTRL_EMPTY` whenever surrounding window has `< GROUP_WIDTH` full/tombstone bytes.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic @noinline
+    pub(pkg) fn erase_slot_ctrl(&mut self, idx: usize, /) {
+        let mask: usize = self.bucket_mask as usize;
+        let idx_before: usize = (idx -% GROUP_WIDTH) & mask;
+        let empty_before: GroupBitMask = ProbeGroup
+            .load(
+                unsafe {
+                    self.ctrl.add(idx_before)
+                } as *u8,
+            )
+            .match_empty();
+        let empty_after: GroupBitMask = ProbeGroup
+            .load(
+                unsafe {
+                    self.ctrl.add(idx)
+                } as *u8,
+            )
+            .match_empty();
+        let use_tombstone: bool = (empty_before.leading_zeros() +% empty_after.trailing_zeros()) >= GROUP_WIDTH;
+        if use_tombstone {
+            self.set_ctrl(idx, CTRL_DELETED);
+        } else {
+            self.set_ctrl(idx, CTRL_EMPTY);
+            self.growth_left_mut().* = self.growth_left() +% 1;
+        }
+        self.items = self.items -% 1;
+    }
+
+    /// Zero-allocation in-place tombstone compaction used when `items <= buckets / 2` and `growth_left == 0`.
+    @std_cap_boundary(clears: [unsafe_op, alloc, may_panic])
+    @no_alloc @no_panic
+    fn rehash_in_place_raw(
+        &mut self,
+        seed: u64,
+        elem_size: usize,
+        elem_align: usize,
+        hash_bucket: |u64, *u8| -> u64,
+        /,
+    ) {
+        let mask: usize = self.bucket_mask as usize;
+        let buckets: usize = mask +% 1;
+        var i: usize = 0;
+        while i < buckets {
+            let old_ctrl: u8 = unsafe {
+                self.ctrl.add(i).read()
+            };
+            let next_ctrl: u8 = if (old_ctrl & 0x80_u8) != 0_u8 {
+                CTRL_EMPTY
+            } else {
+                CTRL_DELETED
+            };
+            self.set_ctrl(i, next_ctrl);
+            i = i +% 1;
+        }
+        self.growth_left_mut().* = (bucket_usable_capacity(buckets) -% (self.items as usize)) as u32;
+
+        var idx: usize = 0;
+        while idx < buckets {
+            while unsafe {
+                self.ctrl.add(idx).read()
+            } == CTRL_DELETED {
+                let cur_ptr: *mut u8 = self.bucket_ptr(idx, elem_size, elem_align);
+                let hash_val: u64 = hash_bucket(seed, cur_ptr as *u8);
+                let h2: u8 = (hash_val & 0x7F_u64) as u8;
+                let h1_pos: usize = ((hash_val >> 7_u64) as usize) & mask;
+                let target_idx: usize = self.find_first_avail_slot(hash_val);
+
+                if (((idx -% h1_pos) & mask) / GROUP_WIDTH) == (
+                    ((target_idx -% h1_pos) & mask) / GROUP_WIDTH
+                ) {
+                    self.set_ctrl(idx, h2);
+                    break;
+                }
+                let target_ctrl: u8 = unsafe {
+                    self.ctrl.add(target_idx).read()
+                };
+                if target_ctrl == CTRL_EMPTY {
+                    self.set_ctrl(target_idx, h2);
+                    self.set_ctrl(idx, CTRL_EMPTY);
+                    if elem_size != 0 {
+                        let dst_ptr: *mut u8 = self.bucket_ptr(target_idx, elem_size, elem_align);
+                        unsafe {
+                            @memcpy(dst_ptr as *mut opaque, cur_ptr as *opaque, elem_size);
+                        }
+                    }
+                    break;
+                }
+                self.set_ctrl(target_idx, h2);
+                if elem_size != 0 {
+                    let dst_ptr: *mut u8 = self.bucket_ptr(target_idx, elem_size, elem_align);
+                    swap_raw_bytes(cur_ptr, dst_ptr, elem_size);
+                }
+            }
+            idx = idx +% 1;
+        }
+    }
+
+    /// Allocates and migrates live entries to `next_buckets` power-of-two capacity (`next_buckets >= GROUP_WIDTH`).
+    @std_cap_boundary(clears: [unsafe_op])
+    fn grow_to_buckets_raw(
+        &mut self,
+        next_buckets: usize,
+        seed: u64,
+        elem_size: usize,
+        elem_align: usize,
+        hash_bucket: |u64, *u8| -> u64,
+        /,
+    ) -> unit!AllocError {
+        if next_buckets -% 1 > (u32.MAX as usize) {
+            return .Err(.OutOfMemory);
+        }
+        let (_, new_layout) = raw_table_slab_layout(next_buckets, elem_size, elem_align)?;
+        let new_base: *mut u8 = self.alloc.alloc(new_layout)?;
+        let new_ctrl: *mut u8 = unsafe {
+            new_base.add(8_usize)
+        };
+        unsafe {
+            (new_base as *mut u32).write(bucket_usable_capacity(next_buckets) as u32);
+            (new_base.add(4_usize) as *mut u32).write(0_u32);
+            @memset(new_ctrl as *mut opaque, CTRL_EMPTY, next_buckets +% GROUP_WIDTH);
+        }
+
+        var next_table = RawTableInner {
+            ctrl: new_ctrl,
+            bucket_mask: (next_buckets -% 1) as u32,
+            items: self.items,
+            alloc: self.alloc,
+        };
+
+        if self.items != 0 {
+            let old_buckets: usize = (self.bucket_mask as usize) +% 1;
+            var old_idx: usize = 0;
+            while old_idx < old_buckets {
+                let ctrl_byte: u8 = unsafe {
+                    self.ctrl.add(old_idx).read()
+                };
+                if (ctrl_byte & 0x80_u8) == 0_u8 {
+                    let src_ptr: *mut u8 = self.bucket_ptr(old_idx, elem_size, elem_align);
+                    let hash_val: u64 = hash_bucket(seed, src_ptr as *u8);
+                    let dst_idx: usize = next_table.find_first_avail_slot(hash_val);
+                    next_table.growth_left_mut().* -= 1;
+                    next_table.set_ctrl(dst_idx, (hash_val & 0x7F_u64) as u8);
+                    if elem_size != 0 {
+                        let dst_ptr: *mut u8 = next_table.bucket_ptr(dst_idx, elem_size, elem_align);
+                        unsafe {
+                            @memcpy(dst_ptr as *mut opaque, src_ptr as *opaque, elem_size);
+                        }
+                    }
+                }
+                old_idx = old_idx +% 1;
+            }
+        }
+
+        self.dealloc_slab_raw(elem_size, elem_align);
+        self.* = next_table;
+        return .Ok(());
+    }
+
+    /// Compacts tombstones in place when occupancy `<= 50%`, else doubles bucket count (`@noinline` ICF boundary).
+    @noinline
+    pub(pkg) fn rehash_or_grow_raw(
+        &mut self,
+        seed: u64,
+        elem_size: usize,
+        elem_align: usize,
+        hash_bucket: |u64, *u8| -> u64,
+        /,
+    ) -> unit!AllocError {
+        if self.bucket_mask == 0 {
+            return self.grow_to_buckets_raw(GROUP_WIDTH, seed, elem_size, elem_align, hash_bucket);
+        }
+        let cur_buckets: usize = (self.bucket_mask as usize) +% 1;
+        if (self.items as usize) <= cur_buckets / 2 {
+            self.rehash_in_place_raw(seed, elem_size, elem_align, hash_bucket);
+            return .Ok(());
+        }
+        if cur_buckets > (usize.MAX >> 1_usize) {
+            return .Err(.OutOfMemory);
+        }
+        return self.grow_to_buckets_raw(
+            cur_buckets << 1_usize,
+            seed,
+            elem_size,
+            elem_align,
+            hash_bucket,
+        );
+    }
+
+    /// Ensures capacity for `additional` new items without reallocating during subsequent insertions.
+    pub(pkg) fn reserve_raw(
+        &mut self,
+        additional: usize,
+        seed: u64,
+        elem_size: usize,
+        elem_align: usize,
+        hash_bucket: |u64, *u8| -> u64,
+        /,
+    ) -> unit!AllocError {
+        if additional <= (self.growth_left() as usize) {
+            return .Ok(());
+        }
+        if additional > (u32.MAX as usize) -% (self.items as usize) {
+            return .Err(.OutOfMemory);
+        }
+        let needed_items: usize = (self.items as usize) +% additional;
+        if self.bucket_mask != 0 {
+            let cur_buckets: usize = (self.bucket_mask as usize) +% 1;
+            if needed_items <= bucket_usable_capacity(cur_buckets) {
+                self.rehash_in_place_raw(seed, elem_size, elem_align, hash_bucket);
+                return .Ok(());
+            }
+        }
+        var target_buckets: usize = GROUP_WIDTH;
+        while bucket_usable_capacity(target_buckets) < needed_items {
+            if target_buckets > ((u32.MAX as usize) >> 1_usize) {
+                return .Err(.OutOfMemory);
+            }
+            target_buckets = target_buckets << 1_usize;
+        }
+        return self.grow_to_buckets_raw(target_buckets, seed, elem_size, elem_align, hash_bucket);
+    }
+
+    /// Resets all allocated control bytes to `CTRL_EMPTY` and restores full `growth_left`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub(pkg) fn reset_ctrl_empty(&mut self) {
+        if self.bucket_mask != 0 {
+            let buckets: usize = (self.bucket_mask as usize) +% 1;
+            unsafe {
+                @memset(self.ctrl as *mut opaque, CTRL_EMPTY, buckets +% GROUP_WIDTH);
+            }
+            self.growth_left_mut().* = bucket_usable_capacity(buckets) as u32;
+        }
+        self.items = 0;
+    }
+
+    /// Frees the backing SwissTable slab (when heap-owned and allocated) and resets `self` to `empty`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub(pkg) fn dealloc_slab_raw(&mut self, elem_size: usize, elem_align: usize, /) {
+        if self.bucket_mask != 0 and not self.alloc.is_arena_or_static() {
+            let buckets: usize = (self.bucket_mask as usize) +% 1;
+            let slab_align: usize = max_usize_local(8, max_usize_local(GROUP_WIDTH, elem_align));
+            let entries_off: usize = align_up_wrapping(8_usize +% buckets +% GROUP_WIDTH, elem_align);
+            let total_bytes: usize = entries_off +% (buckets *% elem_size);
+            self.alloc.dealloc(
+                unsafe {
+                    self.ctrl.sub(8_usize)
+                },
+                Layout { size: total_bytes, alignment: slab_align },
+            );
+        }
+        self.ctrl = EMPTY_CTRL_GROUP.as_ptr() as *mut u8;
+        self.bucket_mask = 0;
+        self.items = 0;
+    }
+}
+
+/// Computes seeded `64`-bit hash of `key` through generic `H: Hasher`.
+@inline @no_alloc @no_panic
+fn hash_key_seeded[K: Hash, H: Hasher](seed: u64, key: &K, /) -> u64 {
+    var hasher: H = @default_init[H]();
+    hasher.write_u64(seed);
+    key.hash(&mut hasher);
+    return hasher.finish();
+}
+
+/// Computes `floor(log2(n))` for non-zero `n >= 1`.
+@inline @no_alloc @no_panic
+fn ilog2_usize_local(n: usize, /) -> u32 {
+    if n <= 1 {
+        return 0_u32;
+    }
+    return (usize.BITS -% 1_u32) -% n.leading_zeros();
+}
+
+/// Munro & Wild (2018) `u128`-widened `Powersort` node power (`0` overflow traps across 32-bit and 64-bit).
+@std_cap_boundary(clears: [may_panic])
+@inline @no_alloc @no_panic
+pub(pkg) fn powersort_node_power(n: usize, start_a: usize, end_a: usize, end_b: usize, /) -> u8 {
+    if n == 0 {
+        return 0_u8;
+    }
+    let denom: u128 = n as u128;
+    let quot_a: u128 = (((start_a as u128) +% (end_a as u128)) << 61_u128) / denom;
+    let quot_b: u128 = (((end_a as u128) +% (end_b as u128)) << 61_u128) / denom;
+    let diff_64: u64 = (quot_a ^ quot_b) as u64;
+    return ((diff_64.leading_zeros() -| 1_u32) & 0xFF_u32) as u8;
+}
+
+impl[T] SliceOps[T] {
+    /// Projects non-null `ptr` as `&T` with dominating non-null proof (`0` bounds traps).
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    fn ptr_ref(&self, ptr: *T, /) -> &T {
+        if not ptr.is_null() {
+            return unsafe {
+                &ptr.*
+            };
+        }
+        return self.ptr_ref(dangling_ptr[T]() as *T);
+    }
+
+    /// Projects non-null `ptr` as `&mut T` with dominating non-null proof (`0` bounds traps).
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    fn ptr_mut(&self, ptr: *mut T, /) -> &mut T {
+        if not ptr.is_null() {
+            return unsafe {
+                &mut ptr.*
+            };
+        }
+        return self.ptr_mut(dangling_ptr[T]());
+    }
+
+    /// Swaps `base[idx_a]` and `base[idx_b]` in place via `swap_raw_bytes` (`AutoDrop`/ZST-safe).
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    fn swap_at(&self, base: *mut T, idx_a: usize, idx_b: usize, /) {
+        let elem_size: usize = @size_of[T]();
+        if elem_size == 0 or idx_a == idx_b {
+            return;
+        }
+        unsafe {
+            swap_raw_bytes(base.add(idx_a) as *mut u8, base.add(idx_b) as *mut u8, elem_size);
+        }
+    }
+
+    /// Reverses `slice` in place via `swap_at` (`AutoDrop`-safe and ZST-safe).
+    @inline @no_alloc @no_panic
+    fn reverse(&self, slice: &mut [T], /) {
+        let n: usize = slice.len();
+        if n <= 1 or @size_of[T]() == 0 {
+            return;
+        }
+        let base: *mut T = slice.as_mut_ptr();
+        var lo: usize = 0;
+        var hi: usize = n -% 1;
+        while lo < hi {
+            self.swap_at(base, lo, hi);
+            lo = lo +% 1;
+            hi = hi -% 1;
+        }
+    }
+
+    /// Small-range linear insertion sort (`N <= 24`; `AutoDrop`-safe via `defer` writeback on comparator panic).
+    @std_cap_boundary(clears: [unsafe_op, alloc])
+    @inline @no_alloc
+    fn insertion_sort(&self, base: *mut T, n: usize, less: |&T, &T| -> bool, /) {
+        if n < 2 or @size_of[T]() == 0 {
+            return;
+        }
+        var i: usize = 1;
+        while i < n {
+            var hole_val: T = unsafe {
+                @ptr_read(base.add(i) as *T)
+            };
+            var hole_idx: usize = i;
+            var committed: bool = false;
+            defer {
+                if not committed {
+                    unsafe {
+                        @ptr_write(base.add(hole_idx), own hole_val);
+                    }
+                }
+            }
+            while hole_idx > 0 and less(
+                &hole_val,
+                self.ptr_ref(
+                    unsafe {
+                        base.add(hole_idx -% 1) as *T
+                    },
+                ),
+            ) {
+                unsafe {
+                    @ptr_copy_nonoverlapping(base.add(hole_idx -% 1) as *T, base.add(hole_idx), 1);
+                }
+                hole_idx = hole_idx -% 1;
+            }
+            committed = true;
+            unsafe {
+                @ptr_write(base.add(hole_idx), own hole_val);
+            }
+            i = i +% 1;
+        }
+    }
+
+    /// Restores max-heap invariant on `base[root..heap_len]` in $O(\log N)$ swaps.
+    @std_cap_boundary(clears: [unsafe_op, alloc])
+    @no_alloc
+    fn sift_down_heap(
+        &self,
+        base: *mut T,
+        var root: usize,
+        heap_len: usize,
+        less: |&T, &T| -> bool,
+        /,
+    ) {
+        while true {
+            var child: usize = (root << 1_usize) +% 1;
+            if child >= heap_len {
+                return;
+            }
+            if child +% 1 < heap_len and less(
+                self.ptr_ref(
+                    unsafe {
+                        base.add(child) as *T
+                    },
+                ),
+                self.ptr_ref(
+                    unsafe {
+                        base.add(child +% 1) as *T
+                    },
+                ),
+            ) {
+                child = child +% 1;
+            }
+            if not less(
+                self.ptr_ref(
+                    unsafe {
+                        base.add(root) as *T
+                    },
+                ),
+                self.ptr_ref(
+                    unsafe {
+                        base.add(child) as *T
+                    },
+                ),
+            ) {
+                return;
+            }
+            self.swap_at(base, root, child);
+            root = child;
+        }
+    }
+
+    /// Guaranteed $O(N \log N)$ worst-case heapsort fallback when `ipnsort` exhausts recursion depth.
+    @std_cap_boundary(clears: [unsafe_op, alloc])
+    @no_alloc @noinline
+    fn heapsort_fallback(&self, base: *mut T, n: usize, less: |&T, &T| -> bool, /) {
+        if n < 2 or @size_of[T]() == 0 {
+            return;
+        }
+        var start: usize = n / 2;
+        while start > 0 {
+            start = start -% 1;
+            self.sift_down_heap(base, start, n, less);
+        }
+        var end_idx: usize = n;
+        while end_idx > 1 {
+            end_idx = end_idx -% 1;
+            self.swap_at(base, 0, end_idx);
+            self.sift_down_heap(base, 0, end_idx, less);
+        }
+    }
+
+    /// Branchless cyclic Lomuto partition (`2` moves/item via `@ptr_copy` + `defer` gap guard for unwind safety).
+    @std_cap_boundary(clears: [unsafe_op, alloc])
+    @no_alloc
+    fn partition_lomuto_branchless_cyclic(
+        &self,
+        base: *mut T,
+        n: usize,
+        pivot: &T,
+        less: |&T, &T| -> bool,
+        /,
+    ) -> usize {
+        if n == 0 or @size_of[T]() == 0 {
+            return 0;
+        }
+        var gap_val: T = unsafe {
+            @ptr_read(base as *T)
+        };
+        var gap_pos: usize = 0;
+        var num_lt: usize = 0;
+        var committed: bool = false;
+        defer {
+            if not committed {
+                unsafe {
+                    @ptr_write(base.add(gap_pos), own gap_val);
+                }
+            }
+        }
+
+        var right: usize = 1;
+        while right < n {
+            let is_lt: usize = less(
+                self.ptr_ref(
+                    unsafe {
+                        base.add(right) as *T
+                    },
+                ),
+                pivot,
+            ) as usize;
+            unsafe {
+                @ptr_copy(base.add(num_lt) as *T, base.add(gap_pos), 1);
+                @ptr_copy(base.add(right) as *T, base.add(num_lt), 1);
+            }
+            gap_pos = right;
+            num_lt = num_lt +% is_lt;
+            right = right +% 1;
+        }
+
+        let gap_is_lt: usize = less(&gap_val, pivot) as usize;
+        unsafe {
+            @ptr_copy(base.add(num_lt) as *T, base.add(gap_pos), 1);
+            committed = true;
+            @ptr_write(base.add(num_lt), own gap_val);
+        }
+        return num_lt +% gap_is_lt;
+    }
+
+    /// Returns the median index of `(idx_a, idx_b, idx_c)` under `less`.
+    @std_cap_boundary(clears: [unsafe_op, alloc])
+    @inline @no_alloc
+    fn median3_index(
+        &self,
+        base: *T,
+        var idx_a: usize,
+        var idx_b: usize,
+        var idx_c: usize,
+        less: |&T, &T| -> bool,
+        /,
+    ) -> usize {
+        if less(
+            self.ptr_ref(
+                unsafe {
+                    base.add(idx_b)
+                },
+            ),
+            self.ptr_ref(
+                unsafe {
+                    base.add(idx_a)
+                },
+            ),
+        ) {
+            (idx_a, idx_b) = (idx_b, idx_a);
+        }
+        if less(
+            self.ptr_ref(
+                unsafe {
+                    base.add(idx_c)
+                },
+            ),
+            self.ptr_ref(
+                unsafe {
+                    base.add(idx_b)
+                },
+            ),
+        ) {
+            (idx_b, idx_c) = (idx_c, idx_b);
+            if less(
+                self.ptr_ref(
+                    unsafe {
+                        base.add(idx_b)
+                    },
+                ),
+                self.ptr_ref(
+                    unsafe {
+                        base.add(idx_a)
+                    },
+                ),
+            ) {
+                (idx_a, idx_b) = (idx_b, idx_a);
+            }
+        }
+        return idx_b;
+    }
+
+    /// Selects pivot index via Tukey's ninther (`N >= 50`) or median-of-three (`N < 50`).
+    @std_cap_boundary(clears: [unsafe_op, alloc])
+    @no_alloc
+    fn choose_pivot_ninther(&self, base: *T, n: usize, less: |&T, &T| -> bool, /) -> usize {
+        let mid: usize = n / 2;
+        if n >= 50 {
+            let step: usize = n / 8;
+            let med_lo: usize = self.median3_index(base, 0, step, step *% 2, less);
+            let med_mid: usize = self.median3_index(base, mid -% step, mid, mid +% step, less);
+            let med_hi: usize = self.median3_index(
+                base,
+                n -% 1 -% (step *% 2),
+                n -% 1 -% step,
+                n -% 1,
+                less,
+            );
+            return self.median3_index(base, med_lo, med_mid, med_hi, less);
+        }
+        return self.median3_index(base, 0, mid, n -% 1, less);
+    }
+
+    /// Outlined `ipnsort` quicksort loop (`@noinline` to keep `<= 24` fast path tiny in caller I-cache).
+    @std_cap_boundary(clears: [unsafe_op, alloc])
+    @no_alloc @noinline
+    fn ipnsort_loop(
+        &self,
+        var base: *mut T,
+        var n: usize,
+        var ancestor_pivot: (*T)?,
+        var depth_limit: u32,
+        less: |&T, &T| -> bool,
+        /,
+    ) {
+        while n > SMALL_SORT_THRESHOLD {
+            if depth_limit == 0_u32 {
+                self.heapsort_fallback(base, n, less);
+                return;
+            }
+            depth_limit -= 1_u32;
+
+            let piv_idx: usize = self.choose_pivot_ninther(base as *T, n, less);
+            if ancestor_pivot is .Some(anc_ptr) and not less(
+                self.ptr_ref(anc_ptr),
+                self.ptr_ref(
+                    unsafe {
+                        base.add(piv_idx) as *T
+                    },
+                ),
+            ) {
+                self.swap_at(base, 0, piv_idx);
+                let eq_len: usize = self.partition_lomuto_branchless_cyclic(
+                    unsafe {
+                        base.add(1_usize)
+                    },
+                    n -% 1,
+                    self.ptr_ref(base as *T),
+                    |elem: &T, piv: &T| not less(piv, elem),
+                );
+                let skip: usize = eq_len +% 1;
+                base = unsafe {
+                    base.add(skip)
+                };
+                n = n -% skip;
+                ancestor_pivot = .None;
+                continue;
+            }
+
+            self.swap_at(base, 0, piv_idx);
+            let num_lt: usize = self.partition_lomuto_branchless_cyclic(
+                unsafe {
+                    base.add(1_usize)
+                },
+                n -% 1,
+                self.ptr_ref(base as *T),
+                less,
+            );
+            self.swap_at(base, 0, num_lt);
+
+            self.ipnsort_loop(base, num_lt, ancestor_pivot, depth_limit, less);
+            let piv_final: *T = unsafe {
+                base.add(num_lt) as *T
+            };
+            ancestor_pivot = .Some(piv_final);
+            let right_off: usize = num_lt +% 1;
+            base = unsafe {
+                base.add(right_off)
+            };
+            n = n -% right_off;
+        }
+        self.insertion_sort(base, n, less);
+    }
+
+    /// Detects the natural ascending or strictly-descending run starting at `start`, extending short runs to `>= 24`.
+    @std_cap_boundary(clears: [unsafe_op, alloc])
+    @no_alloc
+    fn next_natural_run(&self, base: *mut T, n: usize, start: usize, less: |&T, &T| -> bool, /) -> usize {
+        if start +% 1 >= n {
+            return n;
+        }
+        var end_idx: usize = start +% 2;
+        if less(
+            self.ptr_ref(
+                unsafe {
+                    base.add(start +% 1) as *T
+                },
+            ),
+            self.ptr_ref(
+                unsafe {
+                    base.add(start) as *T
+                },
+            ),
+        ) {
+            while end_idx < n and less(
+                self.ptr_ref(
+                    unsafe {
+                        base.add(end_idx) as *T
+                    },
+                ),
+                self.ptr_ref(
+                    unsafe {
+                        base.add(end_idx -% 1) as *T
+                    },
+                ),
+            ) {
+                end_idx = end_idx +% 1;
+            }
+            self.reverse(
+                unsafe {
+                    @slice_from_raw_parts_mut(base.add(start), end_idx -% start)
+                },
+            );
+        } else {
+            while end_idx < n and not less(
+                self.ptr_ref(
+                    unsafe {
+                        base.add(end_idx) as *T
+                    },
+                ),
+                self.ptr_ref(
+                    unsafe {
+                        base.add(end_idx -% 1) as *T
+                    },
+                ),
+            ) {
+                end_idx = end_idx +% 1;
+            }
+        }
+        if end_idx -% start < SMALL_SORT_THRESHOLD {
+            let target_end: usize = min_usize_local(n, start +% SMALL_SORT_THRESHOLD);
+            self.insertion_sort(
+                unsafe {
+                    base.add(start)
+                },
+                target_end -% start,
+                less,
+            );
+            return target_end;
+        }
+        return end_idx;
+    }
+
+    /// Merges adjacent sorted runs `base[start..mid]` and `base[mid..end_idx]` stably using `scratch`.
+    @std_cap_boundary(clears: [unsafe_op, alloc])
+    @no_alloc
+    fn merge_runs_stable(
+        &self,
+        base: *mut T,
+        start: usize,
+        mid: usize,
+        end_idx: usize,
+        scratch: *mut T,
+        less: |&T, &T| -> bool,
+        /,
+    ) {
+        let left_len: usize = mid -% start;
+        let right_len: usize = end_idx -% mid;
+        if left_len == 0 or right_len == 0 {
+            return;
+        }
+        if not less(
+            self.ptr_ref(
+                unsafe {
+                    base.add(mid) as *T
+                },
+            ),
+            self.ptr_ref(
+                unsafe {
+                    base.add(mid -% 1) as *T
+                },
+            ),
+        ) {
+            return;
+        }
+
+        if left_len <= right_len {
+            unsafe {
+                @ptr_copy_nonoverlapping(base.add(start) as *T, scratch, left_len);
+            }
+            var sc_pos: usize = 0;
+            var right_pos: usize = mid;
+            var dst_pos: usize = start;
+            defer {
+                if sc_pos < left_len {
+                    unsafe {
+                        @ptr_copy_nonoverlapping(
+                            scratch.add(sc_pos) as *T,
+                            base.add(dst_pos),
+                            left_len -% sc_pos,
+                        );
+                    }
+                }
+            }
+            while sc_pos < left_len and right_pos < end_idx {
+                if less(
+                    self.ptr_ref(
+                        unsafe {
+                            base.add(right_pos) as *T
+                        },
+                    ),
+                    self.ptr_ref(
+                        unsafe {
+                            scratch.add(sc_pos) as *T
+                        },
+                    ),
+                ) {
+                    unsafe {
+                        @ptr_copy_nonoverlapping(base.add(right_pos) as *T, base.add(dst_pos), 1);
+                    }
+                    right_pos = right_pos +% 1;
+                } else {
+                    unsafe {
+                        @ptr_copy_nonoverlapping(scratch.add(sc_pos) as *T, base.add(dst_pos), 1);
+                    }
+                    sc_pos = sc_pos +% 1;
+                }
+                dst_pos = dst_pos +% 1;
+            }
+        } else {
+            unsafe {
+                @ptr_copy_nonoverlapping(base.add(mid) as *T, scratch, right_len);
+            }
+            var left_end: usize = mid;
+            var sc_end: usize = right_len;
+            var dst_end: usize = end_idx;
+            defer {
+                if sc_end > 0 {
+                    unsafe {
+                        @ptr_copy_nonoverlapping(
+                            scratch as *T,
+                            base.add(dst_end -% sc_end),
+                            sc_end,
+                        );
+                    }
+                }
+            }
+            while left_end > start and sc_end > 0 {
+                dst_end = dst_end -% 1;
+                if less(
+                    self.ptr_ref(
+                        unsafe {
+                            scratch.add(sc_end -% 1) as *T
+                        },
+                    ),
+                    self.ptr_ref(
+                        unsafe {
+                            base.add(left_end -% 1) as *T
+                        },
+                    ),
+                ) {
+                    left_end = left_end -% 1;
+                    unsafe {
+                        @ptr_copy_nonoverlapping(base.add(left_end) as *T, base.add(dst_end), 1);
+                    }
+                } else {
+                    sc_end = sc_end -% 1;
+                    unsafe {
+                        @ptr_copy_nonoverlapping(scratch.add(sc_end) as *T, base.add(dst_end), 1);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Outlined Munro–Wild `Powersort` merge driver borrowing `<= (N + 1) / 2` scratch space from `with_scratch`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @noinline
+    fn powersort_driver(&self, base: *mut T, n: usize, less: |&T, &T| -> bool, /) {
+        let half_cap: usize = (n +% 1) / 2;
+        let scratch_layout: Layout = Layout {
+            size: half_cap *% @size_of[T](),
+            alignment: @align_of[T](),
+        };
+
+        with_scratch[unit](|scratch_arena: &mut Arena| {
+            if scratch_arena.alloc_raw(scratch_layout) is .Ok(raw_bytes) {
+                let scratch_ptr: *mut T = raw_bytes as *mut T;
+                var stack: [PowersortRun; 64] = [PowersortRun { .. }; 64];
+                var top: usize = 0;
+
+                var run_start: usize = 0;
+                var run_end: usize = self.next_natural_run(base, n, 0, less);
+
+                while run_end < n {
+                    let next_start: usize = run_end;
+                    let next_end: usize = self.next_natural_run(base, n, next_start, less);
+                    let power: u8 = powersort_node_power(n, run_start, run_end, next_end);
+
+                    while top > 0 and top <= stack.len() {
+                        let prev_idx: usize = top - 1;
+                        if prev_idx >= stack.len() or stack[prev_idx].power <= power {
+                            break;
+                        }
+                        top = prev_idx;
+                        let prev_run: PowersortRun = stack[prev_idx];
+                        self.merge_runs_stable(
+                            base,
+                            prev_run.start,
+                            run_start,
+                            run_end,
+                            scratch_ptr,
+                            less,
+                        );
+                        run_start = prev_run.start;
+                    }
+                    if top < stack.len() {
+                        stack[top] = PowersortRun {
+                            start: run_start,
+                            end: run_end,
+                            power: power,
+                        };
+                        top = top +% 1;
+                    }
+                    run_start = next_start;
+                    run_end = next_end;
+                }
+
+                while top > 0 and top <= stack.len() {
+                    let prev_idx: usize = top - 1;
+                    top = prev_idx;
+                    if prev_idx < stack.len() {
+                        let prev_run: PowersortRun = stack[prev_idx];
+                        self.merge_runs_stable(
+                            base,
+                            prev_run.start,
+                            run_start,
+                            run_end,
+                            scratch_ptr,
+                            less,
+                        );
+                        run_start = prev_run.start;
+                    }
+                }
+            } else {
+                // OOM-resilient in-place insertion fallback if `> 64 KiB` scratch mapping fails:
+                self.insertion_sort(base, n, less);
+            }
+        });
+    }
+
+    /// Introselect loop partitioning `base[0..n]` in place until `base[nth]` holds its sorted order statistic.
+    @std_cap_boundary(clears: [unsafe_op, alloc])
+    @no_alloc @noinline
+    fn introselect_loop(
+        &self,
+        var base: *mut T,
+        var n: usize,
+        var nth: usize,
+        var depth_limit: u32,
+        less: |&T, &T| -> bool,
+        /,
+    ) {
+        while n > SMALL_SORT_THRESHOLD {
+            if depth_limit == 0_u32 {
+                self.heapsort_fallback(base, n, less);
+                return;
+            }
+            depth_limit -= 1_u32;
+
+            let piv_idx: usize = self.choose_pivot_ninther(base as *T, n, less);
+            self.swap_at(base, 0, piv_idx);
+            let num_lt: usize = self.partition_lomuto_branchless_cyclic(
+                unsafe {
+                    base.add(1_usize)
+                },
+                n -% 1,
+                self.ptr_ref(base as *T),
+                less,
+            );
+            self.swap_at(base, 0, num_lt);
+
+            if nth == num_lt {
+                return;
+            } else if nth < num_lt {
+                n = num_lt;
+            } else {
+                let skip: usize = num_lt +% 1;
+                base = unsafe {
+                    base.add(skip)
+                };
+                n = n -% skip;
+                nth = nth -% skip;
+            }
+        }
+        self.insertion_sort(base, n, less);
+    }
+
+    /// Unconstrained `ipnsort` entry point shared by `sort_unstable`, `sort_unstable_by`, and `sort_unstable_by_key`.
+    @std_cap_boundary(clears: [unsafe_op, alloc])
+    @inline @no_alloc
+    fn sort_unstable_by_impl(&self, slice: &mut [T], less: |&T, &T| -> bool, /) {
+        let n: usize = slice.len();
+        let base: *mut T = slice.as_mut_ptr();
+        if n <= SMALL_SORT_THRESHOLD or @size_of[T]() == 0 {
+            if n >= 2 and @size_of[T]() != 0 {
+                self.insertion_sort(base, n, less);
+            }
+            return;
+        }
+        var is_asc: bool = true;
+        var is_desc: bool = true;
+        var i: usize = 1;
+        while i < n and (is_asc or is_desc) {
+            let cur_lt_prev: bool = less(
+                self.ptr_ref(
+                    unsafe {
+                        base.add(i) as *T
+                    },
+                ),
+                self.ptr_ref(
+                    unsafe {
+                        base.add(i -% 1) as *T
+                    },
+                ),
+            );
+            if cur_lt_prev {
+                is_asc = false;
+            } else {
+                is_desc = false;
+            }
+            i = i +% 1;
+        }
+        if is_asc {
+            return;
+        }
+        if is_desc {
+            self.reverse(
+                unsafe {
+                    @slice_from_raw_parts_mut(base, n)
+                },
+            );
+            return;
+        }
+        let depth_limit: u32 = 2_u32 *% (ilog2_usize_local(n) +% 1_u32);
+        self.ipnsort_loop(base, n, .None, depth_limit, less);
+    }
+
+    /// Unconstrained `Powersort` entry point shared by `sort`, `sort_by`, and `sort_by_key`.
+    @inline
+    fn sort_by_impl(&self, slice: &mut [T], less: |&T, &T| -> bool, /) {
+        let n: usize = slice.len();
+        let base: *mut T = slice.as_mut_ptr();
+        if n <= SMALL_SORT_THRESHOLD or @size_of[T]() == 0 {
+            if n >= 2 and @size_of[T]() != 0 {
+                self.insertion_sort(base, n, less);
+            }
+            return;
+        }
+        self.powersort_driver(base, n, less);
+    }
+
+    /// Unconstrained `Quickselect` entry point shared by `select_nth_unstable` and `select_nth_unstable_by`.
+    @std_cap_boundary(clears: [alloc])
+    @no_alloc
+    fn select_nth_by_impl(&self, slice: &mut [T], nth: usize, less: |&T, &T| -> bool, /) {
+        let n: usize = slice.len();
+        assert(nth < n, "select_nth_unstable index out of bounds");
+        if n <= SMALL_SORT_THRESHOLD or @size_of[T]() == 0 {
+            if n >= 2 and @size_of[T]() != 0 {
+                self.insertion_sort(slice.as_mut_ptr(), n, less);
+            }
+            return;
+        }
+        let depth_limit: u32 = 2_u32 *% (ilog2_usize_local(n) +% 1_u32);
+        self.introselect_loop(slice.as_mut_ptr(), n, nth, depth_limit, less);
+    }
+}
+
+// ------------------------------------- PUBLIC API --------------------------------------
+// --------------------------- Vec[T] ---------------------------
+impl[T] Vec[T] {
+    /// Constructs an empty `Vec[T]` without allocating (`cap = u32.MAX` when `@size_of[T]() == 0`).
+    @std_cap_boundary(clears: [alloc])
+    @inline @no_alloc @no_panic
+    pub fn new() -> Self {
+        return Self {
+            ptr: dangling_ptr[T](),
+            elem_len: 0,
+            cap: if @size_of[T]() == 0 {
+                u32.MAX
+            } else {
+                0
+            },
+            alloc: context.allocator,
+        };
+    }
+
+    /// Pre-allocates capacity for at least `cap` elements using `context.allocator`, panicking on `AllocError`.
+    pub fn with_capacity(cap: usize, /) -> Self {
+        return Self.try_with_capacity(cap) catch {
+            panic("Vec.with_capacity({cap=}) out of memory");
+        };
+    }
+
+    /// Fallibly pre-allocates capacity for at least `cap` elements using `context.allocator`.
+    pub fn try_with_capacity(cap: usize, /) -> Self!AllocError {
+        var out: Self = Self.new();
+        if cap > 0 {
+            out.try_reserve(cap)?;
+        }
+        return .Ok(own out);
+    }
+
+    /// Constructs a `Vec[T]` backed directly by `arena` (`0`-instruction drop when `T: TrivialDrop`).
+    pub fn in_arena(arena: &mut Arena, /, cap: usize = 0) -> Self {
+        var out = Self {
+            ptr: dangling_ptr[T](),
+            elem_len: 0,
+            cap: if @size_of[T]() == 0 {
+                u32.MAX
+            } else {
+                0
+            },
+            alloc: arena.as_handle(),
+        };
+        if cap > 0 {
+            out.reserve(cap);
+        }
+        return out;
+    }
+
+    /// Allocates a new `Vec[T]` populated by copying `src`.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn from_slice(src: &[T], /) -> Self where T: Copy {
+        let count: usize = src.len();
+        var out: Self = Self.with_capacity(count);
+        if count > 0 and @size_of[T]() != 0 {
+            unsafe {
+                @ptr_copy_nonoverlapping(src.as_ptr(), out.ptr, count);
+            }
+        }
+        out.elem_len = count as u32;
+        return out;
+    }
+
+    /// Returns the number of live elements in `self`.
+    @inline @no_alloc @no_panic
+    pub fn len(&self) -> usize {
+        return self.elem_len as usize;
+    }
+
+    /// Returns the number of elements `self` can hold without reallocating.
+    @inline @no_alloc @no_panic
+    pub fn capacity(&self) -> usize {
+        return self.cap as usize;
+    }
+
+    /// Returns `true` if `self` contains zero elements.
+    @inline @no_alloc @no_panic
+    pub fn is_empty(&self) -> bool {
+        return self.elem_len == 0;
+    }
+
+    /// Borrows `self` as an immutable slice `&[T]`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub fn as_slice(&self) -> &[T] {
+        return unsafe {
+            @slice_from_raw_parts(self.ptr as *T, self.elem_len as usize)
+        };
+    }
+
+    /// Borrows `self` as a mutable slice `&mut [T]`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        return unsafe {
+            @slice_from_raw_parts_mut(self.ptr, self.elem_len as usize)
+        };
+    }
+
+    /// Returns a raw immutable pointer to the vector's buffer.
+    @inline @no_alloc @no_panic
+    pub fn as_ptr(&self) -> *T {
+        return self.ptr as *T;
+    }
+
+    /// Returns a raw mutable pointer to the vector's buffer.
+    @inline @no_alloc @no_panic
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        return self.ptr;
+    }
+
+    /// Bounds-checked element projection supporting both shared (`let`) and mutable (`inout`) access.
+    @std_cap_boundary(clears: [alloc])
+    @inline @no_alloc
+    pub subscript(idx: usize, /) -> T {
+        let {
+            let view: &[T] = self.as_slice();
+            if idx >= view.len() {
+                panic("Vec index out of bounds");
+            }
+            yield view[idx];
+        }
+        inout {
+            let view_mut: &mut [T] = self.as_mut_slice();
+            if idx >= view_mut.len() {
+                panic("Vec index out of bounds");
+            }
+            yield &mut view_mut[idx];
+        }
+    }
+
+    /// Appends `item` to the back of `self`, growing capacity if needed.
+    @inline
+    pub fn push(&mut self, item: own T, /) {
+        self.try_push(own item) catch {
+            panic("Vec.push capacity overflow or out of memory");
+        };
+    }
+
+    /// Fallibly appends `item` to the back of `self` without panicking on `AllocError`.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn try_push(&mut self, item: own T, /) -> unit!AllocError {
+        if self.elem_len == self.cap {
+            self.try_reserve(1)?;
+        }
+        let write_idx: usize = self.elem_len as usize;
+        if @size_of[T]() != 0 {
+            unsafe {
+                @ptr_write(self.ptr.add(write_idx), own item);
+            }
+        } else {
+            @forget(own item);
+        }
+        self.elem_len += 1;
+        return .Ok(());
+    }
+
+    /// Removes and returns the last element of `self`, or `.None` when empty.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn pop(&mut self) -> T? {
+        if self.elem_len == 0 {
+            return .None;
+        }
+        self.elem_len = self.elem_len -% 1_u32;
+        let last_idx: usize = self.elem_len as usize;
+        if @size_of[T]() == 0 {
+            return .Some(
+                unsafe {
+                    @ptr_read(self.ptr as *T)
+                },
+            );
+        }
+        return .Some(
+            unsafe {
+                @ptr_read(self.ptr.add(last_idx) as *T)
+            },
+        );
+    }
+
+    /// Reserves capacity for at least `additional` more elements, panicking on `AllocError`.
+    pub fn reserve(&mut self, additional: usize, /) {
+        self.try_reserve(additional) catch {
+            panic("Vec.reserve({additional=}) out of memory");
+        };
+    }
+
+    /// Fallibly reserves capacity for at least `additional` more elements.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn try_reserve(&mut self, additional: usize, /) -> unit!AllocError {
+        let cur_len: usize = self.elem_len as usize;
+        if additional > (u32.MAX as usize) -% cur_len {
+            return .Err(.OutOfMemory);
+        }
+        if @size_of[T]() == 0 {
+            return .Ok(());
+        }
+        let req_cap: usize = cur_len +% additional;
+        let cur_cap: usize = self.cap as usize;
+        if req_cap <= cur_cap {
+            return .Ok(());
+        }
+        let next_cap: usize = next_amortized_cap[T](cur_cap, req_cap)?;
+        let elem_size: usize = @size_of[T]();
+        let elem_align: usize = @align_of[T]();
+        let new_bytes: usize = next_cap *% elem_size;
+        let raw_ptr: *mut u8 = if cur_cap == 0 {
+            self.alloc.alloc(Layout { size: new_bytes, alignment: elem_align })?
+        } else {
+            self
+                .alloc
+                .realloc(
+                    self.ptr as *mut u8,
+                    Layout { size: cur_cap *% elem_size, alignment: elem_align },
+                    new_bytes,
+                )?
+        };
+        self.ptr = raw_ptr as *mut T;
+        self.cap = next_cap as u32;
+        return .Ok(());
+    }
+
+    /// Appends a bitwise copy of all elements in `src`.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn extend_from_slice(&mut self, src: &[T], /) where T: Copy {
+        let count: usize = src.len();
+        if count == 0 {
+            return;
+        }
+        self.reserve(count);
+        if @size_of[T]() != 0 {
+            let cur_len: usize = self.elem_len as usize;
+            unsafe {
+                @ptr_copy_nonoverlapping(src.as_ptr(), self.ptr.add(cur_len), count);
+            }
+        }
+        self.elem_len += count as u32;
+    }
+
+    /// Inserts `item` at `idx` (`idx <= len`), shifting subsequent elements right by one slot.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn insert(&mut self, idx: usize, item: own T, /) {
+        let cur_len: usize = self.elem_len as usize;
+        assert(idx <= cur_len, "Vec.insert index {idx=} out of bounds (len={self.elem_len})");
+        self.reserve(1);
+        if @size_of[T]() != 0 {
+            unsafe {
+                if idx < cur_len {
+                    @ptr_copy(self.ptr.add(idx) as *T, self.ptr.add(idx +% 1), cur_len -% idx);
+                }
+                @ptr_write(self.ptr.add(idx), own item);
+            }
+        } else {
+            @forget(own item);
+        }
+        self.elem_len += 1;
+    }
+
+    /// Removes and returns the element at `idx`, shifting subsequent elements left to preserve order.
+    @std_cap_boundary(clears: [unsafe_op, alloc])
+    @no_alloc
+    pub fn remove(&mut self, idx: usize, /) -> T {
+        let cur_len: usize = self.elem_len as usize;
+        assert(idx < cur_len, "Vec.remove index out of bounds");
+        self.elem_len = self.elem_len -% 1_u32;
+        if @size_of[T]() == 0 {
+            return unsafe {
+                @ptr_read(self.ptr as *T)
+            };
+        }
+        let removed: T = unsafe {
+            @ptr_read(self.ptr.add(idx) as *T)
+        };
+        let tail_len: usize = (cur_len -% 1) -% idx;
+        if tail_len > 0 {
+            unsafe {
+                @ptr_copy(self.ptr.add(idx +% 1) as *T, self.ptr.add(idx), tail_len);
+            }
+        }
+        return removed;
+    }
+
+    /// Removes and returns the element at `idx` in $O(1)$ by moving the last element into `idx`.
+    @std_cap_boundary(clears: [unsafe_op, alloc])
+    @no_alloc
+    pub fn swap_remove(&mut self, idx: usize, /) -> T {
+        let cur_len: usize = self.elem_len as usize;
+        assert(idx < cur_len, "Vec.swap_remove index out of bounds");
+        let last_idx: usize = cur_len -% 1;
+        self.elem_len = self.elem_len -% 1_u32;
+        if @size_of[T]() == 0 {
+            return unsafe {
+                @ptr_read(self.ptr as *T)
+            };
+        }
+        let removed: T = unsafe {
+            @ptr_read(self.ptr.add(idx) as *T)
+        };
+        if idx != last_idx {
+            unsafe {
+                @ptr_copy_nonoverlapping(self.ptr.add(last_idx) as *T, self.ptr.add(idx), 1);
+            }
+        }
+        return removed;
+    }
+
+    /// Shortens `self` to `new_len`, dropping excess tail elements in order.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc
+    pub fn truncate(&mut self, new_len: usize, /) {
+        let old_len: usize = self.elem_len as usize;
+        if new_len >= old_len {
+            return;
+        }
+        self.elem_len = new_len as u32;
+        comptime if not @implements[T, TrivialDrop]() {
+            var i: usize = new_len;
+            while i < old_len {
+                if @size_of[T]() == 0 {
+                    unsafe {
+                        @drop_in_place(self.ptr);
+                    }
+                } else {
+                    unsafe {
+                        @drop_in_place(self.ptr.add(i));
+                    }
+                }
+                i = i +% 1;
+            }
+        }
+    }
+
+    /// Drops all live elements while retaining allocated capacity.
+    @no_alloc
+    pub fn clear(&mut self) {
+        self.truncate(0);
+    }
+
+    /// Retains only elements satisfying `keep(&elem)` in original order (`100%` unwind-safe via swap compaction).
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn retain(&mut self, keep: |&T| -> bool, /) {
+        let total: usize = self.elem_len as usize;
+        var write_idx: usize = 0;
+        var read_idx: usize = 0;
+        while read_idx < total {
+            let elem_ptr: *T = if @size_of[T]() == 0 {
+                self.ptr as *T
+            } else {
+                unsafe {
+                    self.ptr.add(read_idx) as *T
+                }
+            };
+            if keep((SliceOps[T] {}).ptr_ref(elem_ptr)) {
+                (SliceOps[T] {}).swap_at(self.ptr, write_idx, read_idx);
+                write_idx = write_idx +% 1;
+            }
+            read_idx = read_idx +% 1;
+        }
+        self.truncate(write_idx);
+    }
+
+    /// Consumes `self` without dropping or freeing, returning `(ptr, len, capacity, alloc)`.
+    @inline @no_alloc @no_panic
+    pub fn into_raw_parts(own self) -> (*mut T, usize, usize, AllocatorHandle) {
+        let out_ptr: *mut T = self.ptr;
+        let out_len: usize = self.elem_len as usize;
+        let out_cap: usize = self.cap as usize;
+        let out_alloc: AllocatorHandle = self.alloc;
+        @forget(own self);
+        return (out_ptr, out_len, out_cap, out_alloc);
+    }
+
+    /// Reconstructs a `Vec[T]` directly from raw backing components previously obtained from `into_raw_parts`.
+    @inline @no_alloc @no_panic
+    pub unsafe fn from_raw_parts(
+        ptr: *mut T,
+        len: usize,
+        cap: usize,
+        alloc: AllocatorHandle,
+        /,
+    ) -> Self {
+        return Self {
+            ptr: ptr,
+            elem_len: len as u32,
+            cap: cap as u32,
+            alloc: alloc,
+        };
+    }
+}
+
+impl[T] AutoDrop for Vec[T] {
+    /// Drops live elements (when `not TrivialDrop`) and frees general-heap storage (`0` ops on `Arena` + `TrivialDrop`).
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn drop(&mut self) {
+        self.truncate(0);
+        let cur_cap: usize = self.cap as usize;
+        if cur_cap != 0 and @size_of[T]() != 0 and not self.alloc.is_arena_or_static() {
+            self.alloc.dealloc(
+                self.ptr as *mut u8,
+                Layout {
+                    size: cur_cap *% @size_of[T](),
+                    alignment: @align_of[T](),
+                },
+            );
+        }
+        self.cap = if @size_of[T]() == 0 {
+            u32.MAX
+        } else {
+            0
+        };
+    }
+}
+
+impl[T] Default for Vec[T] {
+    /// Returns an empty `Vec[T]`.
+    @inline @no_alloc @no_panic
+    pub fn default() -> Self {
+        return Self.new();
+    }
+}
+
+impl[T: Clone] Clone for Vec[T] {
+    /// Deep-clones every element into a fresh `Vec[T]` allocated from `context.allocator` (unwind-safe).
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn clone(&self) -> Self {
+        let count: usize = self.elem_len as usize;
+        var out: Self = Self.with_capacity(count);
+        var i: usize = 0;
+        while i < count {
+            let elem_ref: &T = if @size_of[T]() == 0 {
+                (SliceOps[T] {}).ptr_ref(self.ptr as *T)
+            } else {
+                (SliceOps[T] {}).ptr_ref(
+                    unsafe {
+                        self.ptr.add(i) as *T
+                    },
+                )
+            };
+            let cloned: T = elem_ref.clone();
+            if @size_of[T]() != 0 {
+                unsafe {
+                    @ptr_write(out.ptr.add(i), own cloned);
+                }
+            } else {
+                @forget(own cloned);
+            }
+            out.elem_len += 1;
+            i = i +% 1;
+        }
+        return out;
+    }
+}
+
+impl[T: Equatable] Equatable for Vec[T] {
+    /// Compares two vectors element-by-element for structural equality (`0` bounds traps).
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn eq(&self, other: &Self, /) -> bool {
+        if self.elem_len != other.elem_len {
+            return false;
+        }
+        if @size_of[T]() == 0 {
+            let count_zst: usize = self.elem_len as usize;
+            var z_idx: usize = 0;
+            while z_idx < count_zst {
+                if (SliceOps[T] {}).ptr_ref(self.ptr as *T).* != (SliceOps[T] {}).ptr_ref(
+                    other.ptr as *T,
+                ).* {
+                    return false;
+                }
+                z_idx = z_idx +% 1;
+            }
+            return true;
+        }
+        let count: usize = self.elem_len as usize;
+        var i: usize = 0;
+        while i < count {
+            if (SliceOps[T] {}).ptr_ref(
+                unsafe {
+                    self.ptr.add(i) as *T
+                },
+            ).* != (SliceOps[T] {}).ptr_ref(
+                unsafe {
+                    other.ptr.add(i) as *T
+                },
+            ).* {
+                return false;
+            }
+            i = i +% 1;
+        }
+        return true;
+    }
+}
+
+impl[T: Debug] Debug for Vec[T] {
+    /// Formats `self` as `[elem0, elem1, …]` into `out` without heap allocation.
+    @std_cap_boundary(clears: [unsafe_op, alloc])
+    @no_alloc
+    pub fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        _ = spec;
+        out.write_str("[")?;
+        let count: usize = self.elem_len as usize;
+        var i: usize = 0;
+        while i < count {
+            if i > 0 {
+                out.write_str(", ")?;
+            }
+            let elem_ref: &T = if @size_of[T]() == 0 {
+                (SliceOps[T] {}).ptr_ref(self.ptr as *T)
+            } else {
+                (SliceOps[T] {}).ptr_ref(
+                    unsafe {
+                        self.ptr.add(i) as *T
+                    },
+                )
+            };
+            @fmt_write(out, "{elem_ref:?}")?;
+            i = i +% 1;
+        }
+        return out.write_str("]");
+    }
+}
+
+// ----------------------- SmallVec[T, N] -----------------------
+impl[T, const N: usize] SmallVec[T, N] {
+    /// Constructs an empty inline `SmallVec[T, N]` without heap allocation.
+    @inline @no_alloc @no_panic
+    pub fn new() -> Self {
+        return Self {
+            len_and_flag: 0_u32,
+            heap_cap: if @size_of[T]() == 0 {
+                u32.MAX
+            } else {
+                0_u32
+            },
+            storage: SmallVecStorage {
+                heap: SmallVecHeap {
+                    ptr: dangling_ptr[T](),
+                    alloc: COL_STATIC_RODATA,
+                },
+            },
+        };
+    }
+
+    /// Constructs a `SmallVec[T, N]` in spilled mode backed by `arena` so `push` never overwrites `alloc`.
+    pub fn in_arena(arena: &mut Arena, /, cap: usize = 0) -> Self {
+        var out = Self {
+            len_and_flag: SMALLVEC_SPILL_FLAG,
+            heap_cap: if @size_of[T]() == 0 {
+                u32.MAX
+            } else {
+                0_u32
+            },
+            storage: SmallVecStorage {
+                heap: SmallVecHeap {
+                    ptr: dangling_ptr[T](),
+                    alloc: arena.as_handle(),
+                },
+            },
+        };
+        if cap > 0 {
+            out.reserve(cap);
+        }
+        return out;
+    }
+
+    /// Pre-allocates capacity for `cap` elements (remaining inline when `cap <= N`).
+    pub fn with_capacity(cap: usize, /) -> Self {
+        var out: Self = Self.new();
+        if cap > N {
+            out.reserve(cap);
+        }
+        return out;
+    }
+
+    /// Returns `true` if elements currently reside in a spilled heap/arena buffer rather than inline storage.
+    @inline @no_alloc @no_panic
+    pub fn is_spilled(&self) -> bool {
+        return (self.len_and_flag & SMALLVEC_SPILL_FLAG) != 0_u32;
+    }
+
+    /// Returns the number of live elements in `self`.
+    @inline @no_alloc @no_panic
+    pub fn len(&self) -> usize {
+        return (self.len_and_flag & SMALLVEC_LEN_MASK) as usize;
+    }
+
+    /// Returns the current capacity (`N` when inline, `heap_cap` when spilled, `SMALLVEC_LEN_MASK` for ZST).
+    @inline @no_alloc @no_panic
+    pub fn capacity(&self) -> usize {
+        if @size_of[T]() == 0 {
+            return SMALLVEC_LEN_MASK as usize;
+        }
+        return if self.is_spilled() {
+            self.heap_cap as usize
+        } else {
+            N
+        };
+    }
+
+    /// Returns `true` if `self` contains zero elements.
+    @inline @no_alloc @no_panic
+    pub fn is_empty(&self) -> bool {
+        return self.len() == 0;
+    }
+
+    /// Returns a raw immutable pointer to the active inline or spilled element buffer.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub fn as_ptr(&self) -> *T {
+        if @size_of[T]() == 0 {
+            return dangling_ptr[T]() as *T;
+        }
+        if self.is_spilled() {
+            return (
+                unsafe {
+                    self.storage.heap
+                }
+            ).ptr as *T;
+        }
+        return &raw self.storage as *T;
+    }
+
+    /// Returns a raw mutable pointer to the active inline or spilled element buffer.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        if @size_of[T]() == 0 {
+            return dangling_ptr[T]();
+        }
+        if self.is_spilled() {
+            return (
+                unsafe {
+                    self.storage.heap
+                }
+            ).ptr;
+        }
+        return &raw mut self.storage as *mut T;
+    }
+
+    /// Borrows `self` as an immutable slice `&[T]`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub fn as_slice(&self) -> &[T] {
+        return unsafe {
+            @slice_from_raw_parts(self.as_ptr(), self.len())
+        };
+    }
+
+    /// Borrows `self` as a mutable slice `&mut [T]`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        return unsafe {
+            @slice_from_raw_parts_mut(self.as_mut_ptr(), self.len())
+        };
+    }
+
+    /// Bounds-checked element projection supporting shared and mutable indexing.
+    @std_cap_boundary(clears: [alloc])
+    @inline @no_alloc
+    pub subscript(idx: usize, /) -> T {
+        let {
+            let view: &[T] = self.as_slice();
+            if idx >= view.len() {
+                panic("SmallVec index out of bounds");
+            }
+            yield view[idx];
+        }
+        inout {
+            let view_mut: &mut [T] = self.as_mut_slice();
+            if idx >= view_mut.len() {
+                panic("SmallVec index out of bounds");
+            }
+            yield &mut view_mut[idx];
+        }
+    }
+
+    /// Reserves space for `additional` more elements, spilling inline elements to `context.allocator` if needed.
+    pub fn reserve(&mut self, additional: usize, /) {
+        self.try_reserve(additional) catch {
+            panic("SmallVec.reserve({additional=}) out of memory");
+        };
+    }
+
+    /// Fallibly reserves space for `additional` more elements.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn try_reserve(&mut self, additional: usize, /) -> unit!AllocError {
+        let cur_len: usize = self.len();
+        if additional > (SMALLVEC_LEN_MASK as usize) -% cur_len {
+            return .Err(.OutOfMemory);
+        }
+        if @size_of[T]() == 0 {
+            return .Ok(());
+        }
+        let req_cap: usize = cur_len +% additional;
+        if req_cap <= self.capacity() {
+            return .Ok(());
+        }
+        let cur_cap: usize = self.capacity();
+        let next_cap: usize = min_usize_local(
+            next_amortized_cap[T](cur_cap, req_cap)?,
+            SMALLVEC_LEN_MASK as usize,
+        );
+        if next_cap < req_cap {
+            return .Err(.OutOfMemory);
+        }
+        let elem_size: usize = @size_of[T]();
+        let elem_align: usize = @align_of[T]();
+        let new_bytes: usize = next_cap *% elem_size;
+
+        if self.is_spilled() {
+            let heap_cur: SmallVecHeap[T] = unsafe {
+                self.storage.heap
+            };
+            let old_cap: usize = self.heap_cap as usize;
+            let new_raw: *mut u8 = if old_cap == 0 {
+                heap_cur.alloc.alloc(Layout { size: new_bytes, alignment: elem_align })?
+            } else {
+                heap_cur
+                    .alloc
+                    .realloc(
+                        heap_cur.ptr as *mut u8,
+                        Layout { size: old_cap *% elem_size, alignment: elem_align },
+                        new_bytes,
+                    )?
+            };
+            self.storage = SmallVecStorage {
+                heap: SmallVecHeap {
+                    ptr: new_raw as *mut T,
+                    alloc: heap_cur.alloc,
+                },
+            };
+            self.heap_cap = next_cap as u32;
+            return .Ok(());
+        }
+
+        let target_alloc: AllocatorHandle = context.allocator;
+        let new_raw: *mut u8 = target_alloc.alloc(Layout { size: new_bytes, alignment: elem_align })?;
+        let new_ptr: *mut T = new_raw as *mut T;
+        if cur_len > 0 {
+            unsafe {
+                @ptr_copy_nonoverlapping(&raw self.storage as *T, new_ptr, cur_len);
+            }
+        }
+        self.storage = SmallVecStorage {
+            heap: SmallVecHeap {
+                ptr: new_ptr,
+                alloc: target_alloc,
+            },
+        };
+        self.heap_cap = next_cap as u32;
+        self.len_and_flag = (cur_len as u32) | SMALLVEC_SPILL_FLAG;
+        return .Ok(());
+    }
+
+    /// Appends `item`, spilling inline storage to `context.allocator` if `len == N`.
+    pub fn push(&mut self, item: own T, /) {
+        self.try_push(own item) catch {
+            panic("SmallVec.push capacity overflow or out of memory");
+        };
+    }
+
+    /// Fallibly appends `item` without panicking on `AllocError`.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn try_push(&mut self, item: own T, /) -> unit!AllocError {
+        let cur_len: usize = self.len();
+        if cur_len == self.capacity() {
+            self.try_reserve(1)?;
+        }
+        if @size_of[T]() != 0 {
+            unsafe {
+                @ptr_write(self.as_mut_ptr().add(cur_len), own item);
+            }
+        } else {
+            @forget(own item);
+        }
+        let flag_bits: u32 = self.len_and_flag & SMALLVEC_SPILL_FLAG;
+        self.len_and_flag = flag_bits | ((cur_len +% 1) as u32);
+        return .Ok(());
+    }
+
+    /// Removes and returns the last element, or `.None` if empty.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn pop(&mut self) -> T? {
+        let cur_len: usize = self.len();
+        if cur_len == 0 {
+            return .None;
+        }
+        let next_len: usize = cur_len -% 1;
+        let flag_bits: u32 = self.len_and_flag & SMALLVEC_SPILL_FLAG;
+        self.len_and_flag = flag_bits | (next_len as u32);
+        if @size_of[T]() == 0 {
+            return .Some(
+                unsafe {
+                    @ptr_read(dangling_ptr[T]() as *T)
+                },
+            );
+        }
+        return .Some(
+            unsafe {
+                @ptr_read(self.as_ptr().add(next_len))
+            },
+        );
+    }
+
+    /// Shortens `self` to `new_len`, dropping excess tail elements while preserving spill state.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc
+    pub fn truncate(&mut self, new_len: usize, /) {
+        let old_len: usize = self.len();
+        if new_len >= old_len {
+            return;
+        }
+        let flag_bits: u32 = self.len_and_flag & SMALLVEC_SPILL_FLAG;
+        self.len_and_flag = flag_bits | (new_len as u32);
+        comptime if not @implements[T, TrivialDrop]() {
+            let base: *mut T = self.as_mut_ptr();
+            var i: usize = new_len;
+            while i < old_len {
+                if @size_of[T]() == 0 {
+                    unsafe {
+                        @drop_in_place(base);
+                    }
+                } else {
+                    unsafe {
+                        @drop_in_place(base.add(i));
+                    }
+                }
+                i = i +% 1;
+            }
+        }
+    }
+
+    /// Drops all live elements while keeping spilled capacity and `alloc` handle intact.
+    @no_alloc
+    pub fn clear(&mut self) {
+        self.truncate(0);
+    }
+}
+
+impl[T, const N: usize] AutoDrop for SmallVec[T, N] {
+    /// Drops live elements and frees spilled general-heap backing memory.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn drop(&mut self) {
+        self.truncate(0);
+        if self.is_spilled() {
+            let heap_cur: SmallVecHeap[T] = unsafe {
+                self.storage.heap
+            };
+            let cap_val: usize = self.heap_cap as usize;
+            if cap_val != 0 and @size_of[T]() != 0 and not heap_cur.alloc.is_arena_or_static() {
+                heap_cur.alloc.dealloc(
+                    heap_cur.ptr as *mut u8,
+                    Layout {
+                        size: cap_val *% @size_of[T](),
+                        alignment: @align_of[T](),
+                    },
+                );
+            }
+            self.heap_cap = 0_u32;
+            self.len_and_flag = 0_u32;
+        }
+    }
+}
+
+impl[T, const N: usize] Default for SmallVec[T, N] {
+    /// Returns an empty inline `SmallVec[T, N]`.
+    @inline @no_alloc @no_panic
+    pub fn default() -> Self {
+        return Self.new();
+    }
+}
+
+impl[T: Clone, const N: usize] Clone for SmallVec[T, N] {
+    /// Clones all elements of `self` into a new `SmallVec[T, N]`.
+    pub fn clone(&self) -> Self {
+        let count: usize = self.len();
+        var out: Self = Self.with_capacity(count);
+        let src: &[T] = self.as_slice();
+        var i: usize = 0;
+        while i < count {
+            out.push(src[i].clone());
+            i = i +% 1;
+        }
+        return out;
+    }
+}
+
+impl[T: Equatable, const N: usize] Equatable for SmallVec[T, N] {
+    /// Compares two `SmallVec` instances element-by-element.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn eq(&self, other: &Self, /) -> bool {
+        let count: usize = self.len();
+        if count != other.len() {
+            return false;
+        }
+        let lhs_ptr: *T = self.as_ptr();
+        let rhs_ptr: *T = other.as_ptr();
+        var i: usize = 0;
+        while i < count {
+            let lhs_ref: &T = if @size_of[T]() == 0 {
+                (SliceOps[T] {}).ptr_ref(lhs_ptr)
+            } else {
+                (SliceOps[T] {}).ptr_ref(
+                    unsafe {
+                        lhs_ptr.add(i)
+                    },
+                )
+            };
+            let rhs_ref: &T = if @size_of[T]() == 0 {
+                (SliceOps[T] {}).ptr_ref(rhs_ptr)
+            } else {
+                (SliceOps[T] {}).ptr_ref(
+                    unsafe {
+                        rhs_ptr.add(i)
+                    },
+                )
+            };
+            if lhs_ref.* != rhs_ref.* {
+                return false;
+            }
+            i = i +% 1;
+        }
+        return true;
+    }
+}
+
+impl[T: Debug, const N: usize] Debug for SmallVec[T, N] {
+    /// Formats `self` as `[elem0, elem1, …]` into `out`.
+    @std_cap_boundary(clears: [unsafe_op, alloc])
+    @no_alloc
+    pub fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        _ = spec;
+        out.write_str("[")?;
+        let count: usize = self.len();
+        let ptr: *T = self.as_ptr();
+        var i: usize = 0;
+        while i < count {
+            if i > 0 {
+                out.write_str(", ")?;
+            }
+            let elem_ref: &T = if @size_of[T]() == 0 {
+                (SliceOps[T] {}).ptr_ref(ptr)
+            } else {
+                (SliceOps[T] {}).ptr_ref(
+                    unsafe {
+                        ptr.add(i)
+                    },
+                )
+            };
+            @fmt_write(out, "{elem_ref:?}")?;
+            i = i +% 1;
+        }
+        return out.write_str("]");
+    }
+}
+
+// -------------------------- Deque[T] --------------------------
+impl[T] Deque[T] {
+    /// Constructs an empty `Deque[T]` without heap allocation (`24 B` on 64-bit, `16 B` on `wasm32`).
+    @std_cap_boundary(clears: [alloc])
+    @inline @no_alloc @no_panic
+    pub fn new() -> Self {
+        return Self {
+            ptr: dangling_ptr[T](),
+            head_exp: DequeHeadExp {
+                head: 0_u32,
+                exp_plus_1: if @size_of[T]() == 0 {
+                    28_u8
+                } else {
+                    0_u8
+                },
+            },
+            elem_len: 0_u32,
+            alloc: context.allocator,
+        };
+    }
+
+    /// Pre-allocates ring capacity for at least `cap` elements, panicking on `AllocError`.
+    pub fn with_capacity(cap: usize, /) -> Self {
+        return Self.try_with_capacity(cap) catch {
+            panic("Deque.with_capacity({cap=}) out of memory");
+        };
+    }
+
+    /// Fallibly pre-allocates ring capacity for at least `cap` elements.
+    pub fn try_with_capacity(cap: usize, /) -> Self!AllocError {
+        var out: Self = Self.new();
+        if cap > 0 {
+            out.try_reserve(cap)?;
+        }
+        return .Ok(own out);
+    }
+
+    /// Constructs a `Deque[T]` backed by `arena` (`0`-instruction drop when `T: TrivialDrop`).
+    pub fn in_arena(arena: &mut Arena, /, cap: usize = 0) -> Self {
+        var out = Self {
+            ptr: dangling_ptr[T](),
+            head_exp: DequeHeadExp {
+                head: 0_u32,
+                exp_plus_1: if @size_of[T]() == 0 {
+                    28_u8
+                } else {
+                    0_u8
+                },
+            },
+            elem_len: 0_u32,
+            alloc: arena.as_handle(),
+        };
+        if cap > 0 {
+            out.reserve(cap);
+        }
+        return out;
+    }
+
+    /// Returns the number of live elements in `self`.
+    @inline @no_alloc @no_panic
+    pub fn len(&self) -> usize {
+        return self.elem_len as usize;
+    }
+
+    /// Returns the allocated power-of-two ring capacity (`0` when unallocated, `1 << 27` max).
+    @inline @no_alloc @no_panic
+    pub fn capacity(&self) -> usize {
+        let exp_p1: u8 = self.head_exp.exp_plus_1;
+        if exp_p1 == 0_u8 {
+            return 0;
+        }
+        return 1_usize << (((exp_p1 -% 1_u8) & 31_u8) as usize);
+    }
+
+    /// Returns `true` if `self` contains zero elements.
+    @inline @no_alloc @no_panic
+    pub fn is_empty(&self) -> bool {
+        return self.elem_len == 0_u32;
+    }
+
+    /// Projects the ring buffer as two contiguous ordered slices `(front_slice, back_slice)`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn as_slices(&self) -> (&[T], &[T]) {
+        let cur_len: usize = self.elem_len as usize;
+        if cur_len == 0 or @size_of[T]() == 0 {
+            let first: &[T] = unsafe {
+                @slice_from_raw_parts(self.ptr as *T, cur_len)
+            };
+            let empty_sl: &[T] = unsafe {
+                @slice_from_raw_parts(self.ptr as *T, 0)
+            };
+            return (first, empty_sl);
+        }
+        let cap_val: usize = self.capacity();
+        let head_idx: usize = self.head_exp.head as usize;
+        let tail_room: usize = cap_val -% head_idx;
+        if cur_len <= tail_room {
+            let front: &[T] = unsafe {
+                @slice_from_raw_parts(self.ptr.add(head_idx) as *T, cur_len)
+            };
+            let empty_back: &[T] = unsafe {
+                @slice_from_raw_parts(self.ptr as *T, 0)
+            };
+            return (front, empty_back);
+        }
+        let front_part: &[T] = unsafe {
+            @slice_from_raw_parts(self.ptr.add(head_idx) as *T, tail_room)
+        };
+        let back_part: &[T] = unsafe {
+            @slice_from_raw_parts(self.ptr as *T, cur_len -% tail_room)
+        };
+        return (front_part, back_part);
+    }
+
+    /// Bounds-checked logical ring indexing `0..len` using branchless power-of-two mask wrap.
+    @std_cap_boundary(clears: [unsafe_op, alloc])
+    @inline @no_alloc
+    pub subscript(idx: usize, /) -> T {
+        let {
+            if idx >= (self.elem_len as usize) {
+                panic("Deque index out of bounds");
+            }
+            let cap: usize = self.capacity();
+            let phys: usize = deque_phys_slot(self.head_exp, cap, idx);
+            let ring: &[T] = unsafe {
+                @slice_from_raw_parts(self.ptr as *T, cap)
+            };
+            if phys >= ring.len() {
+                panic("Deque index out of bounds");
+            }
+            yield ring[phys];
+        }
+        inout {
+            if idx >= (self.elem_len as usize) {
+                panic("Deque index out of bounds");
+            }
+            let cap: usize = self.capacity();
+            let phys: usize = deque_phys_slot(self.head_exp, cap, idx);
+            let ring_mut: &mut [T] = unsafe {
+                @slice_from_raw_parts_mut(self.ptr, cap)
+            };
+            if phys >= ring_mut.len() {
+                panic("Deque index out of bounds");
+            }
+            yield &mut ring_mut[phys];
+        }
+    }
+
+    /// Reserves power-of-two capacity for `additional` more elements, panicking on `AllocError`.
+    pub fn reserve(&mut self, additional: usize, /) {
+        self.try_reserve(additional) catch {
+            panic("Deque.reserve({additional=}) out of memory");
+        };
+    }
+
+    /// Fallibly reserves power-of-two capacity (`<= 2^27` elements) linearizing wrapped elements to `head = 0`.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn try_reserve(&mut self, additional: usize, /) -> unit!AllocError {
+        let max_ring_cap: usize = 1_usize << 27_usize;
+        let cur_len: usize = self.elem_len as usize;
+        if additional > max_ring_cap -% cur_len {
+            return .Err(.OutOfMemory);
+        }
+        if @size_of[T]() == 0 {
+            return .Ok(());
+        }
+        let needed: usize = cur_len +% additional;
+        let old_cap: usize = self.capacity();
+        if needed <= old_cap {
+            return .Ok(());
+        }
+        var exp: u8 = 2_u8;
+        var next_cap: usize = 4;
+        while next_cap < needed {
+            exp = exp +% 1_u8;
+            next_cap = 1_usize << (exp as usize);
+        }
+        let elem_size: usize = @size_of[T]();
+        if next_cap > (isize.MAX as usize) / elem_size {
+            return .Err(.OutOfMemory);
+        }
+        let elem_align: usize = @align_of[T]();
+        let new_raw: *mut u8 = self
+            .alloc
+            .alloc(
+                Layout { size: next_cap *% elem_size, alignment: elem_align },
+            )?;
+        let new_ptr: *mut T = new_raw as *mut T;
+
+        if cur_len > 0 {
+            let head_idx: usize = self.head_exp.head as usize;
+            let first_len: usize = min_usize_local(cur_len, old_cap -% head_idx);
+            unsafe {
+                @ptr_copy_nonoverlapping(self.ptr.add(head_idx) as *T, new_ptr, first_len);
+                if cur_len > first_len {
+                    @ptr_copy_nonoverlapping(
+                        self.ptr as *T,
+                        new_ptr.add(first_len),
+                        cur_len -% first_len,
+                    );
+                }
+            }
+        }
+        if old_cap != 0 and not self.alloc.is_arena_or_static() {
+            self.alloc.dealloc(
+                self.ptr as *mut u8,
+                Layout { size: old_cap *% elem_size, alignment: elem_align },
+            );
+        }
+        self.ptr = new_ptr;
+        self.head_exp = DequeHeadExp {
+            head: 0_u32,
+            exp_plus_1: exp +% 1_u8,
+        };
+        return .Ok(());
+    }
+
+    /// Appends `item` to the back of the ring buffer.
+    pub fn push_back(&mut self, item: own T, /) {
+        self.try_push_back(own item) catch {
+            panic("Deque.push_back out of memory");
+        };
+    }
+
+    /// Fallibly appends `item` to the back of the ring buffer.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn try_push_back(&mut self, item: own T, /) -> unit!AllocError {
+        if (self.elem_len as usize) == self.capacity() {
+            self.try_reserve(1)?;
+        }
+        if @size_of[T]() != 0 {
+            let mask: usize = self.capacity() -% 1;
+            let slot: usize = ((self.head_exp.head as usize) +% (self.elem_len as usize)) & mask;
+            unsafe {
+                @ptr_write(self.ptr.add(slot), own item);
+            }
+        } else {
+            @forget(own item);
+        }
+        self.elem_len += 1_u32;
+        return .Ok(());
+    }
+
+    /// Prepends `item` to the front of the ring buffer.
+    pub fn push_front(&mut self, item: own T, /) {
+        self.try_push_front(own item) catch {
+            panic("Deque.push_front out of memory");
+        };
+    }
+
+    /// Fallibly prepends `item` to the front of the ring buffer.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn try_push_front(&mut self, item: own T, /) -> unit!AllocError {
+        if (self.elem_len as usize) == self.capacity() {
+            self.try_reserve(1)?;
+        }
+        if @size_of[T]() != 0 {
+            let mask: usize = self.capacity() -% 1;
+            let new_head: usize = ((self.head_exp.head as usize) -% 1) & mask;
+            self.head_exp.head = new_head as u32;
+            unsafe {
+                @ptr_write(self.ptr.add(new_head), own item);
+            }
+        } else {
+            @forget(own item);
+        }
+        self.elem_len += 1_u32;
+        return .Ok(());
+    }
+
+    /// Removes and returns the front element in $O(1)$, or `.None` when empty.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn pop_front(&mut self) -> T? {
+        if self.elem_len == 0_u32 {
+            return .None;
+        }
+        self.elem_len = self.elem_len -% 1_u32;
+        if @size_of[T]() == 0 {
+            return .Some(
+                unsafe {
+                    @ptr_read(self.ptr as *T)
+                },
+            );
+        }
+        let old_head: usize = self.head_exp.head as usize;
+        let mask: usize = self.capacity() -% 1;
+        self.head_exp.head = ((old_head +% 1) & mask) as u32;
+        return .Some(
+            unsafe {
+                @ptr_read(self.ptr.add(old_head) as *T)
+            },
+        );
+    }
+
+    /// Removes and returns the back element in $O(1)$, or `.None` when empty.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn pop_back(&mut self) -> T? {
+        if self.elem_len == 0_u32 {
+            return .None;
+        }
+        self.elem_len = self.elem_len -% 1_u32;
+        if @size_of[T]() == 0 {
+            return .Some(
+                unsafe {
+                    @ptr_read(self.ptr as *T)
+                },
+            );
+        }
+        let mask: usize = self.capacity() -% 1;
+        let tail_slot: usize = ((self.head_exp.head as usize) +% (self.elem_len as usize)) & mask;
+        return .Some(
+            unsafe {
+                @ptr_read(self.ptr.add(tail_slot) as *T)
+            },
+        );
+    }
+
+    /// Drops all live elements and resets `head = 0` while preserving ring capacity.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc
+    pub fn clear(&mut self) {
+        let old_len: usize = self.elem_len as usize;
+        let old_head: usize = self.head_exp.head as usize;
+        self.elem_len = 0_u32;
+        self.head_exp.head = 0_u32;
+        comptime if not @implements[T, TrivialDrop]() {
+            let mask: usize = self.capacity() -% 1;
+            var i: usize = 0;
+            while i < old_len {
+                if @size_of[T]() == 0 {
+                    unsafe {
+                        @drop_in_place(self.ptr);
+                    }
+                } else {
+                    let phys: usize = (old_head +% i) & mask;
+                    unsafe {
+                        @drop_in_place(self.ptr.add(phys));
+                    }
+                }
+                i = i +% 1;
+            }
+        }
+    }
+}
+
+impl[T] AutoDrop for Deque[T] {
+    /// Drops live elements across wrapped ring segments and frees general-heap storage.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn drop(&mut self) {
+        self.clear();
+        let cap_val: usize = self.capacity();
+        if cap_val != 0 and @size_of[T]() != 0 and not self.alloc.is_arena_or_static() {
+            self.alloc.dealloc(
+                self.ptr as *mut u8,
+                Layout {
+                    size: cap_val *% @size_of[T](),
+                    alignment: @align_of[T](),
+                },
+            );
+        }
+        self.head_exp.exp_plus_1 = if @size_of[T]() == 0 {
+            28_u8
+        } else {
+            0_u8
+        };
+    }
+}
+
+impl[T] Default for Deque[T] {
+    /// Returns an empty `Deque[T]`.
+    @inline @no_alloc @no_panic
+    pub fn default() -> Self {
+        return Self.new();
+    }
+}
+
+impl[T: Clone] Clone for Deque[T] {
+    /// Clones all elements of `self` in logical front-to-back order.
+    pub fn clone(&self) -> Self {
+        var out: Self = Self.with_capacity(self.len());
+        let (front_part, back_part) = self.as_slices();
+        var i: usize = 0;
+        while i < front_part.len() {
+            out.push_back(front_part[i].clone());
+            i = i +% 1;
+        }
+        var j: usize = 0;
+        while j < back_part.len() {
+            out.push_back(back_part[j].clone());
+            j = j +% 1;
+        }
+        return out;
+    }
+}
+
+impl[T: Equatable] Equatable for Deque[T] {
+    /// Compares two `Deque` instances in logical order across ring wrap boundaries.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn eq(&self, other: &Self, /) -> bool {
+        if self.elem_len != other.elem_len {
+            return false;
+        }
+        let count: usize = self.elem_len as usize;
+        if @size_of[T]() == 0 {
+            return true;
+        }
+        let lhs_mask: usize = self.capacity() -% 1;
+        let rhs_mask: usize = other.capacity() -% 1;
+        let lhs_head: usize = self.head_exp.head as usize;
+        let rhs_head: usize = other.head_exp.head as usize;
+        var i: usize = 0;
+        while i < count {
+            let lhs_elem: &T = (SliceOps[T] {}).ptr_ref(
+                unsafe {
+                    self.ptr.add((lhs_head +% i) & lhs_mask) as *T
+                },
+            );
+            let rhs_elem: &T = (SliceOps[T] {}).ptr_ref(
+                unsafe {
+                    other.ptr.add((rhs_head +% i) & rhs_mask) as *T
+                },
+            );
+            if lhs_elem.* != rhs_elem.* {
+                return false;
+            }
+            i = i +% 1;
+        }
+        return true;
+    }
+}
+
+impl[T: Debug] Debug for Deque[T] {
+    /// Formats `self` as `[elem0, elem1, …]` in logical front-to-back order.
+    @std_cap_boundary(clears: [alloc])
+    @no_alloc
+    pub fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        _ = spec;
+        out.write_str("[")?;
+        let (front_part, back_part) = self.as_slices();
+        var i: usize = 0;
+        while i < front_part.len() {
+            if i > 0 {
+                out.write_str(", ")?;
+            }
+            let elem_ref: &T = &front_part[i];
+            @fmt_write(out, "{elem_ref:?}")?;
+            i = i +% 1;
+        }
+        var j: usize = 0;
+        while j < back_part.len() {
+            if front_part.len() +% j > 0 {
+                out.write_str(", ")?;
+            }
+            let elem_ref: &T = &back_part[j];
+            @fmt_write(out, "{elem_ref:?}")?;
+            j = j +% 1;
+        }
+        return out.write_str("]");
+    }
+}
+
+// ----------------------- SlotMap[K, V] ------------------------
+impl[V] Hash for SlotKey[V] {
+    /// Hashes `(index, generation)` packed into a single 64-bit word (`3` ALU ops in `WyHasher`).
+    @inline @no_alloc @no_panic
+    pub fn hash[H: Hasher](&self, state: &mut H, /) {
+        let packed: u64 = (self.index as u64) | ((self.generation as u64) << 32_u64);
+        state.write_u64(packed);
+    }
+}
+
+impl[K, V] SlotMap[K, V] {
+    /// Constructs an empty `SlotMap[K, V]` without allocating.
+    @std_cap_boundary(clears: [alloc])
+    @inline @no_alloc @no_panic
+    pub fn new() -> Self {
+        return Self {
+            base_ptr: dangling_ptr[u32]() as *mut u8,
+            live_len: 0_u32,
+            cap: 0_u32,
+            free_head: SLOT_FREE_NONE,
+            alloc: context.allocator,
+            ..
+        };
+    }
+
+    /// Pre-allocates at least `cap` generational slots, panicking on `AllocError`.
+    pub fn with_capacity(cap: usize, /) -> Self {
+        var out: Self = Self.new();
+        if cap > 0 {
+            out.try_reserve(cap) catch {
+                panic("SlotMap.with_capacity({cap=}) out of memory");
+            };
+        }
+        return out;
+    }
+
+    /// Constructs a `SlotMap[K, V]` backed by `arena` (`0`-instruction drop when `V: TrivialDrop`).
+    pub fn in_arena(arena: &mut Arena, /, cap: usize = 0) -> Self {
+        var out = Self {
+            base_ptr: dangling_ptr[u32]() as *mut u8,
+            live_len: 0_u32,
+            cap: 0_u32,
+            free_head: SLOT_FREE_NONE,
+            alloc: arena.as_handle(),
+            ..
+        };
+        if cap > 0 {
+            out.try_reserve(cap) catch {
+                panic("SlotMap.in_arena({cap=}) out of memory");
+            };
+        }
+        return out;
+    }
+
+    /// Returns the number of live values stored in `self`.
+    @inline @no_alloc @no_panic
+    pub fn len(&self) -> usize {
+        return self.live_len as usize;
+    }
+
+    /// Returns the total allocated slot capacity.
+    @inline @no_alloc @no_panic
+    pub fn capacity(&self) -> usize {
+        return self.cap as usize;
+    }
+
+    /// Returns `true` if `self` contains zero live values.
+    @inline @no_alloc @no_panic
+    pub fn is_empty(&self) -> bool {
+        return self.live_len == 0_u32;
+    }
+
+    /// Returns raw pointer to `generations: [u32; cap]` at offset `0` of `base_ptr`.
+    @inline @no_alloc @no_panic
+    fn gens_ptr(&self) -> *mut u32 {
+        return self.base_ptr as *mut u32;
+    }
+
+    /// Returns raw pointer to `slots: [SlotUnion[V]; cap]` inside `base_ptr`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    fn slots_ptr(&self) -> *mut SlotUnion[V] {
+        let gens_bytes: usize = (self.cap as usize) *% 4;
+        let slots_off: usize = align_up_wrapping(gens_bytes, @align_of[SlotUnion[V]]());
+        return unsafe {
+            self.base_ptr.add(slots_off) as *mut SlotUnion[V]
+        };
+    }
+
+    /// Verifies `index < cap`, odd live generation bit `(gen_val & 1) != 0`, and exact generation match.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    fn is_live_slot(&self, raw_key: RawSlotKey, /) -> bool {
+        if raw_key.index >= self.cap or (raw_key.generation & 1_u32) == 0_u32 {
+            return false;
+        }
+        let stored_gen: u32 = unsafe {
+            self.gens_ptr().add(raw_key.index as usize).read()
+        };
+        return stored_gen == raw_key.generation;
+    }
+
+    /// Fallibly grows the combined `[generations | slots]` slab to hold `additional` more items.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn try_reserve(&mut self, additional: usize, /) -> unit!AllocError {
+        let cur_len: usize = self.live_len as usize;
+        if additional > ((SLOT_FREE_NONE -% 1_u32) as usize) -% cur_len {
+            return .Err(.OutOfMemory);
+        }
+        let req_cap: usize = cur_len +% additional;
+        let old_cap: usize = self.cap as usize;
+        if req_cap <= old_cap and (additional == 0 or self.free_head != SLOT_FREE_NONE) {
+            return .Ok(());
+        }
+        let min_needed: usize = max_usize_local(req_cap, old_cap +% 1);
+        let next_cap: usize = min_usize_local(
+            next_amortized_cap[SlotUnion[V]](old_cap, min_needed)?,
+            (SLOT_FREE_NONE -% 1_u32) as usize,
+        );
+        if next_cap < min_needed {
+            return .Err(.OutOfMemory);
+        }
+
+        let (new_slots_off, new_layout) = slot_map_slab_layout[V](next_cap)?;
+        let new_base: *mut u8 = self.alloc.alloc(new_layout)?;
+        let new_gens: *mut u32 = new_base as *mut u32;
+        let new_slots: *mut SlotUnion[V] = unsafe {
+            new_base.add(new_slots_off) as *mut SlotUnion[V]
+        };
+
+        if old_cap > 0 {
+            let old_gens: *mut u32 = self.gens_ptr();
+            let old_slots: *mut SlotUnion[V] = self.slots_ptr();
+            unsafe {
+                @ptr_copy_nonoverlapping(old_gens as *u32, new_gens, old_cap);
+                @ptr_copy_nonoverlapping(old_slots as *SlotUnion[V], new_slots, old_cap);
+            }
+            if not self.alloc.is_arena_or_static() {
+                let (_, old_layout) = slot_map_slab_layout[V](old_cap)?;
+                self.alloc.dealloc(self.base_ptr, old_layout);
+            }
+        }
+
+        var idx: usize = old_cap;
+        while idx < next_cap {
+            let next_link: u32 = if idx +% 1 < next_cap {
+                (idx +% 1) as u32
+            } else {
+                self.free_head
+            };
+            unsafe {
+                new_gens.add(idx).write(0_u32);
+                new_slots.add(idx).write(SlotUnion[V] { next_free: next_link });
+            }
+            idx = idx +% 1;
+        }
+
+        self.base_ptr = new_base;
+        self.cap = next_cap as u32;
+        self.free_head = old_cap as u32;
+        return .Ok(());
+    }
+
+    /// Inserts `val` in $O(1)$ amortized time and returns its unique odd-generation `K` handle.
+    pub fn insert(&mut self, val: own V, /) -> K {
+        return self.try_insert(own val) catch {
+            panic("SlotMap.insert out of memory");
+        };
+    }
+
+    /// Fallibly inserts `val` and returns its unique odd-generation `K` handle.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn try_insert(&mut self, val: own V, /) -> K!AllocError {
+        if self.free_head == SLOT_FREE_NONE {
+            self.try_reserve(1)?;
+        }
+        let slot_idx: u32 = self.free_head;
+        let idx_usz: usize = slot_idx as usize;
+        let gens: *mut u32 = self.gens_ptr();
+        let slots: *mut SlotUnion[V] = self.slots_ptr();
+
+        let slot_ref: &mut SlotUnion[V] = (SliceOps[SlotUnion[V]] {}).ptr_mut(
+            unsafe {
+                slots.add(idx_usz)
+            },
+        );
+        let next_free: u32 = unsafe {
+            slot_ref.next_free
+        };
+        let next_gen: u32 = (
+            unsafe {
+                gens.add(idx_usz).read()
+            } +% 1_u32
+        ) | 1_u32;
+        unsafe {
+            gens.add(idx_usz).write(next_gen);
+            @ptr_write(&raw mut slot_ref.value, own val);
+        }
+        self.free_head = next_free;
+        self.live_len += 1_u32;
+        return .Ok(pack_slot_key[K](slot_idx, next_gen));
+    }
+
+    /// Returns `true` if `key` still addresses a live unremoved value in `self`.
+    @inline @no_alloc @no_panic
+    pub fn contains(&self, key: K, /) -> bool {
+        return self.is_live_slot(unpack_slot_key(&key));
+    }
+
+    /// Borrows the value associated with `key`, or returns `.None` if `key` is stale or out of bounds.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub fn get(&self, key: K, /) -> (&V)? {
+        let raw_key: RawSlotKey = unpack_slot_key(&key);
+        if not self.is_live_slot(raw_key) {
+            return .None;
+        }
+        let slot_ref: &SlotUnion[V] = (SliceOps[SlotUnion[V]] {}).ptr_ref(
+            unsafe {
+                self.slots_ptr().add(raw_key.index as usize) as *SlotUnion[V]
+            },
+        );
+        return .Some(
+            unsafe {
+                &slot_ref.value
+            },
+        );
+    }
+
+    /// Mutably borrows the value associated with `key`, or returns `.None` if `key` is stale.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub fn get_mut(&mut self, key: K, /) -> (&mut V)? {
+        let raw_key: RawSlotKey = unpack_slot_key(&key);
+        if not self.is_live_slot(raw_key) {
+            return .None;
+        }
+        let slot_ref: &mut SlotUnion[V] = (SliceOps[SlotUnion[V]] {}).ptr_mut(
+            unsafe {
+                self.slots_ptr().add(raw_key.index as usize)
+            },
+        );
+        return .Some(
+            unsafe {
+                &mut slot_ref.value
+            },
+        );
+    }
+
+    /// Mutably borrows two distinct live slots `(key_a, key_b)` simultaneously, returning `.None` if aliased or stale.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn get_disjoint_mut(&mut self, key_a: K, key_b: K, /) -> (&mut V, &mut V)? {
+        let raw_a: RawSlotKey = unpack_slot_key(&key_a);
+        let raw_b: RawSlotKey = unpack_slot_key(&key_b);
+        if raw_a.index == raw_b.index or not self.is_live_slot(raw_a) or not self.is_live_slot(raw_b) {
+            return .None;
+        }
+        let slots: *mut SlotUnion[V] = self.slots_ptr();
+        let slot_a: &mut SlotUnion[V] = (SliceOps[SlotUnion[V]] {}).ptr_mut(
+            unsafe {
+                slots.add(raw_a.index as usize)
+            },
+        );
+        let slot_b: &mut SlotUnion[V] = (SliceOps[SlotUnion[V]] {}).ptr_mut(
+            unsafe {
+                slots.add(raw_b.index as usize)
+            },
+        );
+        return .Some(
+            (
+                unsafe {
+                    &mut slot_a.value
+                },
+                unsafe {
+                    &mut slot_b.value
+                },
+            ),
+        );
+    }
+
+    /// Removes and returns the value at `key`, advancing its generation to an even free value (retiring on `u32.MAX`).
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn remove(&mut self, key: K, /) -> V? {
+        let raw_key: RawSlotKey = unpack_slot_key(&key);
+        if not self.is_live_slot(raw_key) {
+            return .None;
+        }
+        let idx_usz: usize = raw_key.index as usize;
+        let gens: *mut u32 = self.gens_ptr();
+        let slots: *mut SlotUnion[V] = self.slots_ptr();
+        let slot_ref: &SlotUnion[V] = (SliceOps[SlotUnion[V]] {}).ptr_ref(
+            unsafe {
+                slots.add(idx_usz) as *SlotUnion[V]
+            },
+        );
+        let taken: V = unsafe {
+            @ptr_read(&raw slot_ref.value)
+        };
+        if raw_key.generation == u32.MAX {
+            // Retire saturated slot permanently (`0` = even/dead) so `u32` generation never wraps ABA:
+            unsafe {
+                gens.add(idx_usz).write(0_u32);
+            }
+        } else {
+            unsafe {
+                gens.add(idx_usz).write(raw_key.generation +% 1_u32);
+                slots.add(idx_usz).write(SlotUnion[V] { next_free: self.free_head });
+            }
+            self.free_head = raw_key.index;
+        }
+        self.live_len = self.live_len -% 1_u32;
+        return .Some(own taken);
+    }
+
+    /// Drops all live values while advancing their generations so existing `SlotKey`s become stale.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc
+    pub fn clear(&mut self) {
+        if self.live_len == 0_u32 {
+            return;
+        }
+        let total_cap: usize = self.cap as usize;
+        let gens: *mut u32 = self.gens_ptr();
+        let slots: *mut SlotUnion[V] = self.slots_ptr();
+        var i: usize = 0;
+        while i < total_cap {
+            let gen_val: u32 = unsafe {
+                gens.add(i).read()
+            };
+            if (gen_val & 1_u32) != 0_u32 {
+                if gen_val == u32.MAX {
+                    unsafe {
+                        gens.add(i).write(0_u32);
+                    }
+                } else {
+                    unsafe {
+                        gens.add(i).write(gen_val +% 1_u32);
+                    }
+                }
+                self.live_len -= 1_u32;
+                comptime if not @implements[V, TrivialDrop]() {
+                    let slot_mut: &mut SlotUnion[V] = (SliceOps[SlotUnion[V]] {}).ptr_mut(
+                        unsafe {
+                            slots.add(i)
+                        },
+                    );
+                    unsafe {
+                        @drop_in_place(&raw mut slot_mut.value);
+                    }
+                }
+                if gen_val != u32.MAX {
+                    unsafe {
+                        slots.add(i).write(SlotUnion[V] { next_free: self.free_head });
+                    }
+                    self.free_head = i as u32;
+                }
+            }
+            i = i +% 1;
+        }
+    }
+}
+
+impl[K, V] AutoDrop for SlotMap[K, V] {
+    /// Drops all live slot values and frees general-heap slab storage.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn drop(&mut self) {
+        self.clear();
+        let cur_cap: usize = self.cap as usize;
+        if cur_cap != 0 and not self.alloc.is_arena_or_static() {
+            if slot_map_slab_layout[V](cur_cap) is .Ok((_, slab_layout)) {
+                self.alloc.dealloc(self.base_ptr, slab_layout);
+            }
+        }
+        self.cap = 0_u32;
+        self.free_head = SLOT_FREE_NONE;
+    }
+}
+
+impl[K, V] Default for SlotMap[K, V] {
+    /// Returns an empty `SlotMap[K, V]`.
+    @inline @no_alloc @no_panic
+    pub fn default() -> Self {
+        return Self.new();
+    }
+}
+
+// ------------------- Wyhash & WyHasher API --------------------
+/// Hashes `bytes` into a 64-bit `Wyhash` digest seeded with `seed` (`0` unaligned UB, `0` heap allocs).
+@std_cap_boundary(clears: [unsafe_op, may_panic])
+@no_alloc @no_panic
+pub fn wyhash_bytes(bytes: &[u8], seed: u64, /) -> u64 {
+    let total_len: usize = bytes.len();
+    let base: *u8 = bytes.as_ptr();
+    var cur_seed: u64 = seed ^ wy_mix(seed ^ WY_P0, WY_P1);
+    var a_word: u64 = 0_u64;
+    var b_word: u64 = 0_u64;
+
+    if total_len <= 16 {
+        if total_len >= 4 {
+            let half_off: usize = (total_len >> 3_usize) << 2_usize;
+            let tail_off: usize = total_len -% 4;
+            a_word = (wy_read_u32_le(base) << 32_u64) | wy_read_u32_le(
+                unsafe {
+                    base.add(half_off)
+                },
+            );
+            b_word = (
+                wy_read_u32_le(
+                    unsafe {
+                        base.add(tail_off)
+                    },
+                ) << 32_u64
+            ) | wy_read_u32_le(
+                unsafe {
+                    base.add(tail_off -% half_off)
+                },
+            );
+        } else if total_len > 0 {
+            let byte0: u64 = bytes[0] as u64;
+            let byte_mid: u64 = bytes[total_len >> 1_usize] as u64;
+            let byte_end: u64 = bytes[total_len -% 1] as u64;
+            a_word = (byte0 << 16_u64) | (byte_mid << 8_u64) | byte_end;
+        }
+    } else {
+        var rem: usize = total_len;
+        var cursor: *u8 = base;
+        if rem > 48 {
+            var see1: u64 = cur_seed;
+            var see2: u64 = cur_seed;
+            while rem > 48 {
+                cur_seed = wy_mix(
+                    wy_read_u64_le(cursor) ^ WY_P1,
+                    wy_read_u64_le(
+                        unsafe {
+                            cursor.add(8_usize)
+                        },
+                    ) ^ cur_seed,
+                );
+                see1 = wy_mix(
+                    wy_read_u64_le(
+                        unsafe {
+                            cursor.add(16_usize)
+                        },
+                    ) ^ WY_P2,
+                    wy_read_u64_le(
+                        unsafe {
+                            cursor.add(24_usize)
+                        },
+                    ) ^ see1,
+                );
+                see2 = wy_mix(
+                    wy_read_u64_le(
+                        unsafe {
+                            cursor.add(32_usize)
+                        },
+                    ) ^ WY_P3,
+                    wy_read_u64_le(
+                        unsafe {
+                            cursor.add(40_usize)
+                        },
+                    ) ^ see2,
+                );
+                cursor = unsafe {
+                    cursor.add(48_usize)
+                };
+                rem = rem -% 48;
+            }
+            cur_seed = cur_seed ^ see1 ^ see2;
+        }
+        while rem > 16 {
+            cur_seed = wy_mix(
+                wy_read_u64_le(cursor) ^ WY_P1,
+                wy_read_u64_le(
+                    unsafe {
+                        cursor.add(8_usize)
+                    },
+                ) ^ cur_seed,
+            );
+            cursor = unsafe {
+                cursor.add(16_usize)
+            };
+            rem = rem -% 16;
+        }
+        a_word = wy_read_u64_le(
+            unsafe {
+                base.add(total_len -% 16)
+            },
+        );
+        b_word = wy_read_u64_le(
+            unsafe {
+                base.add(total_len -% 8)
+            },
+        );
+    }
+
+    a_word = a_word ^ WY_P1;
+    b_word = b_word ^ cur_seed;
+    let (mul_lo, mul_hi) = widening_mul_u64(a_word, b_word);
+    return wy_mix(mul_lo ^ WY_P0 ^ (total_len as u64), mul_hi ^ WY_P1);
+}
+
+impl WyHasher {
+    /// Constructs a `WyHasher` with canonical default secret state.
+    @inline @no_alloc @no_panic
+    pub fn new() -> Self {
+        return Self {
+            state: WY_P0,
+            seed: WY_P1,
+        };
+    }
+
+    /// Constructs a `WyHasher` initialized from explicit 64-bit `seed`.
+    @inline @no_alloc @no_panic
+    pub fn with_seed(seed: u64, /) -> Self {
+        return Self {
+            state: wy_mix(seed ^ WY_P0, WY_P1),
+            seed: seed ^ WY_P2,
+        };
+    }
+}
+
+impl Default for WyHasher {
+    /// Returns `WyHasher.new()`.
+    @inline @no_alloc @no_panic
+    pub fn default() -> Self {
+        return Self.new();
+    }
+}
+
+impl Hasher for WyHasher {
+    /// Mixes arbitrary byte slice `bytes` into the running `Wyhash` state.
+    @inline @no_alloc @no_panic
+    pub fn write(&mut self, bytes: &[u8], /) {
+        self.state = wyhash_bytes(bytes, self.state ^ self.seed ^ WY_P0);
+        self.seed = self.seed +% WY_P0;
+    }
+
+    /// Mixes a 64-bit word directly in `3` instructions without byte-slice dispatch.
+    @inline @no_alloc @no_panic
+    pub fn write_u64(&mut self, word: u64, /) {
+        self.state = wy_mix(word ^ WY_P1, self.state ^ self.seed ^ WY_P0);
+        self.seed = self.seed +% WY_P0;
+    }
+
+    /// Finalizes and returns the 64-bit `Wyhash` digest without mutating `self`.
+    @inline @no_alloc @no_panic
+    pub fn finish(&self) -> u64 {
+        return wy_mix(self.state ^ WY_P0, self.seed ^ WY_P3);
+    }
+}
+
+// ------------------------ Map[K, V, H] ------------------------
+impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
+    /// Constructs an empty `Map` seeded deterministically from `@ctx_next_rng_seed()` (`0` heap allocs).
+    @std_cap_boundary(clears: [alloc])
+    @no_alloc @no_panic
+    pub fn new() -> Self {
+        return Self {
+            raw: RawTableInner.empty(context.allocator),
+            seed: @ctx_next_rng_seed(),
+        };
+    }
+
+    /// Pre-allocates SwissTable buckets for at least `cap` entries, panicking on `AllocError`.
+    pub fn with_capacity(cap: usize, /) -> Self {
+        var out: Self = Self.new();
+        if cap > 0 {
+            out.reserve(cap);
+        }
+        return out;
+    }
+
+    /// Fallibly pre-allocates SwissTable buckets for at least `cap` entries.
+    pub fn try_with_capacity(cap: usize, /) -> Self!AllocError {
+        var out: Self = Self.new();
+        if cap > 0 {
+            out.try_reserve(cap)?;
+        }
+        return .Ok(own out);
+    }
+
+    /// Constructs a `Map` backed by `arena` (`0`-instruction drop when `K: TrivialDrop` and `V: TrivialDrop`).
+    pub fn in_arena(arena: &mut Arena, /, cap: usize = 0) -> Self {
+        var out = Self {
+            raw: RawTableInner.empty(arena.as_handle()),
+            seed: @ctx_next_rng_seed(),
+        };
+        if cap > 0 {
+            out.reserve(cap);
+        }
+        return out;
+    }
+
+    /// Returns the number of live `(K, V)` entries in `self`.
+    @inline @no_alloc @no_panic
+    pub fn len(&self) -> usize {
+        return self.raw.items as usize;
+    }
+
+    /// Returns the number of entries `self` can hold before rehashing or growing.
+    @inline @no_alloc @no_panic
+    pub fn capacity(&self) -> usize {
+        return (self.raw.items as usize) +% (self.raw.growth_left() as usize);
+    }
+
+    /// Returns `true` if `self` contains zero live entries.
+    @inline @no_alloc @no_panic
+    pub fn is_empty(&self) -> bool {
+        return self.raw.items == 0_u32;
+    }
+
+    /// Internal helper locating bucket index matching `key`, or `.None`.
+    @inline @no_alloc @no_panic
+    fn find_bucket_idx(&self, key: &K, /) -> usize? {
+        if self.raw.items == 0_u32 {
+            return .None;
+        }
+        let hash_val: u64 = hash_key_seeded[K, H](self.seed, key);
+        let target_ptr: *K = &raw key.*;
+        return self.raw.find_raw(
+            hash_val,
+            @size_of[MapBucket[K, V]](),
+            @align_of[MapBucket[K, V]](),
+            |bucket_raw: *u8| -> bool {
+                let target_ref: &K = (SliceOps[K] {}).ptr_ref(target_ptr);
+                let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(
+                    bucket_raw as *MapBucket[K, V],
+                );
+                return target_ref.* == bucket_ref.key;
+            },
+        );
+    }
+
+    /// Returns `true` if `self` contains an entry matching `key`.
+    @no_alloc @no_panic
+    pub fn contains_key(&self, key: &K, /) -> bool {
+        return self.find_bucket_idx(key) is .Some(_);
+    }
+
+    /// Borrows the value associated with `key`, or `.None` if absent.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn get(&self, key: &K, /) -> (&V)? {
+        if self.find_bucket_idx(key) is .Some(idx) {
+            let bucket_ptr: *MapBucket[K, V] = self.raw.bucket_ptr(
+                idx,
+                @size_of[MapBucket[K, V]](),
+                @align_of[MapBucket[K, V]](),
+            ) as *MapBucket[K, V];
+            let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(bucket_ptr);
+            return .Some(&bucket_ref.val);
+        }
+        return .None;
+    }
+
+    /// Mutably borrows the value associated with `key`, or `.None` if absent.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn get_mut(&mut self, key: &K, /) -> (&mut V)? {
+        if self.find_bucket_idx(key) is .Some(idx) {
+            let bucket_ptr: *mut MapBucket[K, V] = self.raw.bucket_ptr(
+                idx,
+                @size_of[MapBucket[K, V]](),
+                @align_of[MapBucket[K, V]](),
+            ) as *mut MapBucket[K, V];
+            let bucket_ref: &mut MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_mut(bucket_ptr);
+            return .Some(&mut bucket_ref.val);
+        }
+        return .None;
+    }
+
+    /// Borrows both the stored `(&K, &V)` entry matching `key`, or `.None` if absent.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn get_key_value(&self, key: &K, /) -> (&K, &V)? {
+        if self.find_bucket_idx(key) is .Some(idx) {
+            let bucket_ptr: *MapBucket[K, V] = self.raw.bucket_ptr(
+                idx,
+                @size_of[MapBucket[K, V]](),
+                @align_of[MapBucket[K, V]](),
+            ) as *MapBucket[K, V];
+            let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(bucket_ptr);
+            return .Some((&bucket_ref.key, &bucket_ref.val));
+        }
+        return .None;
+    }
+
+    /// Inserts `(key, val)`, returning the displaced `V` if `key` was already present.
+    pub fn insert(&mut self, key: own K, val: own V, /) -> V? {
+        return self.try_insert(own key, own val) catch {
+            panic("Map.insert out of memory");
+        };
+    }
+
+    /// Fallibly inserts `(key, val)`, returning `.Ok(.Some(old_val))` on overwrite or `.Ok(.None)` on new key.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn try_insert(&mut self, key: own K, val: own V, /) -> (V?)!AllocError {
+        let hash_val: u64 = hash_key_seeded[K, H](self.seed, &key);
+        let target_ptr: *K = &raw key;
+        let (slot, was_present) = self
+            .raw
+            .find_or_prepare_insert_raw(
+                hash_val,
+                self.seed,
+                @size_of[MapBucket[K, V]](),
+                @align_of[MapBucket[K, V]](),
+                |bucket_raw: *u8| -> bool {
+                    let target_ref: &K = (SliceOps[K] {}).ptr_ref(target_ptr);
+                    let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(
+                        bucket_raw as *MapBucket[K, V],
+                    );
+                    return target_ref.* == bucket_ref.key;
+                },
+                |cur_seed: u64, bucket_raw: *u8| -> u64 {
+                    let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(
+                        bucket_raw as *MapBucket[K, V],
+                    );
+                    return hash_key_seeded[K, H](cur_seed, &bucket_ref.key);
+                },
+            )?;
+        let bucket_ptr: *mut MapBucket[K, V] = self.raw.bucket_ptr(
+            slot,
+            @size_of[MapBucket[K, V]](),
+            @align_of[MapBucket[K, V]](),
+        ) as *mut MapBucket[K, V];
+
+        if was_present {
+            let bucket_ref: &mut MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_mut(bucket_ptr);
+            let old_val: V = unsafe {
+                @ptr_read(&raw bucket_ref.val)
+            };
+            unsafe {
+                @ptr_write(&raw mut bucket_ref.val, own val);
+            }
+            return .Ok(.Some(own old_val));
+        }
+        unsafe {
+            @ptr_write(bucket_ptr, MapBucket[K, V] { key: own key, val: own val });
+        }
+        return .Ok(.None);
+    }
+
+    /// Returns a mutable reference to `key`'s value, lazily evaluating `default_fn()` only when absent.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn get_or_insert_with(&mut self, key: own K, default_fn: || -> V, /) -> &mut V {
+        let hash_val: u64 = hash_key_seeded[K, H](self.seed, &key);
+        let target_ptr: *K = &raw key;
+        if self.raw.items != 0_u32 {
+            if self.raw.find_raw(
+                hash_val,
+                @size_of[MapBucket[K, V]](),
+                @align_of[MapBucket[K, V]](),
+                |bucket_raw: *u8| -> bool {
+                    let target_ref: &K = (SliceOps[K] {}).ptr_ref(target_ptr);
+                    let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(
+                        bucket_raw as *MapBucket[K, V],
+                    );
+                    return target_ref.* == bucket_ref.key;
+                },
+            ) is .Some(existing_idx) {
+                let existing_ptr: *mut MapBucket[K, V] = self.raw.bucket_ptr(
+                    existing_idx,
+                    @size_of[MapBucket[K, V]](),
+                    @align_of[MapBucket[K, V]](),
+                ) as *mut MapBucket[K, V];
+                let existing_ref: &mut MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_mut(
+                    existing_ptr,
+                );
+                return &mut existing_ref.val;
+            }
+        }
+        self.reserve(1);
+        let init_val: V = default_fn();
+        let (slot, was_present) = self.raw.find_or_prepare_insert_raw(
+            hash_val,
+            self.seed,
+            @size_of[MapBucket[K, V]](),
+            @align_of[MapBucket[K, V]](),
+            |bucket_raw: *u8| -> bool {
+                let target_ref: &K = (SliceOps[K] {}).ptr_ref(target_ptr);
+                let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(
+                    bucket_raw as *MapBucket[K, V],
+                );
+                return target_ref.* == bucket_ref.key;
+            },
+            |cur_seed: u64, bucket_raw: *u8| -> u64 {
+                let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(
+                    bucket_raw as *MapBucket[K, V],
+                );
+                return hash_key_seeded[K, H](cur_seed, &bucket_ref.key);
+            },
+        ) catch {
+            panic("Map.get_or_insert_with out of memory");
+        };
+        let bucket_ptr: *mut MapBucket[K, V] = self.raw.bucket_ptr(
+            slot,
+            @size_of[MapBucket[K, V]](),
+            @align_of[MapBucket[K, V]](),
+        ) as *mut MapBucket[K, V];
+        let bucket_ref: &mut MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_mut(bucket_ptr);
+        if was_present {
+            let prev_val: V = unsafe {
+                @ptr_read(&raw bucket_ref.val)
+            };
+            _ = prev_val;
+            unsafe {
+                @ptr_write(&raw mut bucket_ref.val, own init_val);
+            }
+        } else {
+            unsafe {
+                @ptr_write(bucket_ptr, MapBucket[K, V] { key: own key, val: own init_val });
+            }
+        }
+        return &mut bucket_ref.val;
+    }
+
+    /// Removes `key` from `self` and returns `(K, V)`, or `.None` if absent.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn remove_entry(&mut self, key: &K, /) -> (K, V)? {
+        if self.find_bucket_idx(key) is .Some(idx) {
+            let bucket_ptr: *MapBucket[K, V] = self.raw.bucket_ptr(
+                idx,
+                @size_of[MapBucket[K, V]](),
+                @align_of[MapBucket[K, V]](),
+            ) as *MapBucket[K, V];
+            let entry: MapBucket[K, V] = unsafe {
+                @ptr_read(bucket_ptr)
+            };
+            self.raw.erase_slot_ctrl(idx);
+            return .Some((own entry.key, own entry.val));
+        }
+        return .None;
+    }
+
+    /// Removes `key` from `self` and returns its `V`, dropping the stored `K` (`@no_alloc @no_panic` when `K: TrivialDrop`).
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn remove(&mut self, key: &K, /) -> V? {
+        if self.find_bucket_idx(key) is .Some(idx) {
+            let bucket_ptr: *mut MapBucket[K, V] = self.raw.bucket_ptr(
+                idx,
+                @size_of[MapBucket[K, V]](),
+                @align_of[MapBucket[K, V]](),
+            ) as *mut MapBucket[K, V];
+            let bucket_ref: &mut MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_mut(bucket_ptr);
+            let out_val: V = unsafe {
+                @ptr_read(&raw bucket_ref.val)
+            };
+            comptime if not @implements[K, TrivialDrop]() {
+                unsafe {
+                    @drop_in_place(&raw mut bucket_ref.key);
+                }
+            }
+            self.raw.erase_slot_ctrl(idx);
+            return .Some(own out_val);
+        }
+        return .None;
+    }
+
+    /// Reserves space for at least `additional` new entries without reallocating, panicking on `AllocError`.
+    pub fn reserve(&mut self, additional: usize, /) {
+        self.try_reserve(additional) catch {
+            panic("Map.reserve({additional=}) out of memory");
+        };
+    }
+
+    /// Fallibly reserves space for at least `additional` new entries.
+    pub fn try_reserve(&mut self, additional: usize, /) -> unit!AllocError {
+        return self.raw.reserve_raw(
+            additional,
+            self.seed,
+            @size_of[MapBucket[K, V]](),
+            @align_of[MapBucket[K, V]](),
+            |cur_seed: u64, bucket_raw: *u8| -> u64 {
+                let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(
+                    bucket_raw as *MapBucket[K, V],
+                );
+                return hash_key_seeded[K, H](cur_seed, &bucket_ref.key);
+            },
+        );
+    }
+
+    /// Drops all live `(K, V)` entries while retaining the allocated bucket slab.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc
+    pub fn clear(&mut self) {
+        if self.raw.items == 0_u32 {
+            return;
+        }
+        comptime if not (@implements[K, TrivialDrop]() and @implements[V, TrivialDrop]()) {
+            let buckets: usize = (self.raw.bucket_mask as usize) +% 1;
+            var idx: usize = 0;
+            while idx < buckets {
+                let ctrl_byte: u8 = unsafe {
+                    self.raw.ctrl.add(idx).read()
+                };
+                if (ctrl_byte & 0x80_u8) == 0_u8 {
+                    self.raw.set_ctrl(idx, CTRL_EMPTY);
+                    self.raw.items -= 1_u32;
+                    let bucket_ptr: *mut MapBucket[K, V] = self.raw.bucket_ptr(
+                        idx,
+                        @size_of[MapBucket[K, V]](),
+                        @align_of[MapBucket[K, V]](),
+                    ) as *mut MapBucket[K, V];
+                    unsafe {
+                        @drop_in_place(bucket_ptr);
+                    }
+                }
+                idx = idx +% 1;
+            }
+        }
+        self.raw.reset_ctrl_empty();
+    }
+
+    /// Retains only entries satisfying `keep(&key, &mut val)`, erasing rejected slots cleanly on unwind.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn retain(&mut self, keep: |&K, &mut V| -> bool, /) {
+        if self.raw.items == 0_u32 {
+            return;
+        }
+        let buckets: usize = (self.raw.bucket_mask as usize) +% 1;
+        var idx: usize = 0;
+        while idx < buckets {
+            if (
+                unsafe {
+                    self.raw.ctrl.add(idx).read()
+                } & 0x80_u8
+            ) == 0_u8 {
+                let bucket_ptr: *mut MapBucket[K, V] = self.raw.bucket_ptr(
+                    idx,
+                    @size_of[MapBucket[K, V]](),
+                    @align_of[MapBucket[K, V]](),
+                ) as *mut MapBucket[K, V];
+                let bucket_ref: &mut MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_mut(
+                    bucket_ptr,
+                );
+                if not keep(&bucket_ref.key, &mut bucket_ref.val) {
+                    self.raw.erase_slot_ctrl(idx);
+                    comptime if not (@implements[K, TrivialDrop]() and @implements[V, TrivialDrop]()) {
+                        unsafe {
+                            @drop_in_place(bucket_ptr);
+                        }
+                    }
+                }
+            }
+            idx = idx +% 1;
+        }
+    }
+
+    /// Returns a zero-allocation iterator yielding `(&K, &V)` over all live entries.
+    @inline @no_alloc @no_panic
+    pub fn iter(&self) -> MapIter[K, V] {
+        return MapIter[K, V] {
+            ctrl: self.raw.ctrl as *u8,
+            buckets_base: self.raw.bucket_ptr(
+                0,
+                @size_of[MapBucket[K, V]](),
+                @align_of[MapBucket[K, V]](),
+            ) as *u8,
+            index: 0,
+            remaining: self.raw.items as usize,
+        };
+    }
+
+    /// Returns a zero-allocation iterator yielding `&K` over all live keys.
+    @inline @no_alloc @no_panic
+    pub fn keys(&self) -> MapKeysIter[K, V] {
+        return MapKeysIter[K, V] { inner: self.iter() };
+    }
+
+    /// Returns a zero-allocation iterator yielding `&V` over all live values.
+    @inline @no_alloc @no_panic
+    pub fn values(&self) -> MapValuesIter[K, V] {
+        return MapValuesIter[K, V] { inner: self.iter() };
+    }
+}
+
+impl[K, V] MapIter[K, V] {
+    /// Advances the iterator and returns the next live `(&K, &V)` pair, or `.None` when exhausted.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn next(&mut self) -> (&K, &V)? {
+        if self.remaining == 0 {
+            return .None;
+        }
+        let stride: usize = @size_of[MapBucket[K, V]]();
+        while true {
+            let idx: usize = self.index;
+            self.index = idx +% 1;
+            if (
+                unsafe {
+                    self.ctrl.add(idx).read()
+                } & 0x80_u8
+            ) == 0_u8 {
+                self.remaining = self.remaining -% 1;
+                let bucket_ptr: *MapBucket[K, V] = if stride == 0 {
+                    self.buckets_base as *MapBucket[K, V]
+                } else {
+                    unsafe {
+                        self.buckets_base.add(idx *% stride) as *MapBucket[K, V]
+                    }
+                };
+                let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(bucket_ptr);
+                return .Some((&bucket_ref.key, &bucket_ref.val));
+            }
+        }
+        return .None;
+    }
+}
+
+impl[K, V] MapKeysIter[K, V] {
+    /// Advances and returns the next `&K`, or `.None` when exhausted.
+    @inline @no_alloc @no_panic
+    pub fn next(&mut self) -> (&K)? {
+        if self.inner.next() is .Some((key_ref, _)) {
+            return .Some(key_ref);
+        }
+        return .None;
+    }
+}
+
+impl[K, V] MapValuesIter[K, V] {
+    /// Advances and returns the next `&V`, or `.None` when exhausted.
+    @inline @no_alloc @no_panic
+    pub fn next(&mut self) -> (&V)? {
+        if self.inner.next() is .Some((_, val_ref)) {
+            return .Some(val_ref);
+        }
+        return .None;
+    }
+}
+
+impl[K: Equatable + Hash, V, H: Hasher] AutoDrop for Map[K, V, H] {
+    /// Drops all live `(K, V)` entries and frees general-heap SwissTable storage.
+    pub fn drop(&mut self) {
+        self.clear();
+        self.raw.dealloc_slab_raw(@size_of[MapBucket[K, V]](), @align_of[MapBucket[K, V]]());
+    }
+}
+
+impl[K: Equatable + Hash, V, H: Hasher] Default for Map[K, V, H] {
+    /// Returns an empty `Map[K, V, H]`.
+    @no_alloc @no_panic
+    pub fn default() -> Self {
+        return Self.new();
+    }
+}
+
+impl[K: Equatable + Hash + Clone, V: Clone, H: Hasher] Clone for Map[K, V, H] {
+    /// Deep-clones all `(K, V)` pairs into a fresh `Map`.
+    pub fn clone(&self) -> Self {
+        var out: Self = Self.with_capacity(self.len());
+        var it: MapIter[K, V] = self.iter();
+        while it.next() is .Some((key_ref, val_ref)) {
+            _ = out.insert(key_ref.clone(), val_ref.clone());
+        }
+        return out;
+    }
+}
+
+impl[K: Equatable + Hash, V: Equatable, H: Hasher] Equatable for Map[K, V, H] {
+    /// Returns `true` iff both maps have identical key sets and equal corresponding values.
+    @no_alloc @no_panic
+    pub fn eq(&self, other: &Self, /) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        var it: MapIter[K, V] = self.iter();
+        while it.next() is .Some((key_ref, val_ref)) {
+            if other.get(key_ref) is .Some(other_val) {
+                if val_ref.* != other_val.* {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+impl[K: Equatable + Hash + Debug, V: Debug, H: Hasher] Debug for Map[K, V, H] {
+    /// Formats `self` as `{k0: v0, k1: v1, …}` into `out`.
+    @std_cap_boundary(clears: [alloc])
+    @no_alloc
+    pub fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        _ = spec;
+        out.write_str("{{")?;
+        var it: MapIter[K, V] = self.iter();
+        var first: bool = true;
+        while it.next() is .Some((key_ref, val_ref)) {
+            if not first {
+                out.write_str(", ")?;
+            }
+            first = false;
+            @fmt_write(out, "{key_ref:?}: {val_ref:?}")?;
+        }
+        return out.write_str("}}");
+    }
+}
+
+// ------------------------- Set[T, H] --------------------------
+impl[T: Equatable + Hash, H: Hasher] Set[T, H] {
+    /// Constructs an empty `Set[T, H]` seeded deterministically from `@ctx_next_rng_seed()`.
+    @std_cap_boundary(clears: [alloc])
+    @inline @no_alloc @no_panic
+    pub fn new() -> Self {
+        return Self {
+            inner: Map {
+                raw: RawTableInner.empty(context.allocator),
+                seed: @ctx_next_rng_seed(),
+            },
+        };
+    }
+
+    /// Pre-allocates SwissTable buckets for at least `cap` elements, panicking on `AllocError`.
+    pub fn with_capacity(cap: usize, /) -> Self {
+        var out: Self = Self.new();
+        if cap > 0 {
+            out.inner.reserve(cap);
+        }
+        return out;
+    }
+
+    /// Fallibly pre-allocates SwissTable buckets for at least `cap` elements.
+    pub fn try_with_capacity(cap: usize, /) -> Self!AllocError {
+        var out: Self = Self.new();
+        if cap > 0 {
+            out.inner.try_reserve(cap)?;
+        }
+        return .Ok(own out);
+    }
+
+    /// Constructs a `Set[T, H]` backed directly by `arena`.
+    pub fn in_arena(arena: &mut Arena, /, cap: usize = 0) -> Self {
+        var out = Self {
+            inner: Map {
+                raw: RawTableInner.empty(arena.as_handle()),
+                seed: @ctx_next_rng_seed(),
+            },
+        };
+        if cap > 0 {
+            out.inner.reserve(cap);
+        }
+        return out;
+    }
+
+    /// Returns the number of distinct elements in `self`.
+    @inline @no_alloc @no_panic
+    pub fn len(&self) -> usize {
+        return self.inner.len();
+    }
+
+    /// Returns the number of elements `self` can hold without rehashing or growing.
+    @inline @no_alloc @no_panic
+    pub fn capacity(&self) -> usize {
+        return self.inner.capacity();
+    }
+
+    /// Returns `true` if `self` contains zero elements.
+    @inline @no_alloc @no_panic
+    pub fn is_empty(&self) -> bool {
+        return self.inner.is_empty();
+    }
+
+    /// Returns `true` if `self` contains `value`.
+    @inline @no_alloc @no_panic
+    pub fn contains(&self, value: &T, /) -> bool {
+        return self.inner.contains_key(value);
+    }
+
+    /// Inserts `value`, returning `true` if newly inserted or `false` if already present.
+    pub fn insert(&mut self, value: own T, /) -> bool {
+        return self.inner.insert(own value, ()) is .None;
+    }
+
+    /// Fallibly inserts `value`, returning `.Ok(true)` if newly inserted.
+    pub fn try_insert(&mut self, value: own T, /) -> bool!AllocError {
+        return .Ok((self.inner.try_insert(own value, ())?) is .None);
+    }
+
+    /// Removes `value` from `self`, returning `true` if it was present.
+    @inline @no_alloc @no_panic
+    pub fn remove(&mut self, value: &T, /) -> bool {
+        return self.inner.remove(value) is .Some(_);
+    }
+
+    /// Reserves capacity for at least `additional` new elements.
+    pub fn reserve(&mut self, additional: usize, /) {
+        self.inner.reserve(additional);
+    }
+
+    /// Fallibly reserves capacity for at least `additional` new elements.
+    pub fn try_reserve(&mut self, additional: usize, /) -> unit!AllocError {
+        return self.inner.try_reserve(additional);
+    }
+
+    /// Drops all elements while retaining allocated bucket capacity.
+    @inline @no_alloc
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+
+    /// Retains only elements satisfying `keep(&elem)`.
+    pub fn retain(&mut self, keep: |&T| -> bool, /) {
+        self.inner.retain(|elem_ref: &T, _: &mut unit| keep(elem_ref));
+    }
+
+    /// Returns a zero-allocation iterator yielding `&T` over all live elements.
+    @inline @no_alloc @no_panic
+    pub fn iter(&self) -> SetIter[T] {
+        return SetIter[T] { inner: self.inner.iter() };
+    }
+}
+
+impl[T] SetIter[T] {
+    /// Advances and returns the next `&T` element, or `.None` when exhausted.
+    @inline @no_alloc @no_panic
+    pub fn next(&mut self) -> (&T)? {
+        if self.inner.next() is .Some((elem_ref, _)) {
+            return .Some(elem_ref);
+        }
+        return .None;
+    }
+}
+
+impl[T: Equatable + Hash, H: Hasher] AutoDrop for Set[T, H] {
+    /// Idempotently drops `self.inner` so `@implements[Set[T, H], AutoDrop]()` holds cleanly.
+    pub fn drop(&mut self) {
+        self.inner.clear();
+        self.inner.raw.dealloc_slab_raw(
+            @size_of[MapBucket[T, unit]](),
+            @align_of[MapBucket[T, unit]](),
+        );
+    }
+}
+
+impl[T: Equatable + Hash, H: Hasher] Default for Set[T, H] {
+    /// Returns an empty `Set[T, H]`.
+    @no_alloc @no_panic
+    pub fn default() -> Self {
+        return Self.new();
+    }
+}
+
+impl[T: Equatable + Hash + Clone, H: Hasher] Clone for Set[T, H] {
+    /// Deep-clones `self` into a new `Set[T, H]`.
+    pub fn clone(&self) -> Self {
+        return Self {
+            inner: self.inner.clone(),
+        };
+    }
+}
+
+impl[T: Equatable + Hash, H: Hasher] Equatable for Set[T, H] {
+    /// Returns `true` iff both sets contain the exact same elements.
+    @no_alloc @no_panic
+    pub fn eq(&self, other: &Self, /) -> bool {
+        return self.inner == other.inner;
+    }
+}
+
+impl[T: Equatable + Hash + Debug, H: Hasher] Debug for Set[T, H] {
+    /// Formats `self` as `{e0, e1, …}` into `out`.
+    @std_cap_boundary(clears: [alloc])
+    @no_alloc
+    pub fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        _ = spec;
+        out.write_str("{{")?;
+        var it: SetIter[T] = self.iter();
+        var first: bool = true;
+        while it.next() is .Some(elem_ref) {
+            if not first {
+                out.write_str(", ")?;
+            }
+            first = false;
+            @fmt_write(out, "{elem_ref:?}")?;
+        }
+        return out.write_str("}}");
+    }
+}
+
+// ----------------- Slice & Sorting Algorithms -----------------
+/// Sorts `slice` in place in $O(N \log N)$ worst-case time without allocating (`ipnsort`, not stable).
+@std_cap_boundary(clears: [alloc])
+@inline @no_alloc
+pub fn sort_unstable[T: Comparable](slice: &mut [T], /) {
+    (SliceOps[T] {}).sort_unstable_by_impl(slice, |lhs: &T, rhs: &T| lhs.* < rhs.*);
+}
+
+/// Sorts `slice` in place under strict weak ordering `less` (`ipnsort` + cyclic Lomuto + heapsort fallback).
+@std_cap_boundary(clears: [alloc])
+@inline @no_alloc
+pub fn sort_unstable_by[T](slice: &mut [T], less: |&T, &T| -> bool, /) {
+    (SliceOps[T] {}).sort_unstable_by_impl(slice, less);
+}
+
+/// Sorts `slice` in place unstable-order by projected key `key_fn(&elem)`.
+@std_cap_boundary(clears: [alloc])
+@inline @no_alloc
+pub fn sort_unstable_by_key[T, K: Comparable](slice: &mut [T], key_fn: |&T| -> K, /) {
+    (SliceOps[T] {}).sort_unstable_by_impl(slice, |lhs: &T, rhs: &T| key_fn(lhs) < key_fn(rhs));
+}
+
+/// Stably sorts `slice` in place using adaptive Munro–Wild `Powersort` (`with_scratch` half-buffer).
+@inline
+pub fn sort[T: Comparable](slice: &mut [T], /) {
+    (SliceOps[T] {}).sort_by_impl(slice, |lhs: &T, rhs: &T| lhs.* < rhs.*);
+}
+
+/// Stably sorts `slice` in place under strict weak ordering `less` using adaptive `Powersort`.
+@inline
+pub fn sort_by[T](slice: &mut [T], less: |&T, &T| -> bool, /) {
+    (SliceOps[T] {}).sort_by_impl(slice, less);
+}
+
+/// Stably sorts `slice` in place by projected key `key_fn(&elem)` using adaptive `Powersort`.
+@inline
+pub fn sort_by_key[T, K: Comparable](slice: &mut [T], key_fn: |&T| -> K, /) {
+    (SliceOps[T] {}).sort_by_impl(slice, |lhs: &T, rhs: &T| key_fn(lhs) < key_fn(rhs));
+}
+
+/// Reorders `slice` in place so `slice[nth]` holds its sorted element (`<` to the left, `>=` to the right).
+@std_cap_boundary(clears: [alloc])
+@inline @no_alloc
+pub fn select_nth_unstable[T: Comparable](slice: &mut [T], nth: usize, /) {
+    (SliceOps[T] {}).select_nth_by_impl(slice, nth, |lhs: &T, rhs: &T| lhs.* < rhs.*);
+}
+
+/// Reorders `slice` in place under `less` so `slice[nth]` holds its sorted order statistic.
+@std_cap_boundary(clears: [alloc])
+@inline @no_alloc
+pub fn select_nth_unstable_by[T](slice: &mut [T], nth: usize, less: |&T, &T| -> bool, /) {
+    (SliceOps[T] {}).select_nth_by_impl(slice, nth, less);
+}
+
+/// Searches sorted `slice` for `target`, returning `.Ok(found_idx)` or `.Err(insert_idx)` (`0` bounds traps).
+@std_cap_boundary(clears: [unsafe_op])
+@no_alloc @no_panic
+pub fn binary_search[T: Comparable](slice: &[T], target: &T, /) -> usize!usize {
+    var size: usize = slice.len();
+    if size == 0 {
+        return .Err(0);
+    }
+    let ptr: *T = slice.as_ptr();
+    var base: usize = 0;
+    while size > 1 {
+        let half: usize = size >> 1_usize;
+        let mid: usize = base +% half;
+        let go_right: bool = if @size_of[T]() == 0 {
+            (SliceOps[T] {}).ptr_ref(ptr).* <= target.*
+        } else {
+            (SliceOps[T] {}).ptr_ref(
+                unsafe {
+                    ptr.add(mid)
+                },
+            ).* <= target.*
+        };
+        if go_right {
+            base = mid;
+        }
+        size = size -% half;
+    }
+    let final_ref: &T = if @size_of[T]() == 0 {
+        (SliceOps[T] {}).ptr_ref(ptr)
+    } else {
+        (SliceOps[T] {}).ptr_ref(
+            unsafe {
+                ptr.add(base)
+            },
+        )
+    };
+    if final_ref.* == target.* {
+        return .Ok(base);
+    }
+    return .Err(base +% ((final_ref.* < target.*) as usize));
+}
+
+/// Searches sorted `slice` via `cmp_fn(&elem)` (`elem.cmp(target)` convention), returning `.Ok(idx)` or `.Err(ins_idx)`.
+@std_cap_boundary(clears: [unsafe_op, alloc, may_panic])
+@no_alloc @no_panic
+pub fn binary_search_by[T](slice: &[T], cmp_fn: |&T| -> Ordering, /) -> usize!usize {
+    var size: usize = slice.len();
+    if size == 0 {
+        return .Err(0);
+    }
+    let ptr: *T = slice.as_ptr();
+    var base: usize = 0;
+    while size > 1 {
+        let half: usize = size >> 1_usize;
+        let mid: usize = base +% half;
+        let ord_mid: Ordering = if @size_of[T]() == 0 {
+            cmp_fn((SliceOps[T] {}).ptr_ref(ptr))
+        } else {
+            cmp_fn(
+                (SliceOps[T] {}).ptr_ref(
+                    unsafe {
+                        ptr.add(mid)
+                    },
+                ),
+            )
+        };
+        if ord_mid != .Greater {
+            base = mid;
+        }
+        size = size -% half;
+    }
+    let final_ord: Ordering = if @size_of[T]() == 0 {
+        cmp_fn((SliceOps[T] {}).ptr_ref(ptr))
+    } else {
+        cmp_fn(
+            (SliceOps[T] {}).ptr_ref(
+                unsafe {
+                    ptr.add(base)
+                },
+            ),
+        )
+    };
+    if final_ord == .Equal {
+        return .Ok(base);
+    }
+    return .Err(base +% ((final_ord == .Less) as usize));
+}
+
+/// Returns the first index where partitioned `pred(&elem)` becomes `false` (`0` Pentagon bounds traps).
+@std_cap_boundary(clears: [unsafe_op, alloc, may_panic])
+@no_alloc @no_panic
+pub fn partition_point[T](slice: &[T], pred: |&T| -> bool, /) -> usize {
+    var base: usize = 0;
+    var size: usize = slice.len();
+    let ptr: *T = slice.as_ptr();
+    while size > 0 {
+        let half: usize = size >> 1_usize;
+        let mid: usize = base +% half;
+        let go_right: bool = if @size_of[T]() == 0 {
+            pred((SliceOps[T] {}).ptr_ref(ptr))
+        } else {
+            pred(
+                (SliceOps[T] {}).ptr_ref(
+                    unsafe {
+                        ptr.add(mid)
+                    },
+                ),
+            )
+        };
+        base = if go_right {
+            mid +% 1
+        } else {
+            base
+        };
+        size = size -% (half +% ((go_right as usize) *% (1_usize -% (size & 1_usize))));
+    }
+    return base;
+}
+
+/// Compacts consecutive equal elements to the prefix of `slice`, returning the unique prefix length.
+@std_cap_boundary(clears: [unsafe_op])
+@no_alloc
+pub fn dedup_slice[T: Equatable](slice: &mut [T], /) -> usize {
+    let n: usize = slice.len();
+    if n <= 1 or @size_of[T]() == 0 {
+        return if @size_of[T]() == 0 and n > 1 {
+            1
+        } else {
+            n
+        };
+    }
+    let base: *mut T = slice.as_mut_ptr();
+    var write_idx: usize = 1;
+    var read_idx: usize = 1;
+    while read_idx < n {
+        if (SliceOps[T] {}).ptr_ref(
+            unsafe {
+                base.add(read_idx) as *T
+            },
+        ).* != (SliceOps[T] {}).ptr_ref(
+            unsafe {
+                base.add(write_idx -% 1) as *T
+            },
+        ).* {
+            (SliceOps[T] {}).swap_at(base, write_idx, read_idx);
+            write_idx = write_idx +% 1;
+        }
+        read_idx = read_idx +% 1;
+    }
+    return write_idx;
+}
+
+/// Partitions `slice` in place so elements satisfying `pred` precede those that do not, returning the split index.
+@std_cap_boundary(clears: [unsafe_op, alloc])
+@no_alloc
+pub fn partition_in_place[T](slice: &mut [T], pred: |&T| -> bool, /) -> usize {
+    let n: usize = slice.len();
+    if n == 0 {
+        return 0;
+    }
+    let base: *mut T = slice.as_mut_ptr();
+    var left: usize = 0;
+    var right: usize = n;
+    while left < right {
+        while left < right {
+            let keep_left: bool = if @size_of[T]() == 0 {
+                pred((SliceOps[T] {}).ptr_ref(base as *T))
+            } else {
+                pred(
+                    (SliceOps[T] {}).ptr_ref(
+                        unsafe {
+                            base.add(left) as *T
+                        },
+                    ),
+                )
+            };
+            if not keep_left {
+                break;
+            }
+            left = left +% 1;
+        }
+        while left < right {
+            let rhs_idx: usize = right -% 1;
+            let keep_right: bool = if @size_of[T]() == 0 {
+                pred((SliceOps[T] {}).ptr_ref(base as *T))
+            } else {
+                pred(
+                    (SliceOps[T] {}).ptr_ref(
+                        unsafe {
+                            base.add(rhs_idx) as *T
+                        },
+                    ),
+                )
+            };
+            if keep_right {
+                break;
+            }
+            right = rhs_idx;
+        }
+        if left < right {
+            right = right -% 1;
+            (SliceOps[T] {}).swap_at(base, left, right);
+            left = left +% 1;
+        }
+    }
+    return left;
+}
+
+/// Rotates `slice` left by `mid % max(slice.len(), 1)` positions in place using three reversals (`@no_panic`).
+@std_cap_boundary(clears: [unsafe_op, may_panic])
+@no_alloc @no_panic
+pub fn rotate_left[T](slice: &mut [T], mid: usize, /) {
+    let n: usize = slice.len();
+    if n <= 1 or @size_of[T]() == 0 {
+        return;
+    }
+    let split: usize = if mid >= n {
+        mid % n
+    } else {
+        mid
+    };
+    if split == 0 {
+        return;
+    }
+    let base: *mut T = slice.as_mut_ptr();
+    (SliceOps[T] {}).reverse(
+        unsafe {
+            @slice_from_raw_parts_mut(base, split)
+        },
+    );
+    (SliceOps[T] {}).reverse(
+        unsafe {
+            @slice_from_raw_parts_mut(base.add(split), n -% split)
+        },
+    );
+    (SliceOps[T] {}).reverse(
+        unsafe {
+            @slice_from_raw_parts_mut(base, n)
+        },
+    );
+}
+
+/// Returns a sliding-window iterator yielding contiguous sub-slices of statically non-zero `width`.
+@inline @no_alloc @no_panic
+pub fn windows[T](slice: &[T], width: usize is 1..=usize.MAX, /) -> WindowsIter[T] {
+    return WindowsIter[T] {
+        slice: slice,
+        width: width,
+    };
+}
+
+/// Returns a chunk iterator yielding non-overlapping sub-slices of up to non-zero `chunk_size` elements.
+@inline @no_alloc @no_panic
+pub fn chunks[T](slice: &[T], chunk_size: usize is 1..=usize.MAX, /) -> ChunksIter[T] {
+    return ChunksIter[T] {
+        slice: slice,
+        chunk_size: chunk_size,
+    };
+}
+
+impl[T] WindowsIter[T] {
+    /// Advances by 1 element and returns the next `&[T]` window of length `self.width`, or `.None`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub fn next(&mut self) -> (&[T])? {
+        let rem: usize = self.slice.len();
+        if rem < self.width {
+            return .None;
+        }
+        let ptr: *T = self.slice.as_ptr();
+        let win: &[T] = unsafe {
+            @slice_from_raw_parts(ptr, self.width)
+        };
+        let next_ptr: *T = if @size_of[T]() == 0 {
+            ptr
+        } else {
+            unsafe {
+                ptr.add(1_usize)
+            }
+        };
+        self.slice = unsafe {
+            @slice_from_raw_parts(next_ptr, rem -% 1)
+        };
+        return .Some(win);
+    }
+}
+
+impl[T] ChunksIter[T] {
+    /// Advances by `min(rem, chunk_size)` and returns the next `&[T]` chunk, or `.None` when empty.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub fn next(&mut self) -> (&[T])? {
+        let rem: usize = self.slice.len();
+        if rem == 0 {
+            return .None;
+        }
+        let take_len: usize = min_usize_local(rem, self.chunk_size);
+        let ptr: *T = self.slice.as_ptr();
+        let chunk_sl: &[T] = unsafe {
+            @slice_from_raw_parts(ptr, take_len)
+        };
+        let next_ptr: *T = if @size_of[T]() == 0 {
+            ptr
+        } else {
+            unsafe {
+                ptr.add(take_len)
+            }
+        };
+        self.slice = unsafe {
+            @slice_from_raw_parts(next_ptr, rem -% take_len)
+        };
+        return .Some(chunk_sl);
+    }
+}

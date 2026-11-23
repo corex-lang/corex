@@ -630,6 +630,8 @@ pub const VmExecOptions = struct {
     stderr_capture: ?*std.ArrayListUnmanaged(u8) = null,
     /// Enables differential-oracle runtime execution of `@sys_write` and `@sys_exit` (`D-07A`).
     is_oracle_runtime_mode: bool = false,
+    /// Optional deterministic `--sim --seed=<u64>` override stored into `context.rng_seed` (`slot 2`).
+    initial_rng_seed: u64 = 0,
     /// Optional `SymbolTable` override mapping lexical `origin_file_id -> PackageId`.
     sym_table: ?*const SymbolTable = null,
     /// Optional per-`PackageId` `@embed_bytes` sandbox jail policy table (`DR-17` §5).
@@ -819,6 +821,16 @@ const VmTaskGroup = struct {
     is_exited: bool = false,
 };
 
+/// Monotonically assigned virtual address range for `.std_core` / oracle pointer-integer tagging.
+const VmVirtualRange = struct {
+    /// Aligned starting virtual address (`>= 0x0100_0000`).
+    base_vaddr: u64,
+    /// Addressable byte span (`bytes.len + 1`, minimum `16`).
+    span_bytes: u64,
+    /// Backing `MirVm` allocation handle.
+    alloc_id: ComptimeAllocId,
+};
+
 // --------------------------------------- CONSTS ----------------------------------------
 
 /// Default `--comptime-limit` step budget (`10,000,000` instructions, `DR-05` §3.4).
@@ -912,7 +924,8 @@ pub fn classifyValueRepr(
     if (pool.isTaskGroupType(ty) or pool.isTaskHandleType(ty)) return .inline_ptr;
     const node = pool.getNode(ty);
     return switch (node.tag) {
-        .ref_ty, .mut_ref_ty, .raw_ptr_ty, .fn_ty => .inline_ptr,
+        .ref_ty, .mut_ref_ty => if (pool.isSliceRefType(ty)) .by_value_snapshot else .inline_ptr,
+        .raw_ptr_ty, .fn_ty => .inline_ptr,
         .bit_field_ty => classifyValueRepr(
             pool,
             sym_table,
@@ -1077,7 +1090,7 @@ fn resolveVariantPayloadType(
                     for (sym_table.getScopeMembers(enum_sym.target_scope)) |mem_idx| {
                         const mem_sym = sym_table.getSymbol(mem_idx).*;
                         if (mem_sym.kind != .enum_variant_sym) continue;
-                        if (ord == tag_ordinal) break :blk subst.resolve(mem_sym.type_id);
+                        if (ord == tag_ordinal) break :blk subst.lookupExisting(pool, mem_sym.type_id);
                         ord += 1;
                     }
                 }
@@ -1107,6 +1120,14 @@ pub fn computeCompositeFieldOffsetAndType(
     target_layout: TargetLayout,
 ) ?struct { byte_offset: u32, field_ty: TypeId } {
     const comp_ty = pool.unwrapUnderlyingType(raw_comp_ty);
+    if (comp_ty == .fmt_spec_ty) {
+        return switch (field_ordinal) {
+            0 => .{ .byte_offset = 0, .field_ty = .u32_ty },
+            1 => .{ .byte_offset = 4, .field_ty = .u16_ty },
+            2 => .{ .byte_offset = 6, .field_ty = .u16_ty },
+            else => null,
+        };
+    }
     const node = pool.getNode(comp_ty);
     switch (node.tag) {
         .tuple_ty => {
@@ -1141,7 +1162,7 @@ pub fn computeCompositeFieldOffsetAndType(
                         if (ord == field_ordinal) {
                             return .{
                                 .byte_offset = @intCast(byte_off),
-                                .field_ty = subst.resolve(mem_sym.type_id),
+                                .field_ty = subst.lookupExisting(pool, mem_sym.type_id),
                             };
                         }
                         ord += 1;
@@ -1161,7 +1182,7 @@ pub fn computeCompositeFieldOffsetAndType(
                         const mem_sym = sym_table.getSymbol(mem_idx).*;
                         if (mem_sym.kind != .field_sym) continue;
                         if (ord == field_ordinal) {
-                            return .{ .byte_offset = 0, .field_ty = subst.resolve(mem_sym.type_id) };
+                            return .{ .byte_offset = 0, .field_ty = subst.lookupExisting(pool, mem_sym.type_id) };
                         }
                         ord += 1;
                     }
@@ -1379,6 +1400,16 @@ pub const MirVm = struct {
     active_polling_item: u32 = std.math.maxInt(u32),
     /// `true` while executing a coroutine `cancel_bb` cleanup pad so `async_task_group_exit` cancels children.
     is_active_coro_canceling: bool = false,
+    /// Lazily allocated `64 B` zero-initialized TLS backing block for `@tls_scratch_ptr()`.
+    tls_scratch_alloc: ComptimeAllocId = .none,
+    /// Lazily allocated `256 B` zero-initialized TLS backing block for `@tls_alloc_state()`.
+    tls_alloc_state_alloc: ComptimeAllocId = .none,
+    /// Map `ComptimeAllocId.asInt() -> base_vaddr` for `.std_core` / oracle pointer tagging.
+    vaddr_by_alloc: std.AutoHashMapUnmanaged(u32, u64) = .empty,
+    /// Sorted virtual address ranges for `usize -> *mut T` pointer recovery.
+    vaddr_spans: std.ArrayListUnmanaged(VmVirtualRange) = .empty,
+    /// Next virtual base address (`16 MiB` base, fits cleanly in both `32-bit` and `64-bit` `usize`).
+    next_vaddr: u64 = 0x0100_0000,
 
     /// Initializes a `MirVm` instance with reserved slot `0` (`.null_ptr`) in `allocations`.
     pub fn init(
@@ -1423,6 +1454,11 @@ pub const MirVm = struct {
             .is_stack_frame = false,
         });
         vm.dangling_empty_alloc = ComptimeAllocId.fromVmIndex(1);
+        if (options.initial_rng_seed != 0) {
+            vm.context_slots[2] = .{ .scalar_u64 = options.initial_rng_seed };
+            vm.context_slot_types[2] = .u64_ty;
+            vm.context_slots_init[2] = true;
+        }
         return vm;
     }
 
@@ -1463,6 +1499,8 @@ pub const MirVm = struct {
         self.db_backed_defs.deinit(self.allocator);
         self.observed_query_deps.deinit(self.allocator);
         self.drop_trace.deinit(self.allocator);
+        self.vaddr_by_alloc.deinit(self.allocator);
+        self.vaddr_spans.deinit(self.allocator);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -2065,6 +2103,9 @@ pub const MirVm = struct {
                         null,
                     );
                 }
+                if (access_size == 0 and ptr.alloc_id == self.dangling_empty_alloc) {
+                    return 0;
+                }
                 if (is_write and !alloc_rec.is_mutable) {
                     return self.failWithTrap(
                         error.InvalidPointer,
@@ -2186,13 +2227,40 @@ pub const MirVm = struct {
                     }
                 }
                 if (self.hasOverlappingProvenance(alloc_rec, ptr.byte_offset, @intCast(dest_buf.len))) {
-                    return self.failWithTrap(
-                        error.ForbiddenOperation,
-                        .e0503_forbidden_comptime_operation,
-                        "cannot reinterpret pointer provenance bytes as raw scalar data at `comptime`",
-                        "scalar read overlaps pointer provenance here",
-                        null,
-                    );
+                    if (!self.isStdCoreOrOracleFrame(self.call_stack.items.len -| 1)) {
+                        return self.failWithTrap(
+                            error.ForbiddenOperation,
+                            .e0503_forbidden_comptime_operation,
+                            "cannot reinterpret pointer provenance bytes as raw scalar data at `comptime`",
+                            "scalar read overlaps pointer provenance here",
+                            null,
+                        );
+                    }
+                    @memcpy(dest_buf, alloc_rec.bytes[start_off .. start_off + dest_buf.len]);
+                    const ptr_width: u32 = self.options.target_layout.ptr_byte_size;
+                    const read_start: u64 = ptr.byte_offset;
+                    const read_end: u64 = read_start + dest_buf.len;
+                    for (alloc_rec.provenance.items) |prov| {
+                        const prov_start: u64 = prov.byte_offset;
+                        const prov_end: u64 = prov_start + ptr_width;
+                        if (prov_start >= read_start and prov_end <= read_end) {
+                            const stored_off: u64 = if (ptr_width == 8)
+                                std.mem.readInt(u64, alloc_rec.bytes[@intCast(prov_start)..][0..8], .little)
+                            else
+                                std.mem.readInt(u32, alloc_rec.bytes[@intCast(prov_start)..][0..4], .little);
+                            const vaddr = try self.ptrToVirtualAddr(
+                                .{ .alloc_id = prov.alloc_id, .byte_offset = @truncate(stored_off) },
+                                4,
+                            );
+                            const rel_off: usize = @intCast(prov_start - read_start);
+                            if (ptr_width == 8) {
+                                std.mem.writeInt(u64, dest_buf[rel_off..][0..8], vaddr, .little);
+                            } else {
+                                std.mem.writeInt(u32, dest_buf[rel_off..][0..4], @truncate(vaddr), .little);
+                            }
+                        }
+                    }
+                    return;
                 }
                 @memcpy(dest_buf, alloc_rec.bytes[start_off .. start_off + dest_buf.len]);
             },
@@ -2295,7 +2363,15 @@ pub const MirVm = struct {
                         );
                     }
                 }
+                const stored_off: u64 = if (ptr_width == 8)
+                    std.mem.readInt(u64, alloc_rec.bytes[start_off..][0..8], .little)
+                else
+                    std.mem.readInt(u32, alloc_rec.bytes[start_off..][0..4], .little);
                 const target_alloc = findExactProvenance(alloc_rec, src_ptr.byte_offset) orelse {
+                    if (self.isStdCoreOrOracleFrame(self.call_stack.items.len -| 1)) {
+                        if (stored_off == 0) return SymbolicPtr.NULL;
+                        return self.virtualAddrToPtr(stored_off);
+                    }
                     return self.failWithTrap(
                         error.ForbiddenOperation,
                         .e0503_forbidden_comptime_operation,
@@ -2304,10 +2380,6 @@ pub const MirVm = struct {
                         null,
                     );
                 };
-                const stored_off: u64 = if (ptr_width == 8)
-                    std.mem.readInt(u64, alloc_rec.bytes[start_off..][0..8], .little)
-                else
-                    std.mem.readInt(u32, alloc_rec.bytes[start_off..][0..4], .little);
                 if (stored_off > std.math.maxInt(u32)) {
                     return self.failWithTrap(
                         error.OutOfBounds,
@@ -2321,6 +2393,10 @@ pub const MirVm = struct {
             },
             .rodata_blob => {
                 const blob = self.rodata_pool.getBlob(src_ptr.alloc_id.payloadIndex()).?;
+                const stored_off: u64 = if (ptr_width == 8)
+                    std.mem.readInt(u64, blob.bytes[start_off..][0..8], .little)
+                else
+                    std.mem.readInt(u32, blob.bytes[start_off..][0..4], .little);
                 var matched_alloc: ?ComptimeAllocId = null;
                 for (blob.relocs) |reloc| {
                     if (reloc.byte_offset == src_ptr.byte_offset) {
@@ -2329,6 +2405,9 @@ pub const MirVm = struct {
                     }
                 }
                 const target_alloc = matched_alloc orelse {
+                    if (stored_off == 0 and self.isStdCoreOrOracleFrame(self.call_stack.items.len -| 1)) {
+                        return SymbolicPtr.NULL;
+                    }
                     return self.failWithTrap(
                         error.ForbiddenOperation,
                         .e0503_forbidden_comptime_operation,
@@ -2337,10 +2416,6 @@ pub const MirVm = struct {
                         null,
                     );
                 };
-                const stored_off: u64 = if (ptr_width == 8)
-                    std.mem.readInt(u64, blob.bytes[start_off..][0..8], .little)
-                else
-                    std.mem.readInt(u32, blob.bytes[start_off..][0..4], .little);
                 if (stored_off > std.math.maxInt(u32)) {
                     return self.failWithTrap(
                         error.OutOfBounds,
@@ -2650,7 +2725,8 @@ pub const MirVm = struct {
         raw_ty: TypeId,
         is_unaligned: bool,
     ) VmEvalError!RegSlot {
-        const ty = self.pool.unwrapUnderlyingType(raw_ty);
+        const raw_unwrapped = self.pool.unwrapUnderlyingType(raw_ty);
+        const ty = self.pool.getSliceRefInner(raw_unwrapped) orelse raw_unwrapped;
         const lay = type_system.computeTypeLayoutWithPool(
             self.pool,
             self.sym_table,
@@ -2726,7 +2802,8 @@ pub const MirVm = struct {
         slot: RegSlot,
         is_unaligned: bool,
     ) VmEvalError!void {
-        const ty = self.pool.unwrapUnderlyingType(raw_ty);
+        const raw_unwrapped = self.pool.unwrapUnderlyingType(raw_ty);
+        const ty = self.pool.getSliceRefInner(raw_unwrapped) orelse raw_unwrapped;
         const lay = type_system.computeTypeLayoutWithPool(
             self.pool,
             self.sym_table,
@@ -2768,6 +2845,9 @@ pub const MirVm = struct {
         data_ptr: SymbolicPtr,
         elem_len: u64,
     ) VmEvalError!RegSlot {
+        if (self.pool.isSoaSliceOrRefType(slice_ty)) {
+            return self.makeSoaSliceSlot(slice_ty, data_ptr, elem_len, elem_len, 0);
+        }
         const snap = try self.allocSnapshotForType(slice_ty, false);
         const ptr_width: u32 = self.options.target_layout.ptr_byte_size;
         const effective_ptr = if (elem_len == 0 and data_ptr.alloc_id.isNullOrNone())
@@ -2787,6 +2867,48 @@ pub const MirVm = struct {
         }
         self.sealSnapshot(snap);
         return .{ .sym_ptr = snap };
+    }
+
+    /// Constructs a 4-word `(data_ptr, len, stride, elem_off)` snapshot for `#soa [T]` / `&#soa [T]`.
+    pub fn makeSoaSliceSlot(
+        self: *MirVm,
+        slice_ty: TypeId,
+        data_ptr: SymbolicPtr,
+        elem_len: u64,
+        stride: u64,
+        elem_off: u64,
+    ) VmEvalError!RegSlot {
+        const snap = try self.allocSnapshotForType(slice_ty, false);
+        const ptr_width: u32 = self.options.target_layout.ptr_byte_size;
+        const effective_ptr = if (elem_len == 0 and data_ptr.alloc_id.isNullOrNone())
+            SymbolicPtr{ .alloc_id = self.dangling_empty_alloc, .byte_offset = 0 }
+        else
+            data_ptr;
+        try self.writePointerAt(snap, self.options.target_layout.ptr_align_log2, effective_ptr);
+        try self.writeUsizeAt(SymbolicPtr{ .alloc_id = snap.alloc_id, .byte_offset = ptr_width }, elem_len);
+        try self.writeUsizeAt(SymbolicPtr{ .alloc_id = snap.alloc_id, .byte_offset = ptr_width * 2 }, stride);
+        try self.writeUsizeAt(SymbolicPtr{ .alloc_id = snap.alloc_id, .byte_offset = ptr_width * 3 }, elem_off);
+        self.sealSnapshot(snap);
+        return .{ .sym_ptr = snap };
+    }
+
+    /// Reads `(data_ptr, elem_len, stride, elem_off)` out of a `#soa [T]` snapshot or memory location.
+    pub fn readSoaSliceParts(
+        self: *MirVm,
+        slice_base_ptr: SymbolicPtr,
+    ) VmEvalError!struct { data_ptr: SymbolicPtr, elem_len: u64, stride: u64, elem_off: u64 } {
+        const ptr_width: u32 = self.options.target_layout.ptr_byte_size;
+        const ptr_align = self.options.target_layout.ptr_align_log2;
+        const data_ptr = try self.readPointerAt(slice_base_ptr, ptr_align);
+        const elem_len = try self.readUsizeAt(try self.advanceSymbolicPtr(slice_base_ptr, ptr_width));
+        const stride = try self.readUsizeAt(try self.advanceSymbolicPtr(slice_base_ptr, ptr_width * 2));
+        const elem_off = try self.readUsizeAt(try self.advanceSymbolicPtr(slice_base_ptr, ptr_width * 3));
+        return .{
+            .data_ptr = data_ptr,
+            .elem_len = elem_len,
+            .stride = stride,
+            .elem_off = elem_off,
+        };
     }
 
     /// Reads the active variant ordinal (`0 .. V - 1`) of `raw_sum_ty` at `base_ptr`.
@@ -3652,12 +3774,14 @@ pub const MirVm = struct {
             switch (proj.kind) {
                 .deref => {
                     active_downcast = null;
-                    cur_ptr = try self.readPointerAt(
-                        cur_ptr,
-                        if (is_unaligned) 0 else self.options.target_layout.ptr_align_log2,
-                    );
+                    if (!self.pool.isSliceRefType(cur_ty)) {
+                        cur_ptr = try self.readPointerAt(
+                            cur_ptr,
+                            if (is_unaligned) 0 else self.options.target_layout.ptr_align_log2,
+                        );
+                        is_unaligned = false;
+                    }
                     cur_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(ty_node.lhs));
-                    is_unaligned = false;
                 },
                 .downcast => {
                     active_downcast = proj.payload;
@@ -3845,14 +3969,8 @@ pub const MirVm = struct {
                             .field_ty = col.field_ty,
                         };
                     } else if (ty_node.tag == .soa_slice_ty) {
-                        const fat = try self.readFatSliceParts(cur_ptr);
-                        var backing_cap: u32 = @truncate(fat.elem_len);
-                        if (fat.data_ptr.alloc_id.domain() == .vm_alloc) {
-                            const backing_rec = &self.allocations.items[fat.data_ptr.alloc_id.payloadIndex()];
-                            if (backing_rec.soa_elem_capacity > 0) {
-                                backing_cap = backing_rec.soa_elem_capacity;
-                            }
-                        }
+                        const soa_parts = try self.readSoaSliceParts(cur_ptr);
+                        const backing_cap: u32 = @truncate(soa_parts.stride);
                         const col = computeSoaColumnOffsetAndType(
                             self.pool,
                             self.sym_table,
@@ -3867,9 +3985,46 @@ pub const MirVm = struct {
                             "invalid `#soa` slice column",
                             null,
                         );
+                        const field_lay = type_system.computeTypeLayoutWithPool(
+                            self.pool,
+                            self.sym_table,
+                            col.field_ty,
+                            self.options.target_layout,
+                        );
+                        const elem_byte_off = try self.mulOffsetChecked(soa_parts.elem_off, field_lay.byte_size);
+                        const col_ptr = if (soa_parts.elem_len == 0 or backing_cap == 0 or
+                            soa_parts.data_ptr.alloc_id.isNullOrNone())
+                            SymbolicPtr{ .alloc_id = self.dangling_empty_alloc, .byte_offset = 0 }
+                        else
+                            try self.advanceSymbolicPtr(soa_parts.data_ptr, col.column_byte_offset + elem_byte_off);
                         soa_col_view = .{
-                            .data_ptr = try self.advanceSymbolicPtr(fat.data_ptr, col.column_byte_offset),
-                            .elem_len = fat.elem_len,
+                            .data_ptr = col_ptr,
+                            .elem_len = soa_parts.elem_len,
+                            .field_ty = col.field_ty,
+                        };
+                    } else if (ty_node.tag == .soa_vec_ty) {
+                        const hdr = try self.readSoaVecHeader(cur_ptr);
+                        const col = computeSoaColumnOffsetAndType(
+                            self.pool,
+                            self.sym_table,
+                            elem_struct_ty,
+                            proj.payload,
+                            hdr.cap,
+                            self.options.target_layout,
+                        ) orelse return self.failWithTrap(
+                            error.OutOfBounds,
+                            .e0504_comptime_out_of_bounds,
+                            "invalid `#soa Vec` column projection at `comptime`",
+                            "invalid `#soa Vec` column",
+                            null,
+                        );
+                        const col_ptr = if (hdr.cap == 0 or hdr.data_ptr.alloc_id.isNullOrNone())
+                            SymbolicPtr{ .alloc_id = self.dangling_empty_alloc, .byte_offset = 0 }
+                        else
+                            try self.advanceSymbolicPtr(hdr.data_ptr, col.column_byte_offset);
+                        soa_col_view = .{
+                            .data_ptr = col_ptr,
+                            .elem_len = hdr.len,
                             .field_ty = col.field_ty,
                         };
                     }
@@ -3916,6 +4071,40 @@ pub const MirVm = struct {
             break :blk if (!sym.def_id.isNone()) sym.def_id else sym.owner_def_id;
         } else DefId.NONE;
 
+        const wanted_name: SymbolId = if (!sym_idx.isNone() and sym_idx.asInt() < self.sym_table.symbols.items.len)
+            self.sym_table.getSymbol(sym_idx).name
+        else
+            .empty;
+
+        const findByDefAndName = struct {
+            /// Resolves `target_def` (disambiguated by `name_id`) to a registered `callables` index.
+            fn search(vm: *MirVm, target_def: DefId, target_sym: SymbolIndex, name_id: SymbolId) ?u32 {
+                if (target_def.isNone()) return null;
+                if (name_id == .empty) return vm.def_to_callable.get(target_def.asInt());
+                if (vm.def_to_callable.get(target_def.asInt())) |fast_idx| {
+                    if (vm.callables.items[fast_idx].body) |fast_b| {
+                        if (fast_b.name == name_id) return fast_idx;
+                    }
+                }
+                var def_body_count: u32 = 0;
+                var last_for_def: ?u32 = null;
+                for (vm.callables.items, 0..) |cand, c_i| {
+                    if (cand.def_id == target_def and cand.body != null) {
+                        def_body_count += 1;
+                        last_for_def = @intCast(c_i);
+                        if (cand.body.?.name == name_id) {
+                            const matched: u32 = @intCast(c_i);
+                            if (!target_sym.isNone()) {
+                                vm.sym_to_callable.put(vm.allocator, target_sym.asInt(), matched) catch {};
+                            }
+                            return matched;
+                        }
+                    }
+                }
+                return if (def_body_count == 1) last_for_def else null;
+            }
+        }.search;
+
         if (!sym_idx.isNone()) {
             if (self.sym_to_callable.get(sym_idx.asInt())) |found_idx| {
                 if (!resolved_def.isNone() and self.db_backed_defs.contains(resolved_def.asInt())) {
@@ -3929,10 +4118,11 @@ pub const MirVm = struct {
                     const ext_id = self.registerExternFn(sym.def_id, sym_idx) catch return error.OutOfMemory;
                     return ext_id.payloadIndex();
                 }
-                if (!sym.def_id.isNone()) {
-                    if (self.def_to_callable.get(sym.def_id.asInt())) |found_by_sym_def| {
-                        if (self.db_backed_defs.contains(sym.def_id.asInt())) {
-                            try self.recordObservedQueryDep(query_db.QueryKey.forDef(.build_def_mir, sym.def_id));
+                const cand_def = if (!sym.def_id.isNone()) sym.def_id else sym.owner_def_id;
+                if (!cand_def.isNone()) {
+                    if (findByDefAndName(self, cand_def, sym_idx, wanted_name)) |found_by_sym_def| {
+                        if (self.db_backed_defs.contains(cand_def.asInt())) {
+                            try self.recordObservedQueryDep(query_db.QueryKey.forDef(.build_def_mir, cand_def));
                         }
                         return found_by_sym_def;
                     }
@@ -3940,7 +4130,7 @@ pub const MirVm = struct {
             }
         }
         if (!def_id.isNone()) {
-            if (self.def_to_callable.get(def_id.asInt())) |found_idx| {
+            if (findByDefAndName(self, def_id, sym_idx, wanted_name)) |found_idx| {
                 if (self.db_backed_defs.contains(def_id.asInt())) {
                     try self.recordObservedQueryDep(query_db.QueryKey.forDef(.build_def_mir, def_id));
                 }
@@ -3970,7 +4160,7 @@ pub const MirVm = struct {
                             return loaded_sym_idx;
                         }
                     }
-                    if (self.def_to_callable.get(resolved_def.asInt())) |loaded_def_idx| {
+                    if (findByDefAndName(self, resolved_def, sym_idx, wanted_name)) |loaded_def_idx| {
                         return loaded_def_idx;
                     }
                 }
@@ -4981,7 +5171,17 @@ pub const MirVm = struct {
                 } else {
                     _ = try self.validateAccess(mem_ptr.ptr, 0, 0, is_mut_addr);
                 }
-                const res_node = self.pool.getNode(self.pool.unwrapUnderlyingType(inst.type_id));
+                const res_unwrapped = self.pool.unwrapUnderlyingType(inst.type_id);
+                const res_node = self.pool.getNode(res_unwrapped);
+                if (self.pool.getSliceRefInner(res_unwrapped)) |dst_slice_ty| {
+                    if (src_node.tag == .slice_ty or src_node.tag == .soa_slice_ty) {
+                        return self.loadTypedSlotFromMemory(mem_ptr.ptr, dst_slice_ty);
+                    }
+                    if (src_node.tag == .array_ty or src_node.tag == .soa_array_ty) {
+                        const arr_len: u64 = src_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+                        return self.makeFatSliceSlot(dst_slice_ty, mem_ptr.ptr, arr_len);
+                    }
+                }
                 if (res_node.tag == .slice_ty or res_node.tag == .soa_slice_ty) {
                     if (src_node.tag == .slice_ty or src_node.tag == .soa_slice_ty) {
                         return .{ .sym_ptr = mem_ptr.ptr };
@@ -4989,7 +5189,7 @@ pub const MirVm = struct {
                     const arr_len: u64 = src_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
                     return self.makeFatSliceSlot(inst.type_id, mem_ptr.ptr, arr_len);
                 }
-                if (res_node.tag == .ref_ty or res_node.tag == .mut_ref_ty or res_node.tag == .raw_ptr_ty) {
+                if (res_node.tag == .raw_ptr_ty) {
                     const dst_pointee = self.pool.unwrapUnderlyingType(TypeId.fromInt(res_node.lhs));
                     const dst_pointee_tag = self.pool.getNode(dst_pointee).tag;
                     if ((dst_pointee_tag == .slice_ty or dst_pointee_tag == .soa_slice_ty) and
@@ -5009,9 +5209,13 @@ pub const MirVm = struct {
                 var base_ptr = outcome.memory_ptr.ptr;
                 var base_ty = outcome.memory_ptr.pointee_ty;
                 const maybe_ref = self.pool.getNode(base_ty);
-                if (maybe_ref.tag == .ref_ty or maybe_ref.tag == .mut_ref_ty or maybe_ref.tag == .raw_ptr_ty) {
+                if ((maybe_ref.tag == .ref_ty or maybe_ref.tag == .mut_ref_ty or maybe_ref.tag == .raw_ptr_ty) and
+                    !self.pool.isSliceRefType(base_ty))
+                {
                     base_ptr = try self.readPointerAt(base_ptr, self.options.target_layout.ptr_align_log2);
                     base_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(maybe_ref.lhs));
+                } else if (self.pool.getSliceRefInner(base_ty)) |inner_sl| {
+                    base_ty = inner_sl;
                 }
                 const soa_node = self.pool.getNode(base_ty);
                 const elem_struct_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(soa_node.lhs));
@@ -5033,13 +5237,36 @@ pub const MirVm = struct {
                     );
                     const col_ptr = try self.advanceSymbolicPtr(base_ptr, col.column_byte_offset);
                     return self.makeFatSliceSlot(inst.type_id, col_ptr, cap);
+                } else if (soa_node.tag == .soa_vec_ty) {
+                    const hdr = try self.readSoaVecHeader(base_ptr);
+                    const col = computeSoaColumnOffsetAndType(
+                        self.pool,
+                        self.sym_table,
+                        elem_struct_ty,
+                        inst.operands.rhs,
+                        hdr.cap,
+                        self.options.target_layout,
+                    ) orelse return self.failWithTrap(
+                        error.OutOfBounds,
+                        .e0504_comptime_out_of_bounds,
+                        "invalid `#soa Vec` column ordinal at `comptime`",
+                        "invalid `#soa Vec` column",
+                        null,
+                    );
+                    const col_ptr = if (hdr.cap == 0 or hdr.data_ptr.alloc_id.isNullOrNone())
+                        SymbolicPtr{ .alloc_id = self.dangling_empty_alloc, .byte_offset = 0 }
+                    else
+                        try self.advanceSymbolicPtr(hdr.data_ptr, col.column_byte_offset);
+                    const res_unwrapped = self.pool.unwrapUnderlyingType(inst.type_id);
+                    const res_node = self.pool.getNode(res_unwrapped);
+                    const slice_ty = if (res_node.tag == .ref_ty or res_node.tag == .mut_ref_ty)
+                        self.pool.unwrapUnderlyingType(TypeId.fromInt(res_node.lhs))
+                    else
+                        res_unwrapped;
+                    return self.makeFatSliceSlot(slice_ty, col_ptr, hdr.len);
                 } else {
-                    const fat = try self.readFatSliceParts(base_ptr);
-                    var backing_cap: u32 = @truncate(fat.elem_len);
-                    if (fat.data_ptr.alloc_id.domain() == .vm_alloc) {
-                        const rec = &self.allocations.items[fat.data_ptr.alloc_id.payloadIndex()];
-                        if (rec.soa_elem_capacity > 0) backing_cap = rec.soa_elem_capacity;
-                    }
+                    const soa_parts = try self.readSoaSliceParts(base_ptr);
+                    const backing_cap: u32 = @truncate(soa_parts.stride);
                     const col = computeSoaColumnOffsetAndType(
                         self.pool,
                         self.sym_table,
@@ -5054,8 +5281,19 @@ pub const MirVm = struct {
                         "invalid `#soa` column",
                         null,
                     );
-                    const col_ptr = try self.advanceSymbolicPtr(fat.data_ptr, col.column_byte_offset);
-                    return self.makeFatSliceSlot(inst.type_id, col_ptr, fat.elem_len);
+                    const field_lay = type_system.computeTypeLayoutWithPool(
+                        self.pool,
+                        self.sym_table,
+                        col.field_ty,
+                        self.options.target_layout,
+                    );
+                    const elem_byte_off = try self.mulOffsetChecked(soa_parts.elem_off, field_lay.byte_size);
+                    const col_ptr = if (soa_parts.elem_len == 0 or backing_cap == 0 or
+                        soa_parts.data_ptr.alloc_id.isNullOrNone())
+                        SymbolicPtr{ .alloc_id = self.dangling_empty_alloc, .byte_offset = 0 }
+                    else
+                        try self.advanceSymbolicPtr(soa_parts.data_ptr, col.column_byte_offset + elem_byte_off);
+                    return self.makeFatSliceSlot(inst.type_id, col_ptr, soa_parts.elem_len);
                 }
             },
             .intrinsic_op => {
@@ -5067,7 +5305,8 @@ pub const MirVm = struct {
 
     /// Materializes a `MirConst` into a typed `RegSlot`.
     fn evalConstScalar(self: *MirVm, mir_const: mir.MirConst, raw_ty: TypeId) VmEvalError!RegSlot {
-        const ty = self.pool.unwrapUnderlyingType(raw_ty);
+        const raw_unwrapped = self.pool.unwrapUnderlyingType(raw_ty);
+        const ty = self.pool.getSliceRefInner(raw_unwrapped) orelse raw_unwrapped;
         switch (mir_const) {
             .unit_val => {
                 if (ty != .unit_ty and
@@ -5126,7 +5365,7 @@ pub const MirVm = struct {
                     self.sealSnapshot(snap);
                     return .{ .sym_ptr = snap };
                 }
-                if (ty_node.tag == .ref_ty or ty_node.tag == .raw_ptr_ty) {
+                if ((ty_node.tag == .ref_ty or ty_node.tag == .raw_ptr_ty) and !self.pool.isSliceRefType(ty)) {
                     const pointee_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(ty_node.lhs));
                     if (self.pool.getNode(pointee_ty).tag == .slice_ty) {
                         const slice_slot = try self.makeFatSliceSlot(pointee_ty, data_ptr, bytes.len);
@@ -5175,7 +5414,7 @@ pub const MirVm = struct {
                     self.sealSnapshot(snap);
                     return .{ .sym_ptr = snap };
                 }
-                if (ty_node.tag == .ref_ty or ty_node.tag == .raw_ptr_ty) {
+                if ((ty_node.tag == .ref_ty or ty_node.tag == .raw_ptr_ty) and !self.pool.isSliceRefType(ty)) {
                     const pointee_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(ty_node.lhs));
                     if (self.pool.getNode(pointee_ty).tag == .slice_ty) {
                         const slice_slot = try self.makeFatSliceSlot(pointee_ty, data_ptr, raw_bytes.len);
@@ -5250,7 +5489,8 @@ pub const MirVm = struct {
         depth: u32,
     ) VmEvalError!bool {
         if (depth > 64) return false;
-        const ty = self.pool.unwrapUnderlyingType(raw_ty);
+        const raw_unwrapped = self.pool.unwrapUnderlyingType(raw_ty);
+        const ty = self.pool.getSliceRefInner(raw_unwrapped) orelse raw_unwrapped;
         const lay = type_system.computeTypeLayoutWithPool(
             self.pool,
             self.sym_table,
@@ -5320,6 +5560,56 @@ pub const MirVm = struct {
 
         const node = self.pool.getNode(ty);
         switch (node.tag) {
+            .soa_vec_ty => {
+                const lhs_hdr = try self.readSoaVecHeader(lhs_slot.sym_ptr);
+                const rhs_hdr = try self.readSoaVecHeader(rhs_slot.sym_ptr);
+                if (lhs_hdr.len != rhs_hdr.len) return false;
+                if (lhs_hdr.len == 0) return true;
+                const elem_struct_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+                var col_ord: u32 = 0;
+                while (true) : (col_ord += 1) {
+                    const lhs_col = computeSoaColumnOffsetAndType(
+                        self.pool,
+                        self.sym_table,
+                        elem_struct_ty,
+                        col_ord,
+                        lhs_hdr.cap,
+                        self.options.target_layout,
+                    ) orelse break;
+                    const rhs_col = computeSoaColumnOffsetAndType(
+                        self.pool,
+                        self.sym_table,
+                        elem_struct_ty,
+                        col_ord,
+                        rhs_hdr.cap,
+                        self.options.target_layout,
+                    ) orelse break;
+                    const f_lay = type_system.computeTypeLayoutWithPool(
+                        self.pool,
+                        self.sym_table,
+                        lhs_col.field_ty,
+                        self.options.target_layout,
+                    );
+                    var elem_i: u64 = 0;
+                    while (elem_i < lhs_hdr.len) : (elem_i += 1) {
+                        const elem_off = try self.mulOffsetChecked(elem_i, f_lay.byte_size);
+                        const lhs_e = try self.loadTypedSlotFromMemoryAligned(
+                            try self.advanceSymbolicPtr(lhs_hdr.data_ptr, lhs_col.column_byte_offset + elem_off),
+                            lhs_col.field_ty,
+                            true,
+                        );
+                        const rhs_e = try self.loadTypedSlotFromMemoryAligned(
+                            try self.advanceSymbolicPtr(rhs_hdr.data_ptr, rhs_col.column_byte_offset + elem_off),
+                            rhs_col.field_ty,
+                            true,
+                        );
+                        if (!(try self.areTypedSlotsEqual(lhs_col.field_ty, lhs_e, rhs_e, depth + 1))) {
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            },
             .enum_ty, .optional_ty, .result_ty => {
                 const lhs_tag = try self.readSumDiscriminantAt(lhs_slot.sym_ptr, ty);
                 const rhs_tag = try self.readSumDiscriminantAt(rhs_slot.sym_ptr, ty);
@@ -5475,20 +5765,13 @@ pub const MirVm = struct {
                 return true;
             },
             .soa_slice_ty => {
-                const lhs_fat = try self.readFatSliceParts(lhs_slot.sym_ptr);
-                const rhs_fat = try self.readFatSliceParts(rhs_slot.sym_ptr);
-                if (lhs_fat.elem_len != rhs_fat.elem_len) return false;
+                const lhs_parts = try self.readSoaSliceParts(lhs_slot.sym_ptr);
+                const rhs_parts = try self.readSoaSliceParts(rhs_slot.sym_ptr);
+                if (lhs_parts.elem_len != rhs_parts.elem_len) return false;
+                if (lhs_parts.elem_len == 0) return true;
                 const elem_struct_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
-                var lhs_cap: u32 = @truncate(lhs_fat.elem_len);
-                if (lhs_fat.data_ptr.alloc_id.domain() == .vm_alloc) {
-                    const rec = &self.allocations.items[lhs_fat.data_ptr.alloc_id.payloadIndex()];
-                    if (rec.soa_elem_capacity > 0) lhs_cap = rec.soa_elem_capacity;
-                }
-                var rhs_cap: u32 = @truncate(rhs_fat.elem_len);
-                if (rhs_fat.data_ptr.alloc_id.domain() == .vm_alloc) {
-                    const rec = &self.allocations.items[rhs_fat.data_ptr.alloc_id.payloadIndex()];
-                    if (rec.soa_elem_capacity > 0) rhs_cap = rec.soa_elem_capacity;
-                }
+                const lhs_cap: u32 = @truncate(lhs_parts.stride);
+                const rhs_cap: u32 = @truncate(rhs_parts.stride);
                 var col_ord: u32 = 0;
                 while (true) : (col_ord += 1) {
                     const lhs_col = computeSoaColumnOffsetAndType(
@@ -5513,16 +5796,20 @@ pub const MirVm = struct {
                         lhs_col.field_ty,
                         self.options.target_layout,
                     );
+                    const lhs_base_off = lhs_col.column_byte_offset +
+                        try self.mulOffsetChecked(lhs_parts.elem_off, f_lay.byte_size);
+                    const rhs_base_off = rhs_col.column_byte_offset +
+                        try self.mulOffsetChecked(rhs_parts.elem_off, f_lay.byte_size);
                     var elem_i: u64 = 0;
-                    while (elem_i < lhs_fat.elem_len) : (elem_i += 1) {
+                    while (elem_i < lhs_parts.elem_len) : (elem_i += 1) {
                         const elem_off = try self.mulOffsetChecked(elem_i, f_lay.byte_size);
                         const lhs_e = try self.loadTypedSlotFromMemoryAligned(
-                            try self.advanceSymbolicPtr(lhs_fat.data_ptr, lhs_col.column_byte_offset + elem_off),
+                            try self.advanceSymbolicPtr(lhs_parts.data_ptr, lhs_base_off + elem_off),
                             lhs_col.field_ty,
                             true,
                         );
                         const rhs_e = try self.loadTypedSlotFromMemoryAligned(
-                            try self.advanceSymbolicPtr(rhs_fat.data_ptr, rhs_col.column_byte_offset + elem_off),
+                            try self.advanceSymbolicPtr(rhs_parts.data_ptr, rhs_base_off + elem_off),
                             rhs_col.field_ty,
                             true,
                         );
@@ -6102,12 +6389,21 @@ pub const MirVm = struct {
             .bitcast_op, .ptr_cast => {
                 const src_repr = classifyValueRepr(self.pool, self.sym_table, src_ty, self.options.target_layout);
                 const dst_repr = classifyValueRepr(self.pool, self.sym_table, dst_ty, self.options.target_layout);
+                const src_is_fat = src_ty == .str_ty or
+                    self.pool.getNode(src_ty).tag == .slice_ty or
+                    self.pool.getNode(src_ty).tag == .soa_slice_ty or
+                    self.pool.isSliceRefType(src_ty);
+                const dst_is_fat = dst_ty == .str_ty or
+                    self.pool.getNode(dst_ty).tag == .slice_ty or
+                    self.pool.getNode(dst_ty).tag == .soa_slice_ty or
+                    self.pool.isSliceRefType(dst_ty);
+                const dst_fat_ty = self.pool.getSliceRefInner(dst_ty) orelse dst_ty;
+
                 if (src_repr == .inline_ptr and dst_repr == .inline_ptr) {
-                    // Check `&[T; N]` coerced to `&[T]` (materializing a 16B fat-slice snapshot) or thin pointer cast:
                     const src_node = self.pool.getNode(src_ty);
                     const dst_node = self.pool.getNode(dst_ty);
                     if ((src_node.tag == .ref_ty or src_node.tag == .mut_ref_ty or src_node.tag == .raw_ptr_ty) and
-                        (dst_node.tag == .ref_ty or dst_node.tag == .mut_ref_ty or dst_node.tag == .raw_ptr_ty))
+                        dst_node.tag == .raw_ptr_ty)
                     {
                         const src_pointee = self.pool.unwrapUnderlyingType(TypeId.fromInt(src_node.lhs));
                         const dst_pointee = self.pool.unwrapUnderlyingType(TypeId.fromInt(dst_node.lhs));
@@ -6122,17 +6418,59 @@ pub const MirVm = struct {
                     }
                     return src_slot;
                 }
-                if (src_repr == .inline_ptr and
-                    (self.pool.getNode(dst_ty).tag == .slice_ty or self.pool.getNode(dst_ty).tag == .soa_slice_ty))
-                {
-                    // `&[T; N]` coerced to `[T]` slice:
+                if (src_repr == .inline_ptr and dst_is_fat) {
                     const src_node = self.pool.getNode(src_ty);
                     if (src_node.tag == .ref_ty or src_node.tag == .mut_ref_ty or src_node.tag == .raw_ptr_ty) {
-                        const arr_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(src_node.lhs));
-                        const arr_node = self.pool.getNode(arr_ty);
+                        const sp = self.pool.unwrapUnderlyingType(TypeId.fromInt(src_node.lhs));
+                        if (sp == .str_ty or self.pool.getNode(sp).tag == .slice_ty or
+                            self.pool.getNode(sp).tag == .soa_slice_ty or self.pool.isSliceRefType(sp))
+                        {
+                            const fat_ptr = if (self.pool.isSliceRefType(sp))
+                                try self.readPointerAt(src_slot.sym_ptr, self.options.target_layout.ptr_align_log2)
+                            else
+                                src_slot.sym_ptr;
+                            if (self.pool.isSoaSliceOrRefType(dst_fat_ty)) {
+                                const soa_p = try self.readSoaSliceParts(fat_ptr);
+                                return self.makeSoaSliceSlot(
+                                    dst_fat_ty,
+                                    soa_p.data_ptr,
+                                    soa_p.elem_len,
+                                    soa_p.stride,
+                                    soa_p.elem_off,
+                                );
+                            }
+                            const parts = try self.readFatSliceParts(fat_ptr);
+                            return self.makeFatSliceSlot(dst_fat_ty, parts.data_ptr, parts.elem_len);
+                        }
+                        const arr_node = self.pool.getNode(sp);
                         if (arr_node.tag == .array_ty or arr_node.tag == .soa_array_ty) {
                             const arr_len: u64 = arr_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
-                            return self.makeFatSliceSlot(dst_ty, src_slot.sym_ptr, arr_len);
+                            return self.makeFatSliceSlot(dst_fat_ty, src_slot.sym_ptr, arr_len);
+                        }
+                    }
+                }
+                if (src_is_fat and dst_is_fat) {
+                    if (self.pool.isSoaSliceOrRefType(src_ty) and self.pool.isSoaSliceOrRefType(dst_fat_ty)) {
+                        const soa_p = try self.readSoaSliceParts(src_slot.sym_ptr);
+                        return self.makeSoaSliceSlot(
+                            dst_fat_ty,
+                            soa_p.data_ptr,
+                            soa_p.elem_len,
+                            soa_p.stride,
+                            soa_p.elem_off,
+                        );
+                    }
+                    const parts = try self.readFatSliceParts(src_slot.sym_ptr);
+                    return self.makeFatSliceSlot(dst_fat_ty, parts.data_ptr, parts.elem_len);
+                }
+                if (src_is_fat and dst_repr == .inline_ptr) {
+                    const dst_node = self.pool.getNode(dst_ty);
+                    if (dst_node.tag == .ref_ty or dst_node.tag == .mut_ref_ty or dst_node.tag == .raw_ptr_ty) {
+                        const dp = self.pool.unwrapUnderlyingType(TypeId.fromInt(dst_node.lhs));
+                        if (dp == .str_ty or self.pool.getNode(dp).tag == .slice_ty or
+                            self.pool.getNode(dp).tag == .soa_slice_ty or self.pool.isSliceRefType(dp))
+                        {
+                            return src_slot;
                         }
                     }
                 }
@@ -6142,6 +6480,18 @@ pub const MirVm = struct {
                             (src_repr == .inline_scalar and dst_repr == .inline_ptr))
                         {
                             return src_slot;
+                        }
+                    }
+                    if (self.isStdCoreOrOracleFrame(frame_idx)) {
+                        if (src_repr == .inline_ptr and dst_repr == .inline_scalar) {
+                            self.context_op_counter += 1;
+                            const vaddr = try self.ptrToVirtualAddr(src_slot.sym_ptr, 4);
+                            return self.makeIntSlot(dst_ty, vaddr);
+                        }
+                        if (src_repr == .inline_scalar and dst_repr == .inline_ptr) {
+                            self.context_op_counter += 1;
+                            const raw_addr: u64 = @truncate(try self.readIntBitsFromSlot(src_slot, src_ty));
+                            return .{ .sym_ptr = try self.virtualAddrToPtr(raw_addr) };
                         }
                     }
                     return self.failWithTrap(
@@ -6573,7 +6923,9 @@ pub const MirVm = struct {
     /// Looks up a registered `Drop.drop` / `AutoDrop.drop` callable index for unwrapped nominal `ty`.
     fn lookupDropCallableForType(self: *MirVm, ty: TypeId) VmEvalError!?u32 {
         const ty_node = self.pool.getNode(ty);
-        if (ty_node.tag == .struct_ty or ty_node.tag == .enum_ty or ty_node.tag == .union_ty) {
+        if ((ty_node.tag == .struct_ty or ty_node.tag == .enum_ty or ty_node.tag == .union_ty) and
+            self.pool.getGenericTypeArgs(ty).len == 0)
+        {
             const sym_idx = SymbolIndex.fromInt(ty_node.rhs);
             if (!sym_idx.isNone() and sym_idx.asInt() < self.sym_table.symbols.items.len) {
                 const nom_sym = self.sym_table.getSymbol(sym_idx).*;
@@ -6594,8 +6946,12 @@ pub const MirVm = struct {
             const cand_body = entry.body orelse continue;
             if (cand_body.param_count != 1 or cand_body.locals.items.len < 2) continue;
             const fn_name = self.interner.get(cand_body.name);
-            if (!std.mem.eql(u8, fn_name, "drop") and
-                !std.mem.endsWith(u8, fn_name, ".drop")) continue;
+            const base_fn_name = if (std.mem.indexOfScalar(u8, fn_name, '$')) |dollar_idx|
+                fn_name[0..dollar_idx]
+            else
+                fn_name;
+            if (!std.mem.eql(u8, base_fn_name, "drop") and
+                !std.mem.endsWith(u8, base_fn_name, ".drop")) continue;
             const raw_param_ty = self.pool.unwrapUnderlyingType(cand_body.locals.items[1].type_id);
             const param_node = self.pool.getNode(raw_param_ty);
             const self_ty = if (param_node.tag == .ref_ty or
@@ -6660,7 +7016,8 @@ pub const MirVm = struct {
     /// Recursively executes `Drop.drop` / `AutoDrop.drop`, reverse-order field drops, and container buffer frees.
     fn dropPlaceInVm(self: *MirVm, place_ptr: SymbolicPtr, raw_ty: TypeId) VmEvalError!void {
         try self.tickStepBudget();
-        const ty = self.pool.unwrapUnderlyingType(raw_ty);
+        const raw_unwrapped = self.pool.unwrapUnderlyingType(raw_ty);
+        const ty = self.pool.getSliceRefInner(raw_unwrapped) orelse raw_unwrapped;
         if (ty.isError() or ty == .unit_ty or ty == .never_ty or ty == .opaque_ty or ty.isPrimitive() or
             ty == .source_loc_ty or ty == .fmt_spec_ty or ty == .fmt_args_ty or ty == .bencher_ty or
             ty == .task_group_base_ty or ty == .task_handle_base_ty or
@@ -6800,6 +7157,68 @@ pub const MirVm = struct {
                             try self.advanceSymbolicPtr(col_ptr, elem_off),
                             col_info.field_ty,
                         );
+                    }
+                }
+            },
+            .soa_vec_ty => {
+                const elem_struct_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(ty_node.lhs));
+                const hdr = try self.readSoaVecHeader(place_ptr);
+                if (hdr.len > 0 and hdr.cap > 0 and !hdr.data_ptr.alloc_id.isNullOrNone()) {
+                    var col_count: u32 = 0;
+                    while (computeSoaColumnOffsetAndType(
+                        self.pool,
+                        self.sym_table,
+                        elem_struct_ty,
+                        col_count,
+                        hdr.cap,
+                        self.options.target_layout,
+                    ) != null) : (col_count += 1) {}
+                    var rev_elem: u32 = hdr.len;
+                    while (rev_elem > 0) {
+                        rev_elem -= 1;
+                        var rev_col: u32 = col_count;
+                        while (rev_col > 0) {
+                            rev_col -= 1;
+                            const col_info = computeSoaColumnOffsetAndType(
+                                self.pool,
+                                self.sym_table,
+                                elem_struct_ty,
+                                rev_col,
+                                hdr.cap,
+                                self.options.target_layout,
+                            ).?;
+                            if (col_info.field_ty.isPrimitive()) continue;
+                            const field_lay = type_system.computeTypeLayoutWithPool(
+                                self.pool,
+                                self.sym_table,
+                                col_info.field_ty,
+                                self.options.target_layout,
+                            );
+                            const col_ptr = try self.advanceSymbolicPtr(hdr.data_ptr, col_info.column_byte_offset);
+                            const elem_off = try self.mulOffsetChecked(rev_elem, field_lay.byte_size);
+                            try self.dropPlaceInVm(
+                                try self.advanceSymbolicPtr(col_ptr, elem_off),
+                                col_info.field_ty,
+                            );
+                        }
+                    }
+                }
+                if (!hdr.data_ptr.alloc_id.isNullOrNone() and hdr.data_ptr.alloc_id.domain() == .vm_alloc) {
+                    const idx = hdr.data_ptr.alloc_id.payloadIndex();
+                    if (idx > 0 and idx < self.allocations.items.len and
+                        self.allocations.items[idx].is_live)
+                    {
+                        if (hdr.cap > 0 and (hdr.alloc_raw & 0x7) == 0 and
+                            try self.tryDeallocSoaViaAllocatorHandle(hdr.alloc_raw, hdr.data_ptr, elem_struct_ty, hdr.cap))
+                        {} else if (self.allocations.items[idx].is_heap_alloc) {
+                            try self.freeHeapMemory(hdr.data_ptr);
+                        }
+                    }
+                }
+                if (place_ptr.alloc_id.domain() == .vm_alloc) {
+                    const p_idx = place_ptr.alloc_id.payloadIndex();
+                    if (p_idx > 0 and p_idx < self.allocations.items.len and self.allocations.items[p_idx].is_mutable) {
+                        try self.writeSoaVecHeader(place_ptr, SymbolicPtr.NULL, 0, 0, hdr.alloc_raw);
                     }
                 }
             },
@@ -7182,9 +7601,9 @@ pub const MirVm = struct {
                 const ref_val = MirValueId.fromInt(args[0]);
                 const ref_ty = self.pool.unwrapUnderlyingType(body.getInst(ref_val).type_id);
                 const ref_node = self.pool.getNode(ref_ty);
-                const val_ty = if (ref_node.tag == .ref_ty or
+                const val_ty = if ((ref_node.tag == .ref_ty or
                     ref_node.tag == .mut_ref_ty or
-                    ref_node.tag == .raw_ptr_ty)
+                    ref_node.tag == .raw_ptr_ty) and !self.pool.isSliceRefType(ref_ty))
                     self.pool.unwrapUnderlyingType(TypeId.fromInt(ref_node.lhs))
                 else
                     ref_ty;
@@ -7263,21 +7682,38 @@ pub const MirVm = struct {
                     src_ty,
                     self.call_stack.items[frame_idx].regs[args[0]],
                 );
-                const byte_len: usize = @intCast(src_lay.byte_size);
-                var stack_buf: [64]u8 = undefined;
-                var heap_buf: ?[]u8 = null;
-                defer if (heap_buf) |buf| self.allocator.free(buf);
-                const raw_buf: []u8 = if (byte_len <= stack_buf.len)
-                    stack_buf[0..byte_len]
-                else blk: {
-                    const allocated = self.allocator.alloc(u8, byte_len) catch return error.OutOfMemory;
-                    heap_buf = allocated;
-                    break :blk allocated;
-                };
-                try self.readScalarBytes(src_snap, 0, raw_buf);
+                if (src_snap.alloc_id.domain() == .vm_alloc) {
+                    const s_rec = &self.allocations.items[src_snap.alloc_id.payloadIndex()];
+                    const s_off: usize = src_snap.byte_offset;
+                    const byte_len: usize = @intCast(src_lay.byte_size);
+                    for (0..byte_len) |off_i| {
+                        if (!isByteInitialized(s_rec, s_off + off_i)) {
+                            return self.failWithTrap(
+                                error.UninitializedRead,
+                                .e0505_comptime_uninitialized_read,
+                                "read of uninitialized byte in `@bit_cast` during `comptime` evaluation",
+                                "uninitialized `@bit_cast` source byte here",
+                                null,
+                            );
+                        }
+                    }
+                    if (!self.isStdCoreOrOracleFrame(frame_idx) and
+                        self.hasOverlappingProvenance(s_rec, src_snap.byte_offset, @intCast(src_lay.byte_size)))
+                    {
+                        return self.failWithTrap(
+                            error.ForbiddenOperation,
+                            .e0503_forbidden_comptime_operation,
+                            "cannot `@bit_cast` pointer provenance bytes at `comptime`",
+                            "pointer provenance inside `@bit_cast` source",
+                            null,
+                        );
+                    }
+                }
 
                 const dst_snap = try self.allocSnapshotForType(dst_ty, true);
-                try self.writeScalarBytes(dst_snap, 0, raw_buf);
+                if (src_lay.byte_size > 0) {
+                    try self.copyMemoryRange(dst_snap, src_snap, src_lay.byte_size, 0);
+                }
                 self.sealSnapshot(dst_snap);
                 return self.loadTypedSlotFromMemory(dst_snap, inst.type_id);
             },
@@ -7566,8 +8002,11 @@ pub const MirVm = struct {
                     .memory_ptr => |mem_info| mem_info,
                     .constant_usize => return .{ .scalar_u64 = 0 },
                 };
-                const ty_node = self.pool.getNode(self.pool.unwrapUnderlyingType(mp.pointee_ty));
-                if (ty_node.tag == .raw_ptr_ty or ty_node.tag == .ref_ty or ty_node.tag == .mut_ref_ty) {
+                const pointee_unwrapped = self.pool.unwrapUnderlyingType(mp.pointee_ty);
+                const ty_node = self.pool.getNode(pointee_unwrapped);
+                if ((ty_node.tag == .raw_ptr_ty or ty_node.tag == .ref_ty or ty_node.tag == .mut_ref_ty) and
+                    !self.pool.isSliceRefType(pointee_unwrapped))
+                {
                     const target_ptr = try self.readPointerAt(
                         mp.ptr,
                         self.options.target_layout.ptr_align_log2,
@@ -8003,6 +8442,38 @@ pub const MirVm = struct {
                 else
                     res_unwrapped;
 
+                if (self.pool.isSoaSliceOrRefType(slice_ty)) {
+                    const lo_u64: u64 = @intCast(lo_u128);
+                    if (self.pool.isSoaSliceOrRefType(base_ty)) {
+                        const soa_p = try self.readSoaSliceParts(base_slot.sym_ptr);
+                        return self.makeSoaSliceSlot(
+                            slice_ty,
+                            soa_p.data_ptr,
+                            sub_len,
+                            soa_p.stride,
+                            soa_p.elem_off + lo_u64,
+                        );
+                    }
+                    if (base_node.tag == .ref_ty or base_node.tag == .mut_ref_ty or base_node.tag == .raw_ptr_ty) {
+                        const pt_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(base_node.lhs));
+                        if (self.pool.isSoaSliceOrRefType(pt_ty)) {
+                            const soa_p = try self.readSoaSliceParts(base_slot.sym_ptr);
+                            return self.makeSoaSliceSlot(
+                                slice_ty,
+                                soa_p.data_ptr,
+                                sub_len,
+                                soa_p.stride,
+                                soa_p.elem_off + lo_u64,
+                            );
+                        }
+                        const pt_node = self.pool.getNode(pt_ty);
+                        const arr_cap: u64 = pt_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+                        return self.makeSoaSliceSlot(slice_ty, base_slot.sym_ptr, sub_len, arr_cap, lo_u64);
+                    }
+                    const arr_cap: u64 = base_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+                    return self.makeSoaSliceSlot(slice_ty, base_slot.sym_ptr, sub_len, arr_cap, lo_u64);
+                }
+
                 const elem_stride: u64 = if (slice_ty == .str_ty)
                     1
                 else blk_stride: {
@@ -8231,7 +8702,1752 @@ pub const MirVm = struct {
                 const fut_slot = self.call_stack.items[frame_idx].regs[args[0]];
                 return self.blockOnFutureInVm(fut_slot.sym_ptr, fut_ty, inst.type_id);
             },
+            .implements => {
+                const is_impl = type_system.evalStaticImplements(
+                    self.pool,
+                    self.sym_table,
+                    self.options.target_layout,
+                    TypeId.fromInt(inst.operands.lhs),
+                    TypeId.fromInt(inst.operands.rhs),
+                );
+                return .{ .scalar_u64 = @intFromBool(is_impl) };
+            },
+            .int_min, .int_max, .int_bits => {
+                const target_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(inst.operands.lhs));
+                const info = resolveIntInfo(self.pool, target_ty, self.options.target_layout) orelse
+                    return .{ .scalar_u64 = 0 };
+                if (kind == .int_bits) {
+                    return self.makeIntSlot(inst.type_id, info.bits);
+                }
+                if (kind == .int_min) {
+                    if (!info.is_signed) return self.makeIntSlot(inst.type_id, 0);
+                    const min_i128: i128 = if (info.bits >= 128)
+                        std.math.minInt(i128)
+                    else
+                        -(@as(i128, 1) << @intCast(info.bits - 1));
+                    return self.makeIntSlot(inst.type_id, @bitCast(min_i128));
+                }
+                if (!info.is_signed) {
+                    const max_u128: u128 = if (info.bits >= 128)
+                        std.math.maxInt(u128)
+                    else
+                        (@as(u128, 1) << @intCast(info.bits)) - 1;
+                    return self.makeIntSlot(inst.type_id, max_u128);
+                }
+                const max_i128: i128 = if (info.bits >= 128)
+                    std.math.maxInt(i128)
+                else
+                    (@as(i128, 1) << @intCast(info.bits - 1)) - 1;
+                return self.makeIntSlot(inst.type_id, @bitCast(max_i128));
+            },
+            .scalar_clz, .scalar_ctz, .scalar_popcnt => {
+                if (args.len < 1) return .{ .scalar_u64 = 0 };
+                const val_ty = body.getInst(MirValueId.fromInt(args[0])).type_id;
+                const info = resolveIntInfo(self.pool, val_ty, self.options.target_layout) orelse
+                    return .{ .scalar_u64 = 0 };
+                const raw = maskToBitsU128(
+                    try self.readIntBitsFromSlot(self.call_stack.items[frame_idx].regs[args[0]], val_ty),
+                    info.bits,
+                );
+                const count: u32 = switch (kind) {
+                    .scalar_clz => if (raw == 0)
+                        info.bits
+                    else
+                        @as(u32, @clz(raw)) - (128 - @as(u32, info.bits)),
+                    .scalar_ctz => if (raw == 0)
+                        info.bits
+                    else
+                        @min(@as(u32, @ctz(raw)), info.bits),
+                    .scalar_popcnt => @as(u32, @popCount(raw)),
+                    else => unreachable,
+                };
+                return .{ .scalar_u64 = count };
+            },
+            .scalar_bswap => {
+                if (args.len < 1) return .{ .scalar_u64 = 0 };
+                const val_ty = body.getInst(MirValueId.fromInt(args[0])).type_id;
+                const info = resolveIntInfo(self.pool, val_ty, self.options.target_layout) orelse
+                    return .{ .scalar_u64 = 0 };
+                const raw = maskToBitsU128(
+                    try self.readIntBitsFromSlot(self.call_stack.items[frame_idx].regs[args[0]], val_ty),
+                    info.bits,
+                );
+                const byte_len: usize = @intCast(@max(info.bits / 8, 1));
+                var buf: [16]u8 = @splat(0);
+                std.mem.writeInt(u128, &buf, raw, .little);
+                std.mem.reverse(u8, buf[0..byte_len]);
+                return self.makeIntSlot(inst.type_id, std.mem.readInt(u128, &buf, .little));
+            },
+            .scalar_rotl, .scalar_rotr => {
+                if (args.len < 2) return .{ .scalar_u64 = 0 };
+                const val_ty = body.getInst(MirValueId.fromInt(args[0])).type_id;
+                const shift_ty = body.getInst(MirValueId.fromInt(args[1])).type_id;
+                const info = resolveIntInfo(self.pool, val_ty, self.options.target_layout) orelse
+                    return .{ .scalar_u64 = 0 };
+                const raw = maskToBitsU128(
+                    try self.readIntBitsFromSlot(self.call_stack.items[frame_idx].regs[args[0]], val_ty),
+                    info.bits,
+                );
+                if (info.bits == 0) return .{ .scalar_u64 = 0 };
+                const shift_raw = try self.readIntBitsFromSlot(self.call_stack.items[frame_idx].regs[args[1]], shift_ty);
+                const amt: u16 = @intCast(shift_raw % info.bits);
+                if (amt == 0) return self.makeIntSlot(inst.type_id, raw);
+                const opp: u16 = info.bits - amt;
+                const rotated = if (kind == .scalar_rotl)
+                    maskToBitsU128((raw << @intCast(amt)) | (raw >> @intCast(opp)), info.bits)
+                else
+                    maskToBitsU128((raw >> @intCast(amt)) | (raw << @intCast(opp)), info.bits);
+                return self.makeIntSlot(inst.type_id, rotated);
+            },
+            .sqrt => {
+                if (args.len < 1) return .{ .scalar_u64 = 0 };
+                const dst_ty = self.pool.unwrapUnderlyingType(inst.type_id);
+                const arg_slot = self.call_stack.items[frame_idx].regs[args[0]];
+                if (dst_ty == .f32_ty) {
+                    const flt_val = unpackF32Slot(arg_slot);
+                    if (flt_val < 0.0) return .{ .scalar_u64 = CANONICAL_F32_QNAN_BITS };
+                    return packF32Slot(@sqrt(flt_val));
+                }
+                const flt_val = canonicalizeF64(arg_slot.scalar_f64);
+                if (flt_val < 0.0) return .{ .scalar_f64 = @bitCast(CANONICAL_F64_QNAN_BITS) };
+                return .{ .scalar_f64 = canonicalizeF64(@sqrt(flt_val)) };
+            },
+            .from_le_bytes, .from_be_bytes => {
+                if (args.len < 1) return .{ .scalar_u64 = 0 };
+                const dst_lay = type_system.computeTypeLayoutWithPool(
+                    self.pool,
+                    self.sym_table,
+                    inst.type_id,
+                    self.options.target_layout,
+                );
+                const n: usize = @intCast(@min(dst_lay.byte_size, 16));
+                var buf: [16]u8 = @splat(0);
+                try self.readScalarBytes(self.call_stack.items[frame_idx].regs[args[0]].sym_ptr, 0, buf[0..n]);
+                if (kind == .from_be_bytes) std.mem.reverse(u8, buf[0..n]);
+                const dst_snap = try self.allocSnapshotForType(inst.type_id, true);
+                try self.writeScalarBytes(dst_snap, 0, buf[0..n]);
+                self.sealSnapshot(dst_snap);
+                return self.loadTypedSlotFromMemory(dst_snap, inst.type_id);
+            },
+            .to_le_bytes, .to_be_bytes => {
+                if (args.len < 1) return .{ .scalar_u64 = 0 };
+                const src_ty = body.getInst(MirValueId.fromInt(args[0])).type_id;
+                const src_lay = type_system.computeTypeLayoutWithPool(
+                    self.pool,
+                    self.sym_table,
+                    src_ty,
+                    self.options.target_layout,
+                );
+                const n: usize = @intCast(@min(src_lay.byte_size, 16));
+                const tmp_snap = try self.allocSnapshotForType(src_ty, true);
+                try self.storeTypedSlotToMemory(tmp_snap, src_ty, self.call_stack.items[frame_idx].regs[args[0]]);
+                var buf: [16]u8 = @splat(0);
+                try self.readScalarBytes(tmp_snap, 0, buf[0..n]);
+                if (kind == .to_be_bytes) std.mem.reverse(u8, buf[0..n]);
+                const arr_snap = try self.allocSnapshotForType(inst.type_id, true);
+                try self.writeScalarBytes(arr_snap, 0, buf[0..n]);
+                self.sealSnapshot(arr_snap);
+                return .{ .sym_ptr = arr_snap };
+            },
+            .ptr_is_null => {
+                if (args.len < 1) return .{ .scalar_u64 = 1 };
+                const sym_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                return .{ .scalar_u64 = @intFromBool(sym_ptr.alloc_id.isNullOrNone()) };
+            },
+            .ptr_offset => {
+                if (args.len < 3) return .{ .sym_ptr = SymbolicPtr.NULL };
+                const base_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const ptr_ty = self.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[0])).type_id);
+                const pointee_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(self.pool.getNode(ptr_ty).lhs));
+                const stride: u64 = if (pointee_ty == .opaque_ty)
+                    1
+                else
+                    type_system.computeTypeLayoutWithPool(
+                        self.pool,
+                        self.sym_table,
+                        pointee_ty,
+                        self.options.target_layout,
+                    ).byte_size;
+                const delta_ty = body.getInst(MirValueId.fromInt(args[1])).type_id;
+                const delta_bits = try self.readIntBitsFromSlot(self.call_stack.items[frame_idx].regs[args[1]], delta_ty);
+                const mode_bits = try self.readIntBitsFromSlot(self.call_stack.items[frame_idx].regs[args[2]], .u32_ty);
+                const ptr_bits: u16 = @as(u16, self.options.target_layout.ptr_byte_size) * 8;
+                const signed_elems: i128 = switch (mode_bits) {
+                    0 => if (delta_bits > std.math.maxInt(i64))
+                        return self.failWithTrap(
+                            error.OutOfBounds,
+                            .e0504_comptime_out_of_bounds,
+                            "pointer `.add()` offset overflowed bounds at `comptime`",
+                            "pointer offset overflow",
+                            null,
+                        )
+                    else
+                        @intCast(delta_bits),
+                    1 => if (delta_bits > std.math.maxInt(i64))
+                        return self.failWithTrap(
+                            error.OutOfBounds,
+                            .e0504_comptime_out_of_bounds,
+                            "pointer `.sub()` offset overflowed bounds at `comptime`",
+                            "pointer offset overflow",
+                            null,
+                        )
+                    else
+                        -@as(i128, @intCast(delta_bits)),
+                    else => signExtendToI128(delta_bits, ptr_bits),
+                };
+                if (signed_elems == 0 or stride == 0) return .{ .sym_ptr = base_ptr };
+                if (base_ptr.alloc_id.isNullOrNone() or base_ptr.alloc_id.isFnAddr()) {
+                    return self.failWithTrap(
+                        error.InvalidPointer,
+                        .e0506_comptime_invalid_pointer,
+                        "cannot offset null or function pointer at `comptime`",
+                        "invalid base pointer here",
+                        null,
+                    );
+                }
+                const byte_delta = std.math.mul(i128, signed_elems, @as(i128, @intCast(stride))) catch {
+                    return self.failWithTrap(
+                        error.OutOfBounds,
+                        .e0504_comptime_out_of_bounds,
+                        "pointer byte offset overflowed bounds at `comptime`",
+                        "pointer offset overflow",
+                        null,
+                    );
+                };
+                const next_off = @as(i128, base_ptr.byte_offset) + byte_delta;
+                if (next_off < 0 or next_off > std.math.maxInt(u32)) {
+                    return self.failWithTrap(
+                        error.OutOfBounds,
+                        .e0504_comptime_out_of_bounds,
+                        "pointer offset out of allocation bounds at `comptime`",
+                        "out-of-bounds pointer offset",
+                        null,
+                    );
+                }
+                return .{ .sym_ptr = .{ .alloc_id = base_ptr.alloc_id, .byte_offset = @intCast(next_off) } };
+            },
+            .memcpy, .memmove => {
+                if (args.len < 3) return .{ .scalar_u64 = 0 };
+                const dst_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const src_ptr = self.call_stack.items[frame_idx].regs[args[1]].sym_ptr;
+                const byte_len_u128 = try self.readIntBitsFromSlot(self.call_stack.items[frame_idx].regs[args[2]], .usize_ty);
+                if (byte_len_u128 == 0) return .{ .scalar_u64 = 0 };
+                if (byte_len_u128 > self.options.mem_limit) {
+                    return self.failWithTrap(
+                        error.ResourceLimitExceeded,
+                        .e0508_comptime_resource_limit_exceeded,
+                        "`@memcpy`/`@memmove` length exceeds `comptime` memory limit",
+                        "oversized copy length",
+                        null,
+                    );
+                }
+                const byte_len: u64 = @intCast(byte_len_u128);
+                if (kind == .memcpy and dst_ptr.alloc_id == src_ptr.alloc_id and
+                    @as(u64, dst_ptr.byte_offset) < @as(u64, src_ptr.byte_offset) + byte_len and
+                    @as(u64, src_ptr.byte_offset) < @as(u64, dst_ptr.byte_offset) + byte_len)
+                {
+                    return self.failWithTrap(
+                        error.InvalidPointer,
+                        .e0506_comptime_invalid_pointer,
+                        "overlapping regions passed to `@memcpy` during `comptime` evaluation; use `@memmove`",
+                        "overlapping `@memcpy` regions here",
+                        null,
+                    );
+                }
+                try self.copyMemoryRange(dst_ptr, src_ptr, byte_len, 0);
+                return .{ .scalar_u64 = 0 };
+            },
+            .memset => {
+                if (args.len < 3) return .{ .scalar_u64 = 0 };
+                const dst_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const fill_u8: u8 = @truncate(
+                    try self.readIntBitsFromSlot(self.call_stack.items[frame_idx].regs[args[1]], .u8_ty),
+                );
+                const byte_len_u128 = try self.readIntBitsFromSlot(self.call_stack.items[frame_idx].regs[args[2]], .usize_ty);
+                if (byte_len_u128 == 0) return .{ .scalar_u64 = 0 };
+                if (byte_len_u128 > self.options.mem_limit) {
+                    return self.failWithTrap(
+                        error.ResourceLimitExceeded,
+                        .e0508_comptime_resource_limit_exceeded,
+                        "`@memset` length exceeds `comptime` memory limit",
+                        "oversized `@memset` length",
+                        null,
+                    );
+                }
+                const byte_len: u64 = @intCast(byte_len_u128);
+                _ = try self.validateAccess(dst_ptr, byte_len, 0, true);
+                const alloc_rec = &self.allocations.items[dst_ptr.alloc_id.payloadIndex()];
+                const start_off: usize = dst_ptr.byte_offset;
+                const len_usize: usize = @intCast(byte_len);
+                @memset(alloc_rec.bytes[start_off .. start_off + len_usize], fill_u8);
+                markRangeInitialized(alloc_rec, start_off, len_usize);
+                self.clearOverlappingProvenance(alloc_rec, dst_ptr.byte_offset, @intCast(byte_len));
+                return .{ .scalar_u64 = 0 };
+            },
+            .ptr_copy, .ptr_copy_nonoverlapping => {
+                if (args.len < 3) return .{ .scalar_u64 = 0 };
+                const src_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const dst_ptr = self.call_stack.items[frame_idx].regs[args[1]].sym_ptr;
+                const count_u128 = try self.readIntBitsFromSlot(self.call_stack.items[frame_idx].regs[args[2]], .usize_ty);
+                const ptr_ty = self.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[0])).type_id);
+                const elem_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(self.pool.getNode(ptr_ty).lhs));
+                const elem_lay = type_system.computeTypeLayoutWithPool(
+                    self.pool,
+                    self.sym_table,
+                    elem_ty,
+                    self.options.target_layout,
+                );
+                const total_bytes = try self.mulOffsetChecked(count_u128, elem_lay.byte_size);
+                if (total_bytes == 0) return .{ .scalar_u64 = 0 };
+                if (kind == .ptr_copy_nonoverlapping and dst_ptr.alloc_id == src_ptr.alloc_id and
+                    @as(u64, dst_ptr.byte_offset) < @as(u64, src_ptr.byte_offset) + total_bytes and
+                    @as(u64, src_ptr.byte_offset) < @as(u64, dst_ptr.byte_offset) + total_bytes)
+                {
+                    return self.failWithTrap(
+                        error.InvalidPointer,
+                        .e0506_comptime_invalid_pointer,
+                        "overlapping regions passed to `@ptr_copy_nonoverlapping` at `comptime`",
+                        "overlapping copy regions here",
+                        null,
+                    );
+                }
+                try self.copyMemoryRange(dst_ptr, src_ptr, total_bytes, elem_lay.align_log2);
+                return .{ .scalar_u64 = 0 };
+            },
+            .ptr_read => {
+                if (args.len < 1) return .{ .scalar_u64 = 0 };
+                const src_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                return self.loadTypedSlotFromMemory(src_ptr, inst.type_id);
+            },
+            .ptr_write => {
+                if (args.len < 2) return .{ .scalar_u64 = 0 };
+                const dst_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const val_ty = body.getInst(MirValueId.fromInt(args[1])).type_id;
+                try self.storeTypedSlotToMemory(dst_ptr, val_ty, self.call_stack.items[frame_idx].regs[args[1]]);
+                return .{ .scalar_u64 = 0 };
+            },
+            .ptr_drop_in_place => {
+                if (args.len < 1) return .{ .scalar_u64 = 0 };
+                const target_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const ptr_ty = self.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[0])).type_id);
+                const elem_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(self.pool.getNode(ptr_ty).lhs));
+                try self.dropPlaceInVm(target_ptr, elem_ty);
+                return .{ .scalar_u64 = 0 };
+            },
+            .forget => return .{ .scalar_u64 = 0 },
+            .slice_split_at => {
+                if (args.len < 2) return .{ .scalar_u64 = 0 };
+                const slice_ref_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const mid_u128 = try self.readIntBitsFromSlot(self.call_stack.items[frame_idx].regs[args[1]], .usize_ty);
+                const fat = try self.readFatSliceParts(slice_ref_ptr);
+                if (mid_u128 > fat.elem_len) {
+                    return self.failWithTrap(
+                        error.OutOfBounds,
+                        .e0504_comptime_out_of_bounds,
+                        "slice `split_at` index exceeds slice length during `comptime` evaluation",
+                        "`split_at` midpoint out of bounds here",
+                        null,
+                    );
+                }
+                const mid_u64: u64 = @intCast(mid_u128);
+                const tuple_ty = self.pool.unwrapUnderlyingType(inst.type_id);
+                const tuple_elems = self.pool.getTupleElements(tuple_ty);
+                const half_ref_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(tuple_elems[0]));
+                const inner_slice_ty = self.pool.unwrapUnderlyingType(
+                    TypeId.fromInt(self.pool.getNode(half_ref_ty).lhs),
+                );
+                const elem_ty = self.pool.unwrapUnderlyingType(
+                    TypeId.fromInt(self.pool.getNode(inner_slice_ty).lhs),
+                );
+                const elem_lay = type_system.computeTypeLayoutWithPool(
+                    self.pool,
+                    self.sym_table,
+                    elem_ty,
+                    self.options.target_layout,
+                );
+                const mid_bytes = try self.mulOffsetChecked(mid_u64, elem_lay.byte_size);
+                const left_slot = try self.makeFatSliceSlot(inner_slice_ty, fat.data_ptr, mid_u64);
+                const right_len = fat.elem_len - mid_u64;
+                const right_data_ptr = if (right_len == 0 and fat.data_ptr.alloc_id.isNullOrNone())
+                    SymbolicPtr{ .alloc_id = self.dangling_empty_alloc, .byte_offset = 0 }
+                else if (mid_bytes == 0)
+                    fat.data_ptr
+                else
+                    try self.advanceSymbolicPtr(fat.data_ptr, mid_bytes);
+                const right_slot = try self.makeFatSliceSlot(inner_slice_ty, right_data_ptr, right_len);
+
+                const tuple_snap = try self.allocSnapshotForType(tuple_ty, false);
+                if (computeCompositeFieldOffsetAndType(
+                    self.pool,
+                    self.sym_table,
+                    tuple_ty,
+                    0,
+                    self.options.target_layout,
+                )) |f0| {
+                    try self.storeTypedSlotToMemory(
+                        try self.advanceSymbolicPtr(tuple_snap, f0.byte_offset),
+                        half_ref_ty,
+                        left_slot,
+                    );
+                }
+                if (computeCompositeFieldOffsetAndType(
+                    self.pool,
+                    self.sym_table,
+                    tuple_ty,
+                    1,
+                    self.options.target_layout,
+                )) |f1| {
+                    try self.storeTypedSlotToMemory(
+                        try self.advanceSymbolicPtr(tuple_snap, f1.byte_offset),
+                        half_ref_ty,
+                        right_slot,
+                    );
+                }
+                self.sealSnapshot(tuple_snap);
+                return .{ .sym_ptr = tuple_snap };
+            },
+            .slice_reverse => {
+                if (args.len < 1) return .{ .scalar_u64 = 0 };
+                const slice_ref_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const fat = try self.readFatSliceParts(slice_ref_ptr);
+                const ref_ty = self.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[0])).type_id);
+                const slice_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(self.pool.getNode(ref_ty).lhs));
+                const elem_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(self.pool.getNode(slice_ty).lhs));
+                const elem_lay = type_system.computeTypeLayoutWithPool(
+                    self.pool,
+                    self.sym_table,
+                    elem_ty,
+                    self.options.target_layout,
+                );
+                if (fat.elem_len >= 2 and elem_lay.byte_size > 0) {
+                    const tmp_ptr = try self.allocSnapshotForType(elem_ty, false);
+                    var lo_idx: u64 = 0;
+                    var hi_idx: u64 = fat.elem_len - 1;
+                    while (lo_idx < hi_idx) {
+                        try self.tickStepBudget();
+                        const lo_ptr = try self.advanceSymbolicPtr(
+                            fat.data_ptr,
+                            try self.mulOffsetChecked(lo_idx, elem_lay.byte_size),
+                        );
+                        const hi_ptr = try self.advanceSymbolicPtr(
+                            fat.data_ptr,
+                            try self.mulOffsetChecked(hi_idx, elem_lay.byte_size),
+                        );
+                        try self.copyMemoryRange(tmp_ptr, lo_ptr, elem_lay.byte_size, elem_lay.align_log2);
+                        try self.copyMemoryRange(lo_ptr, hi_ptr, elem_lay.byte_size, elem_lay.align_log2);
+                        try self.copyMemoryRange(hi_ptr, tmp_ptr, elem_lay.byte_size, elem_lay.align_log2);
+                        lo_idx += 1;
+                        hi_idx -= 1;
+                    }
+                }
+                return .{ .scalar_u64 = 0 };
+            },
+            .slice_from_raw_parts => {
+                if (args.len < 2) return .{ .sym_ptr = SymbolicPtr.NULL };
+                const raw_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const len_u128 = try self.readIntBitsFromSlot(self.call_stack.items[frame_idx].regs[args[1]], .usize_ty);
+                const res_ty = self.pool.unwrapUnderlyingType(inst.type_id);
+                const res_node = self.pool.getNode(res_ty);
+                const slice_ty = if (res_node.tag == .ref_ty or res_node.tag == .mut_ref_ty)
+                    self.pool.unwrapUnderlyingType(TypeId.fromInt(res_node.lhs))
+                else
+                    res_ty;
+                return self.makeFatSliceSlot(slice_ty, raw_ptr, @intCast(len_u128));
+            },
+            .str_from_utf8_unchecked => {
+                if (args.len < 1) return .{ .sym_ptr = SymbolicPtr.NULL };
+                const span_info = try self.extractWireBytesSpan(
+                    body.getInst(MirValueId.fromInt(args[0])).type_id,
+                    self.call_stack.items[frame_idx].regs[args[0]],
+                );
+                return self.makeFatSliceSlot(.str_ty, span_info.data_ptr, span_info.byte_len);
+            },
+            .soa_vec_new => {
+                const alloc_raw = if (args.len >= 1)
+                    try self.extractAllocRawFromSlot(
+                        frame_idx,
+                        body.getInst(MirValueId.fromInt(args[0])).type_id,
+                        self.call_stack.items[frame_idx].regs[args[0]],
+                    )
+                else
+                    0;
+                const vec_snap = try self.allocSnapshotForType(inst.type_id, true);
+                try self.writeSoaVecHeader(vec_snap, SymbolicPtr.NULL, 0, 0, alloc_raw);
+                self.sealSnapshot(vec_snap);
+                return .{ .sym_ptr = vec_snap };
+            },
+            .soa_vec_with_cap => {
+                if (args.len < 3) return .{ .scalar_u64 = 0 };
+                const alloc_raw = try self.extractAllocRawFromSlot(
+                    frame_idx,
+                    body.getInst(MirValueId.fromInt(args[0])).type_id,
+                    self.call_stack.items[frame_idx].regs[args[0]],
+                );
+                const cap_u128 = try self.readIntBitsFromSlot(self.call_stack.items[frame_idx].regs[args[1]], .usize_ty);
+                const is_try = (try self.readIntBitsFromSlot(self.call_stack.items[frame_idx].regs[args[2]], .u32_ty)) != 0;
+                const out_ty = self.pool.unwrapUnderlyingType(inst.type_id);
+                const vec_ty = if (is_try)
+                    self.pool.unwrapUnderlyingType(TypeId.fromInt(self.pool.getNode(out_ty).lhs))
+                else
+                    out_ty;
+                const elem_struct_ty = self.pool.unwrapUnderlyingType(
+                    TypeId.fromInt(self.pool.getNode(vec_ty).lhs),
+                );
+                const vec_snap = try self.allocSnapshotForType(vec_ty, true);
+                try self.writeSoaVecHeader(vec_snap, SymbolicPtr.NULL, 0, 0, alloc_raw);
+                const alloc_ok = if (cap_u128 == 0)
+                    true
+                else
+                    try self.reallocSoaVecBuffer(vec_snap, elem_struct_ty, @intCast(@min(cap_u128, std.math.maxInt(u64))), is_try);
+                self.sealSnapshot(vec_snap);
+                if (!is_try) return .{ .sym_ptr = vec_snap };
+
+                const res_snap = try self.allocSnapshotForType(out_ty, true);
+                const sum_info = computeSumTypeTagAndPayloadLayout(
+                    self.pool,
+                    self.sym_table,
+                    out_ty,
+                    self.options.target_layout,
+                );
+                if (alloc_ok) {
+                    try self.storeTypedSlotToMemory(
+                        try self.advanceSymbolicPtr(res_snap, sum_info.payload_offset),
+                        vec_ty,
+                        .{ .sym_ptr = vec_snap },
+                    );
+                    try self.writeSumDiscriminantAt(res_snap, out_ty, 0);
+                } else {
+                    try self.writeSumDiscriminantAt(res_snap, out_ty, 1);
+                }
+                self.sealSnapshot(res_snap);
+                return .{ .sym_ptr = res_snap };
+            },
+            .soa_vec_len, .soa_vec_cap => {
+                if (args.len < 1) return .{ .scalar_u64 = 0 };
+                const vec_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const hdr = try self.readSoaVecHeader(vec_ptr);
+                return self.makeIntSlot(inst.type_id, if (kind == .soa_vec_len) hdr.len else hdr.cap);
+            },
+            .soa_vec_push => {
+                if (args.len < 3) return .{ .scalar_u64 = 0 };
+                const vec_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const elem_slot = self.call_stack.items[frame_idx].regs[args[1]];
+                const is_try = (try self.readIntBitsFromSlot(self.call_stack.items[frame_idx].regs[args[2]], .u32_ty)) != 0;
+                const vec_ref_ty = self.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[0])).type_id);
+                const vec_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(self.pool.getNode(vec_ref_ty).lhs));
+                const elem_struct_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(self.pool.getNode(vec_ty).lhs));
+                var hdr = try self.readSoaVecHeader(vec_ptr);
+                var alloc_ok = true;
+                if (hdr.len >= hdr.cap) {
+                    alloc_ok = try self.reallocSoaVecBuffer(vec_ptr, elem_struct_ty, @as(u64, hdr.len) + 1, is_try);
+                    hdr = try self.readSoaVecHeader(vec_ptr);
+                }
+                if (alloc_ok) {
+                    try self.storeSoaArrayElementFromSlot(
+                        hdr.data_ptr,
+                        elem_struct_ty,
+                        hdr.cap,
+                        hdr.len,
+                        elem_slot,
+                    );
+                    try self.writeSoaVecHeader(vec_ptr, hdr.data_ptr, hdr.len + 1, hdr.cap, hdr.alloc_raw);
+                } else if (!type_system.isTrivialDropType(self.pool, self.sym_table, elem_struct_ty)) {
+                    const drop_snap = try self.allocSnapshotForType(elem_struct_ty, true);
+                    try self.storeTypedSlotToMemory(drop_snap, elem_struct_ty, elem_slot);
+                    try self.dropPlaceInVm(drop_snap, elem_struct_ty);
+                }
+                if (!is_try) return .{ .scalar_u64 = 0 };
+                const out_ty = self.pool.unwrapUnderlyingType(inst.type_id);
+                const res_snap = try self.allocSnapshotForType(out_ty, true);
+                try self.writeSumDiscriminantAt(res_snap, out_ty, if (alloc_ok) 0 else 1);
+                self.sealSnapshot(res_snap);
+                return self.loadTypedSlotFromMemory(res_snap, out_ty);
+            },
+            .soa_vec_pop => {
+                if (args.len < 1) return .{ .scalar_u64 = 0 };
+                const vec_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const opt_ty = self.pool.unwrapUnderlyingType(inst.type_id);
+                const elem_struct_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(self.pool.getNode(opt_ty).lhs));
+                const hdr = try self.readSoaVecHeader(vec_ptr);
+                const opt_snap = try self.allocSnapshotForType(opt_ty, true);
+                const sum_info = computeSumTypeTagAndPayloadLayout(
+                    self.pool,
+                    self.sym_table,
+                    opt_ty,
+                    self.options.target_layout,
+                );
+                if (hdr.len == 0) {
+                    try self.writeSumDiscriminantAt(opt_snap, opt_ty, 0);
+                    self.sealSnapshot(opt_snap);
+                    return self.loadTypedSlotFromMemory(opt_snap, opt_ty);
+                }
+                const pop_idx = hdr.len - 1;
+                const elem_snap = try self.allocSnapshotForType(elem_struct_ty, true);
+                const dst_packed = isPackedStructType(self.pool, self.sym_table, elem_struct_ty);
+                var field_ord: u32 = 0;
+                while (computeCompositeFieldOffsetAndType(
+                    self.pool,
+                    self.sym_table,
+                    elem_struct_ty,
+                    field_ord,
+                    self.options.target_layout,
+                )) |dst_field| : (field_ord += 1) {
+                    const src_col = computeSoaColumnOffsetAndType(
+                        self.pool,
+                        self.sym_table,
+                        elem_struct_ty,
+                        field_ord,
+                        hdr.cap,
+                        self.options.target_layout,
+                    ) orelse break;
+                    const field_lay = type_system.computeTypeLayoutWithPool(
+                        self.pool,
+                        self.sym_table,
+                        src_col.field_ty,
+                        self.options.target_layout,
+                    );
+                    const col_base = try self.advanceSymbolicPtr(hdr.data_ptr, src_col.column_byte_offset);
+                    const src_field_ptr = try self.advanceSymbolicPtr(
+                        col_base,
+                        try self.mulOffsetChecked(pop_idx, field_lay.byte_size),
+                    );
+                    const dst_field_ptr = try self.advanceSymbolicPtr(elem_snap, dst_field.byte_offset);
+                    try self.copyMemoryRange(
+                        dst_field_ptr,
+                        src_field_ptr,
+                        field_lay.byte_size,
+                        if (dst_packed) 0 else field_lay.align_log2,
+                    );
+                }
+                self.sealSnapshot(elem_snap);
+                try self.writeSoaVecHeader(vec_ptr, hdr.data_ptr, pop_idx, hdr.cap, hdr.alloc_raw);
+                const elem_slot = try self.loadTypedSlotFromMemory(elem_snap, elem_struct_ty);
+                try self.storeTypedSlotToMemory(
+                    try self.advanceSymbolicPtr(opt_snap, sum_info.payload_offset),
+                    elem_struct_ty,
+                    elem_slot,
+                );
+                try self.writeSumDiscriminantAt(opt_snap, opt_ty, 1);
+                self.sealSnapshot(opt_snap);
+                return self.loadTypedSlotFromMemory(opt_snap, opt_ty);
+            },
+            .soa_vec_clear => {
+                if (args.len < 1) return .{ .scalar_u64 = 0 };
+                const vec_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const vec_ref_ty = self.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[0])).type_id);
+                const vec_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(self.pool.getNode(vec_ref_ty).lhs));
+                const elem_struct_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(self.pool.getNode(vec_ty).lhs));
+                const hdr = try self.readSoaVecHeader(vec_ptr);
+                if (hdr.len > 0 and hdr.cap > 0 and !hdr.data_ptr.alloc_id.isNullOrNone() and
+                    !type_system.isTrivialDropType(self.pool, self.sym_table, elem_struct_ty))
+                {
+                    var col_count: u32 = 0;
+                    while (computeSoaColumnOffsetAndType(
+                        self.pool,
+                        self.sym_table,
+                        elem_struct_ty,
+                        col_count,
+                        hdr.cap,
+                        self.options.target_layout,
+                    ) != null) : (col_count += 1) {}
+                    var rev_elem: u32 = hdr.len;
+                    while (rev_elem > 0) {
+                        rev_elem -= 1;
+                        var rev_col: u32 = col_count;
+                        while (rev_col > 0) {
+                            rev_col -= 1;
+                            const col_info = computeSoaColumnOffsetAndType(
+                                self.pool,
+                                self.sym_table,
+                                elem_struct_ty,
+                                rev_col,
+                                hdr.cap,
+                                self.options.target_layout,
+                            ).?;
+                            if (col_info.field_ty.isPrimitive()) continue;
+                            const field_lay = type_system.computeTypeLayoutWithPool(
+                                self.pool,
+                                self.sym_table,
+                                col_info.field_ty,
+                                self.options.target_layout,
+                            );
+                            const col_ptr = try self.advanceSymbolicPtr(hdr.data_ptr, col_info.column_byte_offset);
+                            const elem_off = try self.mulOffsetChecked(rev_elem, field_lay.byte_size);
+                            try self.dropPlaceInVm(
+                                try self.advanceSymbolicPtr(col_ptr, elem_off),
+                                col_info.field_ty,
+                            );
+                        }
+                    }
+                }
+                try self.writeSoaVecHeader(vec_ptr, hdr.data_ptr, 0, hdr.cap, hdr.alloc_raw);
+                return .{ .scalar_u64 = 0 };
+            },
+            .soa_vec_reserve => {
+                if (args.len < 3) return .{ .scalar_u64 = 0 };
+                const vec_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const add_u128 = try self.readIntBitsFromSlot(self.call_stack.items[frame_idx].regs[args[1]], .usize_ty);
+                const is_try = (try self.readIntBitsFromSlot(self.call_stack.items[frame_idx].regs[args[2]], .u32_ty)) != 0;
+                const vec_ref_ty = self.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[0])).type_id);
+                const vec_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(self.pool.getNode(vec_ref_ty).lhs));
+                const elem_struct_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(self.pool.getNode(vec_ty).lhs));
+                const hdr = try self.readSoaVecHeader(vec_ptr);
+                const needed_u128 = @as(u128, hdr.len) + add_u128;
+                const alloc_ok = if (needed_u128 > std.math.maxInt(u32)) blk_ov: {
+                    if (!is_try) {
+                        return self.failWithTrap(
+                            error.ResourceLimitExceeded,
+                            .e0508_comptime_resource_limit_exceeded,
+                            "`#soa Vec` capacity overflowed `u32` limit",
+                            "`#soa Vec` reserve overflow",
+                            null,
+                        );
+                    }
+                    break :blk_ov false;
+                } else try self.reallocSoaVecBuffer(vec_ptr, elem_struct_ty, @intCast(needed_u128), is_try);
+                if (!is_try) return .{ .scalar_u64 = 0 };
+                const out_ty = self.pool.unwrapUnderlyingType(inst.type_id);
+                const res_snap = try self.allocSnapshotForType(out_ty, true);
+                try self.writeSumDiscriminantAt(res_snap, out_ty, if (alloc_ok) 0 else 1);
+                self.sealSnapshot(res_snap);
+                return self.loadTypedSlotFromMemory(res_snap, out_ty);
+            },
+            .soa_vec_as_slice => {
+                if (args.len < 1) return .{ .sym_ptr = SymbolicPtr.NULL };
+                const vec_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const hdr = try self.readSoaVecHeader(vec_ptr);
+                const data_ptr = if (hdr.len == 0 or hdr.data_ptr.alloc_id.isNullOrNone())
+                    SymbolicPtr{ .alloc_id = self.dangling_empty_alloc, .byte_offset = 0 }
+                else
+                    hdr.data_ptr;
+                return self.makeSoaSliceSlot(inst.type_id, data_ptr, hdr.len, hdr.cap, 0);
+            },
+            .soa_vec_col_slice => {
+                if (args.len < 3) return .{ .sym_ptr = SymbolicPtr.NULL };
+                const vec_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const field_ord: u32 = @truncate(
+                    try self.readIntBitsFromSlot(self.call_stack.items[frame_idx].regs[args[1]], .u32_ty),
+                );
+                const vec_ref_ty = self.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[0])).type_id);
+                const vec_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(self.pool.getNode(vec_ref_ty).lhs));
+                const elem_struct_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(self.pool.getNode(vec_ty).lhs));
+                const hdr = try self.readSoaVecHeader(vec_ptr);
+                const col = computeSoaColumnOffsetAndType(
+                    self.pool,
+                    self.sym_table,
+                    elem_struct_ty,
+                    field_ord,
+                    hdr.cap,
+                    self.options.target_layout,
+                ) orelse return self.failWithTrap(
+                    error.OutOfBounds,
+                    .e0504_comptime_out_of_bounds,
+                    "invalid `#soa Vec` column ordinal at `comptime`",
+                    "invalid `#soa Vec` column",
+                    null,
+                );
+                const col_ptr = if (hdr.len == 0 or hdr.cap == 0 or hdr.data_ptr.alloc_id.isNullOrNone())
+                    SymbolicPtr{ .alloc_id = self.dangling_empty_alloc, .byte_offset = 0 }
+                else
+                    try self.advanceSymbolicPtr(hdr.data_ptr, col.column_byte_offset);
+                const res_ty = self.pool.unwrapUnderlyingType(inst.type_id);
+                const res_node = self.pool.getNode(res_ty);
+                const slice_ty = if (res_node.tag == .ref_ty or res_node.tag == .mut_ref_ty)
+                    self.pool.unwrapUnderlyingType(TypeId.fromInt(res_node.lhs))
+                else
+                    res_ty;
+                return self.makeFatSliceSlot(slice_ty, col_ptr, hdr.len);
+            },
+            .ctx_next_rng_seed => {
+                self.context_op_counter += 1;
+                var cur_seed: u64 = 0;
+                if (self.context_slots_init[2]) {
+                    const stored_ty = self.context_slot_types[2];
+                    const stored_repr = classifyValueRepr(
+                        self.pool,
+                        self.sym_table,
+                        stored_ty,
+                        self.options.target_layout,
+                    );
+                    if (stored_repr == .by_value_snapshot) {
+                        var buf8: [8]u8 = @splat(0);
+                        try self.readScalarBytes(self.context_slots[2].sym_ptr, 0, &buf8);
+                        cur_seed = std.mem.readInt(u64, &buf8, .little);
+                    } else {
+                        cur_seed = self.context_slots[2].scalar_u64;
+                    }
+                }
+                const base_seed: u64 = if (cur_seed == 0) 0x9E37_79B9_7F4A_7C15 else cur_seed;
+                const next_seed: u64 = base_seed +% 0x2D35_8DCC_AA6C_78A5;
+                self.context_slots[2] = .{ .scalar_u64 = next_seed };
+                self.context_slot_types[2] = .u64_ty;
+                self.context_slots_init[2] = true;
+                var mixed: u64 = next_seed;
+                mixed = (mixed ^ (mixed >> 30)) *% 0xBF58_476D_1CE4_E5B9;
+                mixed = (mixed ^ (mixed >> 27)) *% 0x94D0_49BB_1331_11EB;
+                mixed = mixed ^ (mixed >> 31);
+                return .{ .scalar_u64 = mixed };
+            },
+            .tls_scratch_ptr => {
+                self.context_op_counter += 1;
+                if (self.tls_scratch_alloc == .none) {
+                    self.tls_scratch_alloc = try self.allocMemory(64, 4, true, false, true, 0, self.active_inst_span);
+                }
+                return .{ .sym_ptr = .{ .alloc_id = self.tls_scratch_alloc, .byte_offset = 0 } };
+            },
+            .tls_alloc_state => {
+                self.context_op_counter += 1;
+                if (self.tls_alloc_state_alloc == .none) {
+                    self.tls_alloc_state_alloc = try self.allocMemory(
+                        256,
+                        4,
+                        true,
+                        false,
+                        true,
+                        0,
+                        self.active_inst_span,
+                    );
+                }
+                return .{ .sym_ptr = .{ .alloc_id = self.tls_alloc_state_alloc, .byte_offset = 0 } };
+            },
+            .fmt_write => {
+                self.context_op_counter += 1;
+                return self.evalFmtWriteInVm(body, frame_idx, args, inst.type_id);
+            },
+            .sys_mmap => {
+                if (!self.isStdCoreOrOracleFrame(frame_idx)) {
+                    return self.failWithTrap(
+                        error.ForbiddenOperation,
+                        .e0503_forbidden_comptime_operation,
+                        "`@sys_mmap` OS virtual memory syscall is forbidden at `comptime`",
+                        "`@sys_mmap` forbidden here",
+                        null,
+                    );
+                }
+                self.context_op_counter += 1;
+                if (args.len < 1) return .{ .sym_ptr = SymbolicPtr.NULL };
+                const len_u128 = try self.readIntBitsFromSlot(self.call_stack.items[frame_idx].regs[args[0]], .usize_ty);
+                if (len_u128 == 0 or len_u128 > self.options.mem_limit -| self.bytes_used) {
+                    return .{ .sym_ptr = SymbolicPtr.NULL };
+                }
+                const mapped_id = self.allocMemory(
+                    @intCast(len_u128),
+                    16,
+                    true,
+                    false,
+                    true,
+                    0,
+                    self.active_inst_span,
+                ) catch return .{ .sym_ptr = SymbolicPtr.NULL };
+                return .{ .sym_ptr = .{ .alloc_id = mapped_id, .byte_offset = 0 } };
+            },
+            .sys_munmap => {
+                if (!self.isStdCoreOrOracleFrame(frame_idx)) {
+                    return self.failWithTrap(
+                        error.ForbiddenOperation,
+                        .e0503_forbidden_comptime_operation,
+                        "`@sys_munmap` OS virtual memory syscall is forbidden at `comptime`",
+                        "`@sys_munmap` forbidden here",
+                        null,
+                    );
+                }
+                self.context_op_counter += 1;
+                if (args.len < 1) return .{ .scalar_u64 = 0 };
+                const ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                if (ptr.alloc_id.isNullOrNone()) return .{ .scalar_u64 = 0 };
+                if (ptr.alloc_id.domain() != .vm_alloc or ptr.byte_offset != 0) {
+                    return self.failWithTrap(
+                        error.InvalidPointer,
+                        .e0506_comptime_invalid_pointer,
+                        "invalid base pointer passed to `@sys_munmap`",
+                        "invalid `@sys_munmap` pointer",
+                        null,
+                    );
+                }
+                const slot_idx = ptr.alloc_id.payloadIndex();
+                if (slot_idx == 0 or slot_idx >= self.allocations.items.len or !self.allocations.items[slot_idx].is_live) {
+                    return self.failWithTrap(
+                        error.InvalidPointer,
+                        .e0506_comptime_invalid_pointer,
+                        "double-unmap or invalid region passed to `@sys_munmap`",
+                        "already unmapped pointer here",
+                        null,
+                    );
+                }
+                if (self.allocations.items[slot_idx].is_heap_alloc and self.live_heap_allocs > 0) {
+                    self.live_heap_allocs -= 1;
+                }
+                self.allocations.items[slot_idx].is_live = false;
+                return .{ .scalar_u64 = 0 };
+            },
+            .wasm_memory_grow => {
+                if (!self.isStdCoreOrOracleFrame(frame_idx)) {
+                    return self.failWithTrap(
+                        error.ForbiddenOperation,
+                        .e0503_forbidden_comptime_operation,
+                        "`@wasm_memory_grow` is forbidden during `comptime` evaluation",
+                        "`@wasm_memory_grow` forbidden here",
+                        null,
+                    );
+                }
+                self.context_op_counter += 1;
+                const fail_sentinel = std.math.maxInt(u128);
+                if (args.len < 2) return self.makeIntSlot(inst.type_id, fail_sentinel);
+                const pages_u128 = try self.readIntBitsFromSlot(
+                    self.call_stack.items[frame_idx].regs[args[1]],
+                    .usize_ty,
+                );
+                const bytes_u128 = pages_u128 *| 65536;
+                if (bytes_u128 > self.options.mem_limit -| self.bytes_used) {
+                    return self.makeIntSlot(inst.type_id, fail_sentinel);
+                }
+                if (bytes_u128 == 0) {
+                    const aligned_cur = std.mem.alignForward(u64, self.next_vaddr, 65536);
+                    return self.makeIntSlot(inst.type_id, aligned_cur >> 16);
+                }
+                const grow_id = self.allocMemory(
+                    @intCast(bytes_u128),
+                    16,
+                    true,
+                    false,
+                    true,
+                    0,
+                    self.active_inst_span,
+                ) catch return self.makeIntSlot(inst.type_id, fail_sentinel);
+                const vaddr = try self.ptrToVirtualAddr(.{ .alloc_id = grow_id, .byte_offset = 0 }, 16);
+                return self.makeIntSlot(inst.type_id, vaddr >> 16);
+            },
+            .simd_load_unaligned => {
+                if (args.len < 1) return .{ .sym_ptr = SymbolicPtr.NULL };
+                const src_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+                const dst_ty = self.pool.unwrapUnderlyingType(inst.type_id);
+                const lay = type_system.computeTypeLayoutWithPool(
+                    self.pool,
+                    self.sym_table,
+                    dst_ty,
+                    self.options.target_layout,
+                );
+                const byte_len: usize = @intCast(@min(lay.byte_size, 64));
+                var buf: [64]u8 = @splat(0);
+                try self.readScalarBytes(src_ptr, 0, buf[0..byte_len]);
+                const snap = try self.allocSnapshotForType(dst_ty, true);
+                try self.writeScalarBytes(snap, 0, buf[0..byte_len]);
+                self.sealSnapshot(snap);
+                return .{ .sym_ptr = snap };
+            },
+            .simd_and, .simd_or, .simd_xor => {
+                if (args.len < 2) return .{ .sym_ptr = SymbolicPtr.NULL };
+                const dst_ty = self.pool.unwrapUnderlyingType(inst.type_id);
+                const lay = type_system.computeTypeLayoutWithPool(
+                    self.pool,
+                    self.sym_table,
+                    dst_ty,
+                    self.options.target_layout,
+                );
+                const byte_len: usize = @intCast(@min(lay.byte_size, 64));
+                var lhs_buf: [64]u8 = @splat(0);
+                var rhs_buf: [64]u8 = @splat(0);
+                var out_buf: [64]u8 = @splat(0);
+                try self.readScalarBytes(self.call_stack.items[frame_idx].regs[args[0]].sym_ptr, 0, lhs_buf[0..byte_len]);
+                try self.readScalarBytes(self.call_stack.items[frame_idx].regs[args[1]].sym_ptr, 0, rhs_buf[0..byte_len]);
+                for (0..byte_len) |i| {
+                    out_buf[i] = switch (kind) {
+                        .simd_and => lhs_buf[i] & rhs_buf[i],
+                        .simd_or => lhs_buf[i] | rhs_buf[i],
+                        else => lhs_buf[i] ^ rhs_buf[i],
+                    };
+                }
+                const snap = try self.allocSnapshotForType(dst_ty, true);
+                try self.writeScalarBytes(snap, 0, out_buf[0..byte_len]);
+                self.sealSnapshot(snap);
+                return .{ .sym_ptr = snap };
+            },
+            .simd_eq, .simd_gt_s8, .simd_lt_s8 => {
+                if (args.len < 2) return .{ .sym_ptr = SymbolicPtr.NULL };
+                const dst_ty = self.pool.unwrapUnderlyingType(inst.type_id);
+                const lay = type_system.computeTypeLayoutWithPool(
+                    self.pool,
+                    self.sym_table,
+                    dst_ty,
+                    self.options.target_layout,
+                );
+                const byte_len: usize = @intCast(@min(lay.byte_size, 64));
+                var lhs_buf: [64]u8 = @splat(0);
+                var rhs_buf: [64]u8 = @splat(0);
+                var out_buf: [64]u8 = @splat(0);
+                try self.readScalarBytes(self.call_stack.items[frame_idx].regs[args[0]].sym_ptr, 0, lhs_buf[0..byte_len]);
+                try self.readScalarBytes(self.call_stack.items[frame_idx].regs[args[1]].sym_ptr, 0, rhs_buf[0..byte_len]);
+                for (0..byte_len) |i| {
+                    const lhs_s8: i8 = @bitCast(lhs_buf[i]);
+                    const rhs_s8: i8 = @bitCast(rhs_buf[i]);
+                    const cond = switch (kind) {
+                        .simd_eq => lhs_buf[i] == rhs_buf[i],
+                        .simd_gt_s8 => lhs_s8 > rhs_s8,
+                        else => lhs_s8 < rhs_s8,
+                    };
+                    out_buf[i] = if (cond) 0xFF else 0x00;
+                }
+                const snap = try self.allocSnapshotForType(dst_ty, true);
+                try self.writeScalarBytes(snap, 0, out_buf[0..byte_len]);
+                self.sealSnapshot(snap);
+                return .{ .sym_ptr = snap };
+            },
+            .simd_swizzle => {
+                if (args.len < 2) return .{ .sym_ptr = SymbolicPtr.NULL };
+                const dst_ty = self.pool.unwrapUnderlyingType(inst.type_id);
+                var tbl_buf: [16]u8 = @splat(0);
+                var idx_buf: [16]u8 = @splat(0);
+                var out_buf: [16]u8 = @splat(0);
+                try self.readScalarBytes(self.call_stack.items[frame_idx].regs[args[0]].sym_ptr, 0, &tbl_buf);
+                try self.readScalarBytes(self.call_stack.items[frame_idx].regs[args[1]].sym_ptr, 0, &idx_buf);
+                for (0..16) |i| {
+                    out_buf[i] = if (idx_buf[i] < 16) tbl_buf[idx_buf[i]] else 0;
+                }
+                const snap = try self.allocSnapshotForType(dst_ty, true);
+                try self.writeScalarBytes(snap, 0, &out_buf);
+                self.sealSnapshot(snap);
+                return .{ .sym_ptr = snap };
+            },
+            .simd_shl_u8, .simd_shr_u8 => {
+                if (args.len < 2) return .{ .sym_ptr = SymbolicPtr.NULL };
+                const dst_ty = self.pool.unwrapUnderlyingType(inst.type_id);
+                const lay = type_system.computeTypeLayoutWithPool(
+                    self.pool,
+                    self.sym_table,
+                    dst_ty,
+                    self.options.target_layout,
+                );
+                const byte_len: usize = @intCast(@min(lay.byte_size, 64));
+                const shift_amt = try self.readIntBitsFromSlot(
+                    self.call_stack.items[frame_idx].regs[args[1]],
+                    body.getInst(MirValueId.fromInt(args[1])).type_id,
+                );
+                var src_buf: [64]u8 = @splat(0);
+                var out_buf: [64]u8 = @splat(0);
+                try self.readScalarBytes(self.call_stack.items[frame_idx].regs[args[0]].sym_ptr, 0, src_buf[0..byte_len]);
+                if (shift_amt < 8) {
+                    const sh3: u3 = @intCast(shift_amt);
+                    for (0..byte_len) |i| {
+                        out_buf[i] = if (kind == .simd_shl_u8) (src_buf[i] << sh3) else (src_buf[i] >> sh3);
+                    }
+                }
+                const snap = try self.allocSnapshotForType(dst_ty, true);
+                try self.writeScalarBytes(snap, 0, out_buf[0..byte_len]);
+                self.sealSnapshot(snap);
+                return .{ .sym_ptr = snap };
+            },
+            .simd_bitmask => {
+                if (args.len < 1) return .{ .scalar_u64 = 0 };
+                const vec_ty = self.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[0])).type_id);
+                const lay = type_system.computeTypeLayoutWithPool(
+                    self.pool,
+                    self.sym_table,
+                    vec_ty,
+                    self.options.target_layout,
+                );
+                const byte_len: usize = @intCast(@min(lay.byte_size, 32));
+                var vec_buf: [32]u8 = @splat(0);
+                try self.readScalarBytes(self.call_stack.items[frame_idx].regs[args[0]].sym_ptr, 0, vec_buf[0..byte_len]);
+                var mask: u32 = 0;
+                for (0..byte_len) |i| {
+                    if ((vec_buf[i] & 0x80) != 0) {
+                        mask |= (@as(u32, 1) << @intCast(i));
+                    }
+                }
+                return .{ .scalar_u64 = mask };
+            },
         }
+    }
+
+    // ---------- STD-01 SoA Vec, Ptr Tagging & @fmt_write ----------
+
+    /// Returns `true` when `frame_idx` executes inside `PackageId.std_core` or `is_oracle_runtime_mode`.
+    fn isStdCoreOrOracleFrame(self: *const MirVm, frame_idx: usize) bool {
+        if (self.options.is_oracle_runtime_mode) return true;
+        if (frame_idx >= self.call_stack.items.len) return false;
+        const body = self.call_stack.items[frame_idx].body;
+        const eff_sym_table = self.options.sym_table orelse self.sym_table;
+        if (eff_sym_table.getFilePackageId(body.file_id) == .std_core) return true;
+        if (!body.symbol_index.isNone() and body.symbol_index.asInt() < eff_sym_table.symbols.items.len) {
+            const sym = eff_sym_table.getSymbol(body.symbol_index).*;
+            if (eff_sym_table.getFilePackageId(sym.decl_span.file_id) == .std_core) return true;
+        }
+        return false;
+    }
+
+    /// Maps `sym_ptr` to a deterministic aligned virtual integer address for `.std_core` / oracle pointer tagging.
+    fn ptrToVirtualAddr(self: *MirVm, sym_ptr: SymbolicPtr, min_align_log2: u8) VmEvalError!u64 {
+        if (sym_ptr.alloc_id.isNullOrNone()) return 0;
+        if (sym_ptr.alloc_id == self.dangling_empty_alloc) {
+            return if (sym_ptr.byte_offset > 0)
+                sym_ptr.byte_offset
+            else
+                (@as(u64, 1) << @intCast(@min(min_align_log2, 16)));
+        }
+        if (self.vaddr_by_alloc.get(sym_ptr.alloc_id.asInt())) |existing_base| {
+            return existing_base + sym_ptr.byte_offset;
+        }
+        var byte_len: u64 = 16;
+        var align_log2: u8 = @max(min_align_log2, 4);
+        switch (sym_ptr.alloc_id.domain()) {
+            .vm_alloc => {
+                const idx = sym_ptr.alloc_id.payloadIndex();
+                if (idx < self.allocations.items.len) {
+                    byte_len = self.allocations.items[idx].bytes.len;
+                    align_log2 = @max(align_log2, self.allocations.items[idx].align_log2);
+                }
+            },
+            .rodata_blob => {
+                if (self.rodata_pool.getBlob(sym_ptr.alloc_id.payloadIndex())) |blob| {
+                    byte_len = blob.bytes.len;
+                    align_log2 = @max(align_log2, blob.align_log2);
+                }
+            },
+            .string_lit => {
+                byte_len = self.interner.get(SymbolId.fromInt(sym_ptr.alloc_id.payloadIndex())).len + 1;
+            },
+            .fn_or_none => {},
+        }
+        const align_bytes: u64 = @as(u64, 1) << @intCast(@min(align_log2, 20));
+        const base_vaddr = std.mem.alignForward(u64, self.next_vaddr, align_bytes);
+        const span_bytes = @max(byte_len + 1, 16);
+        self.vaddr_by_alloc.put(self.allocator, sym_ptr.alloc_id.asInt(), base_vaddr) catch return error.OutOfMemory;
+        self.vaddr_spans.append(self.allocator, .{
+            .base_vaddr = base_vaddr,
+            .span_bytes = span_bytes,
+            .alloc_id = sym_ptr.alloc_id,
+        }) catch return error.OutOfMemory;
+        self.next_vaddr = std.mem.alignForward(u64, base_vaddr + span_bytes + 48, 64);
+        return base_vaddr + sym_ptr.byte_offset;
+    }
+
+    /// Resolves a `.std_core` / oracle virtual integer address back into its owning `SymbolicPtr`.
+    fn virtualAddrToPtr(self: *MirVm, raw_addr: u64) VmEvalError!SymbolicPtr {
+        const masked = if (self.options.target_layout.ptr_byte_size == 4)
+            raw_addr & 0xFFFF_FFFF
+        else
+            raw_addr;
+        if (masked == 0) return SymbolicPtr.NULL;
+        if (masked < 0x0010_0000) {
+            return .{ .alloc_id = self.dangling_empty_alloc, .byte_offset = @intCast(masked) };
+        }
+        const spans = self.vaddr_spans.items;
+        var low: usize = 0;
+        var high: usize = spans.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            if (spans[mid].base_vaddr <= masked) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        if (low > 0) {
+            const entry = spans[low - 1];
+            const delta = masked - entry.base_vaddr;
+            if (delta <= entry.span_bytes and delta <= std.math.maxInt(u32)) {
+                return .{ .alloc_id = entry.alloc_id, .byte_offset = @intCast(delta) };
+            }
+        }
+        return self.failWithTrap(
+            error.ForbiddenOperation,
+            .e0503_forbidden_comptime_operation,
+            "cannot forge pointer from unmapped integer address",
+            "unmapped integer-to-pointer cast here",
+            null,
+        );
+    }
+
+    /// Extracts the raw tagged `usize` word out of an `AllocatorHandle` / `u64` / pointer `RegSlot`.
+    fn extractAllocRawFromSlot(
+        self: *MirVm,
+        frame_idx: usize,
+        alloc_ty: TypeId,
+        alloc_slot: RegSlot,
+    ) VmEvalError!u64 {
+        const unwrapped = self.pool.unwrapUnderlyingType(alloc_ty);
+        const repr = classifyValueRepr(self.pool, self.sym_table, unwrapped, self.options.target_layout);
+        return switch (repr) {
+            .inline_scalar => alloc_slot.scalar_u64,
+            .inline_ptr => blk_ptr: {
+                const raw_vaddr = if (self.isStdCoreOrOracleFrame(frame_idx))
+                    try self.ptrToVirtualAddr(alloc_slot.sym_ptr, 4)
+                else
+                    0;
+                if (!unwrapped.isPrimitiveOrSentinel()) {
+                    const node = self.pool.getNode(unwrapped);
+                    if ((node.tag == .ref_ty or node.tag == .mut_ref_ty or node.tag == .raw_ptr_ty) and
+                        self.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs)) != .u8_ty and
+                        !alloc_slot.sym_ptr.alloc_id.isNullOrNone())
+                    {
+                        break :blk_ptr raw_vaddr | 1;
+                    }
+                }
+                break :blk_ptr raw_vaddr;
+            },
+            .by_value_snapshot => blk_snap: {
+                const lay = type_system.computeTypeLayoutWithPool(
+                    self.pool,
+                    self.sym_table,
+                    unwrapped,
+                    self.options.target_layout,
+                );
+                if (lay.byte_size >= self.options.target_layout.ptr_byte_size) {
+                    break :blk_snap self.readUsizeAt(alloc_slot.sym_ptr) catch 0;
+                }
+                break :blk_snap 0;
+            },
+        };
+    }
+
+    /// Reads `{ data_ptr, len, cap, alloc_raw }` from a `#soa Vec[S]` header at `vec_ptr`.
+    fn readSoaVecHeader(
+        self: *MirVm,
+        vec_ptr: SymbolicPtr,
+    ) VmEvalError!struct { data_ptr: SymbolicPtr, len: u32, cap: u32, alloc_raw: u64 } {
+        const ptr_width: u32 = self.options.target_layout.ptr_byte_size;
+        const ptr_align = self.options.target_layout.ptr_align_log2;
+        _ = try self.validateAccess(vec_ptr, ptr_width * 2 + 8, ptr_align, false);
+
+        var data_ptr = SymbolicPtr.NULL;
+        if (vec_ptr.alloc_id.domain() == .vm_alloc) {
+            const rec = &self.allocations.items[vec_ptr.alloc_id.payloadIndex()];
+            if (findExactProvenance(rec, vec_ptr.byte_offset) != null) {
+                data_ptr = try self.readPointerAt(vec_ptr, ptr_align);
+            }
+        } else {
+            data_ptr = self.readPointerAt(vec_ptr, ptr_align) catch SymbolicPtr.NULL;
+        }
+        var len_buf: [4]u8 = @splat(0);
+        var cap_buf: [4]u8 = @splat(0);
+        try self.readScalarBytes(try self.advanceSymbolicPtr(vec_ptr, ptr_width), 2, &len_buf);
+        try self.readScalarBytes(try self.advanceSymbolicPtr(vec_ptr, ptr_width + 4), 2, &cap_buf);
+        const alloc_raw = self.readUsizeAt(try self.advanceSymbolicPtr(vec_ptr, ptr_width + 8)) catch 0;
+        return .{
+            .data_ptr = data_ptr,
+            .len = std.mem.readInt(u32, &len_buf, .little),
+            .cap = std.mem.readInt(u32, &cap_buf, .little),
+            .alloc_raw = alloc_raw,
+        };
+    }
+
+    /// Writes `{ data_ptr, len, cap, alloc_raw }` into a `#soa Vec[S]` header at `vec_ptr`.
+    fn writeSoaVecHeader(
+        self: *MirVm,
+        vec_ptr: SymbolicPtr,
+        data_ptr: SymbolicPtr,
+        len: u32,
+        cap: u32,
+        alloc_raw: u64,
+    ) VmEvalError!void {
+        const ptr_width: u32 = self.options.target_layout.ptr_byte_size;
+        const ptr_align = self.options.target_layout.ptr_align_log2;
+        try self.writePointerAt(vec_ptr, ptr_align, data_ptr);
+        var len_buf: [4]u8 = undefined;
+        var cap_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len_buf, len, .little);
+        std.mem.writeInt(u32, &cap_buf, cap, .little);
+        try self.writeScalarBytes(try self.advanceSymbolicPtr(vec_ptr, ptr_width), 2, &len_buf);
+        try self.writeScalarBytes(try self.advanceSymbolicPtr(vec_ptr, ptr_width + 4), 2, &cap_buf);
+        try self.writeUsizeAt(try self.advanceSymbolicPtr(vec_ptr, ptr_width + 8), alloc_raw);
+    }
+
+    /// Computes the aligned total byte capacity and power-of-two alignment of a `#soa Vec[S]` slab for `cap` elements.
+    fn computeSoaSlabLayout(
+        self: *const MirVm,
+        elem_struct_ty: TypeId,
+        cap: u32,
+    ) struct { total_bytes: u64, align_bytes: u64, align_log2: u8 } {
+        const elem_lay = type_system.computeTypeLayoutWithPool(
+            self.pool,
+            self.sym_table,
+            elem_struct_ty,
+            self.options.target_layout,
+        );
+        const align_log2: u8 = @max(@max(elem_lay.align_log2, self.options.target_layout.simd_align_log2), 4);
+        const align_bytes: u64 = @as(u64, 1) << @intCast(align_log2);
+        if (cap == 0) {
+            return .{ .total_bytes = 0, .align_bytes = align_bytes, .align_log2 = align_log2 };
+        }
+        var max_end_byte: u64 = 0;
+        var sz_col: u32 = 0;
+        while (true) : (sz_col += 1) {
+            const col_info = type_system.computeSoaColumnInfoReadOnly(
+                self.pool,
+                self.sym_table,
+                elem_struct_ty,
+                cap,
+                sz_col,
+                self.options.target_layout,
+            ) orelse break;
+            const col_lay = type_system.computeTypeLayoutWithPool(
+                self.pool,
+                self.sym_table,
+                col_info.field_ty,
+                self.options.target_layout,
+            );
+            const col_end = col_info.byte_offset + (@as(u64, cap) * col_lay.byte_size);
+            if (col_end > max_end_byte) max_end_byte = col_end;
+        }
+        return .{
+            .total_bytes = max_end_byte,
+            .align_bytes = align_bytes,
+            .align_log2 = align_log2,
+        };
+    }
+
+    /// Resolves `AllocatorHandle.alloc` and `AllocatorHandle.dealloc` `MirBody` pointers in `MirVm` when `cx.mem` is loaded.
+    fn resolveAllocatorHandleBodiesInVm(
+        self: *MirVm,
+    ) VmEvalError!?struct {
+        alloc_body: *const MirBody,
+        dealloc_body: *const MirBody,
+        handle_ty: TypeId,
+        layout_ty: TypeId,
+        ptr_ty: TypeId,
+        res_ty: TypeId,
+    } {
+        var alloc_fn_idx: ?u32 = null;
+        var dealloc_fn_idx: ?u32 = null;
+        for (self.sym_table.symbols.items) |cand_sym| {
+            if (cand_sym.kind == .struct_sym and
+                std.mem.eql(u8, cand_sym.name_text, "AllocatorHandle") and
+                !cand_sym.target_scope.isNone())
+            {
+                for (self.sym_table.getScopeMembers(cand_sym.target_scope)) |mem_idx| {
+                    const mem_sym = self.sym_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind != .fn_sym) continue;
+                    if (std.mem.eql(u8, mem_sym.name_text, "alloc")) {
+                        alloc_fn_idx = self.resolveOrLoadCallable(mem_sym.def_id, mem_idx) catch null;
+                    } else if (std.mem.eql(u8, mem_sym.name_text, "dealloc")) {
+                        dealloc_fn_idx = self.resolveOrLoadCallable(mem_sym.def_id, mem_idx) catch null;
+                    }
+                }
+                break;
+            }
+        }
+        const a_idx = alloc_fn_idx orelse return null;
+        const d_idx = dealloc_fn_idx orelse return null;
+        if (a_idx >= self.callables.items.len or d_idx >= self.callables.items.len) return null;
+        const alloc_body = self.callables.items[a_idx].body orelse return null;
+        const dealloc_body = self.callables.items[d_idx].body orelse return null;
+        if (alloc_body.param_count != 2 or alloc_body.locals.items.len < 3) return null;
+        if (dealloc_body.param_count != 3 or dealloc_body.locals.items.len < 4) return null;
+        return .{
+            .alloc_body = alloc_body,
+            .dealloc_body = dealloc_body,
+            .handle_ty = self.pool.unwrapUnderlyingType(alloc_body.locals.items[1].type_id),
+            .layout_ty = self.pool.unwrapUnderlyingType(alloc_body.locals.items[2].type_id),
+            .ptr_ty = self.pool.unwrapUnderlyingType(dealloc_body.locals.items[2].type_id),
+            .res_ty = self.pool.unwrapUnderlyingType(alloc_body.ret_ty),
+        };
+    }
+
+    /// Invokes `AllocatorHandle.dealloc` in `MirVm` when `cx.mem.AllocatorHandle` is available, returning `true` if handled.
+    fn tryDeallocSoaViaAllocatorHandle(
+        self: *MirVm,
+        alloc_raw: u64,
+        data_ptr: SymbolicPtr,
+        elem_struct_ty: TypeId,
+        old_cap: u32,
+    ) VmEvalError!bool {
+        const ah = (try self.resolveAllocatorHandleBodiesInVm()) orelse return false;
+        const old_lay = self.computeSoaSlabLayout(elem_struct_ty, old_cap);
+        if (old_lay.total_bytes == 0) return true;
+        const ptr_width: u32 = self.options.target_layout.ptr_byte_size;
+        const handle_snap = try self.allocSnapshotForType(ah.handle_ty, false);
+        try self.writeUsizeAt(handle_snap, alloc_raw);
+        self.sealSnapshot(handle_snap);
+        const handle_slot = try self.loadTypedSlotFromMemory(handle_snap, ah.handle_ty);
+
+        const layout_snap = try self.allocSnapshotForType(ah.layout_ty, false);
+        try self.writeUsizeAt(layout_snap, old_lay.total_bytes);
+        try self.writeUsizeAt(try self.advanceSymbolicPtr(layout_snap, ptr_width), old_lay.align_bytes);
+        self.sealSnapshot(layout_snap);
+        const layout_slot = try self.loadTypedSlotFromMemory(layout_snap, ah.layout_ty);
+
+        const ptr_slot = RegSlot{ .sym_ptr = data_ptr };
+        _ = try self.invokeBodyInternal(
+            ah.dealloc_body,
+            &[3]RegSlot{ handle_slot, ptr_slot, layout_slot },
+            &.{},
+            self.active_inst_span,
+        );
+        return true;
+    }
+
+    /// Grows `vec_ptr`'s columnar slab to at least `min_cap`, copying `0..len` across all columns.
+    fn reallocSoaVecBuffer(
+        self: *MirVm,
+        vec_ptr: SymbolicPtr,
+        elem_struct_ty: TypeId,
+        min_cap: u64,
+        is_try: bool,
+    ) VmEvalError!bool {
+        const hdr = try self.readSoaVecHeader(vec_ptr);
+        if (min_cap <= hdr.cap) return true;
+        if (min_cap > std.math.maxInt(u32)) {
+            if (is_try) return false;
+            return self.failWithTrap(
+                error.ResourceLimitExceeded,
+                .e0508_comptime_resource_limit_exceeded,
+                "`#soa Vec` capacity exceeded `u32.MAX`",
+                "`#soa Vec` capacity overflow",
+                null,
+            );
+        }
+        const doubled: u64 = @max(@as(u64, hdr.cap) * 2, 8);
+        const target_u64: u64 = @min(@max(doubled, min_cap), std.math.maxInt(u32));
+        const new_cap: u32 = @intCast(target_u64);
+        const new_slab = self.computeSoaSlabLayout(elem_struct_ty, new_cap);
+        var used_ah_alloc = false;
+        const new_ptr: SymbolicPtr = blk_alloc: {
+            if (try self.resolveAllocatorHandleBodiesInVm()) |ah| {
+                used_ah_alloc = true;
+                const ptr_width: u32 = self.options.target_layout.ptr_byte_size;
+                const handle_snap = try self.allocSnapshotForType(ah.handle_ty, false);
+                try self.writeUsizeAt(handle_snap, hdr.alloc_raw);
+                self.sealSnapshot(handle_snap);
+                const handle_slot = try self.loadTypedSlotFromMemory(handle_snap, ah.handle_ty);
+
+                const layout_snap = try self.allocSnapshotForType(ah.layout_ty, false);
+                try self.writeUsizeAt(layout_snap, new_slab.total_bytes);
+                try self.writeUsizeAt(try self.advanceSymbolicPtr(layout_snap, ptr_width), new_slab.align_bytes);
+                self.sealSnapshot(layout_snap);
+                const layout_slot = try self.loadTypedSlotFromMemory(layout_snap, ah.layout_ty);
+
+                const res_slot = try self.invokeBodyInternal(
+                    ah.alloc_body,
+                    &[2]RegSlot{ handle_slot, layout_slot },
+                    &.{},
+                    self.active_inst_span,
+                );
+                const res_snap = try self.allocSnapshotForType(ah.res_ty, false);
+                try self.storeTypedSlotToMemory(res_snap, ah.res_ty, res_slot);
+                const disc = try self.readSumDiscriminantAt(res_snap, ah.res_ty);
+                if (disc != 0) {
+                    if (is_try) return false;
+                    return self.failWithTrap(
+                        error.ResourceLimitExceeded,
+                        .e0508_comptime_resource_limit_exceeded,
+                        "`#soa Vec` allocation failed with `OutOfMemory`",
+                        "`#soa Vec` out of memory",
+                        null,
+                    );
+                }
+                const sum_info = computeSumTypeTagAndPayloadLayout(
+                    self.pool,
+                    self.sym_table,
+                    ah.res_ty,
+                    self.options.target_layout,
+                );
+                const ok_ptr = try self.readPointerAt(
+                    try self.advanceSymbolicPtr(res_snap, sum_info.payload_offset),
+                    self.options.target_layout.ptr_align_log2,
+                );
+                if (new_slab.total_bytes > 0) {
+                    var zbuf: [64]u8 = @splat(0);
+                    var zoff: u64 = 0;
+                    while (zoff < new_slab.total_bytes) {
+                        const chunk: usize = @intCast(@min(new_slab.total_bytes - zoff, zbuf.len));
+                        try self.writeScalarBytes(try self.advanceSymbolicPtr(ok_ptr, zoff), 0, zbuf[0..chunk]);
+                        zoff += chunk;
+                    }
+                }
+                if (ok_ptr.alloc_id.domain() == .vm_alloc) {
+                    const a_idx = ok_ptr.alloc_id.payloadIndex();
+                    if (a_idx > 0 and a_idx < self.allocations.items.len) {
+                        self.allocations.items[a_idx].soa_elem_capacity = new_cap;
+                    }
+                }
+                break :blk_alloc ok_ptr;
+            }
+            const total_bytes: u64 = (new_slab.total_bytes + 15) & ~@as(u64, 15);
+            if (total_bytes > self.options.mem_limit -| self.bytes_used) {
+                if (is_try) return false;
+            }
+            const is_arena_backed = (hdr.alloc_raw & 0x3) == 1;
+            if (is_arena_backed) {
+                const aid = self.allocMemory(total_bytes, new_slab.align_log2, true, false, true, new_cap, self.active_inst_span) catch |err| {
+                    if (is_try and err == error.ResourceLimitExceeded) return false;
+                    return err;
+                };
+                break :blk_alloc .{ .alloc_id = aid, .byte_offset = 0 };
+            }
+            const hp = self.allocHeapMemory(total_bytes, new_slab.align_log2, self.active_inst_span) catch |err| {
+                if (is_try and err == error.ResourceLimitExceeded) return false;
+                return err;
+            };
+            self.allocations.items[hp.alloc_id.payloadIndex()].soa_elem_capacity = new_cap;
+            break :blk_alloc hp;
+        };
+
+        if (hdr.len > 0 and hdr.cap > 0 and !hdr.data_ptr.alloc_id.isNullOrNone()) {
+            var col_ord: u32 = 0;
+            while (true) : (col_ord += 1) {
+                const old_col = computeSoaColumnOffsetAndType(
+                    self.pool,
+                    self.sym_table,
+                    elem_struct_ty,
+                    col_ord,
+                    hdr.cap,
+                    self.options.target_layout,
+                ) orelse break;
+                const new_col = computeSoaColumnOffsetAndType(
+                    self.pool,
+                    self.sym_table,
+                    elem_struct_ty,
+                    col_ord,
+                    new_cap,
+                    self.options.target_layout,
+                ) orelse break;
+                const field_lay = type_system.computeTypeLayoutWithPool(
+                    self.pool,
+                    self.sym_table,
+                    old_col.field_ty,
+                    self.options.target_layout,
+                );
+                const copy_bytes = try self.mulOffsetChecked(hdr.len, field_lay.byte_size);
+                if (copy_bytes > 0) {
+                    try self.copyMemoryRange(
+                        try self.advanceSymbolicPtr(new_ptr, new_col.column_byte_offset),
+                        try self.advanceSymbolicPtr(hdr.data_ptr, old_col.column_byte_offset),
+                        copy_bytes,
+                        field_lay.align_log2,
+                    );
+                }
+            }
+        }
+
+        if (!hdr.data_ptr.alloc_id.isNullOrNone() and hdr.data_ptr.alloc_id.domain() == .vm_alloc) {
+            const old_idx = hdr.data_ptr.alloc_id.payloadIndex();
+            if (old_idx > 0 and old_idx < self.allocations.items.len and self.allocations.items[old_idx].is_live) {
+                if (used_ah_alloc) {
+                    if (hdr.cap > 0 and (hdr.alloc_raw & 0x7) == 0) {
+                        _ = try self.tryDeallocSoaViaAllocatorHandle(hdr.alloc_raw, hdr.data_ptr, elem_struct_ty, hdr.cap);
+                    }
+                } else if (self.allocations.items[old_idx].is_heap_alloc) {
+                    try self.freeHeapMemory(hdr.data_ptr);
+                } else {
+                    self.allocations.items[old_idx].is_live = false;
+                }
+            }
+        }
+
+        try self.writeSoaVecHeader(vec_ptr, new_ptr, hdr.len, new_cap, hdr.alloc_raw);
+        return true;
+    }
+
+    /// Looks up a 3-parameter `Display.fmt` or `Debug.fmt_debug` callable on nominal type `ty`.
+    fn lookupFmtTraitCallable(self: *MirVm, ty: TypeId, method_name: []const u8) VmEvalError!?u32 {
+        const ty_node = self.pool.getNode(ty);
+        if (ty_node.tag != .struct_ty and ty_node.tag != .enum_ty and ty_node.tag != .union_ty) return null;
+        const sym_idx = SymbolIndex.fromInt(ty_node.rhs);
+        if (!sym_idx.isNone() and sym_idx.asInt() < self.sym_table.symbols.items.len) {
+            const nom_sym = self.sym_table.getSymbol(sym_idx).*;
+            if (!nom_sym.target_scope.isNone()) {
+                for (self.sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
+                    const mem_sym = self.sym_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind == .fn_sym and std.mem.eql(u8, mem_sym.name_text, method_name)) {
+                        if (try self.tryResolveOrLoadCallable(mem_sym.def_id, mem_idx)) |found_idx| {
+                            if (self.callables.items[found_idx].body) |cand_body| {
+                                if (cand_body.param_count == 3) return found_idx;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Streams `FmtArgs` pieces and formatted arguments through `FmtWriter.write_fn` (`@fmt_write`).
+    fn evalFmtWriteInVm(
+        self: *MirVm,
+        body: *const MirBody,
+        frame_idx: usize,
+        args: []const u32,
+        ret_raw_ty: TypeId,
+    ) VmEvalError!RegSlot {
+        const res_ty = self.pool.unwrapUnderlyingType(ret_raw_ty);
+        const makeOk = struct {
+            /// Constructs a `unit!FmtError` `.Ok(())` `RegSlot` for `@fmt_write` completion.
+            fn build(vm: *MirVm, r_ty: TypeId) VmEvalError!RegSlot {
+                const ok_snap = try vm.allocSnapshotForType(r_ty, true);
+                try vm.writeSumDiscriminantAt(ok_snap, r_ty, 0);
+                vm.sealSnapshot(ok_snap);
+                return vm.loadTypedSlotFromMemory(ok_snap, r_ty);
+            }
+        }.build;
+        if (args.len < 2) return makeOk(self, res_ty);
+
+        const ptr_width: u32 = self.options.target_layout.ptr_byte_size;
+        const ptr_align = self.options.target_layout.ptr_align_log2;
+        const str_stride: u32 = ptr_width * 2;
+        const arg_stride: u32 = ptr_width * 2 + 8;
+
+        const out_ptr = self.call_stack.items[frame_idx].regs[args[0]].sym_ptr;
+        const fmt_args_slot = self.call_stack.items[frame_idx].regs[args[1]];
+        const writer_ref_ty = self.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[0])).type_id);
+        const writer_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(self.pool.getNode(writer_ref_ty).lhs));
+        const ctx_off: u32 = @intCast(type_system.computeStructFieldOffset(
+            self.pool,
+            self.sym_table,
+            writer_ty,
+            0,
+            self.options.target_layout,
+        ) orelse 0);
+        const wfn_off: u32 = @intCast(type_system.computeStructFieldOffset(
+            self.pool,
+            self.sym_table,
+            writer_ty,
+            1,
+            self.options.target_layout,
+        ) orelse ptr_width);
+        const ctx_ptr = try self.readPointerAt(try self.advanceSymbolicPtr(out_ptr, ctx_off), ptr_align);
+        const write_fn_ptr = try self.readPointerAt(try self.advanceSymbolicPtr(out_ptr, wfn_off), ptr_align);
+        if (!write_fn_ptr.alloc_id.isFnAddr()) {
+            return self.failWithTrap(
+                error.InvalidPointer,
+                .e0506_comptime_invalid_pointer,
+                "`FmtWriter.write_fn` is not a valid function pointer",
+                "invalid `FmtWriter.write_fn` here",
+                null,
+            );
+        }
+        const write_fn_idx = write_fn_ptr.alloc_id.payloadIndex();
+        if (write_fn_idx >= self.callables.items.len or self.callables.items[write_fn_idx].body == null) {
+            return error.UnresolvedCallee;
+        }
+        const write_body = self.callables.items[write_fn_idx].body.?;
+
+        const writeChunk = struct {
+            /// Invokes `FmtWriter.write_fn` on `chunk` and returns `.Some(err_slot)` on early error exit.
+            fn emit(
+                vm: *MirVm,
+                f_idx: usize,
+                w_body: *const MirBody,
+                c_ptr: SymbolicPtr,
+                chunk: []const u8,
+                r_ty: TypeId,
+            ) VmEvalError!?RegSlot {
+                if (chunk.len == 0) return null;
+                const chunk_aid = try vm.allocMemory(chunk.len, 0, false, true, true, 0, vm.active_inst_span);
+                vm.call_stack.items[f_idx].extra_stack_allocs.append(vm.allocator, chunk_aid) catch
+                    return error.OutOfMemory;
+                @memcpy(vm.allocations.items[chunk_aid.payloadIndex()].bytes, chunk);
+                const param2_ty = if (w_body.locals.items.len >= 3)
+                    vm.pool.unwrapUnderlyingType(w_body.locals.items[2].type_id)
+                else
+                    TypeId.str_ty;
+                const param2_node = vm.pool.getNode(param2_ty);
+                const slice_ty = if (param2_node.tag == .ref_ty or param2_node.tag == .mut_ref_ty)
+                    vm.pool.unwrapUnderlyingType(TypeId.fromInt(param2_node.lhs))
+                else
+                    param2_ty;
+                const slice_slot = try vm.makeFatSliceSlot(
+                    slice_ty,
+                    .{ .alloc_id = chunk_aid, .byte_offset = 0 },
+                    chunk.len,
+                );
+                const call_ret = try vm.invokeBodyInternal(
+                    w_body,
+                    &[2]RegSlot{ .{ .sym_ptr = c_ptr }, slice_slot },
+                    &.{},
+                    vm.active_inst_span,
+                );
+                if (try vm.isResultSlotErr(call_ret, r_ty)) return call_ret;
+                return null;
+            }
+        }.emit;
+
+        const pieces_fat = try self.readFatSliceParts(fmt_args_slot.sym_ptr);
+        const args_fat = try self.readFatSliceParts(
+            try self.advanceSymbolicPtr(fmt_args_slot.sym_ptr, ptr_width * 2),
+        );
+
+        var piece_i: u64 = 0;
+        while (piece_i < pieces_fat.elem_len) : (piece_i += 1) {
+            try self.tickStepBudget();
+            const piece_ptr = try self.advanceSymbolicPtr(
+                pieces_fat.data_ptr,
+                try self.mulOffsetChecked(piece_i, str_stride),
+            );
+            const piece_slot = try self.loadTypedSlotFromMemory(piece_ptr, .str_ty);
+            const piece_bytes = try self.readStrSlotBytes(piece_slot);
+            defer self.allocator.free(piece_bytes);
+            if (try writeChunk(self, frame_idx, write_body, ctx_ptr, piece_bytes, res_ty)) |err_slot| {
+                return err_slot;
+            }
+
+            if (piece_i < args_fat.elem_len) {
+                const arg_entry_ptr = try self.advanceSymbolicPtr(
+                    args_fat.data_ptr,
+                    try self.mulOffsetChecked(piece_i, arg_stride),
+                );
+                var data_ptr = try self.readPointerAt(arg_entry_ptr, ptr_align);
+                const hole_ty_u64 = try self.readUsizeAt(try self.advanceSymbolicPtr(arg_entry_ptr, ptr_width));
+                var spec_bytes: [8]u8 = undefined;
+                try self.readScalarBytes(
+                    try self.advanceSymbolicPtr(arg_entry_ptr, ptr_width * 2),
+                    2,
+                    &spec_bytes,
+                );
+                const spec_lo = std.mem.readInt(u32, spec_bytes[0..4], .little);
+                const spec_hi = std.mem.readInt(u32, spec_bytes[4..8], .little);
+                var hole_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(@truncate(hole_ty_u64)));
+                const raw_verb: u4 = @intCast((spec_lo >> 27) & 0xF);
+                const is_debug_eq = ((spec_lo >> 31) & 0x1) != 0;
+                const verb: u4 = if (raw_verb == 0 and is_debug_eq) 1 else raw_verb;
+
+                if (verb != 9) {
+                    var peel_k: u32 = 0;
+                    while (peel_k < 16) : (peel_k += 1) {
+                        const hn = self.pool.getNode(hole_ty);
+                        if (hn.tag == .ref_ty or hn.tag == .mut_ref_ty) {
+                            if (!self.pool.isSliceRefType(hole_ty)) {
+                                data_ptr = try self.readPointerAt(data_ptr, ptr_align);
+                            }
+                            hole_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(hn.lhs));
+                        } else break;
+                    }
+                }
+
+                if ((verb == 0 or verb == 1) and
+                    (try self.lookupFmtTraitCallable(hole_ty, if (verb == 1) "fmt_debug" else "fmt")) != null)
+                {
+                    const fmt_fn_idx = (try self.lookupFmtTraitCallable(
+                        hole_ty,
+                        if (verb == 1) "fmt_debug" else "fmt",
+                    )).?;
+                    const fmt_body = self.callables.items[fmt_fn_idx].body.?;
+                    const spec_snap = try self.allocSnapshotForType(.fmt_spec_ty, true);
+                    try self.writeScalarBytes(spec_snap, 2, &spec_bytes);
+                    self.sealSnapshot(spec_snap);
+                    const fmt_ret = try self.invokeBodyInternal(
+                        fmt_body,
+                        &[3]RegSlot{
+                            .{ .sym_ptr = data_ptr },
+                            .{ .sym_ptr = out_ptr },
+                            .{ .sym_ptr = spec_snap },
+                        },
+                        &.{},
+                        self.active_inst_span,
+                    );
+                    if (try self.isResultSlotErr(fmt_ret, res_ty)) return fmt_ret;
+                    continue;
+                }
+
+                const hole_slot = try self.loadTypedSlotFromMemory(data_ptr, hole_ty);
+                var hole_buf: std.ArrayListUnmanaged(u8) = .empty;
+                defer hole_buf.deinit(self.allocator);
+                try self.appendFormattedWithSpec(&hole_buf, hole_ty, hole_slot, spec_lo, spec_hi);
+                if (try writeChunk(self, frame_idx, write_body, ctx_ptr, hole_buf.items, res_ty)) |err_slot| {
+                    return err_slot;
+                }
+            }
+        }
+        return makeOk(self, res_ty);
     }
 
     // ------- Stackless Coroutine & FIFO TaskGroup Scheduler -------
@@ -9502,9 +11718,9 @@ pub const MirVm = struct {
                     body.getInst(MirValueId.fromInt(hole_ref_vid)).type_id,
                 );
                 const hole_ref_node = self.pool.getNode(hole_ref_ty);
-                const hole_val_ty = if (hole_ref_node.tag == .ref_ty or
+                const hole_val_ty = if ((hole_ref_node.tag == .ref_ty or
                     hole_ref_node.tag == .mut_ref_ty or
-                    hole_ref_node.tag == .raw_ptr_ty)
+                    hole_ref_node.tag == .raw_ptr_ty) and !self.pool.isSliceRefType(hole_ref_ty))
                     self.pool.unwrapUnderlyingType(TypeId.fromInt(hole_ref_node.lhs))
                 else
                     hole_ref_ty;
@@ -9572,7 +11788,8 @@ pub const MirVm = struct {
         raw_ty: TypeId,
         slot: RegSlot,
     ) VmEvalError![]u8 {
-        const ty = self.pool.unwrapUnderlyingType(raw_ty);
+        const raw_unwrapped = self.pool.unwrapUnderlyingType(raw_ty);
+        const ty = self.pool.getSliceRefInner(raw_unwrapped) orelse raw_unwrapped;
         if (ty == .fmt_args_ty) {
             var builder: std.ArrayListUnmanaged(u8) = .empty;
             errdefer builder.deinit(self.allocator);
@@ -10786,7 +13003,7 @@ pub const MirVm = struct {
 
         const unwrapped = self.pool.unwrapUnderlyingType(res_ty);
         const ty_node = self.pool.getNode(unwrapped);
-        if (ty_node.tag == .ref_ty or ty_node.tag == .raw_ptr_ty) {
+        if ((ty_node.tag == .ref_ty or ty_node.tag == .raw_ptr_ty) and !self.pool.isSliceRefType(unwrapped)) {
             const pointee_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(ty_node.lhs));
             if (self.pool.getNode(pointee_ty).tag == .slice_ty) {
                 const slice_slot = try self.makeFatSliceSlot(pointee_ty, data_ptr, raw_bytes.len);
@@ -11282,7 +13499,8 @@ pub const MirVm = struct {
         raw_ty: TypeId,
         is_emitting_diag: bool,
     ) VmEvalError!bool {
-        const ty = self.pool.unwrapUnderlyingType(raw_ty);
+        const raw_unwrapped = self.pool.unwrapUnderlyingType(raw_ty);
+        const ty = self.pool.getSliceRefInner(raw_unwrapped) orelse raw_unwrapped;
         if (ty == .unit_ty or ty == .never_ty or ty.isError()) return true;
 
         const lay = type_system.computeTypeLayoutWithPool(
@@ -11334,7 +13552,62 @@ pub const MirVm = struct {
                     elem_ty,
                     self.options.target_layout,
                 );
-                if (elem_lay.byte_size == 0) return true;
+                if (elem_lay.byte_size == 0 or arr_len == 0) return true;
+                if (elem_ty != .str_ty and elem_ty != .opaque_ty and elem_ty.isPrimitive()) {
+                    try self.tickStepBudget();
+                    const total_bytes = try self.mulOffsetChecked(arr_len, elem_lay.byte_size);
+                    const end_off_u64 = @as(u64, base_off) + total_bytes;
+                    if (end_off_u64 > alloc_rec.bytes.len or end_off_u64 > std.math.maxInt(u32)) {
+                        if (!is_emitting_diag) return false;
+                        return self.failWithTrap(
+                            error.OutOfBounds,
+                            .e0504_comptime_out_of_bounds,
+                            "array element offset overflowed `u32` during `.rodata` promotion",
+                            "out-of-bounds element offset here",
+                            null,
+                        );
+                    }
+                    const start_byte: usize = base_off;
+                    const end_byte: usize = @intCast(end_off_u64);
+                    var cur_byte: usize = start_byte;
+                    while (cur_byte < end_byte and (cur_byte & 63) != 0) : (cur_byte += 1) {
+                        if (!isByteInitialized(alloc_rec, cur_byte)) {
+                            if (!is_emitting_diag) return false;
+                            return self.failWithTrap(
+                                error.UninitializedRead,
+                                .e0505_comptime_uninitialized_read,
+                                "cannot promote value containing uninitialized scalar bytes to `.rodata`",
+                                "uninitialized byte in promoted value",
+                                null,
+                            );
+                        }
+                    }
+                    while (cur_byte + 64 <= end_byte) : (cur_byte += 64) {
+                        if (alloc_rec.init_mask[cur_byte >> 6] != std.math.maxInt(u64)) {
+                            if (!is_emitting_diag) return false;
+                            return self.failWithTrap(
+                                error.UninitializedRead,
+                                .e0505_comptime_uninitialized_read,
+                                "cannot promote value containing uninitialized scalar bytes to `.rodata`",
+                                "uninitialized byte in promoted value",
+                                null,
+                            );
+                        }
+                    }
+                    while (cur_byte < end_byte) : (cur_byte += 1) {
+                        if (!isByteInitialized(alloc_rec, cur_byte)) {
+                            if (!is_emitting_diag) return false;
+                            return self.failWithTrap(
+                                error.UninitializedRead,
+                                .e0505_comptime_uninitialized_read,
+                                "cannot promote value containing uninitialized scalar bytes to `.rodata`",
+                                "uninitialized byte in promoted value",
+                                null,
+                            );
+                        }
+                    }
+                    return true;
+                }
                 for (0..arr_len) |elem_i| {
                     try self.tickStepBudget();
                     const delta = try self.mulOffsetChecked(elem_i, elem_lay.byte_size);
@@ -11687,7 +13960,8 @@ pub const MirVm = struct {
         out_store: ?*HirStore,
     ) VmEvalError!ComptimeValue {
         try self.tickStepBudget();
-        const ty = self.pool.unwrapUnderlyingType(raw_ty);
+        const raw_unwrapped = self.pool.unwrapUnderlyingType(raw_ty);
+        const ty = self.pool.getSliceRefInner(raw_unwrapped) orelse raw_unwrapped;
         if (ty == .unit_ty or ty == .never_ty) return .unit_val;
         if (ty == .bool_ty) return .{ .bool_val = (slot.scalar_u64 & 1) != 0 };
         if (ty == .char_ty) return .{ .char_val = @truncate(slot.scalar_u64) };
@@ -11712,7 +13986,10 @@ pub const MirVm = struct {
             const pointee = self.pool.unwrapUnderlyingType(TypeId.fromInt(ty_node.lhs));
             const p_node = self.pool.getNode(pointee);
             if (p_node.tag == .slice_ty and TypeId.fromInt(p_node.lhs) == .u8_ty) {
-                const slice_slot = try self.loadTypedSlotFromMemory(slot.sym_ptr, pointee);
+                const slice_slot = if (self.pool.isSliceRefType(ty))
+                    slot
+                else
+                    try self.loadTypedSlotFromMemory(slot.sym_ptr, pointee);
                 const bytes = try self.readStrSlotBytes(slice_slot);
                 defer self.allocator.free(bytes);
                 const sym_id = self.interner.intern(bytes) catch return error.OutOfMemory;

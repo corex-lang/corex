@@ -779,7 +779,7 @@ test "test_hir_desugar_overload_operator_autoref_two_phase_derive_and_attr_schem
         "pub struct WireTag {\n" ++
         "    pub tag_num: i32 = 0,\n" ++
         "}\n" ++
-        "@derive(Eq, Hash, Debug, Clone)\n" ++
+        "@derive(Equatable, Hash, Debug, Clone)\n" ++
         "pub struct Point2D {\n" ++
         "    @WireTag(tag_num: 9)\n" ++
         "    pub px: i32,\n" ++

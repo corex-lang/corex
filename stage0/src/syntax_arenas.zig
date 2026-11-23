@@ -1062,6 +1062,8 @@ pub const AstTag = enum(u8) {
     optional_type,
     /// Payload-first result type node (`main_token = bang_tok`, `lhs = ok_node`, `rhs = err_node`).
     result_type,
+    /// Inline refinement type node (`main_token = is_or_where_tok`, `lhs = base_type`, `rhs = pred_node`).
+    refined_type,
     /// Closure type node (`|T| -> U`).
     closure_type,
     /// Error-set union bound type node (`ErrA | ErrB`).
@@ -1386,7 +1388,7 @@ comptime {
     std.debug.assert(@backingInt(TokenKind.dollar) == 81);
     std.debug.assert(@backingInt(TokenKind.eof) == 119);
     std.debug.assert(@typeInfo(CstNodeKind).@"enum".field_names.len == 153);
-    std.debug.assert(@typeInfo(AstTag).@"enum".field_names.len == 96);
+    std.debug.assert(@typeInfo(AstTag).@"enum".field_names.len == 97);
     std.debug.assert(@sizeOf(TokenKind) == 1);
     std.debug.assert(@sizeOf(TokenFlags) == 1);
     std.debug.assert(@sizeOf(PackedTriviaSpan) == 4);

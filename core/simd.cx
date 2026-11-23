@@ -9,6 +9,9 @@
 //! for floating-point vectors per `Fix-16`).
 
 // ---------------------------------------- TYPES ----------------------------------------
+/// Generic fixed-width portable SIMD vector alias (`[T; N]` for numeric lane `T` and power-of-two `N`).
+pub type Simd[T, const N: usize] = [T; N];
+
 /// 128-bit 4-lane single-precision floating-point SIMD vector (`4 x f32`).
 @repr(C)
 @align(16)

@@ -844,9 +844,9 @@ test "test_lsp_semantic_tokens_delta_hover_and_dr17_contracts" {
     try std.testing.expect(
         std.mem.indexOf(u8, clamp_hover, "pub fn clamp_sample(sample: i32, ceiling: i32) -> i32") != null,
     );
-    try std.testing.expect(std.mem.indexOf(u8, clamp_hover, "✓ @no_alloc (verified)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, clamp_hover, "✓ @no_panic (verified)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, clamp_hover, "• capabilities: none (pure)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, clamp_hover, "✓ `@no_alloc` (verified)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, clamp_hover, "✓ `@no_panic` (verified)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, clamp_hover, "**caps:** none (pure)") != null);
     try std.testing.expect(std.mem.indexOf(u8, clamp_hover, "(budget: 256 B)") != null);
     try std.testing.expect(
         std.mem.indexOf(u8, clamp_hover, "Clamps telemetry sample within real-time bounds.") != null,
@@ -859,7 +859,7 @@ test "test_lsp_semantic_tokens_delta_hover_and_dr17_contracts" {
     try std.testing.expect(
         std.mem.indexOf(u8, mmio_hover, "pub fn read_mmio_word(reg_addr: *i32) -> i32") != null,
     );
-    try std.testing.expect(std.mem.indexOf(u8, mmio_hover, "• capabilities: [unsafe_op]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mmio_hover, "**caps:** `[unsafe_op]`") != null);
     try std.testing.expect(std.mem.indexOf(u8, mmio_hover, "Reads raw MMIO status word.") != null);
 }
 
@@ -1798,4 +1798,264 @@ test "test_lsp_windows_case_uri_watched_eviction_multifile_fix_and_internal_core
 
     const cancel_resp = findFrameByIdFragment(out_b.frames, long_req_id).?;
     try std.testing.expect(std.mem.indexOf(u8, cancel_resp, "-32800") != null);
+}
+
+test "test_lsp_windows_large_mounted_disk_file_remains_writable_and_replaceable" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const ws_dir = try createTempWorkspaceDir(allocator, io, "win_mmap_save");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, ws_dir) catch {};
+        allocator.free(ws_dir);
+    }
+
+    var large_buf = std.Io.Writer.Allocating.init(allocator);
+    defer large_buf.deinit();
+    try large_buf.writer.writeAll("//! Large Workspace Module\n//!\n//! Exercises >= 16 KiB disk mounts inside LspSession.\n\n");
+    var idx: usize = 0;
+    while (large_buf.written().len < 20 * 1024) : (idx += 1) {
+        try large_buf.writer.print("/// Helper {d}.\npub fn helper_{d}() -> i32 = {d};\n", .{ idx, idx, idx });
+    }
+    try writeWorkspaceFile(allocator, io, ws_dir, "large_mod.cx", large_buf.written());
+
+    const full_large_path = try std.fmt.allocPrint(allocator, "{s}/large_mod.cx", .{ws_dir});
+    defer allocator.free(full_large_path);
+
+    var session = try lsp_server.LspSession.init(allocator, io, null, null, .{});
+    defer session.deinit();
+    session.bindInternalPointers();
+
+    const fid = try session.vfs.resolveOrCreatePath(io, full_large_path, .root);
+    try std.testing.expectEqual(large_buf.written().len, session.vfs.getFileSource(fid).?.len);
+
+    // Verify in-place truncating editor saves succeed while `LspSession` holds `fid` mounted on Windows:
+    const updated_src = "//! Updated Module\n//!\n//! Saved in-place by editor.\n\npub fn saved_ok() -> i32 = 42;\n";
+    const truncated_file = try std.Io.Dir.cwd().createFile(io, full_large_path, .{ .truncate = true });
+    defer truncated_file.close(io);
+    try truncated_file.writeStreamingAll(io, updated_src);
+}
+
+test "test_lsp_std_core_tab_switch_epoch_stability_hovers_semantic_tokens_and_spans" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const ws_dir = try createTempWorkspaceDir(allocator, io, "lsp_ux_perf");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, ws_dir) catch {};
+        allocator.free(ws_dir);
+    }
+
+    const core_src =
+        "//! Core Slice Utilities\n\n" ++
+        "/// UTF-8 byte buffer wrapper.\n" ++
+        "pub struct ByteBuf {\n" ++
+        "    pub ptr: *opaque,\n" ++
+        "    pub len: usize,\n" ++
+        "}\n" ++
+        "impl ByteBuf {\n" ++
+        "    /// Returns current byte length.\n" ++
+        "    @no_alloc @no_panic\n" ++
+        "    pub fn byte_len(&self) -> usize {\n" ++
+        "        let mask = 27_usize;\n" ++
+        "        _ = mask;\n" ++
+        "        return self.len;\n" ++
+        "    }\n" ++
+        "}\n";
+    try writeWorkspaceFile(allocator, io, ws_dir, "core/root.cx", core_src);
+
+    const broken_src =
+        "pub fn broken_fn(flag: bool) -> usize {\n" ++
+        "    let total_bytes: usize = 16;\n" ++
+        "    let bad_lit = MissingStruct { size: total_bytes };\n" ++
+        "    _ = bad_lit;\n" ++
+        "    let bad_intr = @nonexistent_intrinsic_call(total_bytes);\n" ++
+        "    _ = bad_intr;\n" ++
+        "    return !flag;\n" ++
+        "}\n" ++
+        "@secret type BadSecretAlias = u64;\n";
+    try writeWorkspaceFile(allocator, io, ws_dir, "src/broken.cx", broken_src);
+
+    const core_path = try std.fmt.allocPrint(allocator, "{s}/core/root.cx", .{ws_dir});
+    defer allocator.free(core_path);
+    const core_uri = try resolvePathToFileUri(allocator, io, core_path);
+    defer allocator.free(core_uri);
+
+    const broken_path = try std.fmt.allocPrint(allocator, "{s}/src/broken.cx", .{ws_dir});
+    defer allocator.free(broken_path);
+    const broken_uri = try resolvePathToFileUri(allocator, io, broken_path);
+    defer allocator.free(broken_uri);
+
+    const ws_uri = core_uri[0 .. core_uri.len - "/core/root.cx".len];
+
+    var session = try lsp_server.LspSession.init(allocator, io, null, null, .{ .is_internal_core = true });
+    defer session.deinit();
+    session.bindInternalPointers();
+
+    // [1] Initialize in push-diagnostics mode (`textDocument.diagnostic` omitted, matching `vscode-ext-corex`):
+    var turn_1: std.ArrayListUnmanaged(u8) = .empty;
+    defer turn_1.deinit(allocator);
+    {
+        var init_buf = std.Io.Writer.Allocating.init(allocator);
+        defer init_buf.deinit();
+        try init_buf.writer.writeAll(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"rootUri\":",
+        );
+        try writeEscapedJsonString(&init_buf.writer, ws_uri);
+        try init_buf.writer.writeAll(",\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-8\"]}}}}");
+        try appendLspFrame(allocator, &turn_1, init_buf.written());
+    }
+    try appendDidOpenFrame(allocator, &turn_1, core_uri, 1, core_src);
+    // Pipelined `semanticTokens/full` (`#2`) + hovers on `&self` (`#3`), `27_usize` (`#4`), and `opaque` (`#5`):
+    {
+        var req_buf = std.Io.Writer.Allocating.init(allocator);
+        defer req_buf.deinit();
+        try req_buf.writer.writeAll(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/semanticTokens/full\",\"params\":{\"textDocument\":{\"uri\":",
+        );
+        try writeEscapedJsonString(&req_buf.writer, core_uri);
+        try req_buf.writer.writeAll("}}}");
+        try appendLspFrame(allocator, &turn_1, req_buf.written());
+    }
+    // Hover on `&self` (`&` at line 10, col 20):
+    {
+        var req_buf = std.Io.Writer.Allocating.init(allocator);
+        defer req_buf.deinit();
+        try req_buf.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":");
+        try writeEscapedJsonString(&req_buf.writer, core_uri);
+        try req_buf.writer.writeAll("},\"position\":{\"line\":10,\"character\":20}}}");
+        try appendLspFrame(allocator, &turn_1, req_buf.written());
+    }
+    // Hover on numeric literal `27_usize` (line 11, col 20) -> must return `null`:
+    {
+        var req_buf = std.Io.Writer.Allocating.init(allocator);
+        defer req_buf.deinit();
+        try req_buf.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":");
+        try writeEscapedJsonString(&req_buf.writer, core_uri);
+        try req_buf.writer.writeAll("},\"position\":{\"line\":11,\"character\":20}}}");
+        try appendLspFrame(allocator, &turn_1, req_buf.written());
+    }
+    // Hover on primitive `opaque` (line 4, col 15) -> concise built-in summary, zero `type opaque = opaque`:
+    {
+        var req_buf = std.Io.Writer.Allocating.init(allocator);
+        defer req_buf.deinit();
+        try req_buf.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":");
+        try writeEscapedJsonString(&req_buf.writer, core_uri);
+        try req_buf.writer.writeAll("},\"position\":{\"line\":4,\"character\":15}}}");
+        try appendLspFrame(allocator, &turn_1, req_buf.written());
+    }
+    // Go-to-definition on `&self` in signature (line 10, col 21) -> jumps to `pub struct ByteBuf` (line 3):
+    {
+        var req_buf = std.Io.Writer.Allocating.init(allocator);
+        defer req_buf.deinit();
+        try req_buf.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"textDocument/definition\",\"params\":{\"textDocument\":{\"uri\":");
+        try writeEscapedJsonString(&req_buf.writer, core_uri);
+        try req_buf.writer.writeAll("},\"position\":{\"line\":10,\"character\":21}}}");
+        try appendLspFrame(allocator, &turn_1, req_buf.written());
+    }
+
+    const epoch_before_open = session.db.stdlib_privilege_epoch;
+    var out_1 = try executeSessionTranscript(allocator, &session, turn_1.items);
+    defer out_1.deinit(allocator);
+
+    // `stdlib_privilege_epoch` must NOT bump when opening `.std_core` files in the editor:
+    try std.testing.expectEqual(epoch_before_open, session.db.stdlib_privilege_epoch);
+
+    // Interactive responses (`#2`..`#6`) arrive BEFORE deferred `publishDiagnostics` notification:
+    var sem_frame_idx: usize = 0;
+    var diag_frame_idx: usize = 0;
+    for (out_1.frames, 0..) |frame_str, f_idx| {
+        if (std.mem.indexOf(u8, frame_str, "\"id\":2") != null) sem_frame_idx = f_idx;
+        if (std.mem.indexOf(u8, frame_str, "publishDiagnostics") != null) diag_frame_idx = f_idx;
+    }
+    try std.testing.expect(sem_frame_idx > 0 and diag_frame_idx > sem_frame_idx);
+
+    // Check `let mask` semantic token on line 11 (`character == 12`, `length == 4`): zero `readonly` (`1<<2`) or `defaultLibrary` (`1<<9`):
+    const sem_data = try extractJsonU32Array(allocator, out_1.frames[sem_frame_idx], "\"data\":[");
+    defer allocator.free(sem_data);
+    var cur_line: u32 = 0;
+    var cur_col: u32 = 0;
+    var saw_mask_local = false;
+    var t_idx: usize = 0;
+    while (t_idx + 5 <= sem_data.len) : (t_idx += 5) {
+        if (sem_data[t_idx] > 0) {
+            cur_line += sem_data[t_idx];
+            cur_col = sem_data[t_idx + 1];
+        } else {
+            cur_col += sem_data[t_idx + 1];
+        }
+        if (cur_line == 11 and cur_col == 12 and sem_data[t_idx + 2] == 4) {
+            saw_mask_local = true;
+            try std.testing.expectEqual(@as(u32, 0), sem_data[t_idx + 4] & ((1 << 2) | (1 << 9)));
+        }
+    }
+    try std.testing.expect(saw_mask_local);
+
+    // Check `&self`, `27_usize`, and `opaque` hovers + `&self` definition jump:
+    const self_hover = findFrameByIdFragment(out_1.frames, "\"id\":3").?;
+    try std.testing.expect(std.mem.indexOf(u8, self_hover, "self: &ByteBuf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, self_hover, "UTF-8 byte buffer wrapper.") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(out_1.frames, "\"id\":4").?, "\"result\":null") != null,
+    );
+    const opaque_hover = findFrameByIdFragment(out_1.frames, "\"id\":5").?;
+    try std.testing.expect(std.mem.indexOf(u8, opaque_hover, "type opaque = opaque") == null);
+    try std.testing.expect(std.mem.indexOf(u8, opaque_hover, "Unsized type-erased pointee") != null);
+    const self_def = findFrameByIdFragment(out_1.frames, "\"id\":6").?;
+    try std.testing.expect(std.mem.indexOf(u8, self_def, "\"line\":3,") != null);
+
+    // [2] Tab close + re-open on `core/root.cx` preserves `stdlib_privilege_epoch` & `SemanticTokensCache` delta `"edits":[]`:
+    var turn_2: std.ArrayListUnmanaged(u8) = .empty;
+    defer turn_2.deinit(allocator);
+    {
+        var close_buf = std.Io.Writer.Allocating.init(allocator);
+        defer close_buf.deinit();
+        try close_buf.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{\"textDocument\":{\"uri\":");
+        try writeEscapedJsonString(&close_buf.writer, core_uri);
+        try close_buf.writer.writeAll("}}}");
+        try appendLspFrame(allocator, &turn_2, close_buf.written());
+    }
+    try appendDidOpenFrame(allocator, &turn_2, core_uri, 2, core_src);
+    {
+        var delta_buf = std.Io.Writer.Allocating.init(allocator);
+        defer delta_buf.deinit();
+        try delta_buf.writer.writeAll(
+            "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/semanticTokens/full/delta\",\"params\":{\"textDocument\":{\"uri\":",
+        );
+        try writeEscapedJsonString(&delta_buf.writer, core_uri);
+        try delta_buf.writer.writeAll("},\"previousResultId\":\"0000000000000001\"}}");
+        try appendLspFrame(allocator, &turn_2, delta_buf.written());
+    }
+    try appendDidOpenFrame(allocator, &turn_2, broken_uri, 1, broken_src);
+    try appendLspFrame(allocator, &turn_2, "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"shutdown\",\"params\":null}");
+    try appendLspFrame(allocator, &turn_2, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}");
+
+    var out_2 = try executeSessionTranscript(allocator, &session, turn_2.items);
+    defer out_2.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), out_2.exit_code);
+    try std.testing.expectEqual(epoch_before_open, session.db.stdlib_privilege_epoch);
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(out_2.frames, "\"id\":7").?, "\"edits\":[]") != null,
+    );
+
+    // [3] Verify `broken.cx` diagnostics: stripped `help:`, zero `W0402` cascade, and full `@ident` span (`19..46`):
+    var broken_diag_frame: ?[]const u8 = null;
+    for (out_2.frames) |frame_str| {
+        if (std.mem.indexOf(u8, frame_str, "publishDiagnostics") != null and
+            std.mem.indexOf(u8, frame_str, "broken.cx") != null)
+        {
+            broken_diag_frame = frame_str;
+        }
+    }
+    try std.testing.expect(broken_diag_frame != null);
+    try std.testing.expect(std.mem.indexOf(u8, broken_diag_frame.?, "• help:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, broken_diag_frame.?, "help:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, broken_diag_frame.?, "W0402") == null);
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            broken_diag_frame.?,
+            "\"start\":{\"line\":4,\"character\":19},\"end\":{\"line\":4,\"character\":46}",
+        ) != null,
+    );
 }

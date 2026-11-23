@@ -6794,7 +6794,8 @@ fn collectSubstageCTier3FixesForFile(
                             );
                             const s_tag = db.type_pool.getTag(s_ty);
                             const is_slice_like = s_ty == .str_ty or s_tag == .slice_ty or
-                                s_tag == .array_ty or s_tag == .soa_slice_ty or s_tag == .soa_array_ty;
+                                s_tag == .array_ty or s_tag == .soa_slice_ty or s_tag == .soa_array_ty or
+                                s_tag == .soa_vec_ty;
                             if (is_slice_like) {
                                 if (extractAstByteSpan(cst_arena, ast_arena, tok_buf, recv_s)) |s_sp| {
                                     if (extractAstByteSpan(cst_arena, ast_arena, tok_buf, len_recv)) |lr_sp| {
@@ -6961,7 +6962,8 @@ fn collectSubstageCTier3FixesForFile(
                         const deref_tag = db.type_pool.getTag(deref_ty);
                         const is_verified_slice_or_e0424 = e0424_mut_map.contains(mem_rec.byte_offset) or
                             deref_ty == .str_ty or deref_tag == .slice_ty or deref_tag == .array_ty or
-                            deref_tag == .soa_slice_ty or deref_tag == .soa_array_ty;
+                            deref_tag == .soa_slice_ty or deref_tag == .soa_array_ty or
+                            deref_tag == .soa_vec_ty;
 
                         if (is_verified_slice_or_e0424) {
                             switch (prop_kind) {
@@ -7793,7 +7795,7 @@ fn discoverVirtualCxTreeSubmodulesInDb(
     }
 }
 
-/// Registers `core/root.cx` (and its `core/` submodule tree) on `db` as `"core"` and `"cx"` when present on disk.
+/// Registers `core/root.cx` and optional `stdlib/cx/mod.cx` on `db` as `"core"` and `"cx"` when present on disk.
 fn registerCoreStdlibInDb(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -7801,8 +7803,42 @@ fn registerCoreStdlibInDb(
     db: *CompilerDb,
     visited_fids: *std.AutoHashMapUnmanaged(u32, void),
 ) !void {
-    const core_root_path = "core/root.cx";
-    const core_fid = source_map.resolveOrCreatePath(io, core_root_path, .std_core) catch return;
+    var prefix_opt: ?[]u8 = null;
+    defer if (prefix_opt) |owned_p| allocator.free(owned_p);
+    var core_path_opt: ?[]u8 = null;
+    defer if (core_path_opt) |owned_c| allocator.free(owned_c);
+
+    var core_fid: FileId = .none;
+    if (source_map.resolveOrCreatePath(io, "core/root.cx", .std_core)) |fid| {
+        prefix_opt = try allocator.dupe(u8, "");
+        core_path_opt = try allocator.dupe(u8, "core/root.cx");
+        core_fid = fid;
+    } else |_| {}
+
+    if (core_fid.isNone()) {
+        if (std.process.executableDirPathAlloc(io, allocator)) |exe_dir| {
+            defer allocator.free(exe_dir);
+            const rel_parents = [_][]const u8{ "..", "../..", "../../.." };
+            for (rel_parents) |rel_up| {
+                const cand_prefix = try std.fmt.allocPrint(allocator, "{s}/{s}/", .{ exe_dir, rel_up });
+                const cand_core = try std.fmt.allocPrint(allocator, "{s}core/root.cx", .{cand_prefix});
+                if (source_map.resolveOrCreatePath(io, cand_core, .std_core)) |fid| {
+                    prefix_opt = cand_prefix;
+                    core_path_opt = cand_core;
+                    core_fid = fid;
+                    break;
+                } else |_| {
+                    allocator.free(cand_core);
+                    allocator.free(cand_prefix);
+                }
+            }
+        } else |_| {}
+    }
+
+    if (core_fid.isNone()) return;
+    const active_prefix = prefix_opt.?;
+    const core_root_path = core_path_opt.?;
+
     var has_dummy_core_mention = true;
     try discoverExternalSubmodulesInDb(
         allocator,
@@ -7818,7 +7854,28 @@ fn registerCoreStdlibInDb(
         0,
     );
     try db.registerRootModule("core", core_fid);
-    try db.registerRootModule("cx", core_fid);
+
+    const cx_mod_path = try std.fmt.allocPrint(allocator, "{s}stdlib/cx/mod.cx", .{active_prefix});
+    defer allocator.free(cx_mod_path);
+    if (source_map.resolveOrCreatePath(io, cx_mod_path, .std_core)) |cx_fid| {
+        var has_dummy_cx_mention = true;
+        try discoverExternalSubmodulesInDb(
+            allocator,
+            io,
+            source_map,
+            db,
+            cx_fid,
+            cx_mod_path,
+            .high,
+            .std_core,
+            visited_fids,
+            &has_dummy_cx_mention,
+            0,
+        );
+        try db.registerCxStdlibPreludeRoot(cx_fid);
+    } else |_| {
+        try db.registerRootModule("cx", core_fid);
+    }
 }
 
 /// Re-binds external `mod <name>;` edges across all `.root` files in `db` after Tier 1/2 syntax healing.

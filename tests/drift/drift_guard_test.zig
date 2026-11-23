@@ -264,11 +264,12 @@ fn checkCxFileFormattingAndDividers(
     try std.testing.expect(!fmt_res.is_changed);
 }
 
-/// Recursively walks `dir_path` and checks all `.cx` files for `< 150` cols, dividers, and `corex fmt` parity.
+/// Walks `dir_path` recursively and verifies every `.cx` file (`>= min_expected_count`) passes `checkCxFileFormattingAndDividers`.
 fn walkCxDirectoryFormatting(
     allocator: std.mem.Allocator,
     io: std.Io,
     dir_path: []const u8,
+    min_expected_count: usize,
 ) !void {
     var opened_dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
     defer opened_dir.close(io);
@@ -284,13 +285,13 @@ fn walkCxDirectoryFormatting(
         try checkCxFileFormattingAndDividers(allocator, io, full_path);
         found_cx_count += 1;
     }
-    try std.testing.expect(found_cx_count >= 14);
+    try std.testing.expect(found_cx_count >= min_expected_count);
 }
 
 // ------------------------------------- PUBLIC API --------------------------------------
 
 test "test_drift_guard_zero_colored_emojis_across_repository" {
-    for ([_][]const u8{ "stage0", "core", "tests", "bench", "docs", ".agents" }) |dir_name| {
+    for ([_][]const u8{ "stage0", "core", "stdlib", "tests", "bench", "docs", ".agents" }) |dir_name| {
         try walkDirectoryZeroBannedEmojis(std.testing.allocator, std.testing.io, dir_name);
     }
     for ([_][]const u8{ "PLAN.md", "CHANGELOG.md", "README.md", "build.zig" }) |file_name| {
@@ -645,6 +646,16 @@ test "test_drift_guard_phase5_hir_mir_vm_opt_layouts_cli_flags_and_diagnostics" 
             try std.testing.expect(std.mem.indexOf(u8, sub_help_out, comp_flag.summary) != null);
         }
 
+        if (sub_id == .@"test") {
+            try std.testing.expectEqual(@as(usize, 2), router.TEST_FLAGS.len);
+            try std.testing.expectEqualStrings("--seed", router.TEST_FLAGS[0].long_flag);
+            try std.testing.expectEqualStrings("--sim", router.TEST_FLAGS[1].long_flag);
+            for (router.TEST_FLAGS) |tst_flag| {
+                try std.testing.expect(std.mem.indexOf(u8, sub_help_out, tst_flag.long_flag) != null);
+                try std.testing.expect(std.mem.indexOf(u8, sub_help_out, tst_flag.summary) != null);
+            }
+        }
+
         const sub_name = sub_id.asDescriptor().name;
         var dev_sink = corex.DiagnosticSink.init(std.testing.allocator);
         defer dev_sink.deinit();
@@ -933,8 +944,9 @@ test "test_drift_guard_phase7_abi_codegen_seam_layouts_and_core" {
     }
     try std.testing.expect(seam_line_count < 200);
 
-    // [4] Verify all `core/**/*.cx` files obey `< 150` cols, 90/65-char dividers, and `corex fmt --check`:
-    try walkCxDirectoryFormatting(std.testing.allocator, std.testing.io, "core");
+    // [4] Verify all `core/**/*.cx` and `stdlib/cx/**/*.cx` files obey `< 150` cols, 90/65-char dividers, and `corex fmt --check`:
+    try walkCxDirectoryFormatting(std.testing.allocator, std.testing.io, "core", 14);
+    try walkCxDirectoryFormatting(std.testing.allocator, std.testing.io, "stdlib/cx", 5);
 
     // [5] Verify Phase 7 diagnostics (`E0006`, `E0007`, `E0008`) and test-suite references:
     const phase7_specs = [_]struct {

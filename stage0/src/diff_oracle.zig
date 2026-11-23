@@ -103,6 +103,8 @@ pub const DiffOracleOptions = struct {
     extra_file_ids: []const FileId = &.{},
     /// Step-count cap enforced on Tier 1 and Tier 2 `MirVm` runs.
     comptime_step_limit: u64 = router.DEFAULT_COMPTIME_STEP_LIMIT,
+    /// Optional deterministic `--sim --seed=<u64>` override stored into `context.rng_seed` before `main`.
+    sim_seed: u64 = 0,
     /// Optional diagnostic sink receiving front-end or codegen errors.
     diagnostic_sink: ?*DiagnosticSink = null,
 };
@@ -239,6 +241,7 @@ fn executeVmTierOnDb(
             .stdout_capture = &stdout_buf,
             .stderr_capture = &stderr_buf,
             .is_oracle_runtime_mode = true,
+            .initial_rng_seed = options.sim_seed,
         },
     );
     defer vm_engine.deinit();
@@ -439,6 +442,7 @@ fn executeNativeTierOnDb(
         .output_path = exe_path,
         .io = options.io,
         .environ_map = options.environ_map,
+        .sim_seed = options.sim_seed,
         .diagnostic_sink = options.diagnostic_sink,
     });
     defer artifact.deinit(allocator);
@@ -614,6 +618,36 @@ fn appendHorizontalRule(
 
 // ------------------------------------- PUBLIC API --------------------------------------
 
+/// Executes `root_file_id` in `MirVm` under deterministic simulation (`--sim --seed=<u64>`).
+pub fn runSimulatedVmOnDb(
+    allocator: std.mem.Allocator,
+    db: *CompilerDb,
+    root_file_id: FileId,
+    is_release_mode: bool,
+    options: DiffOracleOptions,
+) DiffOracleError!OracleTierOutcome {
+    const host_spec = TargetSpec.host();
+    db.setTargetSpec(host_spec);
+    db.setComptimeStepLimit(options.comptime_step_limit);
+    if (options.workspace_root != null or options.virtual_files != null) {
+        db.setEmbedSandbox(options.workspace_root, options.virtual_files);
+    }
+    db.setEmbedIo(options.io);
+
+    var reachable_files: std.ArrayListUnmanaged(FileId) = .empty;
+    defer reachable_files.deinit(allocator);
+    try db.collectReachableModuleFiles(root_file_id, options.extra_file_ids, &reachable_files);
+    return executeVmTierOnDb(
+        allocator,
+        db,
+        root_file_id,
+        reachable_files.items,
+        is_release_mode,
+        host_spec,
+        options,
+    );
+}
+
 /// Compares `outcomes` across all 4 tiers and renders a monochrome Unicode box-drawing diff table on mismatch.
 pub fn compareOutcomesAndRenderTable(
     allocator: std.mem.Allocator,
@@ -774,24 +808,35 @@ pub fn runFourTierDiffOracleOnDb(
     defer reachable_files.deinit(allocator);
     try db.collectReachableModuleFiles(root_file_id, options.extra_file_ids, &reachable_files);
 
-    // Validate front-end, SAST, and constant evaluation once before running all 4 tiers:
+    // Validate front-end, SAST, and constant evaluation once across demand-active `DefId`s:
     var has_front_errors = false;
     for (reachable_files.items) |mod_fid| {
         if ((try db.parseCst(mod_fid)).diagnostics.hasErrors()) has_front_errors = true;
         if ((try db.resolveSignatures(mod_fid)).error_count > 0) has_front_errors = true;
-        for ((try db.extractItemTree(mod_fid)).entries) |entry| {
-            if ((try db.typecheckBody(entry.def_id)).error_count > 0) has_front_errors = true;
-            if (!(try db.verifySastMir(entry.def_id)).is_verified_sound) has_front_errors = true;
-            if (!has_front_errors and (entry.kind == .const_decl or entry.kind == .extern_block)) {
-                const ct_art = db.evalComptimeDef(entry.def_id) catch |ct_err| switch (ct_err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.Canceled => return error.Canceled,
-                    else => {
-                        has_front_errors = true;
-                        continue;
-                    },
-                };
-                if (ct_art.has_errors) has_front_errors = true;
+    }
+    var active_defs: std.ArrayListUnmanaged(query_db.DefId) = .empty;
+    defer active_defs.deinit(allocator);
+    if (!has_front_errors) {
+        try db.collectActiveModuleDefIds(allocator, &.{root_file_id}, reachable_files.items, &active_defs);
+    }
+    for (active_defs.items) |active_def| {
+        if ((try db.typecheckBody(active_def)).error_count > 0) has_front_errors = true;
+        if (!(try db.verifySastMir(active_def)).is_verified_sound) has_front_errors = true;
+        if (!has_front_errors) {
+            for ((try db.extractItemTree(active_def.fileId())).entries) |entry| {
+                if (entry.def_id != active_def) continue;
+                if (entry.kind == .const_decl or entry.kind == .extern_block) {
+                    const ct_art = db.evalComptimeDef(active_def) catch |ct_err| switch (ct_err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.Canceled => return error.Canceled,
+                        else => {
+                            has_front_errors = true;
+                            break;
+                        },
+                    };
+                    if (ct_art.has_errors) has_front_errors = true;
+                }
+                break;
             }
         }
     }

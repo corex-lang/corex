@@ -233,6 +233,16 @@ const CModuleEmitter = struct {
     ordered_res_err_types: std.ArrayListUnmanaged(TypeId) = .empty,
     /// `true` while emitting an `@export`, `@wasm_export`, or `extern "C"` C-ABI function body.
     is_in_c_abi_body: bool = false,
+    /// `true` when `@tls_scratch_ptr()` is referenced (`64 B` zero-initialized TLS).
+    has_tls_scratch: bool = false,
+    /// `true` when `@tls_alloc_state()` is referenced (`256 B` zero-initialized TLS).
+    has_tls_alloc: bool = false,
+    /// `true` when `@sys_mmap` / `@sys_munmap` virtual memory helpers are referenced.
+    has_sys_mmap: bool = false,
+    /// `true` when `#soa Vec[S]` slab helpers (`_cx_soa_zalloc` / `_cx_soa_free`) are needed.
+    has_soa_vec: bool = false,
+    /// `true` when `@fmt_write` streaming formatting is referenced.
+    has_fmt_write: bool = false,
     /// Monotonic per-function temporary counter reset at the start of each `MirBody`.
     temp_counter: u32 = 0,
 
@@ -1072,7 +1082,18 @@ const C99_FREESTANDING_PREAMBLE: []const u8 =
     \\    }
     \\    return 0;
     \\}
+    \\static inline void _cx_fs_memmove(uint8_t *dst_p, const uint8_t *src_p, size_t byte_n) {
+    \\    if (dst_p == src_p || byte_n == 0u) return;
+    \\    if ((uintptr_t)dst_p < (uintptr_t)src_p) {
+    \\        size_t idx_i = 0u;
+    \\        while (idx_i < byte_n) { dst_p[idx_i] = src_p[idx_i]; idx_i += 1u; }
+    \\    } else {
+    \\        size_t idx_i = byte_n;
+    \\        while (idx_i > 0u) { idx_i -= 1u; dst_p[idx_i] = src_p[idx_i]; }
+    \\    }
+    \\}
     \\#define memcpy(dst_p, src_p, byte_n) _cx_fs_memcpy((uint8_t *)(dst_p), (const uint8_t *)(src_p), (size_t)(byte_n))
+    \\#define memmove(dst_p, src_p, byte_n) _cx_fs_memmove((uint8_t *)(dst_p), (const uint8_t *)(src_p), (size_t)(byte_n))
     \\#define memset(dst_p, fill_b, byte_n) _cx_fs_memset((uint8_t *)(dst_p), (uint8_t)(fill_b), (size_t)(byte_n))
     \\#define memcmp(lhs_p, rhs_p, byte_n) _cx_fs_memcmp((const uint8_t *)(lhs_p), (const uint8_t *)(rhs_p), (size_t)(byte_n))
     \\
@@ -1775,6 +1796,7 @@ fn needsCompositeTypedef(emitter: *CModuleEmitter, unwrapped: TypeId) !bool {
         .union_ty,
         .array_ty,
         .soa_array_ty,
+        .soa_vec_ty,
         .slice_ty,
         .soa_slice_ty,
         .optional_ty,
@@ -1803,6 +1825,10 @@ fn formatCType(emitter: *CModuleEmitter, raw_ty: TypeId) ![]u8 {
     {
         const cur_node = emitter.input.pool.getNode(unwrapped);
         if (cur_node.tag != .ref_ty and cur_node.tag != .mut_ref_ty and cur_node.tag != .raw_ptr_ty) break;
+        if (emitter.input.pool.getSliceRefInner(unwrapped)) |slice_inner| {
+            unwrapped = slice_inner;
+            break;
+        }
         is_innermost_ptr_mut = cur_node.tag == .mut_ref_ty or
             (cur_node.tag == .raw_ptr_ty and cur_node.rhs != 0);
         const pointee_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(cur_node.lhs));
@@ -1948,9 +1974,10 @@ fn discoverTypeRecursive(emitter: *CModuleEmitter, raw_ty: TypeId, depth: u32) !
         .slice_ty, .soa_slice_ty => {
             try discoverTypeRecursive(emitter, TypeId.fromInt(node.lhs), depth + 1);
         },
-        .array_ty, .soa_array_ty => {
+        .array_ty, .soa_array_ty, .soa_vec_ty => {
+            if (node.tag == .soa_vec_ty) emitter.has_soa_vec = true;
             try discoverTypeRecursive(emitter, TypeId.fromInt(node.lhs), depth + 1);
-            if (node.tag == .soa_array_ty) {
+            if (node.tag == .soa_array_ty or node.tag == .soa_vec_ty) {
                 const elem_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
                 const elem_lay = try emitter.resolver.resolveType(elem_ty);
                 const fld_start = elem_lay.aux_start;
@@ -2050,7 +2077,12 @@ fn resolveEnumVariantPayloadType(emitter: *CModuleEmitter, raw_sum_ty: TypeId, t
                 if (cur_ord == tag_ord) {
                     const raw_pay = mem_sym.type_id;
                     if (raw_pay.isError() or raw_pay == .unit_ty or raw_pay == sum_ty) return .unit_ty;
-                    return emitter.input.pool.unwrapUnderlyingType(subst.resolve(raw_pay));
+                    const subst_pay = subst.applyMut(
+                        emitter.allocator,
+                        emitter.input.pool,
+                        raw_pay,
+                    ) catch subst.lookupExisting(emitter.input.pool, raw_pay);
+                    return emitter.input.pool.unwrapUnderlyingType(subst_pay);
                 }
                 cur_ord += 1;
             }
@@ -2070,6 +2102,13 @@ fn visitTypeTopoDfs(emitter: *CModuleEmitter, ty: TypeId, depth: u32) !void {
     try emitter.topo_state.put(emitter.allocator, raw_id, 1);
 
     if (ty != .str_ty) {
+        const unwrapDep = struct {
+            /// Unwraps transparent aliases and fat slice references (`&[T]` -> `[T]`) for header dependency ordering.
+            fn get(pool: *const InternPool, raw_dep: TypeId) TypeId {
+                const unwrapped_dep = pool.unwrapUnderlyingType(raw_dep);
+                return pool.getSliceRefInner(unwrapped_dep) orelse unwrapped_dep;
+            }
+        }.get;
         const node = emitter.input.pool.getNode(ty);
         switch (node.tag) {
             .struct_ty, .tuple_ty, .union_ty => {
@@ -2079,27 +2118,27 @@ fn visitTypeTopoDfs(emitter: *CModuleEmitter, ty: TypeId, depth: u32) !void {
                 var fld_i: u32 = 0;
                 while (fld_i < fld_len) : (fld_i += 1) {
                     const fld_raw = emitter.resolver.fields_by_decl.items[fld_start + fld_i].field_ty;
-                    const fld_unwrapped = emitter.input.pool.unwrapUnderlyingType(fld_raw);
+                    const fld_unwrapped = unwrapDep(emitter.input.pool, fld_raw);
                     if (try needsCompositeTypedef(emitter, fld_unwrapped)) {
                         try visitTypeTopoDfs(emitter, fld_unwrapped, depth + 1);
                     }
                 }
             },
             .array_ty => {
-                const elem_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+                const elem_ty = unwrapDep(emitter.input.pool, TypeId.fromInt(node.lhs));
                 if (try needsCompositeTypedef(emitter, elem_ty)) {
                     try visitTypeTopoDfs(emitter, elem_ty, depth + 1);
                 }
             },
             .optional_ty => {
-                const pay_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+                const pay_ty = unwrapDep(emitter.input.pool, TypeId.fromInt(node.lhs));
                 if (try needsCompositeTypedef(emitter, pay_ty)) {
                     try visitTypeTopoDfs(emitter, pay_ty, depth + 1);
                 }
             },
             .result_ty => {
-                const ok_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
-                const err_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.rhs));
+                const ok_ty = unwrapDep(emitter.input.pool, TypeId.fromInt(node.lhs));
+                const err_ty = unwrapDep(emitter.input.pool, TypeId.fromInt(node.rhs));
                 if (try needsCompositeTypedef(emitter, ok_ty)) try visitTypeTopoDfs(emitter, ok_ty, depth + 1);
                 if (try needsCompositeTypedef(emitter, err_ty)) try visitTypeTopoDfs(emitter, err_ty, depth + 1);
             },
@@ -2111,7 +2150,7 @@ fn visitTypeTopoDfs(emitter: *CModuleEmitter, ty: TypeId, depth: u32) !void {
                         var var_ord: u32 = 0;
                         for (emitter.input.sym_table.getScopeMembers(enum_sym.target_scope)) |mem_idx| {
                             if (emitter.input.sym_table.getSymbol(mem_idx).kind != .enum_variant_sym) continue;
-                            const var_pay = resolveEnumVariantPayloadType(emitter, ty, var_ord);
+                            const var_pay = unwrapDep(emitter.input.pool, resolveEnumVariantPayloadType(emitter, ty, var_ord));
                             if (try needsCompositeTypedef(emitter, var_pay)) {
                                 try visitTypeTopoDfs(emitter, var_pay, depth + 1);
                             }
@@ -2122,13 +2161,13 @@ fn visitTypeTopoDfs(emitter: *CModuleEmitter, ty: TypeId, depth: u32) !void {
             },
             .fn_ty, .closure_ty => {
                 if (emitter.input.pool.getFnSignatureView(ty)) |sig| {
-                    const ret_unwrapped = emitter.input.pool.unwrapUnderlyingType(sig.ret_ty);
+                    const ret_unwrapped = unwrapDep(emitter.input.pool, sig.ret_ty);
                     if (try needsCompositeTypedef(emitter, ret_unwrapped)) {
                         try visitTypeTopoDfs(emitter, ret_unwrapped, depth + 1);
                     }
                     var param_i: usize = 0;
                     while (param_i < sig.paramCount()) : (param_i += 1) {
-                        const param_unwrapped = emitter.input.pool.unwrapUnderlyingType(sig.getParamType(param_i));
+                        const param_unwrapped = unwrapDep(emitter.input.pool, sig.getParamType(param_i));
                         if (try needsCompositeTypedef(emitter, param_unwrapped)) {
                             try visitTypeTopoDfs(emitter, param_unwrapped, depth + 1);
                         }
@@ -2136,7 +2175,7 @@ fn visitTypeTopoDfs(emitter: *CModuleEmitter, ty: TypeId, depth: u32) !void {
                 }
             },
             .future_ty => {
-                const out_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+                const out_ty = unwrapDep(emitter.input.pool, TypeId.fromInt(node.lhs));
                 if (try needsCompositeTypedef(emitter, out_ty)) {
                     try visitTypeTopoDfs(emitter, out_ty, depth + 1);
                 }
@@ -2186,7 +2225,8 @@ fn registerDropTypeRecursive(emitter: *CModuleEmitter, raw_ty: TypeId, depth: u3
         .array_ty => {
             try registerDropTypeRecursive(emitter, TypeId.fromInt(node.lhs), depth + 1);
         },
-        .soa_array_ty => {
+        .soa_array_ty, .soa_vec_ty => {
+            if (node.tag == .soa_vec_ty) emitter.has_soa_vec = true;
             const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
             const lay = try emitter.resolver.resolveType(elem_struct);
             const fld_start = lay.aux_start;
@@ -2237,7 +2277,13 @@ fn registerEqTypeRecursive(emitter: *CModuleEmitter, raw_ty: TypeId, depth: u32)
 
     const node = emitter.input.pool.getNode(ty);
     switch (node.tag) {
-        .ref_ty, .mut_ref_ty, .raw_ptr_ty, .fn_ty => return,
+        .ref_ty, .mut_ref_ty => {
+            if (emitter.input.pool.getSliceRefInner(ty)) |slice_inner| {
+                try registerEqTypeRecursive(emitter, slice_inner, depth + 1);
+            }
+            return;
+        },
+        .raw_ptr_ty, .fn_ty => return,
         .bit_field_ty => try registerEqTypeRecursive(emitter, TypeId.fromInt(node.lhs), depth + 1),
         .struct_ty, .tuple_ty => {
             if ((try emitter.eq_type_set.getOrPut(emitter.allocator, ty.toU32())).found_existing) return;
@@ -2258,7 +2304,7 @@ fn registerEqTypeRecursive(emitter: *CModuleEmitter, raw_ty: TypeId, depth: u32)
             try registerEqTypeRecursive(emitter, TypeId.fromInt(node.lhs), depth + 1);
             try emitter.ordered_eq_types.append(emitter.allocator, ty);
         },
-        .soa_array_ty, .soa_slice_ty => {
+        .soa_array_ty, .soa_slice_ty, .soa_vec_ty => {
             if ((try emitter.eq_type_set.getOrPut(emitter.allocator, ty.toU32())).found_existing) return;
             try discoverTypeRecursive(emitter, ty, depth);
             const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
@@ -2304,6 +2350,15 @@ fn registerFmtTypeRecursive(emitter: *CModuleEmitter, raw_ty: TypeId, depth: u32
         switch (node.tag) {
             .ref_ty, .mut_ref_ty, .bit_field_ty, .array_ty, .slice_ty, .optional_ty => {
                 try registerFmtTypeRecursive(emitter, TypeId.fromInt(node.lhs), depth + 1);
+            },
+            .soa_array_ty, .soa_slice_ty, .soa_vec_ty => {
+                const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+                const lay = try emitter.resolver.resolveType(elem_struct);
+                var fld_i: u32 = 0;
+                while (fld_i < lay.aux_len) : (fld_i += 1) {
+                    const fld_ty = emitter.resolver.fields_by_decl.items[lay.aux_start + fld_i].field_ty;
+                    try registerFmtTypeRecursive(emitter, fld_ty, depth + 1);
+                }
             },
             .result_ty => {
                 try registerFmtTypeRecursive(emitter, TypeId.fromInt(node.lhs), depth + 1);
@@ -2625,9 +2680,10 @@ fn indexModuleEntities(emitter: *CModuleEmitter) !void {
                                         body_ptr.getInst(MirValueId.fromInt(words[1 + piece_count + hole_j * 3])).type_id,
                                     );
                                     const hole_node = emitter.input.pool.getNode(hole_ref_ty);
-                                    const hole_ty = if (hole_node.tag == .ref_ty or
+                                    const hole_ty = if ((hole_node.tag == .ref_ty or
                                         hole_node.tag == .mut_ref_ty or
-                                        hole_node.tag == .raw_ptr_ty)
+                                        hole_node.tag == .raw_ptr_ty) and
+                                        !emitter.input.pool.isSliceRefType(hole_ref_ty))
                                         emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(hole_node.lhs))
                                     else
                                         hole_ref_ty;
@@ -2646,6 +2702,62 @@ fn indexModuleEntities(emitter: *CModuleEmitter) !void {
                     else
                         place_ty;
                     try registerDropTypeRecursive(emitter, dropped_ty, 0);
+                } else if (ikind == .ptr_drop_in_place) {
+                    const drop_args = body_ptr.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs];
+                    if (drop_args.len >= 1) {
+                        const ptr_ty = emitter.input.pool.unwrapUnderlyingType(
+                            body_ptr.getInst(MirValueId.fromInt(drop_args[0])).type_id,
+                        );
+                        if (!ptr_ty.isPrimitiveOrSentinel()) {
+                            try registerDropTypeRecursive(
+                                emitter,
+                                TypeId.fromInt(emitter.input.pool.getNode(ptr_ty).lhs),
+                                0,
+                            );
+                        }
+                    }
+                } else if (ikind == .soa_vec_clear) {
+                    emitter.has_soa_vec = true;
+                    const clr_args = body_ptr.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs];
+                    if (clr_args.len >= 1) {
+                        const ref_ty = emitter.input.pool.unwrapUnderlyingType(
+                            body_ptr.getInst(MirValueId.fromInt(clr_args[0])).type_id,
+                        );
+                        if (!ref_ty.isPrimitiveOrSentinel()) {
+                            try registerDropTypeRecursive(
+                                emitter,
+                                TypeId.fromInt(emitter.input.pool.getNode(ref_ty).lhs),
+                                0,
+                            );
+                        }
+                    }
+                } else if (ikind == .soa_vec_new or
+                    ikind == .soa_vec_with_cap or
+                    ikind == .soa_vec_push or
+                    ikind == .soa_vec_reserve or
+                    ikind == .soa_vec_as_slice)
+                {
+                    emitter.has_soa_vec = true;
+                    if (ikind == .soa_vec_push) {
+                        const push_args = body_ptr.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs];
+                        if (push_args.len >= 2) {
+                            try registerDropTypeRecursive(
+                                emitter,
+                                body_ptr.getInst(MirValueId.fromInt(push_args[1])).type_id,
+                                0,
+                            );
+                        }
+                    }
+                } else if (ikind == .ctx_next_rng_seed) {
+                    emitter.has_context_ops = true;
+                } else if (ikind == .tls_scratch_ptr) {
+                    emitter.has_tls_scratch = true;
+                } else if (ikind == .tls_alloc_state) {
+                    emitter.has_tls_alloc = true;
+                } else if (ikind == .sys_mmap or ikind == .sys_munmap) {
+                    emitter.has_sys_mmap = true;
+                } else if (ikind == .fmt_write) {
+                    emitter.has_fmt_write = true;
                 } else if (ikind == .fmt_value or ikind == .derive_debug_fmt) {
                     const fmt_args = body_ptr.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs];
                     if (fmt_args.len >= 1) {
@@ -2898,8 +3010,8 @@ fn emitTypeDeclarations(emitter: *CModuleEmitter) !void {
             },
             .soa_slice_ty => {
                 try emitter.print(
-                    "struct _cx_ty_{d} {{ uint8_t *ptr; {s} len; }};\n",
-                    .{ ty_u32, usize_c },
+                    "struct _cx_ty_{d} {{ uint8_t *ptr; {s} len; {s} stride; {s} elem_off; }};\n",
+                    .{ ty_u32, usize_c, usize_c, usize_c },
                 );
             },
             .closure_ty => {
@@ -2953,6 +3065,12 @@ fn emitTypeDeclarations(emitter: *CModuleEmitter) !void {
                     .{ lay.alignBytes(), ty_u32, @max(lay.size_bytes, 1) },
                 );
             },
+            .soa_vec_ty => {
+                try emitter.print(
+                    "struct __attribute__((aligned({d}))) _cx_ty_{d} {{ uint8_t *ptr; uint32_t len; uint32_t cap; uintptr_t alloc; }};\n",
+                    .{ lay.alignBytes(), ty_u32 },
+                );
+            },
             .union_ty => {
                 try emitter.print("union __attribute__((aligned({d}))) _cx_ty_{d} {{\n", .{
                     lay.alignBytes(),
@@ -2961,29 +3079,17 @@ fn emitTypeDeclarations(emitter: *CModuleEmitter) !void {
                 const is_natural_c_float = rflags.is_repr_c and !rflags.is_packed and
                     (try hasFloatFieldForCAbi(emitter, ty, 0));
                 var max_emitted_bytes: u64 = 0;
-                const sym_idx = SymbolIndex.fromInt(node.rhs);
-                if (!sym_idx.isNone() and sym_idx.asInt() < emitter.input.sym_table.symbols.items.len) {
-                    const un_sym = emitter.input.sym_table.getSymbol(sym_idx).*;
-                    if (!un_sym.target_scope.isNone()) {
-                        const subst = type_system.NominalTypeSubst.init(
-                            emitter.input.pool,
-                            emitter.input.sym_table,
-                            ty,
-                        );
-                        var fld_ord: u32 = 0;
-                        for (emitter.input.sym_table.getScopeMembers(un_sym.target_scope)) |mem_idx| {
-                            const mem_sym = emitter.input.sym_table.getSymbol(mem_idx).*;
-                            if (mem_sym.kind != .field_sym) continue;
-                            const fld_ty = emitter.input.pool.unwrapUnderlyingType(subst.resolve(mem_sym.type_id));
-                            if (!(try isZeroSizedType(emitter, fld_ty))) {
-                                const fld_lay = try emitter.resolver.resolveType(fld_ty);
-                                if (fld_lay.size_bytes > max_emitted_bytes) max_emitted_bytes = fld_lay.size_bytes;
-                                const fld_c = try formatCType(emitter, fld_ty);
-                                defer emitter.allocator.free(fld_c);
-                                try emitter.print("    {s} _f{d};\n", .{ fld_c, fld_ord });
-                            }
-                            fld_ord += 1;
-                        }
+                const fld_start = lay.aux_start;
+                const fld_len = lay.aux_len;
+                var fld_ord: u32 = 0;
+                while (fld_ord < fld_len) : (fld_ord += 1) {
+                    const fld = emitter.resolver.fields_by_decl.items[fld_start + fld_ord];
+                    const fld_ty = emitter.input.pool.unwrapUnderlyingType(fld.field_ty);
+                    if (fld.size_bytes > 0 and !(try isZeroSizedType(emitter, fld_ty))) {
+                        if (fld.size_bytes > max_emitted_bytes) max_emitted_bytes = fld.size_bytes;
+                        const fld_c = try formatCType(emitter, fld_ty);
+                        defer emitter.allocator.free(fld_c);
+                        try emitter.print("    {s} _f{d};\n", .{ fld_c, fld.decl_ordinal });
                     }
                 }
                 if (max_emitted_bytes == 0 or
@@ -3257,6 +3363,22 @@ fn emitRodataAndDevSeam(emitter: *CModuleEmitter, dev_seam_out: *?[]u8) !void {
             .{10 * emitter.ctx_slot_stride_bytes},
         );
     }
+    if (emitter.has_tls_scratch) {
+        try emitter.writeAll(
+            "static CX_THREAD_LOCAL uint64_t __attribute__((aligned(16))) _cx_tls_scratch_buf[8] = {0};\n",
+        );
+    }
+    if (emitter.has_tls_alloc) {
+        try emitter.writeAll(
+            "static CX_THREAD_LOCAL uint64_t __attribute__((aligned(16))) _cx_tls_alloc_buf[32] = {0};\n",
+        );
+    }
+    if (emitter.has_sys_mmap) {
+        try emitSysMmapHelpersC(emitter);
+    }
+    if (emitter.has_soa_vec) {
+        try emitSoaSlabHelpersC(emitter);
+    }
 
     if (emitter.has_async_ops) {
         try emitAsyncRuntimeHelpersC(emitter);
@@ -3283,6 +3405,197 @@ fn emitRodataAndDevSeam(emitter: *CModuleEmitter, dev_seam_out: *?[]u8) !void {
         dev_seam_out.* = try buildDevSeamBytes(emitter);
     }
     try emitter.writeAll("\n");
+}
+
+/// Emits OS-specific anonymous page mapping helpers (`_cx_sys_mmap` / `_cx_sys_munmap`) when referenced.
+fn emitSysMmapHelpersC(emitter: *CModuleEmitter) !void {
+    if (emitter.cfg.target.isWasm()) {
+        try emitter.writeAll(
+            \\static void *_cx_sys_mmap(size_t _byte_len) {
+            \\    if (_byte_len == 0u) return NULL;
+            \\    size_t _pages = (_byte_len + 65535u) >> 16u;
+            \\    size_t _prev = __builtin_wasm_memory_grow(0, _pages);
+            \\    if (_prev == (size_t)-1) return NULL;
+            \\    return (void *)(_prev << 16u);
+            \\}
+            \\static inline void _cx_sys_munmap(void *_ptr, size_t _byte_len) { (void)_ptr; (void)_byte_len; }
+            \\
+        );
+    } else if (emitter.cfg.target.isWindows()) {
+        try emitter.writeAll(
+            \\void *__stdcall VirtualAlloc(void *, size_t, uint32_t, uint32_t);
+            \\int __stdcall VirtualFree(void *, size_t, uint32_t);
+            \\static void *_cx_sys_mmap(size_t _byte_len) {
+            \\    if (_byte_len == 0u) return NULL;
+            \\    return VirtualAlloc(NULL, _byte_len, 0x3000u, 0x04u);
+            \\}
+            \\static inline void _cx_sys_munmap(void *_ptr, size_t _byte_len) {
+            \\    (void)_byte_len;
+            \\    if (_ptr != NULL) (void)VirtualFree(_ptr, 0u, 0x8000u);
+            \\}
+            \\
+        );
+    } else {
+        const map_anon_hex: []const u8 = if (emitter.cfg.target.isDarwin()) "0x1002" else "0x22";
+        try emitter.print(
+            "void *mmap(void *, size_t, int, int, int, int64_t);\n" ++
+                "int munmap(void *, size_t);\n" ++
+                "static void *_cx_sys_mmap(size_t _byte_len) {{\n" ++
+                "    if (_byte_len == 0u) return NULL;\n" ++
+                "    void *_res = mmap(NULL, _byte_len, 3, {s}, -1, 0);\n" ++
+                "    return (_res == (void *)(intptr_t)-1) ? NULL : _res;\n" ++
+                "}}\n" ++
+                "static inline void _cx_sys_munmap(void *_ptr, size_t _byte_len) {{\n" ++
+                "    if (_ptr != NULL && _byte_len > 0u) (void)munmap(_ptr, _byte_len);\n" ++
+                "}}\n",
+            .{map_anon_hex},
+        );
+    }
+}
+
+/// Resolves `AllocatorHandle.alloc` and `AllocatorHandle.dealloc` body indices inside `emitter.input.bodies`.
+fn lookupAllocatorHandleBodiesC(emitter: *const CModuleEmitter) ?struct {
+    alloc_b: u32,
+    dealloc_b: u32,
+    handle_ty: TypeId,
+    layout_ty: TypeId,
+    res_ty: TypeId,
+} {
+    var alloc_b_opt: ?u32 = null;
+    var dealloc_b_opt: ?u32 = null;
+    for (emitter.input.sym_table.symbols.items) |cand_sym| {
+        if (cand_sym.kind == .struct_sym and
+            std.mem.eql(u8, cand_sym.name_text, "AllocatorHandle") and
+            !cand_sym.target_scope.isNone())
+        {
+            for (emitter.input.sym_table.getScopeMembers(cand_sym.target_scope)) |mem_idx| {
+                const mem_sym = emitter.input.sym_table.getSymbol(mem_idx).*;
+                if (mem_sym.kind != .fn_sym) continue;
+                if (std.mem.eql(u8, mem_sym.name_text, "alloc")) {
+                    if (resolveBodyIndex(emitter, mem_sym.def_id, mem_idx)) |found_b| {
+                        if (emitter.input.bodies[found_b].param_count == 2) alloc_b_opt = found_b;
+                    }
+                } else if (std.mem.eql(u8, mem_sym.name_text, "dealloc")) {
+                    if (resolveBodyIndex(emitter, mem_sym.def_id, mem_idx)) |found_b| {
+                        if (emitter.input.bodies[found_b].param_count == 3) dealloc_b_opt = found_b;
+                    }
+                }
+            }
+            break;
+        }
+    }
+    const alloc_b = alloc_b_opt orelse return null;
+    const dealloc_b = dealloc_b_opt orelse return null;
+    const alloc_body = &emitter.input.bodies[alloc_b];
+    if (alloc_body.locals.items.len < 3) return null;
+    return .{
+        .alloc_b = alloc_b,
+        .dealloc_b = dealloc_b,
+        .handle_ty = emitter.input.pool.unwrapUnderlyingType(alloc_body.locals.items[1].type_id),
+        .layout_ty = emitter.input.pool.unwrapUnderlyingType(alloc_body.locals.items[2].type_id),
+        .res_ty = emitter.input.pool.unwrapUnderlyingType(alloc_body.ret_ty),
+    };
+}
+
+/// Emits over-aligned zeroed slab helpers (`_cx_soa_zalloc` / `_cx_soa_free`) for `#soa Vec[S]`.
+fn emitSoaSlabHelpersC(emitter: *CModuleEmitter) !void {
+    try emitter.writeAll(
+        \\static void *_cx_soa_zalloc(uintptr_t _alloc, size_t _byte_n, size_t _align_b, int _is_try);
+        \\static void _cx_soa_free(uintptr_t _alloc, void *_ptr, size_t _old_n, size_t _align_b);
+        \\
+    );
+}
+
+/// Emits deferred C99 definitions of `_cx_soa_zalloc` and `_cx_soa_free` after module prototypes.
+fn emitSoaSlabHelperDefsC(emitter: *CModuleEmitter) !void {
+    const trap_stmt = if (emitter.cfg.target.isFreestanding()) "__builtin_trap()" else "_cx_rt_trap(0u)";
+    try emitter.writeAll("static void *_cx_soa_zalloc(uintptr_t _alloc, size_t _byte_n, size_t _align_b, int _is_try) {\n");
+    try emitter.writeAll("    if (_align_b < 16u) _align_b = 16u;\n");
+    if (lookupAllocatorHandleBodiesC(emitter)) |ah| {
+        const handle_c = try formatCType(emitter, ah.handle_ty);
+        defer emitter.allocator.free(handle_c);
+        const layout_c = try formatCType(emitter, ah.layout_ty);
+        defer emitter.allocator.free(layout_c);
+        const res_c = try formatCType(emitter, ah.res_ty);
+        defer emitter.allocator.free(res_c);
+        const sum_detail = (try emitter.resolver.getSumDetail(ah.res_ty)).?;
+        const discr_expr = try formatSumDiscrReadExpr(emitter, ah.res_ty, sum_detail, "_ar");
+        defer emitter.allocator.free(discr_expr);
+        try emitter.print(
+            "    {s} _ah; memset(&_ah, 0, sizeof(_ah)); memcpy(&_ah, &_alloc, sizeof(_ah) < sizeof(_alloc) ? sizeof(_ah) : sizeof(_alloc));\n" ++
+                "    {s} _ly; _ly._f0 = _byte_n; _ly._f1 = _align_b;\n" ++
+                "    {s} _ar = {s}(_ah, _ly);\n" ++
+                "    if (({s}) != 0u) {{ if (_is_try) return NULL; {s}; }}\n" ++
+                "    void *_out = NULL;\n" ++
+                "    memcpy(&_out, ((uint8_t *)&_ar) + {d}u, sizeof(void *));\n" ++
+                "    if (_out != NULL && _byte_n > 0u) memset(_out, 0, _byte_n);\n" ++
+                "    return _out;\n" ++
+                "}}\n",
+            .{
+                handle_c,
+                layout_c,
+                res_c,
+                emitter.body_c_names.items[ah.alloc_b],
+                discr_expr,
+                trap_stmt,
+                sum_detail.payload_offset,
+            },
+        );
+        try emitter.print(
+            "static void _cx_soa_free(uintptr_t _alloc, void *_ptr, size_t _old_n, size_t _align_b) {{\n" ++
+                "    if (_ptr == NULL || _old_n == 0u || (_alloc & 7u) != 0u) return;\n" ++
+                "    if (_align_b < 16u) _align_b = 16u;\n" ++
+                "    {s} _ah; memset(&_ah, 0, sizeof(_ah)); memcpy(&_ah, &_alloc, sizeof(_ah) < sizeof(_alloc) ? sizeof(_ah) : sizeof(_alloc));\n" ++
+                "    {s} _ly; _ly._f0 = _old_n; _ly._f1 = _align_b;\n" ++
+                "    {s}(_ah, (uint8_t *)_ptr, _ly);\n" ++
+                "}}\n\n",
+            .{ handle_c, layout_c, emitter.body_c_names.items[ah.dealloc_b] },
+        );
+        return;
+    }
+
+    if (emitter.cfg.target.isFreestanding()) {
+        try emitter.writeAll(
+            \\    (void)_alloc;
+            \\    if (_byte_n == 0u) _byte_n = 16u;
+            \\    size_t _pages = (_byte_n + _align_b + 65535u) >> 16u;
+            \\    size_t _prev = __builtin_wasm_memory_grow(0, _pages);
+            \\    if (_prev == (size_t)-1) { if (_is_try) return NULL; __builtin_trap(); }
+            \\    uintptr_t _raw = (uintptr_t)(_prev << 16u);
+            \\    uintptr_t _al = (_raw + (uintptr_t)(_align_b - 1u)) & ~(uintptr_t)(_align_b - 1u);
+            \\    memset((void *)_al, 0, _byte_n);
+            \\    return (void *)_al;
+            \\}
+            \\static void _cx_soa_free(uintptr_t _alloc, void *_ptr, size_t _old_n, size_t _align_b) {
+            \\    (void)_alloc; (void)_ptr; (void)_old_n; (void)_align_b;
+            \\}
+            \\
+        );
+    } else {
+        try emitter.writeAll(
+            \\    (void)_alloc;
+            \\    if (_byte_n == 0u) _byte_n = 16u;
+            \\    size_t _hdr = _align_b > sizeof(void *) ? _align_b : sizeof(void *);
+            \\    if (_byte_n > ((size_t)-1) - _hdr - _align_b) {
+            \\        if (_is_try) return NULL;
+            \\        _cx_rt_trap(0u);
+            \\    }
+            \\    void *_raw = calloc(1u, _byte_n + _hdr + _align_b);
+            \\    if (_raw == NULL) {
+            \\        if (_is_try) return NULL;
+            \\        _cx_rt_trap(0u);
+            \\    }
+            \\    uintptr_t _al = (((uintptr_t)_raw) + _hdr + (_align_b - 1u)) & ~(uintptr_t)(_align_b - 1u);
+            \\    ((void **)_al)[-1] = _raw;
+            \\    return (void *)_al;
+            \\}
+            \\static void _cx_soa_free(uintptr_t _alloc, void *_ptr, size_t _old_n, size_t _align_b) {
+            \\    (void)_alloc; (void)_old_n; (void)_align_b;
+            \\    if (_ptr != NULL) free(((void **)_ptr)[-1]);
+            \\}
+            \\
+        );
+    }
 }
 
 /// Emits the C99 stackless coroutine handle, FIFO `TaskGroup` scheduler, and `ReactorVTable` yield seam (`DR-08`).
@@ -3779,7 +4092,9 @@ fn buildDevSeamBytes(emitter: *CModuleEmitter) ![]u8 {
 /// Finds the 0-based `MirBody` index implementing `Drop.drop` for unwrapped `ty` (`null` if none).
 fn lookupDropBodyIndexForType(emitter: *const CModuleEmitter, ty: TypeId) ?u32 {
     const ty_node = emitter.input.pool.getNode(ty);
-    if (ty_node.tag == .struct_ty or ty_node.tag == .enum_ty or ty_node.tag == .union_ty) {
+    if ((ty_node.tag == .struct_ty or ty_node.tag == .enum_ty or ty_node.tag == .union_ty) and
+        emitter.input.pool.getGenericTypeArgs(ty).len == 0)
+    {
         const sym_idx = SymbolIndex.fromInt(ty_node.rhs);
         if (!sym_idx.isNone() and sym_idx.asInt() < emitter.input.sym_table.symbols.items.len) {
             const nom_sym = emitter.input.sym_table.getSymbol(sym_idx).*;
@@ -3798,8 +4113,12 @@ fn lookupDropBodyIndexForType(emitter: *const CModuleEmitter, ty: TypeId) ?u32 {
     for (emitter.input.bodies, 0..) |*cand_body, b_idx| {
         if (cand_body.param_count != 1 or cand_body.locals.items.len < 2) continue;
         const fn_name = emitter.input.interner.get(cand_body.name);
-        if (!std.mem.eql(u8, fn_name, "drop") and
-            !std.mem.endsWith(u8, fn_name, ".drop")) continue;
+        const base_fn_name = if (std.mem.indexOfScalar(u8, fn_name, '$')) |dollar_idx|
+            fn_name[0..dollar_idx]
+        else
+            fn_name;
+        if (!std.mem.eql(u8, base_fn_name, "drop") and
+            !std.mem.endsWith(u8, base_fn_name, ".drop")) continue;
         const raw_param_ty = emitter.input.pool.unwrapUnderlyingType(cand_body.locals.items[1].type_id);
         const param_node = emitter.input.pool.getNode(raw_param_ty);
         const self_ty = if (param_node.tag == .ref_ty or
@@ -3895,6 +4214,10 @@ fn emitBodyFunctionAttributesC(
         try emitter.writeAll("__attribute__((section(\"");
         try appendEscapedCStringContents(emitter, ffi_meta.link_section);
         try emitter.writeAll("\"))) ");
+    }
+
+    if (sym_rec.extra_flags.is_noinline) {
+        try emitter.writeAll("__attribute__((noinline)) ");
     }
 
     if (isBodyCAbiBoundary(emitter, body)) {
@@ -4151,9 +4474,10 @@ fn computeCoroFrameTotalAndAlignC(
                                         body.getInst(MirValueId.fromInt(hole_ref_raw)).type_id,
                                     );
                                     const hole_node = emitter.input.pool.getNode(hole_ref_ty);
-                                    const is_ptr_arg = hole_node.tag == .ref_ty or
+                                    const is_ptr_arg = (hole_node.tag == .ref_ty or
                                         hole_node.tag == .mut_ref_ty or
-                                        hole_node.tag == .raw_ptr_ty;
+                                        hole_node.tag == .raw_ptr_ty) and
+                                        !emitter.input.pool.isSliceRefType(hole_ref_ty);
                                     if (!is_ptr_arg and !(try isZeroSizedType(emitter, hole_ref_ty))) {
                                         const h_lay = try emitter.resolver.resolveType(hole_ref_ty);
                                         const h_al = @max(h_lay.alignBytes(), 8);
@@ -4175,6 +4499,20 @@ fn computeCoroFrameTotalAndAlignC(
                 max_align = @max(max_align, sl_al);
                 cursor = std.mem.alignForward(u64, cursor, sl_al);
                 cursor += @max(sl_lay.size_bytes, 16);
+            } else if (inst.op == .intrinsic_op and
+                @as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)) == .slice_split_at)
+            {
+                const tup_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
+                const tup_elems = emitter.input.pool.getTupleElements(tup_ty);
+                if (tup_elems.len >= 2) {
+                    if (resolveSliceRefPointee(emitter, TypeId.fromInt(tup_elems[0]))) |sl_pointee| {
+                        const sl_lay = try emitter.resolver.resolveType(sl_pointee);
+                        const sl_al = @max(sl_lay.alignBytes(), 8);
+                        max_align = @max(max_align, sl_al);
+                        cursor = std.mem.alignForward(u64, cursor, sl_al);
+                        cursor += 2 * @max(sl_lay.size_bytes, 16);
+                    }
+                }
             }
         }
         if (inst.op == .intrinsic_op and @as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)) == .ctx_get) {
@@ -4452,6 +4790,57 @@ fn emitDropHelperDefinition(emitter: *CModuleEmitter, drop_ty: TypeId) !void {
                 );
             }
         },
+        .soa_vec_ty => {
+            const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+            const lay = try emitter.resolver.resolveType(elem_struct);
+            const slab_align: u32 = @max(
+                @as(u32, 1) << @intCast(@max(lay.align_log2, emitter.target_layout.simd_align_log2)),
+                16,
+            );
+            if (!type_system.isTrivialDropType(emitter.input.pool, emitter.input.sym_table, elem_struct)) {
+                try emitter.writeAll(
+                    "    if (_self_ptr->ptr != NULL && _self_ptr->len > 0u && _self_ptr->cap > 0u) {\n" ++
+                        "        uint32_t _di = _self_ptr->len;\n" ++
+                        "        while (_di > 0u) {\n" ++
+                        "            _di -= 1u;\n",
+                );
+                var rev_col: u32 = lay.aux_len;
+                while (rev_col > 0) {
+                    rev_col -= 1;
+                    const fld = emitter.resolver.fields_by_decl.items[lay.aux_start + rev_col];
+                    const fld_ty = emitter.input.pool.unwrapUnderlyingType(fld.field_ty);
+                    if (fld.size_bytes == 0 or !emitter.drop_type_set.contains(fld_ty.toU32())) continue;
+                    const off_e = try formatDynamicSoaColOffsetExpr(emitter, elem_struct, rev_col, "_self_ptr->cap");
+                    defer emitter.allocator.free(off_e);
+                    const fld_c = try formatCType(emitter, fld_ty);
+                    defer emitter.allocator.free(fld_c);
+                    try emitter.print(
+                        "            _cx_drop_ty_{d}((({s} *)(_self_ptr->ptr + {s})) + _di);\n",
+                        .{ fld_ty.toU32(), fld_c, off_e },
+                    );
+                }
+                try emitter.writeAll("        }\n    }\n");
+            }
+            var old_total_expr: []u8 = try emitter.allocator.dupe(u8, "((size_t)0u)");
+            defer emitter.allocator.free(old_total_expr);
+            if (lay.aux_len > 0) {
+                const last_ord = lay.aux_len - 1;
+                const last_off = try formatDynamicSoaColOffsetExpr(emitter, elem_struct, last_ord, "_self_ptr->cap");
+                defer emitter.allocator.free(last_off);
+                const last_fld = emitter.resolver.fields_by_decl.items[lay.aux_start + last_ord];
+                emitter.allocator.free(old_total_expr);
+                old_total_expr = try std.fmt.allocPrint(
+                    emitter.allocator,
+                    "({s} + ((size_t){d}u * (size_t)_self_ptr->cap))",
+                    .{ last_off, last_fld.size_bytes },
+                );
+            }
+            try emitter.print(
+                "    if (_self_ptr->ptr != NULL && _self_ptr->cap > 0u) {{ _cx_soa_free(_self_ptr->alloc, _self_ptr->ptr, {s}, {d}u); }}\n" ++
+                    "    _self_ptr->ptr = NULL; _self_ptr->len = 0u; _self_ptr->cap = 0u;\n",
+                .{ old_total_expr, slab_align },
+            );
+        },
         .optional_ty, .result_ty, .enum_ty => {
             if (try emitter.resolver.getSumDetail(drop_ty)) |sum_detail| {
                 const discr_expr = try formatSumDiscrReadExpr(emitter, drop_ty, sum_detail, "(*_self_ptr)");
@@ -4596,6 +4985,34 @@ fn emitEqHelperDefinition(emitter: *CModuleEmitter, eq_ty: TypeId) !void {
             }
             try emitter.writeAll("    return 1u;\n");
         },
+        .soa_vec_ty => {
+            const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+            const lay = try emitter.resolver.resolveType(elem_struct);
+            try emitter.writeAll("    if (_lhs->len != _rhs->len) return 0u;\n");
+            try emitter.writeAll("    if (_lhs->len == 0u) return 1u;\n");
+            var fld_i: u32 = 0;
+            while (fld_i < lay.aux_len) : (fld_i += 1) {
+                const fld = emitter.resolver.fields_by_decl.items[lay.aux_start + fld_i];
+                if (fld.size_bytes == 0) continue;
+                const fld_ty = emitter.input.pool.unwrapUnderlyingType(fld.field_ty);
+                const off_l = try formatDynamicSoaColOffsetExpr(emitter, elem_struct, fld_i, "_lhs->cap");
+                defer emitter.allocator.free(off_l);
+                const off_r = try formatDynamicSoaColOffsetExpr(emitter, elem_struct, fld_i, "_rhs->cap");
+                defer emitter.allocator.free(off_r);
+                const fld_c = try formatCType(emitter, fld_ty);
+                defer emitter.allocator.free(fld_c);
+                const eq_e = try formatAlignedVarEqExprC(emitter, fld_ty, "_cl", "_cr");
+                defer emitter.allocator.free(eq_e);
+                try emitter.print(
+                    "    {{ size_t _ol = {s}; size_t _or = {s}; size_t _ei = 0u; while (_ei < (size_t)_lhs->len) {{ {s} _cl, _cr; " ++
+                        "memcpy(&_cl, _lhs->ptr + _ol + _ei * sizeof(_cl), sizeof(_cl)); " ++
+                        "memcpy(&_cr, _rhs->ptr + _or + _ei * sizeof(_cr), sizeof(_cr)); " ++
+                        "if (!({s})) return 0u; _ei += 1u; }} }}\n",
+                    .{ off_l, off_r, fld_c, eq_e },
+                );
+            }
+            try emitter.writeAll("    return 1u;\n");
+        },
         .soa_slice_ty => {
             const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
             const lay = try emitter.resolver.resolveType(elem_struct);
@@ -4608,18 +5025,22 @@ fn emitEqHelperDefinition(emitter: *CModuleEmitter, eq_ty: TypeId) !void {
                 const fld = emitter.resolver.fields_by_decl.items[fld_start + fld_i];
                 if (fld.size_bytes == 0) continue;
                 const fld_ty = emitter.input.pool.unwrapUnderlyingType(fld.field_ty);
-                const off_e = try formatDynamicSoaColOffsetExpr(emitter, elem_struct, fld_i, "_lhs->len");
-                defer emitter.allocator.free(off_e);
+                const off_l = try formatDynamicSoaColOffsetExpr(emitter, elem_struct, fld_i, "_lhs->stride");
+                defer emitter.allocator.free(off_l);
+                const off_r = try formatDynamicSoaColOffsetExpr(emitter, elem_struct, fld_i, "_rhs->stride");
+                defer emitter.allocator.free(off_r);
                 const fld_c = try formatCType(emitter, fld_ty);
                 defer emitter.allocator.free(fld_c);
                 const eq_e = try formatAlignedVarEqExprC(emitter, fld_ty, "_cl", "_cr");
                 defer emitter.allocator.free(eq_e);
                 try emitter.print(
-                    "    {{ size_t _off = {s}; size_t _ei = 0u; while (_ei < (size_t)_lhs->len) {{ {s} _cl, _cr; " ++
-                        "memcpy(&_cl, _lhs->ptr + _off + _ei * sizeof(_cl), sizeof(_cl)); " ++
-                        "memcpy(&_cr, _rhs->ptr + _off + _ei * sizeof(_cr), sizeof(_cr)); " ++
+                    "    {{ size_t _ol = ({s}) + ((size_t)_lhs->elem_off) * sizeof({s}); " ++
+                        "size_t _or = ({s}) + ((size_t)_rhs->elem_off) * sizeof({s}); " ++
+                        "size_t _ei = 0u; while (_ei < (size_t)_lhs->len) {{ {s} _cl, _cr; " ++
+                        "memcpy(&_cl, _lhs->ptr + _ol + _ei * sizeof(_cl), sizeof(_cl)); " ++
+                        "memcpy(&_cr, _rhs->ptr + _or + _ei * sizeof(_cr), sizeof(_cr)); " ++
                         "if (!({s})) return 0u; _ei += 1u; }} }}\n",
-                    .{ off_e, fld_c, eq_e },
+                    .{ off_l, fld_c, off_r, fld_c, fld_c, eq_e },
                 );
             }
             try emitter.writeAll("    return 1u;\n");
@@ -4887,15 +5308,27 @@ fn emitFmtHelperDefinition(emitter: *CModuleEmitter, fmt_ty: TypeId) !void {
     switch (node.tag) {
         .ref_ty, .mut_ref_ty => {
             const pointee_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
-            try emitter.print(
-                "    const void *_rp = NULL; memcpy(&_rp, _val_p, sizeof(_rp));\n" ++
+            if (emitter.input.pool.isSliceRefType(fmt_ty)) {
+                try emitter.print(
                     "    if (((_spec_lo >> 27) & 0xFu) == 9u) {{\n" ++
-                    "        _cx_rt_fmt_ptr_spec(_out_b, (uintptr_t)_rp, _spec_lo, _spec_hi);\n" ++
-                    "    }} else {{\n" ++
-                    "        _cx_fmt_fn_ty_{d}(_out_b, _rp, _spec_lo, _spec_hi);\n" ++
-                    "    }}\n}}\n",
-                .{pointee_ty.toU32()},
-            );
+                        "        uintptr_t _pv = 0u; memcpy(&_pv, _val_p, sizeof(_pv));\n" ++
+                        "        _cx_rt_fmt_ptr_spec(_out_b, _pv, _spec_lo, _spec_hi);\n" ++
+                        "    }} else {{\n" ++
+                        "        _cx_fmt_fn_ty_{d}(_out_b, (const uint8_t *)_val_p, _spec_lo, _spec_hi);\n" ++
+                        "    }}\n}}\n",
+                    .{pointee_ty.toU32()},
+                );
+            } else {
+                try emitter.print(
+                    "    const void *_rp = NULL; memcpy(&_rp, _val_p, sizeof(_rp));\n" ++
+                        "    if (((_spec_lo >> 27) & 0xFu) == 9u) {{\n" ++
+                        "        _cx_rt_fmt_ptr_spec(_out_b, (uintptr_t)_rp, _spec_lo, _spec_hi);\n" ++
+                        "    }} else {{\n" ++
+                        "        _cx_fmt_fn_ty_{d}(_out_b, _rp, _spec_lo, _spec_hi);\n" ++
+                        "    }}\n}}\n",
+                    .{pointee_ty.toU32()},
+                );
+            }
         },
         .raw_ptr_ty, .fn_ty => {
             try emitter.writeAll(
@@ -5185,6 +5618,8 @@ fn resolvePlaceResultType(emitter: *CModuleEmitter, body: *const MirBody, place_
                         0, 1 => .str_ty,
                         else => .u32_ty,
                     };
+                } else if (cur_ty == .fmt_spec_ty) {
+                    cur_ty = if (proj.payload == 0) .u32_ty else .u16_ty;
                 } else if (node.tag == .union_ty) {
                     cur_ty = resolveUnionFieldType(emitter, cur_ty, proj.payload);
                 } else if (emitter.resolver.getFieldByDeclOrdinal(cur_ty, proj.payload) catch null) |fld| {
@@ -5212,7 +5647,10 @@ fn resolvePlaceResultType(emitter: *CModuleEmitter, body: *const MirBody, place_
 }
 
 /// Resolves field `field_ord` of `.union_ty` `union_ty`.
-fn resolveUnionFieldType(emitter: *const CModuleEmitter, union_ty: TypeId, field_ord: u32) TypeId {
+fn resolveUnionFieldType(emitter: *CModuleEmitter, union_ty: TypeId, field_ord: u32) TypeId {
+    if (emitter.resolver.getFieldByDeclOrdinal(union_ty, field_ord) catch null) |fld| {
+        return emitter.input.pool.unwrapUnderlyingType(fld.field_ty);
+    }
     const node = emitter.input.pool.getNode(union_ty);
     const sym_idx = SymbolIndex.fromInt(node.rhs);
     if (sym_idx.isNone() or sym_idx.asInt() >= emitter.input.sym_table.symbols.items.len) return .unit_ty;
@@ -5228,7 +5666,7 @@ fn resolveUnionFieldType(emitter: *const CModuleEmitter, union_ty: TypeId, field
         const mem_sym = emitter.input.sym_table.getSymbol(mem_idx).*;
         if (mem_sym.kind != .field_sym) continue;
         if (cur_ord == field_ord) {
-            return emitter.input.pool.unwrapUnderlyingType(subst.resolve(mem_sym.type_id));
+            return emitter.input.pool.unwrapUnderlyingType(subst.lookupExisting(emitter.input.pool, mem_sym.type_id));
         }
         cur_ord += 1;
     }
@@ -5371,9 +5809,11 @@ fn lowerPlaceC(emitter: *CModuleEmitter, body: *const MirBody, place_id: PlaceId
         switch (proj.kind) {
             .deref => {
                 active_downcast = null;
-                const next_expr = try std.fmt.allocPrint(emitter.allocator, "(*({s}))", .{cur_expr});
-                emitter.allocator.free(cur_expr);
-                cur_expr = next_expr;
+                if (!emitter.input.pool.isSliceRefType(cur_ty)) {
+                    const next_expr = try std.fmt.allocPrint(emitter.allocator, "(*({s}))", .{cur_expr});
+                    emitter.allocator.free(cur_expr);
+                    cur_expr = next_expr;
+                }
                 cur_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
             },
             .downcast => {
@@ -5416,6 +5856,21 @@ fn lowerPlaceC(emitter: *CModuleEmitter, body: *const MirBody, place_id: PlaceId
                     const next_expr = try std.fmt.allocPrint(
                         emitter.allocator,
                         "(({s})->{s})",
+                        .{ cur_expr, fld_name },
+                    );
+                    emitter.allocator.free(cur_expr);
+                    cur_expr = next_expr;
+                    cur_ty = fld_ty;
+                } else if (cur_ty == .fmt_spec_ty) {
+                    const fld_name = switch (proj.payload) {
+                        0 => "flags_and_fill",
+                        1 => "width_or_none",
+                        else => "precision_or_none",
+                    };
+                    const fld_ty: TypeId = if (proj.payload == 0) .u32_ty else .u16_ty;
+                    const next_expr = try std.fmt.allocPrint(
+                        emitter.allocator,
+                        "(({s}).{s})",
                         .{ cur_expr, fld_name },
                     );
                     emitter.allocator.free(cur_expr);
@@ -5491,18 +5946,31 @@ fn lowerPlaceC(emitter: *CModuleEmitter, body: *const MirBody, place_id: PlaceId
                 } else {
                     const len_str = try std.fmt.allocPrint(emitter.allocator, "(({s}).len)", .{cur_expr});
                     errdefer emitter.allocator.free(len_str);
+                    const stride_str = if (node.tag == .soa_vec_ty)
+                        try std.fmt.allocPrint(emitter.allocator, "(({s}).cap)", .{cur_expr})
+                    else
+                        try std.fmt.allocPrint(emitter.allocator, "(({s}).stride)", .{cur_expr});
+                    defer emitter.allocator.free(stride_str);
                     const off_str = try formatDynamicSoaColOffsetExpr(
                         emitter,
                         elem_struct,
                         proj.payload,
-                        len_str,
+                        stride_str,
                     );
                     defer emitter.allocator.free(off_str);
-                    const col_ptr = try std.fmt.allocPrint(
-                        emitter.allocator,
-                        "(({s} *)((({s}).ptr) + {s}))",
-                        .{ fld_c, cur_expr, off_str },
-                    );
+                    const fld_lay = try emitter.resolver.resolveType(fld_ty);
+                    const col_ptr = if (node.tag == .soa_vec_ty or fld_lay.size_bytes == 0)
+                        try std.fmt.allocPrint(
+                            emitter.allocator,
+                            "(({s} *)((({s}).ptr) + {s}))",
+                            .{ fld_c, cur_expr, off_str },
+                        )
+                    else
+                        try std.fmt.allocPrint(
+                            emitter.allocator,
+                            "(({s} *)((({s}).ptr) + {s} + ((size_t)(({s}).elem_off) * {d}u)))",
+                            .{ fld_c, cur_expr, off_str, cur_expr, fld_lay.size_bytes },
+                        );
                     soa_pending = .{
                         .col_ptr_expr = col_ptr,
                         .len_expr = len_str,
@@ -5788,8 +6256,16 @@ fn formatWireByteSpanExprs(
             };
         },
         .ref_ty, .mut_ref_ty, .raw_ptr_ty => {
+            if (emitter.input.pool.isSliceRefType(ty)) {
+                return .{
+                    .ptr_expr = try std.fmt.allocPrint(emitter.allocator, "((const uint8_t *)_v_{d}.ptr)", .{v_raw}),
+                    .len_expr = try std.fmt.allocPrint(emitter.allocator, "((size_t)_v_{d}.len)", .{v_raw}),
+                };
+            }
             const inner_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
-            if (inner_ty == .str_ty or emitter.input.pool.getNode(inner_ty).tag == .slice_ty) {
+            if (inner_ty == .str_ty or emitter.input.pool.getNode(inner_ty).tag == .slice_ty or
+                emitter.input.pool.isSliceRefType(inner_ty))
+            {
                 return .{
                     .ptr_expr = try std.fmt.allocPrint(emitter.allocator, "((const uint8_t *)(_v_{d}->ptr))", .{v_raw}),
                     .len_expr = try std.fmt.allocPrint(emitter.allocator, "((size_t)(_v_{d}->len))", .{v_raw}),
@@ -5884,10 +6360,10 @@ fn formatIntAsCxU128Expr(
 
 // ------------- MirBody Instruction & CFG Lowering -------------
 
-/// Returns the inner `[T]` / `#soa [T]` slice `TypeId` if `raw_ty` is `&[T]` / `&mut [T]` / `*[T]`.
+/// Returns the inner `str` or `[T]` `TypeId` ONLY when `raw_ty` is a thin pointer to a fat slice (`&str` / `*[T]`).
 fn resolveSliceRefPointee(emitter: *const CModuleEmitter, raw_ty: TypeId) ?TypeId {
     const ty = emitter.input.pool.unwrapUnderlyingType(raw_ty);
-    if (ty.isPrimitiveOrSentinel()) return null;
+    if (ty.isPrimitiveOrSentinel() or emitter.input.pool.isSliceRefType(ty)) return null;
     const node = emitter.input.pool.getNode(ty);
     if (node.tag != .ref_ty and node.tag != .mut_ref_ty and node.tag != .raw_ptr_ty) return null;
     const pointee = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
@@ -6076,9 +6552,10 @@ fn emitMirBody(emitter: *CModuleEmitter, body_idx: u32, body: *const MirBody) !v
                                         body.getInst(MirValueId.fromInt(hole_ref_raw)).type_id,
                                     );
                                     const hole_node = emitter.input.pool.getNode(hole_ref_ty);
-                                    const is_ptr_arg = hole_node.tag == .ref_ty or
+                                    const is_ptr_arg = (hole_node.tag == .ref_ty or
                                         hole_node.tag == .mut_ref_ty or
-                                        hole_node.tag == .raw_ptr_ty;
+                                        hole_node.tag == .raw_ptr_ty) and
+                                        !emitter.input.pool.isSliceRefType(hole_ref_ty);
                                     if (!is_ptr_arg and !(try isZeroSizedType(emitter, hole_ref_ty))) {
                                         const hole_c = try formatCType(emitter, hole_ref_ty);
                                         defer emitter.allocator.free(hole_c);
@@ -6102,6 +6579,22 @@ fn emitMirBody(emitter: *CModuleEmitter, body_idx: u32, body: *const MirBody) !v
                     "    {s} _stmp_{d}; memset(&_stmp_{d}, 0, sizeof(_stmp_{d}));\n",
                     .{ sl_c, inst_i, inst_i, inst_i },
                 );
+            } else if (inst.op == .intrinsic_op and
+                @as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)) == .slice_split_at)
+            {
+                const tup_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
+                const tup_elems = emitter.input.pool.getTupleElements(tup_ty);
+                if (tup_elems.len >= 2) {
+                    if (resolveSliceRefPointee(emitter, TypeId.fromInt(tup_elems[0]))) |sl_pointee| {
+                        const sl_c = try formatCType(emitter, sl_pointee);
+                        defer emitter.allocator.free(sl_c);
+                        try emitter.print(
+                            "    {s} _stmp_a_{d}; memset(&_stmp_a_{d}, 0, sizeof(_stmp_a_{d}));\n" ++
+                                "    {s} _stmp_b_{d}; memset(&_stmp_b_{d}, 0, sizeof(_stmp_b_{d}));\n",
+                            .{ sl_c, inst_i, inst_i, inst_i, sl_c, inst_i, inst_i, inst_i },
+                        );
+                    }
+                }
             }
         }
         if (inst.op == .intrinsic_op) {
@@ -6269,9 +6762,10 @@ fn emitAsyncCoroPollBodyC(emitter: *CModuleEmitter, body_idx: u32, body: *const 
                                         body.getInst(MirValueId.fromInt(hole_ref_raw)).type_id,
                                     );
                                     const hole_node = emitter.input.pool.getNode(hole_ref_ty);
-                                    const is_ptr_arg = hole_node.tag == .ref_ty or
+                                    const is_ptr_arg = (hole_node.tag == .ref_ty or
                                         hole_node.tag == .mut_ref_ty or
-                                        hole_node.tag == .raw_ptr_ty;
+                                        hole_node.tag == .raw_ptr_ty) and
+                                        !emitter.input.pool.isSliceRefType(hole_ref_ty);
                                     if (!is_ptr_arg and !(try isZeroSizedType(emitter, hole_ref_ty))) {
                                         const hole_lay = try emitter.resolver.resolveType(hole_ref_ty);
                                         extra_cursor = std.mem.alignForward(
@@ -6313,6 +6807,38 @@ fn emitAsyncCoroPollBodyC(emitter: *CModuleEmitter, body_idx: u32, body: *const 
                     try std.fmt.allocPrint(emitter.allocator, "_stmp_{d}", .{inst_i}),
                 );
                 extra_cursor += @max(sl_lay.size_bytes, 16);
+            } else if (inst.op == .intrinsic_op and
+                @as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)) == .slice_split_at)
+            {
+                const tup_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
+                const tup_elems = emitter.input.pool.getTupleElements(tup_ty);
+                if (tup_elems.len >= 2) {
+                    if (resolveSliceRefPointee(emitter, TypeId.fromInt(tup_elems[0]))) |sl_pointee| {
+                        const sl_lay = try emitter.resolver.resolveType(sl_pointee);
+                        const sl_c = try formatCType(emitter, sl_pointee);
+                        defer emitter.allocator.free(sl_c);
+                        extra_cursor = std.mem.alignForward(u64, extra_cursor, @max(sl_lay.alignBytes(), 8));
+                        try emitter.print(
+                            "#define _stmp_a_{d} (*(({s} *)(_frame + {d}u)))\n",
+                            .{ inst_i, sl_c, extra_cursor },
+                        );
+                        try undef_macros.append(
+                            emitter.allocator,
+                            try std.fmt.allocPrint(emitter.allocator, "_stmp_a_{d}", .{inst_i}),
+                        );
+                        extra_cursor += @max(sl_lay.size_bytes, 16);
+                        extra_cursor = std.mem.alignForward(u64, extra_cursor, @max(sl_lay.alignBytes(), 8));
+                        try emitter.print(
+                            "#define _stmp_b_{d} (*(({s} *)(_frame + {d}u)))\n",
+                            .{ inst_i, sl_c, extra_cursor },
+                        );
+                        try undef_macros.append(
+                            emitter.allocator,
+                            try std.fmt.allocPrint(emitter.allocator, "_stmp_b_{d}", .{inst_i}),
+                        );
+                        extra_cursor += @max(sl_lay.size_bytes, 16);
+                    }
+                }
             }
         }
         if (inst.op == .intrinsic_op) {
@@ -6545,6 +7071,7 @@ fn emitMirInstC(
                             );
                         }
                     } else if (unwrapped != .str_ty and !unwrapped.isPrimitiveOrSentinel() and
+                        !emitter.input.pool.isSliceRefType(unwrapped) and
                         (emitter.input.pool.getNode(unwrapped).tag == .ref_ty or
                             emitter.input.pool.getNode(unwrapped).tag == .mut_ref_ty or
                             emitter.input.pool.getNode(unwrapped).tag == .raw_ptr_ty))
@@ -6595,6 +7122,7 @@ fn emitMirInstC(
                             );
                         }
                     } else if (unwrapped_rb != .str_ty and !unwrapped_rb.isPrimitiveOrSentinel() and
+                        !emitter.input.pool.isSliceRefType(unwrapped_rb) and
                         (emitter.input.pool.getNode(unwrapped_rb).tag == .ref_ty or
                             emitter.input.pool.getNode(unwrapped_rb).tag == .mut_ref_ty or
                             emitter.input.pool.getNode(unwrapped_rb).tag == .raw_ptr_ty))
@@ -6682,10 +7210,24 @@ fn emitMirInstC(
                     else => "col",
                 };
                 try emitter.print("    _v_{d} = _v_{d}->{s};\n", .{ dst_raw, inst.operands.lhs, fld_name });
-            } else if (agg_ty == .str_ty or agg_tag == .slice_ty or agg_tag == .soa_slice_ty) {
+            } else if (agg_ty == .fmt_spec_ty) {
+                const fld_name = switch (inst.operands.rhs) {
+                    0 => "flags_and_fill",
+                    1 => "width_or_none",
+                    else => "precision_or_none",
+                };
+                try emitter.print("    _v_{d} = _v_{d}.{s};\n", .{ dst_raw, inst.operands.lhs, fld_name });
+            } else if (agg_ty == .str_ty or agg_tag == .slice_ty or agg_tag == .soa_slice_ty or
+                emitter.input.pool.isSliceRefType(agg_ty))
+            {
                 const dst_c = try formatCType(emitter, inst.type_id);
                 defer emitter.allocator.free(dst_c);
-                const slice_fld = if (inst.operands.rhs == 0) "ptr" else "len";
+                const slice_fld = switch (inst.operands.rhs) {
+                    0 => "ptr",
+                    1 => "len",
+                    2 => "stride",
+                    else => "elem_off",
+                };
                 try emitter.print(
                     "    _v_{d} = ({s})(_v_{d}.{s});\n",
                     .{ dst_raw, dst_c, inst.operands.lhs, slice_fld },
@@ -6711,14 +7253,20 @@ fn emitMirInstC(
             if (!(try isZeroSizedType(emitter, elem_ty))) {
                 const agg_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
                 const agg_tag = emitter.input.pool.getNode(agg_ty).tag;
-                if (agg_ty == .str_ty or agg_tag == .slice_ty or agg_tag == .soa_slice_ty) {
+                if (agg_ty == .str_ty or agg_tag == .slice_ty or agg_tag == .soa_slice_ty or
+                    emitter.input.pool.isSliceRefType(agg_ty))
+                {
                     if (ord == 0) {
                         try emitter.print(
                             "    memcpy(&(_v_{d}.ptr), &_v_{d}, sizeof(_v_{d}.ptr));\n",
                             .{ dst_raw, new_val, dst_raw },
                         );
-                    } else {
+                    } else if (ord == 1) {
                         try emitter.print("    _v_{d}.len = _v_{d};\n", .{ dst_raw, new_val });
+                    } else if (ord == 2) {
+                        try emitter.print("    _v_{d}.stride = _v_{d};\n", .{ dst_raw, new_val });
+                    } else {
+                        try emitter.print("    _v_{d}.elem_off = _v_{d};\n", .{ dst_raw, new_val });
                     }
                 } else if (agg_tag == .array_ty) {
                     try emitter.print("    _v_{d}._elems[{d}u] = _v_{d};\n", .{ dst_raw, ord, new_val });
@@ -6977,11 +7525,38 @@ fn emitMirInstC(
             } else if (!target_sym.isNone() and
                 target_sym.asInt() < emitter.input.sym_table.symbols.items.len)
             {
+                const sym_rec = emitter.input.sym_table.getSymbol(target_sym).*;
+                if (sym_rec.kind == .const_sym) {
+                    const resolved_def = if (!target_def.isNone()) target_def else sym_rec.def_id;
+                    if (emitter.input.const_rodata_map) |crm| {
+                        if (crm.get(resolved_def.asInt())) |r_idx| {
+                            const sym_ty = emitter.input.pool.unwrapUnderlyingType(sym_rec.type_id);
+                            const inst_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
+                            const inst_node = emitter.input.pool.getNode(inst_ty);
+                            const is_addr_of_sym = (inst_node.tag == .ref_ty or inst_node.tag == .mut_ref_ty) and
+                                emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(inst_node.lhs)) == sym_ty;
+                            if (!is_addr_of_sym) {
+                                if (!(try isZeroSizedType(emitter, inst.type_id))) {
+                                    try emitter.print(
+                                        "    memcpy(&_v_{d}, _cx_rodata_{d}, sizeof(_v_{d}));\n",
+                                        .{ dst_raw, r_idx, dst_raw },
+                                    );
+                                }
+                            } else {
+                                try emitter.print("    _v_{d} = ({s})_cx_rodata_{d};\n", .{ dst_raw, fn_c, r_idx });
+                            }
+                            return;
+                        }
+                    }
+                }
                 if (emitter.extern_global_sym_set.contains(target_sym.asInt())) {
                     const glob_rec = emitter.input.sym_table.getSymbol(target_sym).*;
                     const sym_ty = emitter.input.pool.unwrapUnderlyingType(glob_rec.type_id);
                     const inst_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
-                    if (inst_ty == sym_ty) {
+                    const inst_node = emitter.input.pool.getNode(inst_ty);
+                    const is_addr_of_sym = (inst_node.tag == .ref_ty or inst_node.tag == .mut_ref_ty) and
+                        emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(inst_node.lhs)) == sym_ty;
+                    if (!is_addr_of_sym) {
                         if (!(try isZeroSizedType(emitter, inst.type_id))) {
                             try emitter.print("    _v_{d} = _cx_ext_glob_{d};\n", .{ dst_raw, target_sym.asInt() });
                         }
@@ -7068,18 +7643,25 @@ fn emitMirInstC(
                     const dst_unwrapped = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
                     const dst_node = emitter.input.pool.getNode(dst_unwrapped);
 
-                    // Array-to-slice coercion (`&[T; N]` -> `[T]` or `&[T]`):
+                    // Array-to-slice or slice-reborrow coercion (`&[T; N]` / `&*s` -> `[T]` or `&[T]`):
                     if ((p_node.tag == .array_ty or p_node.tag == .soa_array_ty) and
-                        (dst_node.tag == .slice_ty or dst_node.tag == .soa_slice_ty))
+                        (dst_node.tag == .slice_ty or dst_node.tag == .soa_slice_ty or
+                            emitter.input.pool.isSliceRefType(dst_unwrapped)))
                     {
+                        const dst_sl = emitter.input.pool.getSliceRefInner(dst_unwrapped) orelse dst_unwrapped;
                         try emitArrayLvalueToSliceValueC(
                             emitter,
                             lv.expr_str,
                             lv.pointee_ty,
-                            dst_unwrapped,
+                            dst_sl,
                             dst_raw,
                             false,
                         );
+                    } else if ((p_node.tag == .slice_ty or p_node.tag == .soa_slice_ty) and
+                        (dst_node.tag == .slice_ty or dst_node.tag == .soa_slice_ty or
+                            emitter.input.pool.isSliceRefType(dst_unwrapped)))
+                    {
+                        try emitter.print("    _v_{d} = {s};\n", .{ dst_raw, lv.expr_str });
                     } else if ((p_node.tag == .array_ty or p_node.tag == .soa_array_ty) and
                         resolveSliceRefPointee(emitter, dst_unwrapped) != null)
                     {
@@ -7139,16 +7721,30 @@ fn emitMirInstC(
                     } else {
                         const len_str = try std.fmt.allocPrint(emitter.allocator, "(({s}).len)", .{lv.expr_str});
                         defer emitter.allocator.free(len_str);
+                        const stride_str = if (base_node.tag == .soa_vec_ty)
+                            try std.fmt.allocPrint(emitter.allocator, "(({s}).cap)", .{lv.expr_str})
+                        else
+                            try std.fmt.allocPrint(emitter.allocator, "(({s}).stride)", .{lv.expr_str});
+                        defer emitter.allocator.free(stride_str);
                         const off_str = try formatDynamicSoaColOffsetExpr(
                             emitter,
                             elem_struct,
                             inst.operands.rhs,
-                            len_str,
+                            stride_str,
                         );
                         defer emitter.allocator.free(off_str);
+                        const elem_off_add = if (base_node.tag == .soa_vec_ty or fld_lay.size_bytes == 0)
+                            try emitter.allocator.dupe(u8, "")
+                        else
+                            try std.fmt.allocPrint(
+                                emitter.allocator,
+                                " + ((size_t)(({s}).elem_off) * {d}u)",
+                                .{ lv.expr_str, fld_lay.size_bytes },
+                            );
+                        defer emitter.allocator.free(elem_off_add);
                         try emitter.print(
                             "    if ({s} == 0u) {{ _v_{d}.ptr = ({s} *)((uintptr_t){d}u); _v_{d}.len = 0u; }} " ++
-                                "else {{ _v_{d}.ptr = ({s} *)((({s}).ptr) + {s}); _v_{d}.len = {s}; }}\n",
+                                "else {{ _v_{d}.ptr = ({s} *)((({s}).ptr) + {s}{s}); _v_{d}.len = {s}; }}\n",
                             .{
                                 len_str,
                                 dst_raw,
@@ -7159,6 +7755,7 @@ fn emitMirInstC(
                                 fld_c,
                                 lv.expr_str,
                                 off_str,
+                                elem_off_add,
                                 dst_raw,
                                 len_str,
                             },
@@ -7213,6 +7810,12 @@ fn emitArrayLvalueToSliceValueC(
         try emitter.print(
             "    {s}{d}.ptr = ({s} *)(&({s})._elems[0]); {s}{d}.len = {d}u;\n",
             .{ dst_prefix, dst_raw, ptr_c, arr_expr, dst_prefix, dst_raw, arr_len },
+        );
+    }
+    if (sl_node.tag == .soa_slice_ty) {
+        try emitter.print(
+            "    {s}{d}.stride = {d}u; {s}{d}.elem_off = 0u;\n",
+            .{ dst_prefix, dst_raw, arr_len, dst_prefix, dst_raw },
         );
     }
     if (is_via_stmp_ref) {
@@ -7280,6 +7883,16 @@ fn formatAlignedVarEqExprC(
     if (ty.isPrimitiveOrSentinel()) return emitter.allocator.dupe(u8, "0u");
 
     const node = emitter.input.pool.getNode(ty);
+    if (emitter.input.pool.getSliceRefInner(ty)) |slice_inner| {
+        if (emitter.eq_type_set.contains(slice_inner.toU32())) {
+            return std.fmt.allocPrint(
+                emitter.allocator,
+                "_cx_eq_ty_{d}(&({s}), &({s}))",
+                .{ slice_inner.toU32(), lhs_var, rhs_var },
+            );
+        }
+        return emitter.allocator.dupe(u8, "0u");
+    }
     return switch (node.tag) {
         .ref_ty, .mut_ref_ty, .raw_ptr_ty, .fn_ty => std.fmt.allocPrint(
             emitter.allocator,
@@ -7292,6 +7905,7 @@ fn formatAlignedVarEqExprC(
         .slice_ty,
         .soa_array_ty,
         .soa_slice_ty,
+        .soa_vec_ty,
         .optional_ty,
         .result_ty,
         .enum_ty,
@@ -7352,7 +7966,7 @@ fn emitBinOpC(
         return;
     }
 
-    if (!op_ty.isPrimitiveOrSentinel()) {
+    if (!op_ty.isPrimitiveOrSentinel() and !emitter.input.pool.isSliceRefType(op_ty)) {
         const op_tag = emitter.input.pool.getNode(op_ty).tag;
         if (op_tag == .ref_ty or op_tag == .mut_ref_ty or op_tag == .raw_ptr_ty or op_tag == .fn_ty) {
             const cmp_op = switch (kind) {
@@ -7849,18 +8463,102 @@ fn emitUnaryOpC(
         .bitcast_op, .ptr_cast => {
             const src_node = emitter.input.pool.getNode(src_ty);
             const dst_node = emitter.input.pool.getNode(unwrapped_dst);
-            if ((src_node.tag == .ref_ty or src_node.tag == .mut_ref_ty or src_node.tag == .raw_ptr_ty) and
-                (dst_node.tag == .slice_ty or dst_node.tag == .soa_slice_ty))
-            {
+            const src_is_fat = src_ty == .str_ty or src_node.tag == .slice_ty or src_node.tag == .soa_slice_ty or
+                emitter.input.pool.isSliceRefType(src_ty);
+            const dst_is_fat = unwrapped_dst == .str_ty or dst_node.tag == .slice_ty or dst_node.tag == .soa_slice_ty or
+                emitter.input.pool.isSliceRefType(unwrapped_dst);
+            const src_is_thin_ptr = (src_node.tag == .ref_ty or src_node.tag == .mut_ref_ty or src_node.tag == .raw_ptr_ty) and
+                !emitter.input.pool.isSliceRefType(src_ty);
+            const dst_is_thin_ptr = (dst_node.tag == .ref_ty or dst_node.tag == .mut_ref_ty or dst_node.tag == .raw_ptr_ty) and
+                !emitter.input.pool.isSliceRefType(unwrapped_dst);
+
+            if (src_is_thin_ptr and dst_is_fat) {
                 const p_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(src_node.lhs));
-                const deref_str = try std.fmt.allocPrint(emitter.allocator, "(*_v_{d})", .{s_raw});
-                defer emitter.allocator.free(deref_str);
-                try emitArrayLvalueToSliceValueC(emitter, deref_str, p_ty, unwrapped_dst, dst_raw, false);
+                const p_tag = if (p_ty.isPrimitiveOrSentinel()) .primitive else emitter.input.pool.getNode(p_ty).tag;
+                if (p_tag == .array_ty or p_tag == .soa_array_ty) {
+                    const dst_sl = emitter.input.pool.getSliceRefInner(unwrapped_dst) orelse unwrapped_dst;
+                    const deref_str = try std.fmt.allocPrint(emitter.allocator, "(*_v_{d})", .{s_raw});
+                    defer emitter.allocator.free(deref_str);
+                    try emitArrayLvalueToSliceValueC(emitter, deref_str, p_ty, dst_sl, dst_raw, false);
+                    return;
+                }
+                if (p_ty == .str_ty or p_tag == .slice_ty or p_tag == .soa_slice_ty or
+                    emitter.input.pool.isSliceRefType(p_ty))
+                {
+                    const dst_sl = emitter.input.pool.getSliceRefInner(unwrapped_dst) orelse unwrapped_dst;
+                    const dst_sl_node = emitter.input.pool.getNode(dst_sl);
+                    const elem_ty = if (dst_sl == .str_ty)
+                        TypeId.u8_ty
+                    else
+                        emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(dst_sl_node.lhs));
+                    const elem_c = if (dst_sl == .str_ty or dst_sl_node.tag == .soa_slice_ty or (try isZeroSizedType(emitter, elem_ty)))
+                        try emitter.allocator.dupe(u8, "uint8_t")
+                    else
+                        try formatCType(emitter, elem_ty);
+                    defer emitter.allocator.free(elem_c);
+                    try emitter.print(
+                        "    _v_{d}.ptr = ({s} *)(_v_{d}->ptr); _v_{d}.len = (uintptr_t)(_v_{d}->len);\n",
+                        .{ dst_raw, elem_c, s_raw, dst_raw, s_raw },
+                    );
+                    if (dst_sl_node.tag == .soa_slice_ty) {
+                        try emitter.print(
+                            "    _v_{d}.stride = (uintptr_t)(_v_{d}->stride); _v_{d}.elem_off = (uintptr_t)(_v_{d}->elem_off);\n",
+                            .{ dst_raw, s_raw, dst_raw, s_raw },
+                        );
+                    }
+                    return;
+                }
+            }
+            if (src_is_fat and dst_is_fat) {
+                const dst_sl = emitter.input.pool.getSliceRefInner(unwrapped_dst) orelse unwrapped_dst;
+                const dst_sl_node = emitter.input.pool.getNode(dst_sl);
+                const elem_ty = if (dst_sl == .str_ty)
+                    TypeId.u8_ty
+                else
+                    emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(dst_sl_node.lhs));
+                const elem_c = if (dst_sl == .str_ty or dst_sl_node.tag == .soa_slice_ty or (try isZeroSizedType(emitter, elem_ty)))
+                    try emitter.allocator.dupe(u8, "uint8_t")
+                else
+                    try formatCType(emitter, elem_ty);
+                defer emitter.allocator.free(elem_c);
+                try emitter.print(
+                    "    _v_{d}.ptr = ({s} *)_v_{d}.ptr; _v_{d}.len = (uintptr_t)_v_{d}.len;\n",
+                    .{ dst_raw, elem_c, s_raw, dst_raw, s_raw },
+                );
+                if (dst_sl_node.tag == .soa_slice_ty and emitter.input.pool.isSoaSliceOrRefType(src_ty)) {
+                    try emitter.print(
+                        "    _v_{d}.stride = (uintptr_t)_v_{d}.stride; _v_{d}.elem_off = (uintptr_t)_v_{d}.elem_off;\n",
+                        .{ dst_raw, s_raw, dst_raw, s_raw },
+                    );
+                }
                 return;
             }
-            if ((src_node.tag == .ref_ty or src_node.tag == .mut_ref_ty or src_node.tag == .raw_ptr_ty) and
-                resolveSliceRefPointee(emitter, unwrapped_dst) != null)
-            {
+            if (src_is_fat and resolveSliceRefPointee(emitter, unwrapped_dst) != null) {
+                const sl_ty = resolveSliceRefPointee(emitter, unwrapped_dst).?;
+                const sl_node = emitter.input.pool.getNode(sl_ty);
+                const elem_ty = if (sl_ty == .str_ty)
+                    TypeId.u8_ty
+                else
+                    emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(sl_node.lhs));
+                const elem_c = if (sl_ty == .str_ty or sl_node.tag == .soa_slice_ty or (try isZeroSizedType(emitter, elem_ty)))
+                    try emitter.allocator.dupe(u8, "uint8_t")
+                else
+                    try formatCType(emitter, elem_ty);
+                defer emitter.allocator.free(elem_c);
+                try emitter.print(
+                    "    _stmp_{d}.ptr = ({s} *)_v_{d}.ptr; _stmp_{d}.len = (uintptr_t)_v_{d}.len;\n",
+                    .{ dst_raw, elem_c, s_raw, dst_raw, s_raw },
+                );
+                if (sl_node.tag == .soa_slice_ty and emitter.input.pool.isSoaSliceOrRefType(src_ty)) {
+                    try emitter.print(
+                        "    _stmp_{d}.stride = (uintptr_t)_v_{d}.stride; _stmp_{d}.elem_off = (uintptr_t)_v_{d}.elem_off;\n",
+                        .{ dst_raw, s_raw, dst_raw, s_raw },
+                    );
+                }
+                try emitter.print("    _v_{d} = &_stmp_{d};\n", .{ dst_raw, dst_raw });
+                return;
+            }
+            if (src_is_thin_ptr and resolveSliceRefPointee(emitter, unwrapped_dst) != null) {
                 const p_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(src_node.lhs));
                 const p_tag = emitter.input.pool.getNode(p_ty).tag;
                 if (p_tag == .array_ty or p_tag == .soa_array_ty) {
@@ -7872,14 +8570,14 @@ fn emitUnaryOpC(
                 }
             }
             if (kind == .ptr_cast) {
-                if ((src_node.tag == .ref_ty or src_node.tag == .mut_ref_ty or
-                    src_node.tag == .raw_ptr_ty or src_node.tag == .fn_ty) and
-                    (dst_node.tag == .ref_ty or dst_node.tag == .mut_ref_ty or
-                        dst_node.tag == .raw_ptr_ty or dst_node.tag == .fn_ty))
+                if ((src_is_thin_ptr or src_node.tag == .fn_ty) and
+                    (dst_is_thin_ptr or dst_node.tag == .fn_ty))
                 {
                     try emitter.print("    _v_{d} = ({s})_v_{d};\n", .{ dst_raw, dst_c, s_raw });
-                } else {
+                } else if (!src_is_fat and !dst_is_fat) {
                     try emitter.print("    _v_{d} = ({s})((uintptr_t)_v_{d});\n", .{ dst_raw, dst_c, s_raw });
+                } else if (!(try isZeroSizedType(emitter, dst_ty))) {
+                    try emitter.print("    memcpy(&_v_{d}, &_v_{d}, sizeof(_v_{d}));\n", .{ dst_raw, s_raw, dst_raw });
                 }
             } else if (!(try isZeroSizedType(emitter, dst_ty))) {
                 try emitter.print("    memcpy(&_v_{d}, &_v_{d}, sizeof(_v_{d}));\n", .{ dst_raw, s_raw, dst_raw });
@@ -7938,6 +8636,17 @@ fn emitAggregateMakeC(
                             .{ dst_raw, elem_raw, elem_raw },
                         );
                     }
+                }
+                return;
+            }
+            if (agg_ty == .fmt_spec_ty) {
+                for (elems, 0..) |elem_raw, fld_i| {
+                    const fld_name = switch (fld_i) {
+                        0 => "flags_and_fill",
+                        1 => "width_or_none",
+                        else => "precision_or_none",
+                    };
+                    try emitter.print("    _v_{d}.{s} = _v_{d};\n", .{ dst_raw, fld_name, elem_raw });
                 }
                 return;
             }
@@ -8139,9 +8848,10 @@ fn emitAggregateMakeC(
                     body.getInst(MirValueId.fromInt(hole_ref_raw)).type_id,
                 );
                 const hole_node = emitter.input.pool.getNode(hole_ref_ty);
-                const is_ptr_arg = hole_node.tag == .ref_ty or
+                const is_ptr_arg = (hole_node.tag == .ref_ty or
                     hole_node.tag == .mut_ref_ty or
-                    hole_node.tag == .raw_ptr_ty;
+                    hole_node.tag == .raw_ptr_ty) and
+                    !emitter.input.pool.isSliceRefType(hole_ref_ty);
                 const hole_ty = if (is_ptr_arg)
                     emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(hole_node.lhs))
                 else
@@ -8458,16 +9168,15 @@ fn emitIntrinsicOpC(
             const ref_val = MirValueId.fromInt(args[0]);
             const ref_ty = emitter.input.pool.unwrapUnderlyingType(body.getInst(ref_val).type_id);
             const ref_node = emitter.input.pool.getNode(ref_ty);
-            const val_ty = if (ref_node.tag == .ref_ty or
+            const is_thin_ptr = (ref_node.tag == .ref_ty or
                 ref_node.tag == .mut_ref_ty or
-                ref_node.tag == .raw_ptr_ty)
+                ref_node.tag == .raw_ptr_ty) and !emitter.input.pool.isSliceRefType(ref_ty);
+            const val_ty = if (is_thin_ptr)
                 emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(ref_node.lhs))
             else
                 ref_ty;
             const val_lay = try emitter.resolver.resolveType(val_ty);
-            const raw_ptr_expr = if (ref_node.tag == .ref_ty or
-                ref_node.tag == .mut_ref_ty or
-                ref_node.tag == .raw_ptr_ty)
+            const raw_ptr_expr = if (is_thin_ptr)
                 try std.fmt.allocPrint(emitter.allocator, "(uint8_t *)_v_{d}", .{args[0]})
             else
                 try std.fmt.allocPrint(emitter.allocator, "(uint8_t *)(&_v_{d})", .{args[0]});
@@ -9125,7 +9834,8 @@ fn emitIntrinsicOpC(
 
             const base_ptr_expr: []u8 = if (base_ty == .str_ty or
                 base_node.tag == .slice_ty or
-                base_node.tag == .soa_slice_ty)
+                base_node.tag == .soa_slice_ty or
+                emitter.input.pool.isSliceRefType(base_ty))
                 try std.fmt.allocPrint(emitter.allocator, "((uintptr_t)(_v_{d}.ptr))", .{args[0]})
             else if (base_node.tag == .ref_ty or
                 base_node.tag == .mut_ref_ty or
@@ -9133,7 +9843,9 @@ fn emitIntrinsicOpC(
             blk_ref: {
                 const pt_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(base_node.lhs));
                 const pt_tag = emitter.input.pool.getNode(pt_ty).tag;
-                if (pt_ty == .str_ty or pt_tag == .slice_ty or pt_tag == .soa_slice_ty) {
+                if (pt_ty == .str_ty or pt_tag == .slice_ty or pt_tag == .soa_slice_ty or
+                    emitter.input.pool.isSliceRefType(pt_ty))
+                {
                     break :blk_ref try std.fmt.allocPrint(
                         emitter.allocator,
                         "((uintptr_t)(_v_{d}->ptr))",
@@ -9148,7 +9860,9 @@ fn emitIntrinsicOpC(
             defer emitter.allocator.free(base_ptr_expr);
 
             const sl_ref_pt = resolveSliceRefPointee(emitter, inst.type_id);
-            const sl_ty = sl_ref_pt orelse emitter.input.pool.unwrapUnderlyingType(inst.type_id);
+            const sl_ty = sl_ref_pt orelse
+                (emitter.input.pool.getSliceRefInner(inst.type_id) orelse
+                    emitter.input.pool.unwrapUnderlyingType(inst.type_id));
             const elem_ty = if (sl_ty == .str_ty)
                 TypeId.u8_ty
             else
@@ -9164,7 +9878,50 @@ fn emitIntrinsicOpC(
             defer emitter.allocator.free(elem_ptr_c);
 
             const usize_c = if (emitter.cfg.target.ptrBytes() == 4) "uint32_t" else "uint64_t";
-            if (sl_ref_pt != null) {
+            const sl_is_soa = sl_ty != .str_ty and emitter.input.pool.getNode(sl_ty).tag == .soa_slice_ty;
+            if (sl_is_soa) {
+                const dst_pfx = if (sl_ref_pt != null) "_stmp_" else "_v_";
+                var stride_expr: []u8 = undefined;
+                var elem_off_expr: []u8 = undefined;
+                var soa_ptr_expr: []u8 = undefined;
+                if (emitter.input.pool.isSoaSliceOrRefType(base_ty)) {
+                    stride_expr = try std.fmt.allocPrint(emitter.allocator, "_v_{d}.stride", .{args[0]});
+                    elem_off_expr = try std.fmt.allocPrint(emitter.allocator, "_v_{d}.elem_off", .{args[0]});
+                    soa_ptr_expr = try std.fmt.allocPrint(emitter.allocator, "_v_{d}.ptr", .{args[0]});
+                } else if (base_node.tag == .ref_ty or base_node.tag == .mut_ref_ty or base_node.tag == .raw_ptr_ty) {
+                    const pt_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(base_node.lhs));
+                    if (emitter.input.pool.isSoaSliceOrRefType(pt_ty)) {
+                        stride_expr = try std.fmt.allocPrint(emitter.allocator, "_v_{d}->stride", .{args[0]});
+                        elem_off_expr = try std.fmt.allocPrint(emitter.allocator, "_v_{d}->elem_off", .{args[0]});
+                        soa_ptr_expr = try std.fmt.allocPrint(emitter.allocator, "_v_{d}->ptr", .{args[0]});
+                    } else {
+                        const arr_cap: u64 = emitter.input.pool.getNode(pt_ty).rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+                        stride_expr = try std.fmt.allocPrint(emitter.allocator, "{d}u", .{arr_cap});
+                        elem_off_expr = try emitter.allocator.dupe(u8, "0u");
+                        soa_ptr_expr = try std.fmt.allocPrint(emitter.allocator, "(uint8_t *)_v_{d}", .{args[0]});
+                    }
+                } else {
+                    const arr_cap: u64 = base_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+                    stride_expr = try std.fmt.allocPrint(emitter.allocator, "{d}u", .{arr_cap});
+                    elem_off_expr = try emitter.allocator.dupe(u8, "0u");
+                    soa_ptr_expr = try std.fmt.allocPrint(emitter.allocator, "(uint8_t *)(&_v_{d}._bytes[0])", .{args[0]});
+                }
+                defer emitter.allocator.free(stride_expr);
+                defer emitter.allocator.free(elem_off_expr);
+                defer emitter.allocator.free(soa_ptr_expr);
+                try emitter.print(
+                    "    {s}{d}.ptr = {s}; {s}{d}.len = ({s})(({s}) - ({s})); " ++
+                        "{s}{d}.stride = ({s})({s}); {s}{d}.elem_off = ({s})(({s}) + ({s}));\n",
+                    .{
+                        dst_pfx, dst_raw, soa_ptr_expr, dst_pfx,     dst_raw, usize_c, hi_expr, lo_expr,
+                        dst_pfx, dst_raw, usize_c,      stride_expr, dst_pfx, dst_raw, usize_c, elem_off_expr,
+                        lo_expr,
+                    },
+                );
+                if (sl_ref_pt != null) {
+                    try emitter.print("    _v_{d} = &_stmp_{d};\n", .{ dst_raw, dst_raw });
+                }
+            } else if (sl_ref_pt != null) {
                 try emitter.print(
                     "    _stmp_{d}.ptr = ({s})({s} + ((uintptr_t)({s}) * (uintptr_t){d}u)); " ++
                         "_stmp_{d}.len = ({s})(({s}) - ({s})); _v_{d} = &_stmp_{d};\n",
@@ -9314,6 +10071,1288 @@ fn emitIntrinsicOpC(
                 try emitter.print("    _cx_async_block_on(&_v_{d}, &_v_{d});\n", .{ args[0], dst_raw });
             }
         },
+        .implements,
+        .int_min,
+        .int_max,
+        .int_bits,
+        .scalar_clz,
+        .scalar_ctz,
+        .scalar_popcnt,
+        .scalar_bswap,
+        .scalar_rotl,
+        .scalar_rotr,
+        .ptr_is_null,
+        .ptr_offset,
+        .slice_split_at,
+        .slice_reverse,
+        .soa_vec_new,
+        .soa_vec_with_cap,
+        .soa_vec_len,
+        .soa_vec_cap,
+        .soa_vec_push,
+        .soa_vec_pop,
+        .soa_vec_clear,
+        .soa_vec_reserve,
+        .soa_vec_as_slice,
+        .soa_vec_col_slice,
+        .ctx_next_rng_seed,
+        .tls_scratch_ptr,
+        .tls_alloc_state,
+        .fmt_write,
+        .memcpy,
+        .memmove,
+        .memset,
+        .ptr_copy,
+        .ptr_copy_nonoverlapping,
+        .ptr_read,
+        .ptr_write,
+        .ptr_drop_in_place,
+        .forget,
+        .slice_from_raw_parts,
+        .str_from_utf8_unchecked,
+        .from_le_bytes,
+        .from_be_bytes,
+        .to_le_bytes,
+        .to_be_bytes,
+        .sqrt,
+        .sys_mmap,
+        .sys_munmap,
+        .wasm_memory_grow,
+        .simd_load_unaligned,
+        .simd_and,
+        .simd_or,
+        .simd_xor,
+        .simd_eq,
+        .simd_gt_s8,
+        .simd_lt_s8,
+        .simd_swizzle,
+        .simd_shl_u8,
+        .simd_shr_u8,
+        .simd_bitmask,
+        => try emitStd01IntrinsicOpC(emitter, body, dst_raw, ikind, inst, args),
+    }
+}
+
+/// Evaluates compile-time `@implements[T, Bound]()` statically for unoptimized MIR fallback.
+fn evalImplementsStaticC(emitter: *const CModuleEmitter, raw_ty: TypeId, raw_bound: TypeId) bool {
+    return type_system.evalStaticImplements(
+        emitter.input.pool,
+        emitter.input.sym_table,
+        emitter.target_layout,
+        raw_ty,
+        raw_bound,
+    );
+}
+
+/// Formats a C99 `uintptr_t` allocator tag/handle expression from `arg_raw` (`0u` for ZST `System`).
+fn formatAllocRawExprC(emitter: *CModuleEmitter, body: *const MirBody, arg_raw: u32) ![]u8 {
+    const arg_ty = emitter.input.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(arg_raw)).type_id);
+    if (try isZeroSizedType(emitter, arg_ty)) {
+        return emitter.allocator.dupe(u8, "((uintptr_t)0u)");
+    }
+    if (!arg_ty.isPrimitiveOrSentinel()) {
+        const node = emitter.input.pool.getNode(arg_ty);
+        if (node.tag == .ref_ty or node.tag == .mut_ref_ty or node.tag == .raw_ptr_ty) {
+            const pointee_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+            if (pointee_ty == .u8_ty) {
+                return std.fmt.allocPrint(emitter.allocator, "((uintptr_t)_v_{d})", .{arg_raw});
+            }
+            return std.fmt.allocPrint(emitter.allocator, "(((uintptr_t)_v_{d}) | 1u)", .{arg_raw});
+        }
+    }
+    const tmp_id = emitter.nextTempId();
+    try emitter.print(
+        "    uintptr_t _ar_{d} = 0u; memcpy(&_ar_{d}, &_v_{d}, sizeof(_v_{d}) < sizeof(uintptr_t) ? sizeof(_v_{d}) : sizeof(uintptr_t));\n",
+        .{ tmp_id, tmp_id, arg_raw, arg_raw, arg_raw },
+    );
+    return std.fmt.allocPrint(emitter.allocator, "_ar_{d}", .{tmp_id});
+}
+
+/// Emits C99 inline reallocation of `#soa Vec[S]` pointed to by `vec_ptr_expr` to at least `min_cap_expr`.
+fn emitSoaVecEnsureCapC(
+    emitter: *CModuleEmitter,
+    vec_ptr_expr: []const u8,
+    elem_struct: TypeId,
+    min_cap_expr: []const u8,
+    is_try_expr: []const u8,
+    ok_var_name: []const u8,
+) !void {
+    const lay = try emitter.resolver.resolveType(elem_struct);
+    const slab_align: u32 = @max(
+        @as(u32, 1) << @intCast(@max(lay.align_log2, emitter.target_layout.simd_align_log2)),
+        16,
+    );
+    const tmp_id = emitter.nextTempId();
+    try emitter.print(
+        "    int {s} = 1;\n" ++
+            "    {{\n" ++
+            "        uint64_t _mc_{d} = (uint64_t)({s});\n" ++
+            "        if (_mc_{d} > (uint64_t)({s})->cap) {{\n" ++
+            "            if (_mc_{d} > 0xFFFFFFFFull) {{\n" ++
+            "                if ({s}) {{ {s} = 0; }} else {{ {s}; }}\n" ++
+            "            }} else {{\n" ++
+            "                uint64_t _dbl_{d} = ((uint64_t)({s})->cap) * 2ull;\n" ++
+            "                if (_dbl_{d} < 8ull) _dbl_{d} = 8ull;\n" ++
+            "                if (_dbl_{d} < _mc_{d}) _dbl_{d} = _mc_{d};\n" ++
+            "                if (_dbl_{d} > 0xFFFFFFFFull) _dbl_{d} = _mc_{d};\n" ++
+            "                uint32_t _nc_{d} = (uint32_t)_dbl_{d};\n",
+        .{
+            ok_var_name,
+            tmp_id,
+            min_cap_expr,
+            tmp_id,
+            vec_ptr_expr,
+            tmp_id,
+            is_try_expr,
+            ok_var_name,
+            if (emitter.cfg.target.isFreestanding()) "__builtin_trap()" else "_cx_rt_trap(0u)",
+            tmp_id,
+            vec_ptr_expr,
+            tmp_id,
+            tmp_id,
+            tmp_id,
+            tmp_id,
+            tmp_id,
+            tmp_id,
+            tmp_id,
+            tmp_id,
+            tmp_id,
+            tmp_id,
+            tmp_id,
+        },
+    );
+    const nc_str = try std.fmt.allocPrint(emitter.allocator, "_nc_{d}", .{tmp_id});
+    defer emitter.allocator.free(nc_str);
+
+    // Compute total byte size for `_nc_<tmp>`:
+    var total_expr: []u8 = try emitter.allocator.dupe(u8, "((size_t)0u)");
+    defer emitter.allocator.free(total_expr);
+    if (lay.aux_len > 0) {
+        const last_ord = lay.aux_len - 1;
+        const last_off = try formatDynamicSoaColOffsetExpr(emitter, elem_struct, last_ord, nc_str);
+        defer emitter.allocator.free(last_off);
+        const last_fld = emitter.resolver.fields_by_decl.items[lay.aux_start + last_ord];
+        emitter.allocator.free(total_expr);
+        total_expr = try std.fmt.allocPrint(
+            emitter.allocator,
+            "({s} + ((size_t){d}u * (size_t)_nc_{d}))",
+            .{ last_off, last_fld.size_bytes, tmp_id },
+        );
+    }
+
+    try emitter.print(
+        "                uint8_t *_np_{d} = (uint8_t *)_cx_soa_zalloc(({s})->alloc, {s}, {d}u, ({s}) ? 1 : 0);\n" ++
+            "                if (_np_{d} == NULL) {{\n" ++
+            "                    {s} = 0;\n" ++
+            "                }} else {{\n" ++
+            "                    if (({s})->ptr != NULL && ({s})->len > 0u) {{\n",
+        .{ tmp_id, vec_ptr_expr, total_expr, slab_align, is_try_expr, tmp_id, ok_var_name, vec_ptr_expr, vec_ptr_expr },
+    );
+    const old_cap_s = try std.fmt.allocPrint(emitter.allocator, "(({s})->cap)", .{vec_ptr_expr});
+    defer emitter.allocator.free(old_cap_s);
+    var old_total_expr: []u8 = try emitter.allocator.dupe(u8, "((size_t)0u)");
+    defer emitter.allocator.free(old_total_expr);
+    if (lay.aux_len > 0) {
+        const last_ord = lay.aux_len - 1;
+        const old_last_off = try formatDynamicSoaColOffsetExpr(emitter, elem_struct, last_ord, old_cap_s);
+        defer emitter.allocator.free(old_last_off);
+        const last_fld = emitter.resolver.fields_by_decl.items[lay.aux_start + last_ord];
+        emitter.allocator.free(old_total_expr);
+        old_total_expr = try std.fmt.allocPrint(
+            emitter.allocator,
+            "({s} + ((size_t){d}u * (size_t)(({s})->cap)))",
+            .{ old_last_off, last_fld.size_bytes, vec_ptr_expr },
+        );
+    }
+    var col_i: u32 = 0;
+    while (col_i < lay.aux_len) : (col_i += 1) {
+        const fld = emitter.resolver.fields_by_decl.items[lay.aux_start + col_i];
+        if (fld.size_bytes == 0) continue;
+        const old_off = try formatDynamicSoaColOffsetExpr(emitter, elem_struct, col_i, old_cap_s);
+        defer emitter.allocator.free(old_off);
+        const new_off = try formatDynamicSoaColOffsetExpr(emitter, elem_struct, col_i, nc_str);
+        defer emitter.allocator.free(new_off);
+        try emitter.print(
+            "                        memcpy(_np_{d} + {s}, ({s})->ptr + {s}, ((size_t)({s})->len) * {d}u);\n",
+            .{ tmp_id, new_off, vec_ptr_expr, old_off, vec_ptr_expr, fld.size_bytes },
+        );
+    }
+    try emitter.print(
+        "                    }}\n" ++
+            "                    if (({s})->ptr != NULL && ({s})->cap > 0u) _cx_soa_free(({s})->alloc, ({s})->ptr, {s}, {d}u);\n" ++
+            "                    ({s})->ptr = _np_{d};\n" ++
+            "                    ({s})->cap = _nc_{d};\n" ++
+            "                }}\n" ++
+            "            }}\n" ++
+            "        }}\n" ++
+            "    }}\n",
+        .{
+            vec_ptr_expr,
+            vec_ptr_expr,
+            vec_ptr_expr,
+            vec_ptr_expr,
+            old_total_expr,
+            slab_align,
+            vec_ptr_expr,
+            tmp_id,
+            vec_ptr_expr,
+            tmp_id,
+        },
+    );
+}
+
+/// Finds a 3-parameter `Display.fmt` (`is_debug == false`) or `Debug.fmt_debug` (`is_debug == true`) body for `ty`.
+fn lookupCustomFmtBodyIndexC(emitter: *const CModuleEmitter, ty: TypeId, is_debug: bool) ?u32 {
+    const target_method = if (is_debug) "fmt_debug" else "fmt";
+    const ty_node = emitter.input.pool.getNode(ty);
+    if (ty_node.tag == .struct_ty or ty_node.tag == .enum_ty or ty_node.tag == .union_ty or ty_node.tag == .distinct_ty) {
+        const sym_idx = SymbolIndex.fromInt(ty_node.rhs);
+        if (!sym_idx.isNone() and sym_idx.asInt() < emitter.input.sym_table.symbols.items.len) {
+            const nom_sym = emitter.input.sym_table.getSymbol(sym_idx).*;
+            if (!nom_sym.target_scope.isNone()) {
+                for (emitter.input.sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
+                    const mem_sym = emitter.input.sym_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind == .fn_sym and std.mem.eql(u8, mem_sym.name_text, target_method)) {
+                        if (resolveBodyIndex(emitter, mem_sym.def_id, mem_idx)) |found_b| {
+                            if (emitter.input.bodies[found_b].param_count == 3) return found_b;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    const dot_suffix = if (is_debug) ".fmt_debug" else ".fmt";
+    for (emitter.input.bodies, 0..) |*cand_b, b_idx| {
+        if (cand_b.param_count != 3 or cand_b.locals.items.len < 4) continue;
+        const fn_name = emitter.input.interner.get(cand_b.name);
+        if (!std.mem.eql(u8, fn_name, target_method) and !std.mem.endsWith(u8, fn_name, dot_suffix)) continue;
+        const p1_ty = emitter.input.pool.unwrapUnderlyingType(cand_b.locals.items[1].type_id);
+        const p1_node = emitter.input.pool.getNode(p1_ty);
+        const recv_ty = if (p1_node.tag == .ref_ty or p1_node.tag == .mut_ref_ty or p1_node.tag == .raw_ptr_ty)
+            emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(p1_node.lhs))
+        else
+            p1_ty;
+        if (recv_ty == ty) return @intCast(b_idx);
+    }
+    return null;
+}
+
+/// Emits streaming `@fmt_write(out, fmt_args) -> unit!FmtError` in C99.
+fn emitFmtWriteOpC(
+    emitter: *CModuleEmitter,
+    body: *const MirBody,
+    dst_raw: u32,
+    inst: mir.MirInst,
+    args: []const u32,
+) !void {
+    if (args.len < 2) return;
+    const res_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
+    const dst_str = try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{dst_raw});
+    defer emitter.allocator.free(dst_str);
+    try emitter.print("    memset(&_v_{d}, 0, sizeof(_v_{d}));\n", .{ dst_raw, dst_raw });
+    try emitSumDiscrWriteStmt(emitter, res_ty, 0, dst_str);
+
+    const sum_detail = (try emitter.resolver.getSumDetail(res_ty)) orelse return;
+    const discr_expr = try formatSumDiscrReadExpr(emitter, res_ty, sum_detail, dst_str);
+    defer emitter.allocator.free(discr_expr);
+
+    const writer_ref_ty = emitter.input.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[0])).type_id);
+    const writer_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(writer_ref_ty).lhs));
+    const write_fn_fld = (try emitter.resolver.getFieldByDeclOrdinal(writer_ty, 1)) orelse return;
+    const write_fn_sig = emitter.input.pool.getFnSignatureView(write_fn_fld.field_ty) orelse return;
+    const chunk_param_ty = write_fn_sig.getParamType(1);
+    const is_chunk_thin_ref = resolveSliceRefPointee(emitter, chunk_param_ty) != null;
+    const u8_slice_ty = emitter.input.pool.getSliceRefInner(chunk_param_ty) orelse
+        resolveSliceRefPointee(emitter, chunk_param_ty) orelse
+        emitter.input.pool.unwrapUnderlyingType(chunk_param_ty);
+    const u8_slice_c = try formatCType(emitter, u8_slice_ty);
+    defer emitter.allocator.free(u8_slice_c);
+    const chunk_pass_pfx: []const u8 = if (is_chunk_thin_ref) "&" else "";
+
+    const tmp_id = emitter.nextTempId();
+    try emitter.print(
+        "    {{\n" ++
+            "        uintptr_t _pi_{d} = 0u;\n" ++
+            "        while (_pi_{d} < _v_{d}.pieces_len) {{\n" ++
+            "            cx_str_t _pc_{d} = _v_{d}.pieces_ptr[_pi_{d}];\n" ++
+            "            if (_pc_{d}.len > 0u) {{\n" ++
+            "                {s} _fws_{d}; _fws_{d}.ptr = _pc_{d}.ptr; _fws_{d}.len = _pc_{d}.len;\n" ++
+            "                _v_{d} = _v_{d}->_f1(_v_{d}->_f0, {s}_fws_{d});\n" ++
+            "                if (({s}) != 0u) goto _fw_done_{d};\n" ++
+            "            }}\n" ++
+            "            if (_pi_{d} < _v_{d}.args_len) {{\n" ++
+            "                cx_fmt_arg_t _fa_{d} = _v_{d}.args_ptr[_pi_{d}];\n" ++
+            "                uint32_t _vb_{d} = (_fa_{d}.spec.flags_and_fill >> 27u) & 0xFu;\n" ++
+            "                uint32_t _de_{d} = (_fa_{d}.spec.flags_and_fill >> 31u) & 1u;\n" ++
+            "                int _handled_{d} = 0;\n" ++
+            "                (void)_vb_{d}; (void)_de_{d};\n",
+        .{
+            tmp_id,     tmp_id,     args[1], tmp_id,  args[1],        tmp_id,
+            tmp_id,     u8_slice_c, tmp_id,  tmp_id,  tmp_id,         tmp_id,
+            tmp_id,     dst_raw,    args[0], args[0], chunk_pass_pfx, tmp_id,
+            discr_expr, tmp_id,     tmp_id,  args[1], tmp_id,         args[1],
+            tmp_id,     tmp_id,     tmp_id,  tmp_id,  tmp_id,         tmp_id,
+            tmp_id,     tmp_id,
+        },
+    );
+
+    if (!emitter.cfg.target.isFreestanding()) {
+        for (emitter.ordered_fmt_types.items) |cand_ty| {
+            const disp_b = lookupCustomFmtBodyIndexC(emitter, cand_ty, false);
+            const dbg_b = lookupCustomFmtBodyIndexC(emitter, cand_ty, true);
+            if (disp_b == null and dbg_b == null) continue;
+            try emitter.print(
+                "                if (!_handled_{d} && _fa_{d}.fmt_fn == _cx_fmt_fn_ty_{d}) {{\n",
+                .{ tmp_id, tmp_id, cand_ty.toU32() },
+            );
+            if (disp_b) |db_idx| {
+                const db_body = &emitter.input.bodies[db_idx];
+                const p1_ty = emitter.input.pool.unwrapUnderlyingType(db_body.locals.items[1].type_id);
+                const p1_tag = emitter.input.pool.getNode(p1_ty).tag;
+                const is_ptr_self = db_body.locals.items[1].mode() == .inout_mode or
+                    ((p1_tag == .ref_ty or p1_tag == .mut_ref_ty or p1_tag == .raw_ptr_ty) and
+                        !emitter.input.pool.isSliceRefType(p1_ty));
+                const cand_c = try formatCType(emitter, cand_ty);
+                defer emitter.allocator.free(cand_c);
+                try emitter.print("                    if (_vb_{d} == 0u && _de_{d} == 0u) {{\n", .{ tmp_id, tmp_id });
+                if (is_ptr_self) {
+                    try emitter.print(
+                        "                        _v_{d} = {s}(({s} *)_fa_{d}.data, _v_{d}, _fa_{d}.spec);\n",
+                        .{ dst_raw, emitter.body_c_names.items[db_idx], cand_c, tmp_id, args[0], tmp_id },
+                    );
+                } else {
+                    try emitter.print(
+                        "                        {s} _self_v; memcpy(&_self_v, _fa_{d}.data, sizeof(_self_v));\n" ++
+                            "                        _v_{d} = {s}(_self_v, _v_{d}, _fa_{d}.spec);\n",
+                        .{ cand_c, tmp_id, dst_raw, emitter.body_c_names.items[db_idx], args[0], tmp_id },
+                    );
+                }
+                try emitter.print(
+                    "                        _handled_{d} = 1;\n" ++
+                        "                        if (({s}) != 0u) goto _fw_done_{d};\n" ++
+                        "                    }}\n",
+                    .{ tmp_id, discr_expr, tmp_id },
+                );
+            }
+            if (dbg_b) |gb_idx| {
+                const gb_body = &emitter.input.bodies[gb_idx];
+                const p1_ty = emitter.input.pool.unwrapUnderlyingType(gb_body.locals.items[1].type_id);
+                const p1_tag = emitter.input.pool.getNode(p1_ty).tag;
+                const is_ptr_self = gb_body.locals.items[1].mode() == .inout_mode or
+                    ((p1_tag == .ref_ty or p1_tag == .mut_ref_ty or p1_tag == .raw_ptr_ty) and
+                        !emitter.input.pool.isSliceRefType(p1_ty));
+                const cand_c = try formatCType(emitter, cand_ty);
+                defer emitter.allocator.free(cand_c);
+                try emitter.print("                    if (!_handled_{d} && (_vb_{d} == 1u || _de_{d} != 0u)) {{\n", .{ tmp_id, tmp_id, tmp_id });
+                if (is_ptr_self) {
+                    try emitter.print(
+                        "                        _v_{d} = {s}(({s} *)_fa_{d}.data, _v_{d}, _fa_{d}.spec);\n",
+                        .{ dst_raw, emitter.body_c_names.items[gb_idx], cand_c, tmp_id, args[0], tmp_id },
+                    );
+                } else {
+                    try emitter.print(
+                        "                        {s} _self_v; memcpy(&_self_v, _fa_{d}.data, sizeof(_self_v));\n" ++
+                            "                        _v_{d} = {s}(_self_v, _v_{d}, _fa_{d}.spec);\n",
+                        .{ cand_c, tmp_id, dst_raw, emitter.body_c_names.items[gb_idx], args[0], tmp_id },
+                    );
+                }
+                try emitter.print(
+                    "                        _handled_{d} = 1;\n" ++
+                        "                        if (({s}) != 0u) goto _fw_done_{d};\n" ++
+                        "                    }}\n",
+                    .{ tmp_id, discr_expr, tmp_id },
+                );
+            }
+            try emitter.writeAll("                }\n");
+        }
+        try emitter.print(
+            "                if (!_handled_{d} && _fa_{d}.fmt_fn != NULL) {{\n" ++
+                "                    _cx_rt_buf_t _hb_{d} = {{ NULL, 0u, 0u }};\n" ++
+                "                    uint32_t _shi_{d} = ((uint32_t)_fa_{d}.spec.width_or_none) | " ++
+                "(((uint32_t)_fa_{d}.spec.precision_or_none) << 16u);\n" ++
+                "                    _fa_{d}.fmt_fn(&_hb_{d}, _fa_{d}.data, _fa_{d}.spec.flags_and_fill, _shi_{d});\n" ++
+                "                    if (_hb_{d}.len > 0u) {{\n" ++
+                "                        {s} _hws_{d}; _hws_{d}.ptr = _hb_{d}.data; _hws_{d}.len = (uintptr_t)_hb_{d}.len;\n" ++
+                "                        _v_{d} = _v_{d}->_f1(_v_{d}->_f0, _hws_{d});\n" ++
+                "                    }}\n" ++
+                "                    free(_hb_{d}.data);\n" ++
+                "                    if (({s}) != 0u) goto _fw_done_{d};\n" ++
+                "                }}\n",
+            .{
+                tmp_id,     tmp_id,  tmp_id,  tmp_id, tmp_id, tmp_id,
+                tmp_id,     tmp_id,  tmp_id,  tmp_id, tmp_id, tmp_id,
+                u8_slice_c, tmp_id,  tmp_id,  tmp_id, tmp_id, tmp_id,
+                dst_raw,    args[0], args[0], tmp_id, tmp_id, discr_expr,
+                tmp_id,
+            },
+        );
+    }
+
+    try emitter.print(
+        "            }}\n" ++
+            "            _pi_{d} += 1u;\n" ++
+            "        }}\n" ++
+            "    _fw_done_{d}: ;\n" ++
+            "    }}\n",
+        .{ tmp_id, tmp_id },
+    );
+}
+
+/// Emits `STD-01` (`MirIntrinsicKind` `52..109`) operations in C99.
+fn emitStd01IntrinsicOpC(
+    emitter: *CModuleEmitter,
+    body: *const MirBody,
+    dst_raw: u32,
+    kind: MirIntrinsicKind,
+    inst: mir.MirInst,
+    args: []const u32,
+) !void {
+    const trap_stmt = if (emitter.cfg.target.isFreestanding() or
+        (emitter.is_in_c_abi_body and !emitter.input.is_oracle_trace_enabled))
+        "__builtin_trap()"
+    else
+        "_cx_rt_trap(2u)";
+
+    switch (kind) {
+        .implements => {
+            const is_impl = evalImplementsStaticC(
+                emitter,
+                TypeId.fromInt(inst.operands.lhs),
+                TypeId.fromInt(inst.operands.rhs),
+            );
+            try emitter.print("    _v_{d} = {d}u;\n", .{ dst_raw, @intFromBool(is_impl) });
+        },
+        .int_min, .int_max, .int_bits => {
+            const target_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(inst.operands.lhs));
+            const info = (try resolveIntegerInfo(emitter, target_ty)) orelse return;
+            const dst_c = try formatCType(emitter, inst.type_id);
+            defer emitter.allocator.free(dst_c);
+            if (kind == .int_bits) {
+                try emitter.print("    _v_{d} = ({s}){d}u;\n", .{ dst_raw, dst_c, info.bits });
+            } else if (info.bits == 128) {
+                if (kind == .int_min) {
+                    const hi: u64 = if (info.is_signed) 0x8000_0000_0000_0000 else 0;
+                    const mk = if (info.is_signed) "_cx_i128_make" else "_cx_u128_make";
+                    try emitter.print("    _v_{d} = {s}(0ull, 0x{x}ull);\n", .{ dst_raw, mk, hi });
+                } else {
+                    const hi: u64 = if (info.is_signed) 0x7FFF_FFFF_FFFF_FFFF else 0xFFFF_FFFF_FFFF_FFFF;
+                    const mk = if (info.is_signed) "_cx_i128_make" else "_cx_u128_make";
+                    try emitter.print("    _v_{d} = {s}(0xFFFFFFFFFFFFFFFFull, 0x{x}ull);\n", .{ dst_raw, mk, hi });
+                }
+            } else if (kind == .int_min) {
+                if (!info.is_signed) {
+                    try emitter.print("    _v_{d} = ({s})0u;\n", .{ dst_raw, dst_c });
+                } else {
+                    const sign_bit: u64 = @as(u64, 1) << @intCast(info.bits - 1);
+                    try emitter.print("    _v_{d} = ({s})((uint64_t)0x{x}ull);\n", .{ dst_raw, dst_c, sign_bit });
+                }
+            } else {
+                const max_bits: u64 = if (!info.is_signed)
+                    (if (info.bits == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(info.bits)) - 1)
+                else
+                    (@as(u64, 1) << @intCast(info.bits - 1)) - 1;
+                try emitter.print("    _v_{d} = ({s})((uint64_t)0x{x}ull);\n", .{ dst_raw, dst_c, max_bits });
+            }
+        },
+        .scalar_clz, .scalar_ctz, .scalar_popcnt => {
+            if (args.len < 1) return;
+            const val_ty = body.getInst(MirValueId.fromInt(args[0])).type_id;
+            const info = (try resolveIntegerInfo(emitter, val_ty)) orelse return;
+            const tmp_id = emitter.nextTempId();
+            if (info.bits == 128) {
+                try emitter.print("    {{ cx_u128 _bw_{d} = _cx_as_u128(_v_{d});\n", .{ tmp_id, args[0] });
+                if (kind == .scalar_clz) {
+                    try emitter.print(
+                        "      _v_{d} = (_bw_{d}.hi != 0ull) ? (uint32_t)__builtin_clzll(_bw_{d}.hi) : " ++
+                            "((_bw_{d}.lo != 0ull) ? (64u + (uint32_t)__builtin_clzll(_bw_{d}.lo)) : 128u); }}\n",
+                        .{ dst_raw, tmp_id, tmp_id, tmp_id, tmp_id },
+                    );
+                } else if (kind == .scalar_ctz) {
+                    try emitter.print(
+                        "      _v_{d} = (_bw_{d}.lo != 0ull) ? (uint32_t)__builtin_ctzll(_bw_{d}.lo) : " ++
+                            "((_bw_{d}.hi != 0ull) ? (64u + (uint32_t)__builtin_ctzll(_bw_{d}.hi)) : 128u); }}\n",
+                        .{ dst_raw, tmp_id, tmp_id, tmp_id, tmp_id },
+                    );
+                } else {
+                    try emitter.print(
+                        "      _v_{d} = (uint32_t)__builtin_popcountll(_bw_{d}.lo) + (uint32_t)__builtin_popcountll(_bw_{d}.hi); }}\n",
+                        .{ dst_raw, tmp_id, tmp_id },
+                    );
+                }
+            } else {
+                const u_c = resolveUnsignedCTypeForBits(info.bits);
+                try emitter.print("    {{ uint64_t _bw_{d} = (uint64_t)(({s})_v_{d});\n", .{ tmp_id, u_c, args[0] });
+                if (kind == .scalar_clz) {
+                    try emitter.print(
+                        "      _v_{d} = (_bw_{d} == 0ull) ? {d}u : ((uint32_t)__builtin_clzll(_bw_{d}) - {d}u); }}\n",
+                        .{ dst_raw, tmp_id, info.bits, tmp_id, 64 - info.bits },
+                    );
+                } else if (kind == .scalar_ctz) {
+                    try emitter.print(
+                        "      _v_{d} = (_bw_{d} == 0ull) ? {d}u : (uint32_t)__builtin_ctzll(_bw_{d}); }}\n",
+                        .{ dst_raw, tmp_id, info.bits, tmp_id },
+                    );
+                } else {
+                    try emitter.print(
+                        "      _v_{d} = (uint32_t)__builtin_popcountll(_bw_{d}); }}\n",
+                        .{ dst_raw, tmp_id },
+                    );
+                }
+            }
+        },
+        .scalar_bswap => {
+            if (args.len < 1) return;
+            const val_ty = body.getInst(MirValueId.fromInt(args[0])).type_id;
+            const lay = try emitter.resolver.resolveType(val_ty);
+            const n: usize = @intCast(@min(lay.size_bytes, 16));
+            const tmp_id = emitter.nextTempId();
+            try emitter.print(
+                "    {{ uint8_t _bsi_{d}[16], _bso_{d}[16]; memcpy(_bsi_{d}, &_v_{d}, {d}u);\n",
+                .{ tmp_id, tmp_id, tmp_id, args[0], n },
+            );
+            for (0..n) |bi| {
+                try emitter.print("      _bso_{d}[{d}u] = _bsi_{d}[{d}u];\n", .{ tmp_id, bi, tmp_id, n - 1 - bi });
+            }
+            try emitter.print("      memcpy(&_v_{d}, _bso_{d}, {d}u); }}\n", .{ dst_raw, tmp_id, n });
+        },
+        .scalar_rotl, .scalar_rotr => {
+            if (args.len < 2) return;
+            const val_ty = body.getInst(MirValueId.fromInt(args[0])).type_id;
+            const info = (try resolveIntegerInfo(emitter, val_ty)) orelse return;
+            const dst_c = try formatCType(emitter, inst.type_id);
+            defer emitter.allocator.free(dst_c);
+            const tmp_id = emitter.nextTempId();
+            if (info.bits == 128) {
+                try emitter.print(
+                    "    {{ cx_u128 _rv_{d} = _cx_as_u128(_v_{d}); uint32_t _ra_{d} = ((uint32_t)_v_{d}) & 127u;\n" ++
+                        "      cx_u128 _ro_{d} = (_ra_{d} == 0u) ? _rv_{d} : ",
+                    .{ tmp_id, args[0], tmp_id, args[1], tmp_id, tmp_id, tmp_id },
+                );
+                if (kind == .scalar_rotl) {
+                    try emitter.print(
+                        "_cx_u128_or(_cx_u128_shl(_rv_{d}, _ra_{d}), _cx_u128_shr(_rv_{d}, 128u - _ra_{d}));\n",
+                        .{ tmp_id, tmp_id, tmp_id, tmp_id },
+                    );
+                } else {
+                    try emitter.print(
+                        "_cx_u128_or(_cx_u128_shr(_rv_{d}, _ra_{d}), _cx_u128_shl(_rv_{d}, 128u - _ra_{d}));\n",
+                        .{ tmp_id, tmp_id, tmp_id, tmp_id },
+                    );
+                }
+                try emitter.print("      memcpy(&_v_{d}, &_ro_{d}, 16u); }}\n", .{ dst_raw, tmp_id });
+            } else {
+                const u_c = resolveUnsignedCTypeForBits(info.bits);
+                try emitter.print(
+                    "    {{ {s} _rv_{d} = ({s})_v_{d}; uint32_t _ra_{d} = ((uint32_t)_v_{d}) % {d}u;\n",
+                    .{ u_c, tmp_id, u_c, args[0], tmp_id, args[1], info.bits },
+                );
+                if (kind == .scalar_rotl) {
+                    try emitter.print(
+                        "      {s} _ro_{d} = (_ra_{d} == 0u) ? _rv_{d} : ({s})((_rv_{d} << _ra_{d}) | (_rv_{d} >> ({d}u - _ra_{d})));\n",
+                        .{ u_c, tmp_id, tmp_id, tmp_id, u_c, tmp_id, tmp_id, tmp_id, info.bits, tmp_id },
+                    );
+                } else {
+                    try emitter.print(
+                        "      {s} _ro_{d} = (_ra_{d} == 0u) ? _rv_{d} : ({s})((_rv_{d} >> _ra_{d}) | (_rv_{d} << ({d}u - _ra_{d})));\n",
+                        .{ u_c, tmp_id, tmp_id, tmp_id, u_c, tmp_id, tmp_id, tmp_id, info.bits, tmp_id },
+                    );
+                }
+                try emitter.print("      _v_{d} = ({s})_ro_{d}; }}\n", .{ dst_raw, dst_c, tmp_id });
+            }
+        },
+        .ptr_is_null => {
+            if (args.len < 1) return;
+            try emitter.print("    _v_{d} = (_v_{d} == NULL) ? 1u : 0u;\n", .{ dst_raw, args[0] });
+        },
+        .ptr_offset => {
+            if (args.len < 3) return;
+            const ptr_ty = emitter.input.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[0])).type_id);
+            const pointee_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(ptr_ty).lhs));
+            const stride: u64 = if (pointee_ty == .opaque_ty)
+                1
+            else
+                (try emitter.resolver.resolveType(pointee_ty)).size_bytes;
+            const dst_c = try formatCType(emitter, inst.type_id);
+            defer emitter.allocator.free(dst_c);
+            const delta_ty = body.getInst(MirValueId.fromInt(args[1])).type_id;
+            const d_info = try resolveIntegerInfo(emitter, delta_ty);
+            const cast_d = if (d_info != null and d_info.?.is_signed) "(uintptr_t)(intptr_t)" else "(uintptr_t)";
+            try emitter.print(
+                "    _v_{d} = ({s})((_v_{d} == 1u) ? (((uintptr_t)_v_{d}) - ({s}_v_{d}) * {d}u) : " ++
+                    "(((uintptr_t)_v_{d}) + ({s}_v_{d}) * {d}u));\n",
+                .{ dst_raw, dst_c, args[2], args[0], cast_d, args[1], stride, args[0], cast_d, args[1], stride },
+            );
+        },
+        .slice_split_at => {
+            if (args.len < 2) return;
+            const tup_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
+            const tup_elems = emitter.input.pool.getTupleElements(tup_ty);
+            if (tup_elems.len < 2) return;
+            const half_ty = TypeId.fromInt(tup_elems[0]);
+            const sl_pointee = emitter.input.pool.getSliceRefInner(half_ty) orelse
+                resolveSliceRefPointee(emitter, half_ty) orelse return;
+            const elem_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(sl_pointee).lhs));
+            const elem_lay = try emitter.resolver.resolveType(elem_ty);
+            const elem_c = if (try isZeroSizedType(emitter, elem_ty))
+                try emitter.allocator.dupe(u8, "uint8_t")
+            else
+                try formatCType(emitter, elem_ty);
+            defer emitter.allocator.free(elem_c);
+            const tmp_id = emitter.nextTempId();
+            if (resolveSliceRefPointee(emitter, half_ty) != null) {
+                try emitter.print(
+                    "    {{ uintptr_t _mid_{d} = (uintptr_t)_v_{d}; uintptr_t _len_{d} = (uintptr_t)_v_{d}->len;\n" ++
+                        "      if (_mid_{d} > _len_{d}) {s};\n" ++
+                        "      _stmp_a_{d}.ptr = _v_{d}->ptr; _stmp_a_{d}.len = _mid_{d};\n" ++
+                        "      uintptr_t _rlen_{d} = _len_{d} - _mid_{d};\n" ++
+                        "      _stmp_b_{d}.ptr = (_rlen_{d} == 0u && _v_{d}->ptr == NULL) ? ({s} *)((uintptr_t){d}u) : " ++
+                        "({s} *)(((uint8_t *)_v_{d}->ptr) + _mid_{d} * {d}u);\n" ++
+                        "      _stmp_b_{d}.len = _rlen_{d};\n" ++
+                        "      _v_{d}._f0 = &_stmp_a_{d}; _v_{d}._f1 = &_stmp_b_{d}; }}\n",
+                    .{
+                        tmp_id,  args[1], tmp_id,                         args[0],
+                        tmp_id,  tmp_id,  trap_stmt,                      dst_raw,
+                        args[0], dst_raw, tmp_id,                         tmp_id,
+                        tmp_id,  tmp_id,  dst_raw,                        tmp_id,
+                        args[0], elem_c,  @max(elem_lay.alignBytes(), 1), elem_c,
+                        args[0], tmp_id,  elem_lay.stride_bytes,          dst_raw,
+                        tmp_id,  dst_raw, dst_raw,                        dst_raw,
+                        dst_raw,
+                    },
+                );
+            } else {
+                try emitter.print(
+                    "    {{ uintptr_t _mid_{d} = (uintptr_t)_v_{d}; uintptr_t _len_{d} = (uintptr_t)_v_{d}.len;\n" ++
+                        "      if (_mid_{d} > _len_{d}) {s};\n" ++
+                        "      _v_{d}._f0.ptr = (_mid_{d} == 0u && _v_{d}.ptr == NULL) ? ({s} *)((uintptr_t){d}u) : _v_{d}.ptr;\n" ++
+                        "      _v_{d}._f0.len = _mid_{d};\n" ++
+                        "      uintptr_t _rlen_{d} = _len_{d} - _mid_{d};\n" ++
+                        "      _v_{d}._f1.ptr = (_rlen_{d} == 0u && _v_{d}.ptr == NULL) ? ({s} *)((uintptr_t){d}u) : " ++
+                        "({s} *)(((uint8_t *)_v_{d}.ptr) + _mid_{d} * {d}u);\n" ++
+                        "      _v_{d}._f1.len = _rlen_{d}; }}\n",
+                    .{
+                        tmp_id,  args[1], tmp_id,                         args[0],
+                        tmp_id,  tmp_id,  trap_stmt,                      dst_raw,
+                        tmp_id,  args[0], elem_c,                         @max(elem_lay.alignBytes(), 1),
+                        args[0], dst_raw, tmp_id,                         tmp_id,
+                        tmp_id,  tmp_id,  dst_raw,                        tmp_id,
+                        args[0], elem_c,  @max(elem_lay.alignBytes(), 1), elem_c,
+                        args[0], tmp_id,  elem_lay.stride_bytes,          dst_raw,
+                        tmp_id,
+                    },
+                );
+            }
+        },
+        .slice_reverse => {
+            if (args.len < 1) return;
+            const ref_ty = emitter.input.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[0])).type_id);
+            const slice_ty = emitter.input.pool.getSliceRefInner(ref_ty) orelse
+                emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(ref_ty).lhs));
+            const elem_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(slice_ty).lhs));
+            if (try isZeroSizedType(emitter, elem_ty)) return;
+            const elem_c = try formatCType(emitter, elem_ty);
+            defer emitter.allocator.free(elem_c);
+            const acc = if (emitter.input.pool.isSliceRefType(ref_ty)) "." else "->";
+            const tmp_id = emitter.nextTempId();
+            try emitter.print(
+                "    if (_v_{d}{s}len >= 2u) {{ size_t _lo_{d} = 0u, _hi_{d} = (size_t)_v_{d}{s}len - 1u;\n" ++
+                    "      while (_lo_{d} < _hi_{d}) {{ {s} _sw_{d} = _v_{d}{s}ptr[_lo_{d}]; " ++
+                    "_v_{d}{s}ptr[_lo_{d}] = _v_{d}{s}ptr[_hi_{d}]; _v_{d}{s}ptr[_hi_{d}] = _sw_{d}; " ++
+                    "_lo_{d} += 1u; _hi_{d} -= 1u; }} }}\n",
+                .{
+                    args[0], acc,     tmp_id, tmp_id, args[0], acc,
+                    tmp_id,  tmp_id,  elem_c, tmp_id, args[0], acc,
+                    tmp_id,  args[0], acc,    tmp_id, args[0], acc,
+                    tmp_id,  args[0], acc,    tmp_id, tmp_id,  tmp_id,
+                    tmp_id,
+                },
+            );
+        },
+        .soa_vec_new => {
+            const alloc_e = if (args.len >= 1)
+                try formatAllocRawExprC(emitter, body, args[0])
+            else
+                try emitter.allocator.dupe(u8, "((uintptr_t)0u)");
+            defer emitter.allocator.free(alloc_e);
+            try emitter.print(
+                "    _v_{d}.ptr = NULL; _v_{d}.len = 0u; _v_{d}.cap = 0u; _v_{d}.alloc = {s};\n",
+                .{ dst_raw, dst_raw, dst_raw, dst_raw, alloc_e },
+            );
+        },
+        .soa_vec_with_cap => {
+            if (args.len < 3) return;
+            const is_try = (extractConstUsizeFromBody(body, args[2]) orelse 0) != 0;
+            const out_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
+            const vec_ty = if (is_try)
+                emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(out_ty).lhs))
+            else
+                out_ty;
+            const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(vec_ty).lhs));
+            const alloc_e = try formatAllocRawExprC(emitter, body, args[0]);
+            defer emitter.allocator.free(alloc_e);
+            const vec_c = try formatCType(emitter, vec_ty);
+            defer emitter.allocator.free(vec_c);
+            const tmp_id = emitter.nextTempId();
+            try emitter.print(
+                "    {s} _svw_{d}; _svw_{d}.ptr = NULL; _svw_{d}.len = 0u; _svw_{d}.cap = 0u; _svw_{d}.alloc = {s};\n",
+                .{ vec_c, tmp_id, tmp_id, tmp_id, tmp_id, tmp_id, alloc_e },
+            );
+            const vp_s = try std.fmt.allocPrint(emitter.allocator, "(&_svw_{d})", .{tmp_id});
+            defer emitter.allocator.free(vp_s);
+            const cap_s = try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{args[1]});
+            defer emitter.allocator.free(cap_s);
+            const ok_s = try std.fmt.allocPrint(emitter.allocator, "_svok_{d}", .{tmp_id});
+            defer emitter.allocator.free(ok_s);
+            try emitSoaVecEnsureCapC(emitter, vp_s, elem_struct, cap_s, if (is_try) "1" else "0", ok_s);
+            if (!is_try) {
+                try emitter.print("    _v_{d} = _svw_{d};\n", .{ dst_raw, tmp_id });
+            } else {
+                const sum_detail = (try emitter.resolver.getSumDetail(out_ty)).?;
+                const dst_s = try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{dst_raw});
+                defer emitter.allocator.free(dst_s);
+                try emitter.print("    memset(&_v_{d}, 0, sizeof(_v_{d}));\n    if ({s}) {{\n", .{ dst_raw, dst_raw, ok_s });
+                try emitter.print(
+                    "        memcpy(((uint8_t *)&_v_{d}) + {d}u, &_svw_{d}, sizeof(_svw_{d}));\n",
+                    .{ dst_raw, sum_detail.payload_offset, tmp_id, tmp_id },
+                );
+                try emitSumDiscrWriteStmt(emitter, out_ty, 0, dst_s);
+                try emitter.writeAll("    } else {\n");
+                try emitSumDiscrWriteStmt(emitter, out_ty, 1, dst_s);
+                try emitter.writeAll("    }\n");
+            }
+        },
+        .soa_vec_len, .soa_vec_cap => {
+            if (args.len < 1) return;
+            const dst_c = try formatCType(emitter, inst.type_id);
+            defer emitter.allocator.free(dst_c);
+            const fld_n = if (kind == .soa_vec_len) "len" else "cap";
+            try emitter.print("    _v_{d} = ({s})(_v_{d}->{s});\n", .{ dst_raw, dst_c, args[0], fld_n });
+        },
+        .soa_vec_push => {
+            if (args.len < 3) return;
+            const is_try = (extractConstUsizeFromBody(body, args[2]) orelse 0) != 0;
+            const ref_ty = emitter.input.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[0])).type_id);
+            const vec_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(ref_ty).lhs));
+            const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(vec_ty).lhs));
+            const lay = try emitter.resolver.resolveType(elem_struct);
+            const tmp_id = emitter.nextTempId();
+            const vp_s = try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{args[0]});
+            defer emitter.allocator.free(vp_s);
+            const min_s = try std.fmt.allocPrint(emitter.allocator, "((uint64_t)_v_{d}->len + 1ull)", .{args[0]});
+            defer emitter.allocator.free(min_s);
+            const ok_s = try std.fmt.allocPrint(emitter.allocator, "_spok_{d}", .{tmp_id});
+            defer emitter.allocator.free(ok_s);
+            try emitSoaVecEnsureCapC(emitter, vp_s, elem_struct, min_s, if (is_try) "1" else "0", ok_s);
+            try emitter.print("    if ({s}) {{\n", .{ok_s});
+            const cap_s = try std.fmt.allocPrint(emitter.allocator, "(_v_{d}->cap)", .{args[0]});
+            defer emitter.allocator.free(cap_s);
+            var col_i: u32 = 0;
+            while (col_i < lay.aux_len) : (col_i += 1) {
+                const fld = emitter.resolver.fields_by_decl.items[lay.aux_start + col_i];
+                if (fld.size_bytes == 0) continue;
+                const col_off = try formatDynamicSoaColOffsetExpr(emitter, elem_struct, col_i, cap_s);
+                defer emitter.allocator.free(col_off);
+                try emitter.print(
+                    "        memcpy(_v_{d}->ptr + {s} + ((size_t)_v_{d}->len) * {d}u, &_v_{d}._f{d}, {d}u);\n",
+                    .{ args[0], col_off, args[0], fld.size_bytes, args[1], col_i, fld.size_bytes },
+                );
+            }
+            if (emitter.drop_type_set.contains(elem_struct.toU32())) {
+                try emitter.print(
+                    "        _v_{d}->len += 1u;\n    }} else {{\n        _cx_drop_ty_{d}(&_v_{d});\n    }}\n",
+                    .{ args[0], elem_struct.toU32(), args[1] },
+                );
+            } else {
+                try emitter.print("        _v_{d}->len += 1u;\n    }}\n", .{args[0]});
+            }
+            if (is_try) {
+                const out_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
+                const dst_s = try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{dst_raw});
+                defer emitter.allocator.free(dst_s);
+                try emitter.print("    memset(&_v_{d}, 0, sizeof(_v_{d}));\n    if ({s}) {{\n", .{ dst_raw, dst_raw, ok_s });
+                try emitSumDiscrWriteStmt(emitter, out_ty, 0, dst_s);
+                try emitter.writeAll("    } else {\n");
+                try emitSumDiscrWriteStmt(emitter, out_ty, 1, dst_s);
+                try emitter.writeAll("    }\n");
+            }
+        },
+        .soa_vec_pop => {
+            if (args.len < 1) return;
+            const opt_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
+            const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(opt_ty).lhs));
+            const lay = try emitter.resolver.resolveType(elem_struct);
+            const sum_detail = (try emitter.resolver.getSumDetail(opt_ty)).?;
+            const elem_c = try formatCType(emitter, elem_struct);
+            defer emitter.allocator.free(elem_c);
+            const dst_s = try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{dst_raw});
+            defer emitter.allocator.free(dst_s);
+            const tmp_id = emitter.nextTempId();
+            try emitter.print(
+                "    memset(&_v_{d}, 0, sizeof(_v_{d}));\n" ++
+                    "    if (_v_{d}->len == 0u) {{\n",
+                .{ dst_raw, dst_raw, args[0] },
+            );
+            try emitSumDiscrWriteStmt(emitter, opt_ty, 0, dst_s);
+            try emitter.print(
+                "    }} else {{\n" ++
+                    "        _v_{d}->len -= 1u;\n" ++
+                    "        {s} _pop_e_{d}; memset(&_pop_e_{d}, 0, sizeof(_pop_e_{d}));\n",
+                .{ args[0], elem_c, tmp_id, tmp_id, tmp_id },
+            );
+            const cap_s = try std.fmt.allocPrint(emitter.allocator, "(_v_{d}->cap)", .{args[0]});
+            defer emitter.allocator.free(cap_s);
+            var col_i: u32 = 0;
+            while (col_i < lay.aux_len) : (col_i += 1) {
+                const fld = emitter.resolver.fields_by_decl.items[lay.aux_start + col_i];
+                if (fld.size_bytes == 0) continue;
+                const col_off = try formatDynamicSoaColOffsetExpr(emitter, elem_struct, col_i, cap_s);
+                defer emitter.allocator.free(col_off);
+                try emitter.print(
+                    "        memcpy(&_pop_e_{d}._f{d}, _v_{d}->ptr + {s} + ((size_t)_v_{d}->len) * {d}u, {d}u);\n",
+                    .{ tmp_id, col_i, args[0], col_off, args[0], fld.size_bytes, fld.size_bytes },
+                );
+            }
+            try emitter.print(
+                "        memcpy(((uint8_t *)&_v_{d}) + {d}u, &_pop_e_{d}, sizeof(_pop_e_{d}));\n",
+                .{ dst_raw, sum_detail.payload_offset, tmp_id, tmp_id },
+            );
+            try emitSumDiscrWriteStmt(emitter, opt_ty, 1, dst_s);
+            try emitter.writeAll("    }\n");
+        },
+        .soa_vec_clear => {
+            if (args.len < 1) return;
+            const ref_ty = emitter.input.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[0])).type_id);
+            const vec_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(ref_ty).lhs));
+            const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(vec_ty).lhs));
+            const lay = try emitter.resolver.resolveType(elem_struct);
+            if (!type_system.isTrivialDropType(emitter.input.pool, emitter.input.sym_table, elem_struct)) {
+                const tmp_id = emitter.nextTempId();
+                const cap_s = try std.fmt.allocPrint(emitter.allocator, "(_v_{d}->cap)", .{args[0]});
+                defer emitter.allocator.free(cap_s);
+                try emitter.print(
+                    "    if (_v_{d}->ptr != NULL && _v_{d}->len > 0u && _v_{d}->cap > 0u) {{\n" ++
+                        "        uint32_t _cdi_{d} = _v_{d}->len;\n" ++
+                        "        while (_cdi_{d} > 0u) {{ _cdi_{d} -= 1u;\n",
+                    .{ args[0], args[0], args[0], tmp_id, args[0], tmp_id, tmp_id },
+                );
+                var rev_col: u32 = lay.aux_len;
+                while (rev_col > 0) {
+                    rev_col -= 1;
+                    const fld = emitter.resolver.fields_by_decl.items[lay.aux_start + rev_col];
+                    const fld_ty = emitter.input.pool.unwrapUnderlyingType(fld.field_ty);
+                    if (fld.size_bytes == 0 or !emitter.drop_type_set.contains(fld_ty.toU32())) continue;
+                    const col_off = try formatDynamicSoaColOffsetExpr(emitter, elem_struct, rev_col, cap_s);
+                    defer emitter.allocator.free(col_off);
+                    const fld_c = try formatCType(emitter, fld_ty);
+                    defer emitter.allocator.free(fld_c);
+                    try emitter.print(
+                        "            _cx_drop_ty_{d}((({s} *)(_v_{d}->ptr + {s})) + _cdi_{d});\n",
+                        .{ fld_ty.toU32(), fld_c, args[0], col_off, tmp_id },
+                    );
+                }
+                try emitter.writeAll("        }\n    }\n");
+            }
+            try emitter.print("    _v_{d}->len = 0u;\n", .{args[0]});
+        },
+        .soa_vec_reserve => {
+            if (args.len < 3) return;
+            const is_try = (extractConstUsizeFromBody(body, args[2]) orelse 0) != 0;
+            const ref_ty = emitter.input.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[0])).type_id);
+            const vec_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(ref_ty).lhs));
+            const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(vec_ty).lhs));
+            const tmp_id = emitter.nextTempId();
+            const vp_s = try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{args[0]});
+            defer emitter.allocator.free(vp_s);
+            try emitter.print(
+                "    uint64_t _radd_{d} = (uint64_t)_v_{d};\n" ++
+                    "    uint64_t _rneed_{d} = (_radd_{d} > 0xFFFFFFFFull - (uint64_t)_v_{d}->len) ? " ++
+                    "0x100000000ull : ((uint64_t)_v_{d}->len + _radd_{d});\n",
+                .{ tmp_id, args[1], tmp_id, tmp_id, args[0], args[0], tmp_id },
+            );
+            const min_s = try std.fmt.allocPrint(emitter.allocator, "_rneed_{d}", .{tmp_id});
+            defer emitter.allocator.free(min_s);
+            const ok_s = try std.fmt.allocPrint(emitter.allocator, "_srok_{d}", .{tmp_id});
+            defer emitter.allocator.free(ok_s);
+            try emitSoaVecEnsureCapC(emitter, vp_s, elem_struct, min_s, if (is_try) "1" else "0", ok_s);
+            if (is_try) {
+                const out_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
+                const dst_s = try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{dst_raw});
+                defer emitter.allocator.free(dst_s);
+                try emitter.print("    memset(&_v_{d}, 0, sizeof(_v_{d}));\n    if ({s}) {{\n", .{ dst_raw, dst_raw, ok_s });
+                try emitSumDiscrWriteStmt(emitter, out_ty, 0, dst_s);
+                try emitter.writeAll("    } else {\n");
+                try emitSumDiscrWriteStmt(emitter, out_ty, 1, dst_s);
+                try emitter.writeAll("    }\n");
+            }
+        },
+        .soa_vec_as_slice => {
+            if (args.len < 1) return;
+            const is_ref = resolveSliceRefPointee(emitter, inst.type_id) != null;
+            const dst_pfx = if (is_ref) "_stmp_" else "_v_";
+            try emitter.print(
+                "    {s}{d}.ptr = (_v_{d}->len == 0u || _v_{d}->ptr == NULL) ? (uint8_t *)((uintptr_t)16u) : _v_{d}->ptr;\n" ++
+                    "    {s}{d}.len = (uintptr_t)_v_{d}->len;\n" ++
+                    "    {s}{d}.stride = (uintptr_t)_v_{d}->cap;\n" ++
+                    "    {s}{d}.elem_off = 0u;\n",
+                .{
+                    dst_pfx, dst_raw, args[0], args[0], args[0],
+                    dst_pfx, dst_raw, args[0], dst_pfx, dst_raw,
+                    args[0], dst_pfx, dst_raw,
+                },
+            );
+            if (is_ref) try emitter.print("    _v_{d} = &_stmp_{d};\n", .{ dst_raw, dst_raw });
+        },
+        .soa_vec_col_slice => {
+            if (args.len < 2) return;
+            const field_ord: u32 = @truncate(extractConstUsizeFromBody(body, args[1]) orelse 0);
+            const ref_ty = emitter.input.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[0])).type_id);
+            const vec_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(ref_ty).lhs));
+            const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(vec_ty).lhs));
+            const fld = (try emitter.resolver.getFieldByDeclOrdinal(elem_struct, field_ord)) orelse return;
+            const fld_ty = emitter.input.pool.unwrapUnderlyingType(fld.field_ty);
+            const fld_lay = try emitter.resolver.resolveType(fld_ty);
+            const fld_c = if (try isZeroSizedType(emitter, fld_ty))
+                try emitter.allocator.dupe(u8, "uint8_t")
+            else
+                try formatCType(emitter, fld_ty);
+            defer emitter.allocator.free(fld_c);
+            const cap_s = try std.fmt.allocPrint(emitter.allocator, "(_v_{d}->cap)", .{args[0]});
+            defer emitter.allocator.free(cap_s);
+            const col_off = try formatDynamicSoaColOffsetExpr(emitter, elem_struct, field_ord, cap_s);
+            defer emitter.allocator.free(col_off);
+            const is_ref = resolveSliceRefPointee(emitter, inst.type_id) != null;
+            const dst_pfx = if (is_ref) "_stmp_" else "_v_";
+            try emitter.print(
+                "    {s}{d}.ptr = (_v_{d}->len == 0u || _v_{d}->ptr == NULL) ? ({s} *)((uintptr_t){d}u) : ({s} *)(_v_{d}->ptr + {s});\n" ++
+                    "    {s}{d}.len = (uintptr_t)_v_{d}->len;\n",
+                .{
+                    dst_pfx,
+                    dst_raw,
+                    args[0],
+                    args[0],
+                    fld_c,
+                    @max(fld_lay.alignBytes(), 1),
+                    fld_c,
+                    args[0],
+                    col_off,
+                    dst_pfx,
+                    dst_raw,
+                    args[0],
+                },
+            );
+            if (is_ref) try emitter.print("    _v_{d} = &_stmp_{d};\n", .{ dst_raw, dst_raw });
+        },
+        .ctx_next_rng_seed => {
+            const tmp_id = emitter.nextTempId();
+            const off_bytes: u64 = 2 * emitter.ctx_slot_stride_bytes;
+            try emitter.print(
+                "    {{ uint64_t _rs_{d} = 0ull; memcpy(&_rs_{d}, &_cx_tls_ctx[{d}u], 8u);\n" ++
+                    "      _rs_{d} = (_rs_{d} == 0ull ? 0x9E3779B97F4A7C15ull : _rs_{d}) + 0x2D358DCCAA6C78A5ull;\n" ++
+                    "      memcpy(&_cx_tls_ctx[{d}u], &_rs_{d}, 8u);\n" ++
+                    "      uint64_t _rz_{d} = _rs_{d};\n" ++
+                    "      _rz_{d} = (_rz_{d} ^ (_rz_{d} >> 30u)) * 0xBF58476D1CE4E5B9ull;\n" ++
+                    "      _rz_{d} = (_rz_{d} ^ (_rz_{d} >> 27u)) * 0x94D049BB133111EBull;\n" ++
+                    "      _v_{d} = _rz_{d} ^ (_rz_{d} >> 31u); }}\n",
+                .{
+                    tmp_id,  tmp_id, off_bytes, tmp_id, tmp_id, tmp_id, off_bytes, tmp_id,
+                    tmp_id,  tmp_id, tmp_id,    tmp_id, tmp_id, tmp_id, tmp_id,    tmp_id,
+                    dst_raw, tmp_id, tmp_id,
+                },
+            );
+        },
+        .tls_scratch_ptr => {
+            const dst_c = try formatCType(emitter, inst.type_id);
+            defer emitter.allocator.free(dst_c);
+            try emitter.print("    _v_{d} = ({s})((void *)_cx_tls_scratch_buf);\n", .{ dst_raw, dst_c });
+        },
+        .tls_alloc_state => {
+            const dst_c = try formatCType(emitter, inst.type_id);
+            defer emitter.allocator.free(dst_c);
+            try emitter.print("    _v_{d} = ({s})((void *)_cx_tls_alloc_buf);\n", .{ dst_raw, dst_c });
+        },
+        .fmt_write => try emitFmtWriteOpC(emitter, body, dst_raw, inst, args),
+        .memcpy => {
+            if (args.len < 3) return;
+            try emitter.print(
+                "    if ((size_t)_v_{d} > 0u) memcpy((void *)_v_{d}, (const void *)_v_{d}, (size_t)_v_{d});\n",
+                .{ args[2], args[0], args[1], args[2] },
+            );
+        },
+        .memmove => {
+            if (args.len < 3) return;
+            try emitter.print(
+                "    if ((size_t)_v_{d} > 0u) memmove((void *)_v_{d}, (const void *)_v_{d}, (size_t)_v_{d});\n",
+                .{ args[2], args[0], args[1], args[2] },
+            );
+        },
+        .memset => {
+            if (args.len < 3) return;
+            try emitter.print(
+                "    if ((size_t)_v_{d} > 0u) memset((void *)_v_{d}, (int)(uint8_t)_v_{d}, (size_t)_v_{d});\n",
+                .{ args[2], args[0], args[1], args[2] },
+            );
+        },
+        .ptr_copy, .ptr_copy_nonoverlapping => {
+            if (args.len < 3) return;
+            const ptr_ty = emitter.input.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[0])).type_id);
+            const elem_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(ptr_ty).lhs));
+            const elem_lay = try emitter.resolver.resolveType(elem_ty);
+            if (elem_lay.size_bytes == 0) return;
+            const fn_n = if (kind == .ptr_copy_nonoverlapping) "memcpy" else "memmove";
+            try emitter.print(
+                "    if ((size_t)_v_{d} > 0u) {s}((void *)_v_{d}, (const void *)_v_{d}, ((size_t)_v_{d}) * {d}u);\n",
+                .{ args[2], fn_n, args[1], args[0], args[2], elem_lay.size_bytes },
+            );
+        },
+        .ptr_read => {
+            if (args.len < 1 or (try isZeroSizedType(emitter, inst.type_id))) return;
+            try emitter.print("    memcpy(&_v_{d}, (const void *)_v_{d}, sizeof(_v_{d}));\n", .{ dst_raw, args[0], dst_raw });
+        },
+        .ptr_write => {
+            if (args.len < 2) return;
+            const val_ty = body.getInst(MirValueId.fromInt(args[1])).type_id;
+            if (try isZeroSizedType(emitter, val_ty)) return;
+            try emitter.print("    memcpy((void *)_v_{d}, &_v_{d}, sizeof(_v_{d}));\n", .{ args[0], args[1], args[1] });
+        },
+        .ptr_drop_in_place => {
+            if (args.len < 1) return;
+            const ptr_ty = emitter.input.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(args[0])).type_id);
+            const elem_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(ptr_ty).lhs));
+            if (emitter.drop_type_set.contains(elem_ty.toU32()) and !(try isZeroSizedType(emitter, elem_ty))) {
+                const elem_c = try formatCType(emitter, elem_ty);
+                defer emitter.allocator.free(elem_c);
+                try emitter.print("    if (_v_{d} != NULL) _cx_drop_ty_{d}(({s} *)_v_{d});\n", .{
+                    args[0],
+                    elem_ty.toU32(),
+                    elem_c,
+                    args[0],
+                });
+            }
+        },
+        .forget => {},
+        .slice_from_raw_parts => {
+            if (args.len < 2) return;
+            const is_ref = resolveSliceRefPointee(emitter, inst.type_id) != null;
+            const sl_ty = if (is_ref)
+                resolveSliceRefPointee(emitter, inst.type_id).?
+            else
+                (emitter.input.pool.getSliceRefInner(inst.type_id) orelse
+                    emitter.input.pool.unwrapUnderlyingType(inst.type_id));
+            const elem_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(sl_ty).lhs));
+            const elem_lay = try emitter.resolver.resolveType(elem_ty);
+            const elem_c = if (try isZeroSizedType(emitter, elem_ty))
+                try emitter.allocator.dupe(u8, "uint8_t")
+            else
+                try formatCType(emitter, elem_ty);
+            defer emitter.allocator.free(elem_c);
+            const dst_pfx = if (is_ref) "_stmp_" else "_v_";
+            try emitter.print(
+                "    {s}{d}.ptr = (_v_{d} == NULL) ? ({s} *)((uintptr_t){d}u) : ({s} *)_v_{d}; " ++
+                    "{s}{d}.len = (uintptr_t)_v_{d};\n",
+                .{
+                    dst_pfx, dst_raw, args[0], elem_c,  @max(elem_lay.alignBytes(), 1),
+                    elem_c,  args[0], dst_pfx, dst_raw, args[1],
+                },
+            );
+            if (is_ref) try emitter.print("    _v_{d} = &_stmp_{d};\n", .{ dst_raw, dst_raw });
+        },
+        .str_from_utf8_unchecked => {
+            if (args.len < 1) return;
+            const span_e = try formatWireByteSpanExprs(
+                emitter,
+                body.getInst(MirValueId.fromInt(args[0])).type_id,
+                MirValueId.fromInt(args[0]),
+            );
+            defer emitter.allocator.free(span_e.ptr_expr);
+            defer emitter.allocator.free(span_e.len_expr);
+            try emitter.print(
+                "    _v_{d}.ptr = (uint8_t *)({s}); _v_{d}.len = (uintptr_t)({s});\n",
+                .{ dst_raw, span_e.ptr_expr, dst_raw, span_e.len_expr },
+            );
+        },
+        .from_le_bytes, .from_be_bytes => {
+            if (args.len < 1) return;
+            const lay = try emitter.resolver.resolveType(inst.type_id);
+            const n: usize = @intCast(@min(lay.size_bytes, 16));
+            if (kind == .from_le_bytes) {
+                try emitter.print("    memcpy(&_v_{d}, &_v_{d}._elems[0], {d}u);\n", .{ dst_raw, args[0], n });
+            } else {
+                const tmp_id = emitter.nextTempId();
+                try emitter.print("    {{ uint8_t _fb_{d}[16];\n", .{tmp_id});
+                for (0..n) |bi| {
+                    try emitter.print("      _fb_{d}[{d}u] = _v_{d}._elems[{d}u];\n", .{ tmp_id, bi, args[0], n - 1 - bi });
+                }
+                try emitter.print("      memcpy(&_v_{d}, _fb_{d}, {d}u); }}\n", .{ dst_raw, tmp_id, n });
+            }
+        },
+        .to_le_bytes, .to_be_bytes => {
+            if (args.len < 1) return;
+            const src_ty = body.getInst(MirValueId.fromInt(args[0])).type_id;
+            const lay = try emitter.resolver.resolveType(src_ty);
+            const n: usize = @intCast(@min(lay.size_bytes, 16));
+            if (kind == .to_le_bytes) {
+                try emitter.print("    memcpy(&_v_{d}._elems[0], &_v_{d}, {d}u);\n", .{ dst_raw, args[0], n });
+            } else {
+                const tmp_id = emitter.nextTempId();
+                try emitter.print("    {{ uint8_t _tb_{d}[16]; memcpy(_tb_{d}, &_v_{d}, {d}u);\n", .{ tmp_id, tmp_id, args[0], n });
+                for (0..n) |bi| {
+                    try emitter.print("      _v_{d}._elems[{d}u] = _tb_{d}[{d}u];\n", .{ dst_raw, bi, tmp_id, n - 1 - bi });
+                }
+                try emitter.writeAll("    }\n");
+            }
+        },
+        .sqrt => {
+            if (args.len < 1) return;
+            const dst_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
+            const tmp_id = emitter.nextTempId();
+            if (dst_ty == .f32_ty) {
+                try emitter.print(
+                    "    if (_v_{d} < 0.0f) {{ uint32_t _qn_{d} = 0x7FC00000u; memcpy(&_v_{d}, &_qn_{d}, 4u); }} " ++
+                        "else {{ _v_{d} = __builtin_sqrtf(_v_{d}); }}\n",
+                    .{ args[0], tmp_id, dst_raw, tmp_id, dst_raw, args[0] },
+                );
+            } else {
+                try emitter.print(
+                    "    if (_v_{d} < 0.0) {{ uint64_t _qn_{d} = 0x7FF8000000000000ull; memcpy(&_v_{d}, &_qn_{d}, 8u); }} " ++
+                        "else {{ _v_{d} = __builtin_sqrt(_v_{d}); }}\n",
+                    .{ args[0], tmp_id, dst_raw, tmp_id, dst_raw, args[0] },
+                );
+            }
+        },
+        .sys_mmap => {
+            if (args.len < 1) return;
+            const dst_c = try formatCType(emitter, inst.type_id);
+            defer emitter.allocator.free(dst_c);
+            try emitter.print("    _v_{d} = ({s})_cx_sys_mmap((size_t)_v_{d});\n", .{ dst_raw, dst_c, args[0] });
+        },
+        .sys_munmap => {
+            if (args.len < 2) return;
+            try emitter.print("    _cx_sys_munmap((void *)_v_{d}, (size_t)_v_{d});\n", .{ args[0], args[1] });
+        },
+        .wasm_memory_grow => {
+            if (args.len < 2) return;
+            const dst_c = try formatCType(emitter, inst.type_id);
+            defer emitter.allocator.free(dst_c);
+            if (emitter.cfg.target.isWasm()) {
+                try emitter.print("    _v_{d} = ({s})__builtin_wasm_memory_grow(0, (size_t)_v_{d});\n", .{ dst_raw, dst_c, args[1] });
+            } else {
+                try emitter.print("    _v_{d} = ({s})((uintptr_t)-1);\n", .{ dst_raw, dst_c });
+            }
+        },
+        .simd_load_unaligned => {
+            if (args.len < 1) return;
+            try emitter.print("    memcpy(&_v_{d}, (const void *)_v_{d}, sizeof(_v_{d}));\n", .{ dst_raw, args[0], dst_raw });
+        },
+        .simd_and, .simd_or, .simd_xor => {
+            if (args.len < 2) return;
+            const lay = try emitter.resolver.resolveType(inst.type_id);
+            const n: usize = @intCast(@min(lay.size_bytes, 64));
+            const op_ch = switch (kind) {
+                .simd_and => "&",
+                .simd_or => "|",
+                else => "^",
+            };
+            const tmp_id = emitter.nextTempId();
+            try emitter.print(
+                "    {{ uint8_t _sa_{d}[64], _sb_{d}[64], _so_{d}[64]; " ++
+                    "memcpy(_sa_{d}, &_v_{d}, {d}u); memcpy(_sb_{d}, &_v_{d}, {d}u);\n" ++
+                    "      size_t _si_{d} = 0u; while (_si_{d} < {d}u) {{ " ++
+                    "_so_{d}[_si_{d}] = (uint8_t)(_sa_{d}[_si_{d}] {s} _sb_{d}[_si_{d}]); _si_{d} += 1u; }}\n" ++
+                    "      memcpy(&_v_{d}, _so_{d}, {d}u); }}\n",
+                .{
+                    tmp_id, tmp_id, tmp_id,  tmp_id, args[0], n,      tmp_id, args[1], n,
+                    tmp_id, tmp_id, n,       tmp_id, tmp_id,  tmp_id, tmp_id, op_ch,   tmp_id,
+                    tmp_id, tmp_id, dst_raw, tmp_id, n,
+                },
+            );
+        },
+        .simd_eq, .simd_gt_s8, .simd_lt_s8 => {
+            if (args.len < 2) return;
+            const lay = try emitter.resolver.resolveType(inst.type_id);
+            const n: usize = @intCast(@min(lay.size_bytes, 64));
+            const cmp_expr = switch (kind) {
+                .simd_eq => "_sa[i] == _sb[i]",
+                .simd_gt_s8 => "(int8_t)_sa[i] > (int8_t)_sb[i]",
+                else => "(int8_t)_sa[i] < (int8_t)_sb[i]",
+            };
+            _ = cmp_expr;
+            const rel_op = switch (kind) {
+                .simd_eq => "==",
+                .simd_gt_s8 => ">",
+                else => "<",
+            };
+            const cast_s = if (kind == .simd_eq) "(uint8_t)" else "(int8_t)";
+            const tmp_id = emitter.nextTempId();
+            try emitter.print(
+                "    {{ uint8_t _sa_{d}[64], _sb_{d}[64], _so_{d}[64]; " ++
+                    "memcpy(_sa_{d}, &_v_{d}, {d}u); memcpy(_sb_{d}, &_v_{d}, {d}u);\n" ++
+                    "      size_t _si_{d} = 0u; while (_si_{d} < {d}u) {{ " ++
+                    "_so_{d}[_si_{d}] = ({s}_sa_{d}[_si_{d}] {s} {s}_sb_{d}[_si_{d}]) ? 0xFFu : 0x00u; _si_{d} += 1u; }}\n" ++
+                    "      memcpy(&_v_{d}, _so_{d}, {d}u); }}\n",
+                .{
+                    tmp_id, tmp_id, tmp_id, tmp_id, args[0], n,      tmp_id, args[1], n,
+                    tmp_id, tmp_id, n,      tmp_id, tmp_id,  cast_s, tmp_id, tmp_id,  rel_op,
+                    cast_s, tmp_id, tmp_id, tmp_id, dst_raw, tmp_id, n,
+                },
+            );
+        },
+        .simd_swizzle => {
+            if (args.len < 2) return;
+            const tmp_id = emitter.nextTempId();
+            try emitter.print(
+                "    {{ uint8_t _st_{d}[16], _sx_{d}[16], _so_{d}[16]; " ++
+                    "memcpy(_st_{d}, &_v_{d}, 16u); memcpy(_sx_{d}, &_v_{d}, 16u);\n" ++
+                    "      size_t _si_{d} = 0u; while (_si_{d} < 16u) {{ " ++
+                    "_so_{d}[_si_{d}] = (_sx_{d}[_si_{d}] < 16u) ? _st_{d}[_sx_{d}[_si_{d}]] : 0u; _si_{d} += 1u; }}\n" ++
+                    "      memcpy(&_v_{d}, _so_{d}, 16u); }}\n",
+                .{
+                    tmp_id, tmp_id, tmp_id, tmp_id,  args[0], tmp_id, args[1],
+                    tmp_id, tmp_id, tmp_id, tmp_id,  tmp_id,  tmp_id, tmp_id,
+                    tmp_id, tmp_id, tmp_id, dst_raw, tmp_id,
+                },
+            );
+        },
+        .simd_shl_u8, .simd_shr_u8 => {
+            if (args.len < 2) return;
+            const lay = try emitter.resolver.resolveType(inst.type_id);
+            const n: usize = @intCast(@min(lay.size_bytes, 64));
+            const sh_op = if (kind == .simd_shl_u8) "<<" else ">>";
+            const tmp_id = emitter.nextTempId();
+            try emitter.print(
+                "    {{ uint8_t _sa_{d}[64], _so_{d}[64]; memcpy(_sa_{d}, &_v_{d}, {d}u);\n" ++
+                    "      uint32_t _sh_{d} = (uint32_t)_v_{d};\n" ++
+                    "      size_t _si_{d} = 0u; while (_si_{d} < {d}u) {{ " ++
+                    "_so_{d}[_si_{d}] = (_sh_{d} >= 8u) ? 0u : (uint8_t)(_sa_{d}[_si_{d}] {s} _sh_{d}); _si_{d} += 1u; }}\n" ++
+                    "      memcpy(&_v_{d}, _so_{d}, {d}u); }}\n",
+                .{
+                    tmp_id, tmp_id, tmp_id, args[0], n,       tmp_id, args[1],
+                    tmp_id, tmp_id, n,      tmp_id,  tmp_id,  tmp_id, tmp_id,
+                    tmp_id, sh_op,  tmp_id, tmp_id,  dst_raw, tmp_id, n,
+                },
+            );
+        },
+        .simd_bitmask => {
+            if (args.len < 1) return;
+            const vec_ty = body.getInst(MirValueId.fromInt(args[0])).type_id;
+            const lay = try emitter.resolver.resolveType(vec_ty);
+            const n: usize = @intCast(@min(lay.size_bytes, 32));
+            const dst_c = try formatCType(emitter, inst.type_id);
+            defer emitter.allocator.free(dst_c);
+            const tmp_id = emitter.nextTempId();
+            try emitter.print(
+                "    {{ uint8_t _sb_{d}[32]; memcpy(_sb_{d}, &_v_{d}, {d}u); uint32_t _sm_{d} = 0u;\n" ++
+                    "      size_t _si_{d} = 0u; while (_si_{d} < {d}u) {{ " ++
+                    "if ((_sb_{d}[_si_{d}] & 0x80u) != 0u) _sm_{d} |= (1u << (uint32_t)_si_{d}); _si_{d} += 1u; }}\n" ++
+                    "      _v_{d} = ({s})_sm_{d}; }}\n",
+                .{
+                    tmp_id, tmp_id, args[0], n,       tmp_id,
+                    tmp_id, tmp_id, n,       tmp_id,  tmp_id,
+                    tmp_id, tmp_id, tmp_id,  dst_raw, dst_c,
+                    tmp_id,
+                },
+            );
+        },
+        else => {},
     }
 }
 
@@ -9828,10 +11867,24 @@ fn emitMirTerminatorC(
             else
                 call_site.args_len;
 
+            const target_body_opt = resolveBodyIndex(emitter, call_site.direct_def_id, call_site.direct_symbol);
+            const has_icf_preamble = target_body_opt != null;
+            if (has_icf_preamble) {
+                try emitter.writeAll("    {\n");
+            }
+
             var arg_i: usize = 0;
             while (arg_i < call_site.args_len) : (arg_i += 1) {
                 const mode = body.call_arg_modes.items[call_site.modes_start + arg_i];
                 const word = body.extra_args.items[call_site.args_start + arg_i];
+                const callee_param_ty_opt: ?TypeId = if (target_body_opt) |tb_idx| blk_cp: {
+                    const cal_b = &emitter.input.bodies[tb_idx];
+                    if (arg_i < cal_b.param_count and 1 + arg_i < cal_b.locals.items.len) {
+                        break :blk_cp emitter.input.pool.unwrapUnderlyingType(cal_b.locals.items[1 + arg_i].type_id);
+                    }
+                    break :blk_cp null;
+                } else null;
+
                 if (mode == .let_mode or mode == .sink_mode) {
                     const arg_ty = emitter.input.pool.unwrapUnderlyingType(
                         body.getInst(MirValueId.fromInt(word)).type_id,
@@ -9860,6 +11913,30 @@ fn emitMirTerminatorC(
                                 }
                             }
                             break :blk_va try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{word});
+                        } else if (callee_param_ty_opt) |cal_p_ty| blk_icf_arg: {
+                            if (cal_p_ty != arg_ty and !(try isZeroSizedType(emitter, cal_p_ty))) {
+                                const cal_p_c = try formatCType(emitter, cal_p_ty);
+                                defer emitter.allocator.free(cal_p_c);
+                                const arg_c = try formatCType(emitter, arg_ty);
+                                defer emitter.allocator.free(arg_c);
+                                if (!std.mem.eql(u8, cal_p_c, arg_c)) {
+                                    if (cal_p_c.len > 0 and arg_c.len > 0 and
+                                        cal_p_c[cal_p_c.len - 1] == '*' and arg_c[arg_c.len - 1] == '*')
+                                    {
+                                        break :blk_icf_arg try std.fmt.allocPrint(
+                                            emitter.allocator,
+                                            "(({s})_v_{d})",
+                                            .{ cal_p_c, word },
+                                        );
+                                    }
+                                    try emitter.print(
+                                        "    {s} _icf_a_{d}; memcpy(&_icf_a_{d}, &_v_{d}, sizeof(_icf_a_{d}));\n",
+                                        .{ cal_p_c, arg_i, arg_i, word, arg_i },
+                                    );
+                                    break :blk_icf_arg try std.fmt.allocPrint(emitter.allocator, "_icf_a_{d}", .{arg_i});
+                                }
+                            }
+                            break :blk_icf_arg try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{word});
                         } else try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{word});
                         try arg_strs.append(emitter.allocator, arg_expr);
                     }
@@ -9878,6 +11955,21 @@ fn emitMirTerminatorC(
                                         .{p_lay.alignBytes()},
                                     ),
                                 );
+                            } else if (callee_param_ty_opt) |cal_p_ty| {
+                                const caller_ptee = emitter.input.pool.unwrapUnderlyingType(lv.pointee_ty);
+                                if (cal_p_ty != caller_ptee and !(try isZeroSizedType(emitter, cal_p_ty))) {
+                                    const cal_p_c = try formatCType(emitter, cal_p_ty);
+                                    defer emitter.allocator.free(cal_p_c);
+                                    try arg_strs.append(
+                                        emitter.allocator,
+                                        try std.fmt.allocPrint(emitter.allocator, "(({s} *)(&({s})))", .{ cal_p_c, lv.expr_str }),
+                                    );
+                                } else {
+                                    try arg_strs.append(
+                                        emitter.allocator,
+                                        try std.fmt.allocPrint(emitter.allocator, "(&({s}))", .{lv.expr_str}),
+                                    );
+                                }
                             } else {
                                 try arg_strs.append(
                                     emitter.allocator,
@@ -9889,18 +11981,55 @@ fn emitMirTerminatorC(
                 }
             }
 
+            const callee_ret_ty: TypeId = if (target_body_opt) |tb_idx|
+                emitter.input.bodies[tb_idx].ret_ty
+            else if (!call_site.direct_symbol.isNone() and
+                call_site.direct_symbol.asInt() < emitter.input.sym_table.symbols.items.len)
+            blk_sym_ret: {
+                const sym_fn_ty = emitter.input.sym_table.getSymbol(call_site.direct_symbol).type_id;
+                if (emitter.input.pool.getFnSignatureView(sym_fn_ty)) |sv| break :blk_sym_ret sv.ret_ty;
+                break :blk_sym_ret call_site.ret_ty;
+            } else if (indirect_sig) |isig|
+                isig.ret_ty
+            else
+                call_site.ret_ty;
+
             const normal_edge = body.extra_edges.items[term.edge_start];
             const dst_params = body.getBlockParams(normal_edge.target_bb);
-            const has_ret_assign = !(try isZeroSizedType(emitter, call_site.ret_ty)) and
+            const has_ret_assign = !(try isZeroSizedType(emitter, callee_ret_ty)) and
+                !(try isZeroSizedType(emitter, call_site.ret_ty)) and
                 dst_params.len >= 1 and
                 !(try isZeroSizedType(emitter, body.getInst(dst_params[0]).type_id));
 
+            var ret_icf_memcpy_dst: ?u32 = null;
             try emitter.writeAll("    ");
             if (has_ret_assign) {
-                try emitter.print("_v_{d} = ", .{dst_params[0].asInt()});
+                const dst_id = dst_params[0].asInt();
+                const dst_ty = emitter.input.pool.unwrapUnderlyingType(body.getInst(dst_params[0]).type_id);
+                const cal_ret_unwrapped = emitter.input.pool.unwrapUnderlyingType(callee_ret_ty);
+                if (dst_ty != cal_ret_unwrapped) {
+                    const dst_c = try formatCType(emitter, dst_ty);
+                    defer emitter.allocator.free(dst_c);
+                    const cal_c = try formatCType(emitter, cal_ret_unwrapped);
+                    defer emitter.allocator.free(cal_c);
+                    if (!std.mem.eql(u8, dst_c, cal_c)) {
+                        if (dst_c.len > 0 and cal_c.len > 0 and
+                            dst_c[dst_c.len - 1] == '*' and cal_c[cal_c.len - 1] == '*')
+                        {
+                            try emitter.print("_v_{d} = ({s})", .{ dst_id, dst_c });
+                        } else {
+                            try emitter.print("{s} _icf_rv = ", .{cal_c});
+                            ret_icf_memcpy_dst = dst_id;
+                        }
+                    } else {
+                        try emitter.print("_v_{d} = ", .{dst_id});
+                    }
+                } else {
+                    try emitter.print("_v_{d} = ", .{dst_id});
+                }
             }
 
-            if (resolveBodyIndex(emitter, call_site.direct_def_id, call_site.direct_symbol)) |target_b| {
+            if (target_body_opt) |target_b| {
                 if (emitter.input.is_dev_got_enabled) {
                     try emitter.print("((_cx_body_fn_t_{d})_cx_dev_got[{d}u])(", .{ target_b, target_b });
                 } else {
@@ -9941,6 +12070,12 @@ fn emitMirTerminatorC(
                     }
                     try emitter.writeAll(");\n");
                 }
+            }
+            if (ret_icf_memcpy_dst) |dst_id| {
+                try emitter.print("    memcpy(&_v_{d}, &_icf_rv, sizeof(_v_{d}));\n", .{ dst_id, dst_id });
+            }
+            if (has_icf_preamble) {
+                try emitter.writeAll("    }\n");
             }
             try emitter.print("    goto _bb_{d};\n", .{normal_edge.target_bb.asInt()});
         },
@@ -9998,6 +12133,12 @@ fn emitMainEntrypointWrapper(emitter: *CModuleEmitter) !void {
     }
 
     try emitter.writeAll("int main(void) {\n    _cx_rt_init();\n");
+    if (emitter.input.sim_seed != 0) {
+        try emitter.print(
+            "    {{ uint64_t _sim_seed = {d}ull; memcpy(&_cx_tls_ctx[{d}u], &_sim_seed, 8u); }}\n",
+            .{ emitter.input.sim_seed, 2 * emitter.ctx_slot_stride_bytes },
+        );
+    }
     if (try isZeroSizedType(emitter, ret_ty)) {
         try emitter.print(
             "    {s}();\n    _cx_rt_trace_append(\"RET:0\\n\");\n    return 0;\n}}\n",
@@ -10128,6 +12269,7 @@ fn compileCSourceWithZigDriver(
             zig_triple,
             "-std=c99",
             "-fno-strict-aliasing",
+            "-ffp-contract=off",
             "-Wno-unused-function",
             "-Wno-unused-variable",
             opt_flag,
@@ -10215,6 +12357,7 @@ fn compileCSourceWithZigDriver(
         zig_triple,
         "-std=c99",
         "-fno-strict-aliasing",
+        "-ffp-contract=off",
         "-ffunction-sections",
         "-fdata-sections",
         "-Wno-unused-function",
@@ -10580,6 +12723,11 @@ pub fn emitModule(
     emitCallablePrototypesAndDrops(&emitter) catch |err| {
         return if (@as(anyerror, err) == error.OutOfMemory) error.OutOfMemory else error.BackendFailure;
     };
+    if (emitter.has_soa_vec) {
+        emitSoaSlabHelperDefsC(&emitter) catch |err| {
+            return if (@as(anyerror, err) == error.OutOfMemory) error.OutOfMemory else error.BackendFailure;
+        };
+    }
 
     for (emitter.input.bodies, 0..) |*body_ptr, b_idx| {
         emitMirBody(&emitter, @intCast(b_idx), body_ptr) catch |err| {

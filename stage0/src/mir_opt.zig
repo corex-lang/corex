@@ -611,7 +611,8 @@ fn classifyOpSemantics(
     }
     const node = pool.getNode(ty);
     return switch (node.tag) {
-        .ref_ty, .mut_ref_ty, .raw_ptr_ty, .fn_ty => .pointer_or_ref,
+        .ref_ty, .mut_ref_ty => if (pool.isSliceRefType(ty)) .aggregate_bytes else .pointer_or_ref,
+        .raw_ptr_ty, .fn_ty => .pointer_or_ref,
         else => .aggregate_bytes,
     };
 }
@@ -1057,7 +1058,7 @@ fn extractInlineDirective(
                     if (std.mem.eql(u8, lex, "inline")) has_inline_kw = true;
                     if (std.mem.eql(u8, lex, "always")) has_always_kw = true;
                     if (std.mem.eql(u8, lex, "never")) has_never_kw = true;
-                    if (std.mem.eql(u8, lex, "cold")) has_cold_kw = true;
+                    if (std.mem.eql(u8, lex, "cold") or std.mem.eql(u8, lex, "noinline")) has_cold_kw = true;
                 }
             }
             if (has_cold_kw or (has_inline_kw and has_never_kw)) return .inline_never;
@@ -2900,10 +2901,17 @@ fn runPassD4BranchFoldAndPrune(allocator: std.mem.Allocator, body: *MirBody) !vo
 
 // -------- Pass `D5`: Monomorphization & `contextless` ---------
 
-/// Returns `true` if `ty` contains unresolved generic `type_param` or Type Group variables.
+/// Returns `true` if `ty` contains unresolved generic `type_param`, `trait_ty`, or Type Group variables.
 fn hasGenericVarsInType(pool: *const InternPool, ty: TypeId) bool {
-    if (ty.isError()) return false;
-    const node = pool.getNode(ty);
+    return hasGenericVarsInTypeBounded(pool, ty, 0);
+}
+
+/// Depth-bounded helper peeling references, pointers, slices, options, results, and tuples for `hasGenericVarsInType`.
+fn hasGenericVarsInTypeBounded(pool: *const InternPool, ty: TypeId, depth: u32) bool {
+    if (ty.isError() or depth > 16) return false;
+    const unwrapped = pool.unwrapUnderlyingType(ty);
+    if (unwrapped.isError()) return false;
+    const node = pool.getNode(unwrapped);
     if (node.flags.has_type_vars) return true;
     return switch (node.tag) {
         .builtin_group,
@@ -2912,7 +2920,29 @@ fn hasGenericVarsInType(pool: *const InternPool, ty: TypeId) bool {
         .bind_once_group_var,
         .bind_many_any_var,
         .associated_ty,
+        .trait_ty,
         => true,
+        .dyn_trait_ty => false,
+        .ref_ty,
+        .mut_ref_ty,
+        .raw_ptr_ty,
+        .slice_ty,
+        .soa_slice_ty,
+        .array_ty,
+        .soa_array_ty,
+        .optional_ty,
+        .refined_ty,
+        => hasGenericVarsInTypeBounded(pool, TypeId.fromInt(node.lhs), depth + 1),
+        .result_ty => hasGenericVarsInTypeBounded(pool, TypeId.fromInt(node.lhs), depth + 1) or
+            hasGenericVarsInTypeBounded(pool, TypeId.fromInt(node.rhs), depth + 1),
+        .tuple_ty => blk: {
+            for (pool.getTupleElements(unwrapped)) |raw_elem| {
+                if (hasGenericVarsInTypeBounded(pool, TypeId.fromInt(raw_elem), depth + 1)) {
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        },
         else => false,
     };
 }
@@ -3018,6 +3048,12 @@ fn inferPlaceTypeInBody(
                         2, 3 => .u32_ty,
                         else => .err_ty,
                     };
+                } else if (cur_ty == .fmt_spec_ty) {
+                    cur_ty = switch (proj.payload) {
+                        0 => .u32_ty,
+                        1, 2 => .u16_ty,
+                        else => .err_ty,
+                    };
                 } else if (node.tag == .tuple_ty) {
                     const elems = pool.getTupleElements(cur_ty);
                     if (proj.payload < elems.len) {
@@ -3026,12 +3062,13 @@ fn inferPlaceTypeInBody(
                 } else if (node.tag == .struct_ty or node.tag == .union_ty) {
                     const sym = sym_table.getSymbol(SymbolIndex.fromInt(node.rhs)).*;
                     if (!sym.target_scope.isNone()) {
+                        const subst = type_system.NominalTypeSubst.init(pool, sym_table, cur_ty);
                         var ord: u32 = 0;
                         for (sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
                             const mem = sym_table.getSymbol(mem_idx).*;
                             if (mem.kind != .field_sym) continue;
                             if (ord == proj.payload) {
-                                cur_ty = pool.unwrapUnderlyingType(mem.type_id);
+                                cur_ty = pool.unwrapUnderlyingType(subst.lookupExisting(pool, mem.type_id));
                                 break;
                             }
                             ord += 1;
@@ -3083,6 +3120,7 @@ fn unifyTemplateTypeBinding(
         .bind_many_any_var,
         .builtin_group,
         .user_group,
+        .trait_ty,
         => {
             if (!subst.contains(pattern_ty.toU32())) {
                 try subst.put(allocator, pattern_ty.toU32(), concrete_ty);
@@ -3094,6 +3132,18 @@ fn unifyTemplateTypeBinding(
     }
 
     const c_unwrapped = pool.unwrapUnderlyingType(concrete_ty);
+    if (p_node.tag == .refined_ty) {
+        try unifyTemplateTypeBinding(
+            allocator,
+            pool,
+            TypeId.fromInt(p_node.rhs),
+            c_unwrapped,
+            subst,
+            ordered_vars,
+            depth + 1,
+        );
+        return;
+    }
     const c_node = pool.getNode(c_unwrapped);
     if (p_node.tag != c_node.tag) return;
 
@@ -3103,6 +3153,7 @@ fn unifyTemplateTypeBinding(
         .raw_ptr_ty,
         .slice_ty,
         .soa_slice_ty,
+        .soa_vec_ty,
         .optional_ty,
         .tilde_approx,
         => {
@@ -3287,6 +3338,29 @@ fn substituteMirTypeMemo(
             const inner = try substituteMirTypeMemo(allocator, pool, TypeId.fromInt(node.lhs), subst, depth + 1, memo);
             break :blk try pool.internSlice(inner, true);
         },
+        .soa_vec_ty => blk: {
+            const inner = try substituteMirTypeMemo(allocator, pool, TypeId.fromInt(node.lhs), subst, depth + 1, memo);
+            break :blk try pool.internSoaVec(inner, SymbolIndex.fromInt(node.rhs));
+        },
+        .refined_ty => blk: {
+            const base_sub = try substituteMirTypeMemo(allocator, pool, TypeId.fromInt(node.rhs), subst, depth + 1, memo);
+            var bounds = pool.getRefinementBounds(ty) orelse break :blk base_sub;
+            if (bounds.dyn_flags != 0) {
+                const unwrapped_base = pool.unwrapUnderlyingType(base_sub);
+                if (type_system.getTargetPrimitiveIntBounds(unwrapped_base, TargetLayout.NATIVE_64)) |ib| {
+                    if ((bounds.dyn_flags & 1) != 0) bounds.min_val = ib.min_val;
+                    if ((bounds.dyn_flags & 2) != 0) bounds.max_val = ib.max_val;
+                    if (!hasGenericVarsInType(pool, base_sub)) bounds.dyn_flags = 0;
+                }
+            }
+            break :blk try pool.internRefinedWithDyn(
+                base_sub,
+                bounds.sym_idx,
+                bounds.min_val,
+                bounds.max_val,
+                bounds.dyn_flags,
+            );
+        },
         .array_ty, .soa_array_ty => blk: {
             const inner = try substituteMirTypeMemo(allocator, pool, TypeId.fromInt(node.lhs), subst, depth + 1, memo);
             const is_soa = (node.tag == .soa_array_ty);
@@ -3317,53 +3391,65 @@ fn substituteMirTypeMemo(
             break :blk try pool.internFuture(out_ty, node.rhs);
         },
         .tuple_ty => blk: {
-            const old_elems = pool.getTupleElements(ty);
-            const new_elems = try allocator.alloc(TypeId, old_elems.len);
+            const arity = pool.getTupleElements(ty).len;
+            const new_elems = try allocator.alloc(TypeId, arity);
             defer allocator.free(new_elems);
-            for (old_elems, 0..) |raw_elem, i| {
+            for (0..arity) |i| {
+                const raw_elem = pool.getTupleElements(ty)[i];
                 new_elems[i] = try substituteMirTypeMemo(allocator, pool, TypeId.fromInt(raw_elem), subst, depth + 1, memo);
             }
             break :blk try pool.internTuple(new_elems);
         },
         .struct_ty, .enum_ty, .union_ty => blk: {
-            const raw_args = pool.getGenericTypeArgs(ty);
-            if (raw_args.len == 0) break :blk ty;
-            const new_args = try allocator.alloc(TypeId, raw_args.len);
+            const arity = pool.getGenericTypeArgs(ty).len;
+            if (arity == 0) break :blk ty;
+            const new_args = try allocator.alloc(TypeId, arity);
             defer allocator.free(new_args);
-            for (raw_args, 0..) |raw_arg, i| {
+            for (0..arity) |i| {
+                const raw_arg = pool.getGenericTypeArgs(ty)[i];
                 new_args[i] = try substituteMirTypeMemo(allocator, pool, TypeId.fromInt(raw_arg), subst, depth + 1, memo);
             }
             break :blk try pool.internNominalInstantiation(ty, new_args, node.flags.is_copy, node.flags.has_drop);
         },
         .fn_ty, .closure_ty => blk: {
-            const sig_view = pool.getFnSignatureView(ty) orelse break :blk ty;
-            const arity = sig_view.paramCount();
+            const init_sig = pool.getFnSignatureView(ty) orelse break :blk ty;
+            const arity = init_sig.paramCount();
+            const orig_ret_ty = init_sig.ret_ty;
+            const sig_contracts = init_sig.contracts;
+            const sig_capture_tier = init_sig.capture_tier;
+            const sig_has_linear_cap = init_sig.has_linear_capture;
+            const sig_is_variadic = init_sig.is_variadic;
+            const sig_is_c_abi = init_sig.is_c_abi;
+            const sig_is_async = init_sig.is_async;
+            const sig_has_env_cap = init_sig.has_env_capture;
             const new_params = try allocator.alloc(TypeId, arity);
             defer if (arity > 0) allocator.free(new_params);
             const new_modes = try allocator.alloc(ParamMode, arity);
             defer if (arity > 0) allocator.free(new_modes);
             for (0..arity) |i| {
+                const cur_sig = pool.getFnSignatureView(ty).?;
+                const param_ty = cur_sig.getParamType(i);
+                new_modes[i] = cur_sig.getParamMode(i);
                 new_params[i] = try substituteMirTypeMemo(
                     allocator,
                     pool,
-                    sig_view.getParamType(i),
+                    param_ty,
                     subst,
                     depth + 1,
                     memo,
                 );
-                new_modes[i] = sig_view.getParamMode(i);
             }
-            const new_ret = try substituteMirTypeMemo(allocator, pool, sig_view.ret_ty, subst, depth + 1, memo);
+            const new_ret = try substituteMirTypeMemo(allocator, pool, orig_ret_ty, subst, depth + 1, memo);
             if (node.tag == .closure_ty) {
                 break :blk try pool.internClosureSignatureExt(
                     new_params,
                     new_modes,
                     new_ret,
-                    sig_view.contracts,
-                    sig_view.capture_tier,
-                    sig_view.has_linear_capture,
-                    sig_view.is_async,
-                    sig_view.has_env_capture,
+                    sig_contracts,
+                    sig_capture_tier,
+                    sig_has_linear_cap,
+                    sig_is_async,
+                    sig_has_env_cap,
                 );
             }
             break :blk try pool.internFnSignatureExt(
@@ -3372,12 +3458,12 @@ fn substituteMirTypeMemo(
                 new_modes,
                 new_ret,
                 node.flags.is_must_use,
-                sig_view.contracts,
-                sig_view.capture_tier,
-                sig_view.has_linear_capture,
-                sig_view.is_variadic,
-                sig_view.is_c_abi,
-                sig_view.is_async,
+                sig_contracts,
+                sig_capture_tier,
+                sig_has_linear_cap,
+                sig_is_variadic,
+                sig_is_c_abi,
+                sig_is_async,
             );
         },
         else => ty,
@@ -3560,6 +3646,14 @@ fn resolveOptCompositeFieldStep(
             else => null,
         };
     }
+    if (comp_ty == .fmt_spec_ty) {
+        return switch (field_ordinal) {
+            0 => .{ .byte_offset = 0, .field_ty = .u32_ty },
+            1 => .{ .byte_offset = 4, .field_ty = .u16_ty },
+            2 => .{ .byte_offset = 6, .field_ty = .u16_ty },
+            else => null,
+        };
+    }
     const node = pool.getNode(comp_ty);
     switch (node.tag) {
         .tuple_ty => {
@@ -3585,7 +3679,7 @@ fn resolveOptCompositeFieldStep(
                 const mem_sym = sym_table.getSymbol(mem_idx).*;
                 if (mem_sym.kind != .field_sym) continue;
                 if (ord == field_ordinal) {
-                    const resolved_ty = subst.resolve(mem_sym.type_id);
+                    const resolved_ty = subst.lookupExisting(pool, mem_sym.type_id);
                     if (subst.len > 0 and pool.getFlags(resolved_ty).has_type_vars) return null;
                     const byte_off: u64 = type_system.computeStructFieldOffset(
                         pool,
@@ -3611,7 +3705,7 @@ fn resolveOptCompositeFieldStep(
                 const mem_sym = sym_table.getSymbol(mem_idx).*;
                 if (mem_sym.kind != .field_sym) continue;
                 if (ord == field_ordinal) {
-                    const resolved_ty = subst.resolve(mem_sym.type_id);
+                    const resolved_ty = subst.lookupExisting(pool, mem_sym.type_id);
                     if (subst.len > 0 and pool.getFlags(resolved_ty).has_type_vars) return null;
                     return .{ .byte_offset = 0, .field_ty = resolved_ty };
                 }
@@ -3678,6 +3772,108 @@ fn resolveOptVariantPayloadType(
     };
 }
 
+/// Returns `true` when `bound_ty` is a concrete trait or type-group bound free of uninstantiated type parameters.
+fn isConcreteImplementsBound(pool: *const InternPool, bound_ty: TypeId) bool {
+    if (bound_ty.isError()) return false;
+    const unwrapped = pool.unwrapUnderlyingType(bound_ty);
+    if (unwrapped.isError()) return false;
+    const node = pool.getNode(unwrapped);
+    if (node.flags.has_type_vars) return false;
+    return switch (node.tag) {
+        .type_param, .bind_once_group_var, .bind_many_any_var, .associated_ty => false,
+        else => true,
+    };
+}
+
+/// Evaluates `@implements[T, Bound]()` on concrete monomorphized types `(subst_ty, bound_ty)`.
+fn evalMonomorphizedImplements(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    target_layout: TargetLayout,
+    subst_ty: TypeId,
+    bound_ty: TypeId,
+) bool {
+    return type_system.evalStaticImplements(pool, sym_table, target_layout, subst_ty, bound_ty);
+}
+
+/// Redirects prototype-only trait method calls (`Hasher.write_u64`, `Hash.hash`, `Equatable.eq`, `Comparable.cmp`,
+/// `Default.default`, `Display.fmt`, etc.) inside a monomorphized `spec` body to their concrete `impl` method.
+fn resolveMonomorphizedTraitMethodCall(
+    spec: *MirBody,
+    sub_cs: *mir.MirCallSite,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+) void {
+    if (sub_cs.direct_symbol.isNone() or sub_cs.direct_symbol.asInt() >= sym_table.symbols.items.len) return;
+    const proto_sym = sym_table.getSymbol(sub_cs.direct_symbol).*;
+    if (proto_sym.kind != .fn_sym) return;
+
+    var is_trait_proto = false;
+    for (sym_table.symbols.items) |cand_sym| {
+        if (cand_sym.kind == .trait_sym and cand_sym.target_scope == proto_sym.scope_id) {
+            is_trait_proto = true;
+            break;
+        }
+    }
+    if (!is_trait_proto) return;
+
+    const raw_recv_ty: TypeId = if (sub_cs.args_len >= 1 and
+        sub_cs.modes_start < spec.call_arg_modes.items.len and
+        sub_cs.args_start < spec.extra_args.items.len)
+    blk_recv: {
+        const mode0 = spec.call_arg_modes.items[sub_cs.modes_start];
+        const word0 = spec.extra_args.items[sub_cs.args_start];
+        if (mode0 == .let_mode or mode0 == .sink_mode) {
+            if (word0 < spec.insts.len) {
+                break :blk_recv spec.getInst(MirValueId.fromInt(word0)).type_id;
+            }
+            break :blk_recv TypeId.err_ty;
+        }
+        break :blk_recv inferPlaceTypeInBody(spec, PlaceId.fromInt(word0), pool, sym_table);
+    } else sub_cs.ret_ty;
+
+    if (raw_recv_ty.isError()) return;
+    var unwrapped_recv = pool.unwrapUnderlyingType(raw_recv_ty);
+    const recv_outer = pool.getNode(unwrapped_recv);
+    if (recv_outer.tag == .ref_ty or recv_outer.tag == .mut_ref_ty) {
+        unwrapped_recv = pool.unwrapUnderlyingType(TypeId.fromInt(recv_outer.lhs));
+    }
+    if (unwrapped_recv.isError() or hasGenericVarsInType(pool, unwrapped_recv)) return;
+
+    var target_scope: mem_foundation.ScopeId = .none;
+    const recv_node = pool.getNode(unwrapped_recv);
+    if (recv_node.tag == .struct_ty or recv_node.tag == .enum_ty or recv_node.tag == .union_ty) {
+        const nom_sym_idx = SymbolIndex.fromInt(recv_node.rhs);
+        if (!nom_sym_idx.isNone() and nom_sym_idx.asInt() < sym_table.symbols.items.len) {
+            target_scope = sym_table.getSymbol(nom_sym_idx).target_scope;
+        }
+    } else {
+        target_scope = sym_table.getBuiltinTypeMemberScope(unwrapped_recv);
+    }
+    if (target_scope.isNone()) return;
+
+    const impl_sym_idx = sym_table.lookupInScopeDirect(
+        target_scope,
+        proto_sym.name,
+        symbol_resolver.NamespaceMask.VALUE_ONLY,
+    );
+    if (impl_sym_idx.isNone()) return;
+    const impl_sym = sym_table.getSymbol(impl_sym_idx).*;
+    if (impl_sym.kind != .fn_sym) return;
+
+    sub_cs.direct_symbol = impl_sym_idx;
+    sub_cs.direct_def_id = impl_sym.def_id;
+    sub_cs.is_callee_contextless = impl_sym.flags.is_comptime or impl_sym.flags.is_builtin;
+    if (!sub_cs.callee_val.isNone() and sub_cs.callee_val.asInt() < spec.insts.len) {
+        var cal_inst = spec.getInst(sub_cs.callee_val);
+        if (cal_inst.op == .fn_addr) {
+            cal_inst.operands.lhs = impl_sym.def_id.asInt();
+            cal_inst.operands.rhs = impl_sym_idx.asInt();
+            spec.insts.set(sub_cs.callee_val.asInt(), cal_inst);
+        }
+    }
+}
+
 /// Rewrites `body.calls[call_idx]` and its backing `fn_addr` instruction to target `target_def`.
 fn redirectDirectCallSite(body: *MirBody, call_idx: usize, target_def: DefId) void {
     var cs = &body.calls.items[call_idx];
@@ -3740,14 +3936,154 @@ fn extractAsyncFutureMakeTemplateTarget(
     return .{ .tmpl_idx = tmpl_idx, .direct_symbol = resolved_sym, .origin_token = origin_tok };
 }
 
-/// Enqueues all reachable generic `.call` and `async_future_make` sites inside `body` onto `worklist`.
+/// Recursively enqueues generic `AutoDrop.drop` templates reachable from `raw_drop_ty` onto `worklist`.
+fn enqueueDropGlueGenericWorkItems(
+    allocator: std.mem.Allocator,
+    raw_drop_ty: TypeId,
+    caller_idx: usize,
+    depth: u32,
+    type_depth: u32,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    tmpl_map: *const BodyDefMap,
+    seen_drop_types: ?*std.AutoHashMapUnmanaged(u32, void),
+    worklist: *std.ArrayListUnmanaged(MonoWorkItem),
+) anyerror!void {
+    if (type_depth >= 16) return;
+    const ty = pool.unwrapUnderlyingType(raw_drop_ty);
+    if (ty.isError() or ty.isPrimitiveOrSentinel() or hasGenericVarsInType(pool, ty)) return;
+    if (seen_drop_types) |seen_map| {
+        const gop = try seen_map.getOrPut(allocator, ty.toU32());
+        if (gop.found_existing) return;
+    }
+    const node = pool.getNode(ty);
+    switch (node.tag) {
+        .array_ty, .soa_array_ty, .soa_vec_ty, .optional_ty => {
+            try enqueueDropGlueGenericWorkItems(
+                allocator,
+                TypeId.fromInt(node.lhs),
+                caller_idx,
+                depth,
+                type_depth + 1,
+                pool,
+                sym_table,
+                tmpl_map,
+                seen_drop_types,
+                worklist,
+            );
+        },
+        .result_ty => {
+            try enqueueDropGlueGenericWorkItems(
+                allocator,
+                TypeId.fromInt(node.lhs),
+                caller_idx,
+                depth,
+                type_depth + 1,
+                pool,
+                sym_table,
+                tmpl_map,
+                seen_drop_types,
+                worklist,
+            );
+            try enqueueDropGlueGenericWorkItems(
+                allocator,
+                TypeId.fromInt(node.rhs),
+                caller_idx,
+                depth,
+                type_depth + 1,
+                pool,
+                sym_table,
+                tmpl_map,
+                seen_drop_types,
+                worklist,
+            );
+        },
+        .tuple_ty => {
+            for (pool.getTupleElements(ty)) |elem_raw| {
+                try enqueueDropGlueGenericWorkItems(
+                    allocator,
+                    TypeId.fromInt(elem_raw),
+                    caller_idx,
+                    depth,
+                    type_depth + 1,
+                    pool,
+                    sym_table,
+                    tmpl_map,
+                    seen_drop_types,
+                    worklist,
+                );
+            }
+        },
+        .struct_ty, .enum_ty, .union_ty => {
+            const sym_idx = SymbolIndex.fromInt(node.rhs);
+            if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return;
+            const nom_sym = sym_table.getSymbol(sym_idx).*;
+            if (nom_sym.target_scope.isNone()) return;
+            if (pool.getGenericTypeArgs(ty).len > 0) {
+                for (sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
+                    const mem_sym = sym_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind == .fn_sym and std.mem.eql(u8, mem_sym.name_text, "drop")) {
+                        if (tmpl_map.lookup(mem_sym.def_id, mem_idx, sym_table)) |tmpl_idx| {
+                            try worklist.append(allocator, .{
+                                .caller_idx = caller_idx,
+                                .call_idx = tmpl_idx,
+                                .depth = depth,
+                                .is_drop_glue = true,
+                                .drop_ty = ty,
+                            });
+                        }
+                        break;
+                    }
+                }
+            }
+            const subst = type_system.NominalTypeSubst.init(pool, sym_table, ty);
+            for (sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
+                const mem_sym = sym_table.getSymbol(mem_idx).*;
+                if ((node.tag == .struct_ty or node.tag == .union_ty) and mem_sym.kind == .field_sym) {
+                    try enqueueDropGlueGenericWorkItems(
+                        allocator,
+                        subst.lookupExisting(pool, mem_sym.type_id),
+                        caller_idx,
+                        depth,
+                        type_depth + 1,
+                        pool,
+                        sym_table,
+                        tmpl_map,
+                        seen_drop_types,
+                        worklist,
+                    );
+                } else if (node.tag == .enum_ty and mem_sym.kind == .enum_variant_sym and
+                    !mem_sym.type_id.isNone() and mem_sym.type_id != .unit_ty)
+                {
+                    try enqueueDropGlueGenericWorkItems(
+                        allocator,
+                        subst.lookupExisting(pool, mem_sym.type_id),
+                        caller_idx,
+                        depth,
+                        type_depth + 1,
+                        pool,
+                        sym_table,
+                        tmpl_map,
+                        seen_drop_types,
+                        worklist,
+                    );
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+/// Enqueues all reachable generic `.call`, `async_future_make`, and `AutoDrop` sites inside `body` onto `worklist`.
 fn enqueueBodyGenericWorkItems(
     allocator: std.mem.Allocator,
     body: *const MirBody,
     caller_idx: usize,
     depth: u32,
+    pool: *const InternPool,
     tmpl_map: *const BodyDefMap,
     sym_table: *const SymbolTable,
+    seen_drop_types: ?*std.AutoHashMapUnmanaged(u32, void),
     worklist: *std.ArrayListUnmanaged(MonoWorkItem),
 ) !void {
     for (body.blocks.items, 0..) |bb_rec, bb_i| {
@@ -3759,6 +4095,47 @@ fn enqueueBodyGenericWorkItems(
                     .depth = depth,
                     .is_async_future_make = true,
                 });
+                continue;
+            }
+            const inst = body.getInst(inst_vid);
+            if (inst.op != .intrinsic_op) continue;
+            const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+            if (ikind == .drop_in_place or ikind == .drop_if_live) {
+                const dropped_ty = if (inst.type_id != .unit_ty and !inst.type_id.isError())
+                    inst.type_id
+                else
+                    inferPlaceTypeInBody(body, PlaceId.fromInt(inst.operands.lhs), pool, sym_table);
+                try enqueueDropGlueGenericWorkItems(
+                    allocator,
+                    dropped_ty,
+                    caller_idx,
+                    depth,
+                    0,
+                    pool,
+                    sym_table,
+                    tmpl_map,
+                    seen_drop_types,
+                    worklist,
+                );
+            } else if (ikind == .ptr_drop_in_place or ikind == .soa_vec_push or ikind == .soa_vec_clear) {
+                if (inst.operands.rhs >= 1 and inst.operands.lhs < body.extra_args.items.len) {
+                    const arg0_vid = MirValueId.fromInt(body.extra_args.items[inst.operands.lhs]);
+                    const ptr_ty = pool.unwrapUnderlyingType(body.getInst(arg0_vid).type_id);
+                    if (!ptr_ty.isError() and !ptr_ty.isPrimitiveOrSentinel()) {
+                        try enqueueDropGlueGenericWorkItems(
+                            allocator,
+                            TypeId.fromInt(pool.getNode(ptr_ty).lhs),
+                            caller_idx,
+                            depth,
+                            0,
+                            pool,
+                            sym_table,
+                            tmpl_map,
+                            seen_drop_types,
+                            worklist,
+                        );
+                    }
+                }
             }
         }
         if (bb_rec.terminator.kind == .call and bb_rec.terminator.cond_or_val < body.calls.items.len) {
@@ -4097,6 +4474,19 @@ fn computeFieldOffsetsAndCalleesDigest(
     }
     for (0..body.insts.len) |inst_idx| {
         const inst = body.insts.get(inst_idx);
+        if (inst.op == .aggregate_make) {
+            const agg_kind: mir.AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+            if (agg_kind == .closure_make) {
+                hashCalleeTargetCanonical(
+                    &hasher,
+                    inst.operands.lhs,
+                    SymbolIndex.none.asInt(),
+                    sym_table,
+                    interner,
+                );
+            }
+            continue;
+        }
         if (inst.op != .intrinsic_op) continue;
         hasher.update(std.mem.asBytes(&inst.aux_u16));
         const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
@@ -4157,12 +4547,16 @@ fn computeFieldOffsetsAndCalleesDigest(
 const MonoWorkItem = struct {
     /// Index of caller body in `concrete_bodies`.
     caller_idx: usize,
-    /// Index of `MirCallSite` in `calls` (or `MirInst` in `insts` when `is_async_future_make`).
+    /// Index of `MirCallSite` in `calls`, `MirInst` in `insts`, or template index when `is_drop_glue`.
     call_idx: usize,
     /// Specialization chain depth (`<= MAX_MONOMORPH_DEPTH`).
     depth: u32,
     /// `true` when `call_idx` targets a `MirIntrinsicKind.async_future_make` instruction.
     is_async_future_make: bool = false,
+    /// `true` when `call_idx` is a `templates` index for a generic `AutoDrop.drop` glue body on `drop_ty`.
+    is_drop_glue: bool = false,
+    /// Concrete instantiated nominal `TypeId` being dropped when `is_drop_glue` is `true`.
+    drop_ty: TypeId = .none,
 };
 
 /// Sound deduplication record for `LayoutShapeKey`-equivalent monomorphizations.
@@ -4337,6 +4731,326 @@ fn promoteContextlessTarjanScc(
     }
 }
 
+/// Specializes a generic closure template `templates[clos_tmpl_idx]` under its enclosing function's `subst`.
+fn specializeClosureTemplateRecursive(
+    allocator: std.mem.Allocator,
+    clos_tmpl_idx: usize,
+    templates: []const MirBody,
+    tmpl_map: *const BodyDefMap,
+    concrete_bodies: *std.ArrayListUnmanaged(MirBody),
+    dedup_entries: *std.ArrayListUnmanaged(MonoDedupEntry),
+    worklist: *std.ArrayListUnmanaged(MonoWorkItem),
+    subst: *const std.AutoHashMapUnmanaged(u32, TypeId),
+    ordered_vars: []const u32,
+    depth: u32,
+    pool: *InternPool,
+    sym_table: *const SymbolTable,
+    interner: *StringInterner,
+    config: MirOptConfig,
+    sink: ?*DiagnosticSink,
+    next_synth_def_raw: *u32,
+    instance_count: *u32,
+    dedup_merged_out: *u32,
+) anyerror!DefId {
+    const clos_tmpl = &templates[clos_tmpl_idx];
+    if (depth > MAX_MONOMORPH_DEPTH + 8) return clos_tmpl.def_id;
+
+    const tmpl_key: u64 = (@as(u64, clos_tmpl.def_id.asInt()) << 32) | @as(u64, clos_tmpl.symbol_index.asInt());
+    for (dedup_entries.items) |entry| {
+        if (entry.template_key != tmpl_key or entry.param_type_ids.len != ordered_vars.len) continue;
+        var is_exact = true;
+        for (entry.param_type_ids, ordered_vars) |ty_a, var_raw| {
+            if (ty_a != (subst.get(var_raw) orelse .unit_ty)) {
+                is_exact = false;
+                break;
+            }
+        }
+        if (is_exact) {
+            dedup_merged_out.* += 1;
+            return entry.specialized_def_id;
+        }
+    }
+
+    var spec = try clos_tmpl.clone(allocator);
+    errdefer spec.deinit();
+
+    spec.ret_ty = try substituteMirType(allocator, pool, spec.ret_ty, subst, 0);
+    for (spec.locals.items) |*loc| {
+        loc.type_id = try substituteMirType(allocator, pool, loc.type_id, subst, 0);
+    }
+    for (spec.vacated_windows.items) |*win| {
+        win.yielded_ty = try substituteMirType(allocator, pool, win.yielded_ty, subst, 0);
+    }
+    for (0..spec.insts.len) |inst_i| {
+        var inst = spec.insts.get(inst_i);
+        inst.type_id = try substituteMirType(allocator, pool, inst.type_id, subst, 0);
+        if (inst.op == .fn_addr and inst.operands.rhs < sym_table.symbols.items.len) {
+            const ref_sym = sym_table.getSymbol(SymbolIndex.fromInt(inst.operands.rhs)).*;
+            if (ref_sym.kind == .const_param_sym) {
+                const len_key = try pool.internSymbolicArray(.unit_ty, ref_sym.name, false);
+                if (subst.get(len_key.toU32())) |bound_len_ty| {
+                    const bound_node = pool.getNode(bound_len_ty);
+                    if (bound_node.tag == .array_ty and
+                        (bound_node.rhs & type_system.SYMBOLIC_ARRAY_LEN_FLAG) == 0)
+                    {
+                        const c_idx = try spec.appendConst(.{ .int_val = @as(i128, bound_node.rhs) });
+                        inst = .{
+                            .op = .const_scalar,
+                            .flags = .{},
+                            .type_id = inst.type_id,
+                            .operands = .{ .lhs = c_idx, .rhs = 0 },
+                        };
+                    }
+                }
+            }
+        } else if (inst.op == .aggregate_make) {
+            const agg_kind: mir.AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+            if (agg_kind == .closure_make) {
+                if (tmpl_map.lookup(DefId.fromInt(inst.operands.lhs), .none, sym_table)) |nested_clos_idx| {
+                    const nested_def = try specializeClosureTemplateRecursive(
+                        allocator,
+                        nested_clos_idx,
+                        templates,
+                        tmpl_map,
+                        concrete_bodies,
+                        dedup_entries,
+                        worklist,
+                        subst,
+                        ordered_vars,
+                        depth + 1,
+                        pool,
+                        sym_table,
+                        interner,
+                        config,
+                        sink,
+                        next_synth_def_raw,
+                        instance_count,
+                        dedup_merged_out,
+                    );
+                    inst.operands.lhs = nested_def.asInt();
+                }
+            }
+        } else if (inst.op == .intrinsic_op) {
+            const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+            if (ikind.hasTypeIdInLhs()) {
+                const subst_ty = try substituteMirType(
+                    allocator,
+                    pool,
+                    TypeId.fromInt(inst.operands.lhs),
+                    subst,
+                    0,
+                );
+                inst.operands.lhs = subst_ty.asInt();
+                if (ikind == .implements) {
+                    const subst_rhs = try substituteMirType(
+                        allocator,
+                        pool,
+                        TypeId.fromInt(inst.operands.rhs),
+                        subst,
+                        0,
+                    );
+                    inst.operands.rhs = subst_rhs.asInt();
+                }
+                if (!subst_ty.isError() and !hasGenericVarsInType(pool, subst_ty)) {
+                    switch (ikind) {
+                        .size_of => {
+                            const lay = type_system.computeTypeLayoutWithPool(
+                                pool,
+                                sym_table,
+                                subst_ty,
+                                config.target_layout,
+                            );
+                            if (lay.is_sized) {
+                                const c_idx = try spec.appendConst(.{ .int_val = @as(i128, lay.byte_size) });
+                                inst = .{
+                                    .op = .const_scalar,
+                                    .flags = .{},
+                                    .type_id = inst.type_id,
+                                    .operands = .{ .lhs = c_idx, .rhs = 0 },
+                                };
+                            }
+                        },
+                        .align_of => {
+                            const lay = type_system.computeTypeLayoutWithPool(
+                                pool,
+                                sym_table,
+                                subst_ty,
+                                config.target_layout,
+                            );
+                            const c_idx = try spec.appendConst(.{ .int_val = @as(i128, lay.align_bytes) });
+                            inst = .{
+                                .op = .const_scalar,
+                                .flags = .{},
+                                .type_id = inst.type_id,
+                                .operands = .{ .lhs = c_idx, .rhs = 0 },
+                            };
+                        },
+                        .type_name => {
+                            var type_name_buf: [512]u8 = undefined;
+                            const formatted_name = pool.formatType(subst_ty, sym_table, &type_name_buf);
+                            const sym_id = try interner.intern(formatted_name);
+                            const c_idx = try spec.appendConst(.{ .str_val = sym_id });
+                            inst = .{
+                                .op = .const_scalar,
+                                .flags = .{},
+                                .type_id = inst.type_id,
+                                .operands = .{ .lhs = c_idx, .rhs = 0 },
+                            };
+                        },
+                        .implements => {
+                            const bound_ty = TypeId.fromInt(inst.operands.rhs);
+                            if (isConcreteImplementsBound(pool, bound_ty)) {
+                                const does_impl = evalMonomorphizedImplements(
+                                    pool,
+                                    sym_table,
+                                    config.target_layout,
+                                    subst_ty,
+                                    bound_ty,
+                                );
+                                const c_idx = try spec.appendConst(.{ .bool_val = does_impl });
+                                inst = .{
+                                    .op = .const_scalar,
+                                    .flags = .{},
+                                    .type_id = .bool_ty,
+                                    .operands = .{ .lhs = c_idx, .rhs = 0 },
+                                };
+                            }
+                        },
+                        .int_min, .int_max => {
+                            const unwrapped_int = pool.unwrapUnderlyingType(subst_ty);
+                            if (type_system.getTargetPrimitiveIntBounds(unwrapped_int, config.target_layout)) |ib| {
+                                const raw_v = if (ikind == .int_min) ib.min_val else ib.max_val;
+                                const mc = makeTypedIntMirConst(
+                                    pool,
+                                    inst.type_id,
+                                    @bitCast(raw_v),
+                                    config.target_layout,
+                                );
+                                const c_idx = try spec.appendConst(mc);
+                                inst = .{
+                                    .op = .const_scalar,
+                                    .flags = .{},
+                                    .type_id = inst.type_id,
+                                    .operands = .{ .lhs = c_idx, .rhs = 0 },
+                                };
+                            }
+                        },
+                        .int_bits => {
+                            const unwrapped_int = pool.unwrapUnderlyingType(subst_ty);
+                            if (type_system.getTargetPrimitiveIntBits(unwrapped_int, config.target_layout)) |bits| {
+                                const c_idx = try spec.appendConst(.{ .int_val = @as(i128, bits) });
+                                inst = .{
+                                    .op = .const_scalar,
+                                    .flags = .{},
+                                    .type_id = inst.type_id,
+                                    .operands = .{ .lhs = c_idx, .rhs = 0 },
+                                };
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            }
+        }
+        spec.insts.set(inst_i, inst);
+    }
+
+    for (0..spec.insts.len) |inst_i| {
+        var inst = spec.insts.get(inst_i);
+        if (inst.op == .bin_op and inst.operands.lhs < spec.insts.len) {
+            const op_ty = spec.getInst(MirValueId.fromInt(inst.operands.lhs)).type_id;
+            const sem = classifyOpSemantics(pool, op_ty, config.target_layout);
+            const bkind: BinOpKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+            inst.aux_u16 = @backingInt(specializeBinOpForSemantics(bkind, sem));
+            spec.insts.set(inst_i, inst);
+        } else if (inst.op == .unary_op and inst.operands.lhs < spec.insts.len) {
+            const op_ty = spec.getInst(MirValueId.fromInt(inst.operands.lhs)).type_id;
+            spec.insts.set(inst_i, specializeMonomorphizedUnaryInst(pool, inst, op_ty, config.target_layout));
+        }
+    }
+
+    for (spec.calls.items) |*sub_cs| {
+        sub_cs.ret_ty = try substituteMirType(allocator, pool, sub_cs.ret_ty, subst, 0);
+        if (sub_cs.type_args_len > 0 and
+            sub_cs.type_args_start + sub_cs.type_args_len <= spec.extra_args.items.len)
+        {
+            for (0..sub_cs.type_args_len) |ta_i| {
+                const slot_ptr = &spec.extra_args.items[sub_cs.type_args_start + ta_i];
+                const subst_ta = try substituteMirType(allocator, pool, TypeId.fromInt(slot_ptr.*), subst, 0);
+                slot_ptr.* = subst_ta.toU32();
+            }
+        }
+        resolveMonomorphizedTraitMethodCall(&spec, sub_cs, pool, sym_table);
+    }
+
+    try runPassD2ReachableConstFold(allocator, &spec, pool, sym_table, config, sink);
+    try runPassD3StripGhostInstructions(allocator, &spec);
+    try runPassD4BranchFoldAndPrune(allocator, &spec);
+
+    const p_type_ids = try allocator.alloc(TypeId, ordered_vars.len);
+    errdefer allocator.free(p_type_ids);
+    const p_shapes = try allocator.alloc(LayoutShapeKey, ordered_vars.len);
+    errdefer allocator.free(p_shapes);
+    const p_sems = try allocator.alloc(OpSemanticsTag, ordered_vars.len);
+    errdefer allocator.free(p_sems);
+
+    var shape_hasher = std.hash.Wyhash.init(0);
+    shape_hasher.update(std.mem.asBytes(&tmpl_key));
+    for (ordered_vars, 0..) |var_raw, vi| {
+        const conc_ty = subst.get(var_raw) orelse .unit_ty;
+        p_type_ids[vi] = conc_ty;
+        p_shapes[vi] = computeLayoutShapeKey(pool, sym_table, conc_ty, config.target_layout);
+        p_sems[vi] = classifyOpSemantics(pool, conc_ty, config.target_layout);
+        shape_hasher.update(std.mem.asBytes(&p_shapes[vi]));
+        shape_hasher.update(&[_]u8{@backingInt(p_sems[vi])});
+    }
+    const offsets_callees = computeFieldOffsetsAndCalleesDigest(
+        &spec,
+        pool,
+        sym_table,
+        interner,
+        config.target_layout,
+    );
+    shape_hasher.update(std.mem.asBytes(&offsets_callees));
+    const shape_digest = shape_hasher.final();
+
+    instance_count.* += 1;
+    const spec_def = DefId.fromInt(next_synth_def_raw.*);
+    next_synth_def_raw.* += 1;
+    spec.def_id = spec_def;
+    spec.symbol_index = .none;
+    var name_buf: [128]u8 = undefined;
+    const base_name = if (clos_tmpl.name != .empty) interner.get(clos_tmpl.name) else "closure";
+    const mangled = std.fmt.bufPrint(&name_buf, "{s}$mono{d}", .{ base_name, instance_count.* }) catch base_name;
+    spec.name = try interner.intern(mangled);
+
+    const new_body_idx = concrete_bodies.items.len;
+    try concrete_bodies.append(allocator, spec);
+    try dedup_entries.append(allocator, .{
+        .template_key = tmpl_key,
+        .specialized_body_idx = new_body_idx,
+        .specialized_def_id = spec_def,
+        .param_type_ids = p_type_ids,
+        .shape_digest = shape_digest,
+        .param_shapes = p_shapes,
+        .param_semantics = p_sems,
+        .offsets_and_callees = offsets_callees,
+        .is_async_body = clos_tmpl.is_async,
+    });
+    try enqueueBodyGenericWorkItems(
+        allocator,
+        &concrete_bodies.items[new_body_idx],
+        new_body_idx,
+        depth,
+        pool,
+        tmpl_map,
+        sym_table,
+        null,
+        worklist,
+    );
+    return spec_def;
+}
+
 /// Pass `D5`: FIFO worklist monomorphization (`MAX_MONOMORPH_DEPTH = 64`, `MAX_MONOMORPH_INSTANCES = 65,536`),
 /// sound `LayoutShapeKey` deduplication, and Tarjan SCC `contextless` promotion.
 fn runPassD5MonomorphizeAndPromote(
@@ -4391,9 +5105,22 @@ fn runPassD5MonomorphizeAndPromote(
             dedup_entries.deinit(allocator);
         }
 
-        // Seed worklist with all generic `.call` and `async_future_make` sites from concrete root bodies:
+        var seen_drop_types: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer seen_drop_types.deinit(allocator);
+
+        // Seed worklist with all generic `.call`, `async_future_make`, and `AutoDrop` sites from concrete root bodies:
         for (concrete_bodies.items, 0..) |*cb_ptr, c_idx| {
-            try enqueueBodyGenericWorkItems(allocator, cb_ptr, c_idx, 1, &tmpl_map, sym_table, &worklist);
+            try enqueueBodyGenericWorkItems(
+                allocator,
+                cb_ptr,
+                c_idx,
+                1,
+                pool,
+                &tmpl_map,
+                sym_table,
+                &seen_drop_types,
+                &worklist,
+            );
         }
 
         var next_synth_def_raw: u32 = 0x7000_0000;
@@ -4418,6 +5145,8 @@ fn runPassD5MonomorphizeAndPromote(
                         diag_tok = meta.origin_token;
                         diag_sym = meta.direct_symbol;
                     }
+                } else if (item.is_drop_glue) {
+                    diag_sym = templates.items[item.call_idx].symbol_index;
                 } else {
                     const cs = caller_ref.calls.items[item.call_idx];
                     diag_tok = cs.origin_token;
@@ -4443,7 +5172,10 @@ fn runPassD5MonomorphizeAndPromote(
 
             var site_origin_tok: TokenIndex = .none;
             var site_direct_sym: SymbolIndex = .none;
-            const tmpl_idx: usize = if (item.is_async_future_make) blk_afm_t: {
+            const tmpl_idx: usize = if (item.is_drop_glue) blk_dg_t: {
+                site_direct_sym = templates.items[item.call_idx].symbol_index;
+                break :blk_dg_t item.call_idx;
+            } else if (item.is_async_future_make) blk_afm_t: {
                 const afm_target = extractAsyncFutureMakeTemplateTarget(
                     &concrete_bodies.items[item.caller_idx],
                     item.call_idx,
@@ -4473,7 +5205,61 @@ fn runPassD5MonomorphizeAndPromote(
 
             const caller_ref = &concrete_bodies.items[item.caller_idx];
             var maybe_subst_afm_callee_ty: ?TypeId = null;
-            if (item.is_async_future_make) {
+            if (item.is_drop_glue) {
+                const drop_node = pool.getNode(item.drop_ty);
+                const drop_sym_idx = SymbolIndex.fromInt(drop_node.rhs);
+                if (!drop_sym_idx.isNone() and drop_sym_idx.asInt() < sym_table.symbols.items.len) {
+                    const drop_sym = sym_table.getSymbol(drop_sym_idx).*;
+                    const raw_args = pool.getGenericTypeArgs(item.drop_ty);
+                    if (!drop_sym.target_scope.isNone() and raw_args.len > 0) {
+                        var tp_ord: usize = 0;
+                        for (sym_table.getScopeMembers(drop_sym.target_scope)) |mem_idx| {
+                            if (tp_ord >= raw_args.len) break;
+                            const mem_sym = sym_table.getSymbol(mem_idx).*;
+                            if (mem_sym.kind == .type_param_sym and !mem_sym.type_id.isError()) {
+                                const arg_ta = TypeId.fromInt(raw_args[tp_ord]);
+                                tp_ord += 1;
+                                try unifyTemplateTypeBinding(
+                                    allocator,
+                                    pool,
+                                    mem_sym.type_id,
+                                    arg_ta,
+                                    &subst,
+                                    &ordered_vars,
+                                    0,
+                                );
+                            } else if (mem_sym.kind == .const_param_sym and !mem_sym.name.isNone()) {
+                                const arg_ta = TypeId.fromInt(raw_args[tp_ord]);
+                                tp_ord += 1;
+                                const len_key = try pool.internSymbolicArray(.unit_ty, mem_sym.name, false);
+                                if (!subst.contains(len_key.toU32())) {
+                                    try subst.put(allocator, len_key.toU32(), arg_ta);
+                                    try ordered_vars.append(allocator, len_key.toU32());
+                                }
+                            }
+                        }
+                    }
+                }
+                if (tmpl.param_count >= 1 and tmpl.locals.items.len >= 2) {
+                    const p0_unwrapped = pool.unwrapUnderlyingType(tmpl.locals.items[1].type_id);
+                    const p0_node = pool.getNode(p0_unwrapped);
+                    const tmpl_self_ty = if (p0_node.tag == .ref_ty or
+                        p0_node.tag == .mut_ref_ty or
+                        p0_node.tag == .raw_ptr_ty)
+                        TypeId.fromInt(p0_node.lhs)
+                    else
+                        tmpl.locals.items[1].type_id;
+                    try unifyTemplateTypeBinding(
+                        allocator,
+                        pool,
+                        tmpl_self_ty,
+                        item.drop_ty,
+                        &subst,
+                        &ordered_vars,
+                        0,
+                    );
+                }
+            } else if (item.is_async_future_make) {
                 const afm_inst = caller_ref.insts.get(item.call_idx);
                 const args_start = afm_inst.operands.lhs;
                 const args_len = afm_inst.operands.rhs;
@@ -4531,25 +5317,96 @@ fn runPassD5MonomorphizeAndPromote(
                     }
                     if (!tmpl_sym_idx.isNone() and tmpl_sym_idx.asInt() < sym_table.symbols.items.len) {
                         const tmpl_sym = sym_table.getSymbol(tmpl_sym_idx).*;
+                        var owner_param_count: usize = 0;
+                        var fn_param_count: usize = 0;
+                        if (!tmpl_sym.scope_id.isNone()) {
+                            const enc_kind = sym_table.scope_arena.getScope(tmpl_sym.scope_id).kind;
+                            if (enc_kind == .nominal_type_scope or enc_kind == .trait_scope or enc_kind == .impl_scope) {
+                                for (sym_table.getScopeMembers(tmpl_sym.scope_id)) |mem_idx| {
+                                    const mem_sym = sym_table.getSymbol(mem_idx).*;
+                                    if ((mem_sym.kind == .type_param_sym and !mem_sym.type_id.isError()) or
+                                        (mem_sym.kind == .const_param_sym and !mem_sym.name.isNone()))
+                                    {
+                                        owner_param_count += 1;
+                                    }
+                                }
+                            }
+                        }
                         if (!tmpl_sym.target_scope.isNone()) {
-                            var tp_ord: usize = 0;
                             for (sym_table.getScopeMembers(tmpl_sym.target_scope)) |mem_idx| {
                                 const mem_sym = sym_table.getSymbol(mem_idx).*;
-                                if (mem_sym.kind != .type_param_sym or mem_sym.type_id.isError()) continue;
+                                if ((mem_sym.kind == .type_param_sym and !mem_sym.type_id.isError()) or
+                                    (mem_sym.kind == .const_param_sym and !mem_sym.name.isNone()))
+                                {
+                                    fn_param_count += 1;
+                                }
+                            }
+                        }
+
+                        var tp_ord: usize = 0;
+                        const include_owner_params = owner_param_count > 0 and
+                            (cs_snapshot.type_args_len == owner_param_count + fn_param_count or
+                                (fn_param_count == 0 and cs_snapshot.type_args_len >= owner_param_count));
+                        if (include_owner_params and !tmpl_sym.scope_id.isNone()) {
+                            for (sym_table.getScopeMembers(tmpl_sym.scope_id)) |mem_idx| {
+                                const mem_sym = sym_table.getSymbol(mem_idx).*;
                                 if (tp_ord >= cs_snapshot.type_args_len) break;
-                                const call_ta = TypeId.fromInt(
-                                    caller_ref.extra_args.items[cs_snapshot.type_args_start + tp_ord],
-                                );
-                                tp_ord += 1;
-                                try unifyTemplateTypeBinding(
-                                    allocator,
-                                    pool,
-                                    mem_sym.type_id,
-                                    call_ta,
-                                    &subst,
-                                    &ordered_vars,
-                                    0,
-                                );
+                                if (mem_sym.kind == .type_param_sym and !mem_sym.type_id.isError()) {
+                                    const call_ta = TypeId.fromInt(
+                                        caller_ref.extra_args.items[cs_snapshot.type_args_start + tp_ord],
+                                    );
+                                    tp_ord += 1;
+                                    try unifyTemplateTypeBinding(
+                                        allocator,
+                                        pool,
+                                        mem_sym.type_id,
+                                        call_ta,
+                                        &subst,
+                                        &ordered_vars,
+                                        0,
+                                    );
+                                } else if (mem_sym.kind == .const_param_sym and !mem_sym.name.isNone()) {
+                                    const call_ta = TypeId.fromInt(
+                                        caller_ref.extra_args.items[cs_snapshot.type_args_start + tp_ord],
+                                    );
+                                    tp_ord += 1;
+                                    const len_key = try pool.internSymbolicArray(.unit_ty, mem_sym.name, false);
+                                    if (!subst.contains(len_key.toU32())) {
+                                        try subst.put(allocator, len_key.toU32(), call_ta);
+                                        try ordered_vars.append(allocator, len_key.toU32());
+                                    }
+                                }
+                            }
+                        }
+                        if (!tmpl_sym.target_scope.isNone()) {
+                            for (sym_table.getScopeMembers(tmpl_sym.target_scope)) |mem_idx| {
+                                const mem_sym = sym_table.getSymbol(mem_idx).*;
+                                if (tp_ord >= cs_snapshot.type_args_len) break;
+                                if (mem_sym.kind == .type_param_sym and !mem_sym.type_id.isError()) {
+                                    const call_ta = TypeId.fromInt(
+                                        caller_ref.extra_args.items[cs_snapshot.type_args_start + tp_ord],
+                                    );
+                                    tp_ord += 1;
+                                    try unifyTemplateTypeBinding(
+                                        allocator,
+                                        pool,
+                                        mem_sym.type_id,
+                                        call_ta,
+                                        &subst,
+                                        &ordered_vars,
+                                        0,
+                                    );
+                                } else if (mem_sym.kind == .const_param_sym and !mem_sym.name.isNone()) {
+                                    const call_ta = TypeId.fromInt(
+                                        caller_ref.extra_args.items[cs_snapshot.type_args_start + tp_ord],
+                                    );
+                                    tp_ord += 1;
+                                    const len_key = try pool.internSymbolicArray(.unit_ty, mem_sym.name, false);
+                                    if (!subst.contains(len_key.toU32())) {
+                                        try subst.put(allocator, len_key.toU32(), call_ta);
+                                        try ordered_vars.append(allocator, len_key.toU32());
+                                    }
+                                }
                             }
                         }
                     }
@@ -4617,6 +5474,33 @@ fn runPassD5MonomorphizeAndPromote(
                             }
                         }
                     }
+                } else if (inst.op == .aggregate_make) {
+                    const agg_kind: mir.AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+                    if (agg_kind == .closure_make) {
+                        if (tmpl_map.lookup(DefId.fromInt(inst.operands.lhs), .none, sym_table)) |clos_tmpl_idx| {
+                            const clos_def = try specializeClosureTemplateRecursive(
+                                allocator,
+                                clos_tmpl_idx,
+                                templates.items,
+                                &tmpl_map,
+                                &concrete_bodies,
+                                &dedup_entries,
+                                &worklist,
+                                &subst,
+                                ordered_vars.items,
+                                item.depth + 1,
+                                pool,
+                                sym_table,
+                                interner,
+                                config,
+                                sink,
+                                &next_synth_def_raw,
+                                &instance_count,
+                                dedup_merged_out,
+                            );
+                            inst.operands.lhs = clos_def.asInt();
+                        }
+                    }
                 } else if (inst.op == .intrinsic_op) {
                     const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
                     if (ikind.hasTypeIdInLhs()) {
@@ -4628,6 +5512,16 @@ fn runPassD5MonomorphizeAndPromote(
                             0,
                         );
                         inst.operands.lhs = subst_ty.asInt();
+                        if (ikind == .implements) {
+                            const subst_rhs = try substituteMirType(
+                                allocator,
+                                pool,
+                                TypeId.fromInt(inst.operands.rhs),
+                                &subst,
+                                0,
+                            );
+                            inst.operands.rhs = subst_rhs.asInt();
+                        }
                         if (!subst_ty.isError() and !hasGenericVarsInType(pool, subst_ty)) {
                             switch (ikind) {
                                 .size_of => {
@@ -4674,6 +5568,56 @@ fn runPassD5MonomorphizeAndPromote(
                                         .operands = .{ .lhs = c_idx, .rhs = 0 },
                                     };
                                 },
+                                .implements => {
+                                    const bound_ty = TypeId.fromInt(inst.operands.rhs);
+                                    if (isConcreteImplementsBound(pool, bound_ty)) {
+                                        const does_impl = evalMonomorphizedImplements(
+                                            pool,
+                                            sym_table,
+                                            config.target_layout,
+                                            subst_ty,
+                                            bound_ty,
+                                        );
+                                        const c_idx = try spec.appendConst(.{ .bool_val = does_impl });
+                                        inst = .{
+                                            .op = .const_scalar,
+                                            .flags = .{},
+                                            .type_id = .bool_ty,
+                                            .operands = .{ .lhs = c_idx, .rhs = 0 },
+                                        };
+                                    }
+                                },
+                                .int_min, .int_max => {
+                                    const unwrapped_int = pool.unwrapUnderlyingType(subst_ty);
+                                    if (type_system.getTargetPrimitiveIntBounds(unwrapped_int, config.target_layout)) |ib| {
+                                        const raw_v = if (ikind == .int_min) ib.min_val else ib.max_val;
+                                        const mc = makeTypedIntMirConst(
+                                            pool,
+                                            inst.type_id,
+                                            @bitCast(raw_v),
+                                            config.target_layout,
+                                        );
+                                        const c_idx = try spec.appendConst(mc);
+                                        inst = .{
+                                            .op = .const_scalar,
+                                            .flags = .{},
+                                            .type_id = inst.type_id,
+                                            .operands = .{ .lhs = c_idx, .rhs = 0 },
+                                        };
+                                    }
+                                },
+                                .int_bits => {
+                                    const unwrapped_int = pool.unwrapUnderlyingType(subst_ty);
+                                    if (type_system.getTargetPrimitiveIntBits(unwrapped_int, config.target_layout)) |bits| {
+                                        const c_idx = try spec.appendConst(.{ .int_val = @as(i128, bits) });
+                                        inst = .{
+                                            .op = .const_scalar,
+                                            .flags = .{},
+                                            .type_id = inst.type_id,
+                                            .operands = .{ .lhs = c_idx, .rhs = 0 },
+                                        };
+                                    }
+                                },
                                 else => {},
                             }
                         }
@@ -4716,6 +5660,7 @@ fn runPassD5MonomorphizeAndPromote(
                         slot_ptr.* = subst_ta.toU32();
                     }
                 }
+                resolveMonomorphizedTraitMethodCall(&spec, sub_cs, pool, sym_table);
                 if (tmpl_map.lookup(sub_cs.direct_def_id, sub_cs.direct_symbol, sym_table) != null) {
                     has_nested_generic_call = true;
                 }
@@ -4772,7 +5717,12 @@ fn runPassD5MonomorphizeAndPromote(
                     matched_def = entry.specialized_def_id;
                     break;
                 }
-                if (item.is_async_future_make or spec.is_async or entry.is_async_body or has_nested_generic_call) {
+                if (item.is_drop_glue or
+                    item.is_async_future_make or
+                    spec.is_async or
+                    entry.is_async_body or
+                    has_nested_generic_call)
+                {
                     continue;
                 }
                 if (entry.shape_digest != shape_digest or
@@ -4814,7 +5764,7 @@ fn runPassD5MonomorphizeAndPromote(
                         canon_def,
                         maybe_subst_afm_callee_ty,
                     );
-                } else {
+                } else if (!item.is_drop_glue) {
                     redirectDirectCallSite(&concrete_bodies.items[item.caller_idx], item.call_idx, canon_def);
                 }
                 dedup_merged_out.* += 1;
@@ -4898,18 +5848,20 @@ fn runPassD5MonomorphizeAndPromote(
                     spec_def,
                     maybe_subst_afm_callee_ty,
                 );
-            } else {
+            } else if (!item.is_drop_glue) {
                 redirectDirectCallSite(&concrete_bodies.items[item.caller_idx], item.call_idx, spec_def);
             }
 
-            // Enqueue any nested generic `.call` or `async_future_make` sites inside the specialized body:
+            // Enqueue any nested generic `.call`, `async_future_make`, or `AutoDrop` sites inside the specialized body:
             try enqueueBodyGenericWorkItems(
                 allocator,
                 &concrete_bodies.items[new_body_idx],
                 new_body_idx,
                 item.depth + 1,
+                pool,
                 &tmpl_map,
                 sym_table,
+                &seen_drop_types,
                 &worklist,
             );
         }
@@ -5019,6 +5971,16 @@ fn runPassD5MonomorphizeAndPromote(
                                 if (mono_remap.get(inst.operands.lhs)) |mapped_def| {
                                     inst.operands.lhs = mapped_def.asInt();
                                     cb_ptr.insts.set(inst_i, inst);
+                                }
+                            } else if (inst.op == .aggregate_make) {
+                                const agg_kind: mir.AggregateKind = @fromBackingInt(
+                                    @intCast(@as(u8, @truncate(inst.aux_u16))),
+                                );
+                                if (agg_kind == .closure_make) {
+                                    if (mono_remap.get(inst.operands.lhs)) |mapped_def| {
+                                        inst.operands.lhs = mapped_def.asInt();
+                                        cb_ptr.insts.set(inst_i, inst);
+                                    }
                                 }
                             }
                         }
@@ -5270,12 +6232,14 @@ fn isSroaRegisterType(pool: *const InternPool, raw_ty: TypeId) bool {
         .char_ty,
         .str_ty,
         .source_loc_ty,
+        .fmt_spec_ty,
         => return true,
         else => {},
     }
     const tag = pool.getNode(ty).tag;
     if (tag == .enum_ty and pool.getEnumBackingIntType(ty) != null) return true;
-    return tag == .ref_ty or tag == .mut_ref_ty or tag == .raw_ptr_ty or tag == .fn_ty or tag == .bit_field_ty;
+    if (tag == .ref_ty or tag == .mut_ref_ty) return !pool.isSliceRefType(ty);
+    return tag == .raw_ptr_ty or tag == .fn_ty or tag == .bit_field_ty;
 }
 
 /// Extracts scalar field `TypeId`s if `raw_ty` is a small struct/tuple (`<= MAX_SROA_COMPOSITE_FIELDS`).

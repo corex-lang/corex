@@ -17,7 +17,7 @@ It serves two roles:
 
 ## 2. Cross-Language Capability Matrix
 
-Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `stage0/` + `core/` + `vscode-ext-corex` (`Phases 0–10.6`); **`[v0.0.1]`** = scheduled in `Phases 11–12` prior to initial release; **`[0.x]`** = scheduled in `Phase 13.0–13.4` prior to `v1.0.0`.
+Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `stage0/` + `core/` + `stdlib/cx/` + `vscode-ext-corex` (`Phases 0–11.1`); **`[v0.0.1]`** = scheduled in `Phases 11.2–12` prior to initial release; **`[0.x]`** = scheduled in `Phase 13.0–13.4` prior to `v1.0.0`.
 
 | Dimension | CoreX | Rust | Zig | C23 / C++23 | Go | Python |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -71,7 +71,7 @@ Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `st
 
 ### 3.5 Constrained Type Groups & Inline Union Bounds (`[Live]`)
 
--   Instead of C++ template duck-typing walls or verbose Rust trait bounds (`fn scale<T: Copy + Add<Output = T> + Mul<Output = T>>(a: T, b: T) -> T`), CoreX provides 12 built-in $O(1)$ bitmask **Constrained Type Groups** (`Number`, `Integer`, `Signed`, `Unsigned`, `Float`, `Scalar`, `Bytes`, `FromBytes`, `IntoBytes`, …), user-defined type groups (`type WireScalar = u8 | u16 | u32 | u64;`), and PEP 695-style **inline union bounds** (`pub fn parse_header[Data: str | &[u8]](input: Data)`).
+-   Instead of C++ template duck-typing walls or verbose Rust trait bounds (`fn scale<T: Copy + Add<Output = T> + Mul<Output = T>>(a: T, b: T) -> T`), CoreX provides 13 built-in $O(1)$ bitmask **Constrained Type Groups** (`Number`, `Integer`, `Signed`, `Unsigned`, `Float`, `Scalar`, `Bytes`, `Equatable`, `Comparable`, `Copy`, `FromBytes`, `IntoBytes`, `TrivialDrop`), user-defined type groups (`type WireScalar = u8 | u16 | u32 | u64;`), and PEP 695-style **inline union bounds** (`pub fn parse_header[Data: str | &[u8]](input: Data)`).
 -   `distinct` nominal types (`pub type UserId = distinct u64;`) isolate units and IDs at zero runtime cost (`E0405`), `@secret` enforces constant-time discipline (`Phase 13.1`), and `is` range refinements (`pub type Port = u16 is 1..=65535;`) catch out-of-range constants and unverified casts (`E0406`).
 
 ### 3.6 Python-Grade Ergonomics With Zero Runtime Cost (`[Live]`)
@@ -135,7 +135,7 @@ CoreX systematically adopts the highest-leverage ergonomic wins from Python, Swi
     -   **Full compile-time memory, borrow, `@linear`, and Pentagon bounds verification** (`Release` builds stay memory-safe without runtime overhead) (`[Live]`).
     -   **Checked generics via Constrained Type Groups** (`[T: Float]`, `[Data: str | &[u8]]`) + **3-tier closures** (`fn`, `|…|`, `own |…|`) + **`subscript`/`yield`** + **named/default arguments** (`[Live]`).
     -   **In-house zero-`libclang` C11/C23 translator** (`[Live]`) keeping the entire CoreX toolchain **`< 1 MB`** (`[v0.0.1]`).
-    -   **Implicit `context` (`context.allocator`, `context.rng`, `context.logger`) + `with context.allocator = arena { … }`** (`SE-08`) giving explicit allocator control without threading `allocator: Allocator` through every single function signature (`[Live]`).
+    -   **Implicit `context` (`context.allocator`, `context.rng_seed`, `context.logger`) + `with context.allocator = arena.as_handle() { … }`** (`SE-08`, `STD-01`) giving explicit allocator control and zero-instruction `TrivialDrop` arena destructor elision without threading `allocator: Allocator` through every single function signature (`[Live]`).
 
 ### 4.4 CoreX vs. Go
 
@@ -428,5 +428,39 @@ pub fn connect_timeout(endpoint: str, *, timeout_ms: u32 = 5000) -> i32 {
 // `connect_timeout(addr, timeout_ms: 5000)` automatically when `$0` is pure and comment-free!
 pub fn bootstrap_client(addr: str) -> i32 {
     return connect_timeout(addr, timeout_ms: 5000);
+}
+```
+
+### Showcase 10: Zero-Instruction Arena Drop Elision, `with_scratch` (`E0328`) & `24B` SSO `String` (`[Live]`)
+
+```cx
+use cx.mem.{AllocError, Arena, with_scratch};
+
+pub fn summarize_tokens(tokens: &[str]) -> String!AllocError {
+    var arena = Arena.new();
+    defer arena.release();
+
+    // `Map` allocated `.in_arena(&mut arena)` compiles to ZERO destructor instructions at scope exit;
+    // nested same-slot `with_scratch` while `scratch` is live is rejected at compile time (`E0328`):
+    var counts = Map[str, u32].in_arena(&mut arena);
+    for token in tokens {
+        let prev: u32 = if counts.get(&token) is .Some(cnt) {
+            cnt.*
+        } else {
+            0_u32
+        };
+        _ = counts.try_insert(token, prev + 1_u32)?;
+    }
+
+    let seen_len: usize = with_scratch(|scratch: &mut Arena| -> usize!AllocError {
+        var seen = Vec[str].in_arena(scratch);
+        for token in tokens {
+            seen.try_push(token)?;
+        }
+        return .Ok(seen.len());
+    })?;
+
+    // `<= 23`-byte UTF-8 stays 100% inline on the stack (`24B` SSO; `String?` is also `24B`):
+    return .Ok(String.fmt("u={counts.len()},n={seen_len}"));
 }
 ```

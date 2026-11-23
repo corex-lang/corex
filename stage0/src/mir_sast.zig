@@ -586,8 +586,10 @@ pub const MovePathFlags = packed struct(u8) {
     is_behind_shared_ref: bool = false,
     /// `true` if the path traverses through a raw pointer `*T` / `*mut T` dereference.
     is_deref_raw_ptr: bool = false,
-    /// Reserved zero bits.
-    _reserved: u2 = 0,
+    /// `true` if proven unswapped bump-arena `AutoDrop` container with `TrivialDrop` elements (`STD-01` §1.5).
+    is_arena_drop_elided: bool = false,
+    /// Reserved zero bit.
+    _reserved: u1 = 0,
 };
 
 /// Canonical 20-byte `MovePath` trie node (`DR-06` §2.1, `@sizeOf == 20`).
@@ -1635,12 +1637,15 @@ const ARENA_TYPE_NAME_MAP = std.StaticStringMap(void).initComptime(.{
 
 /// $O(1)$ static map of lifecycle-only `Arena` methods that do NOT count as arena allocation (`W0308`).
 const ARENA_LIFECYCLE_METHOD_MAP = std.StaticStringMap(void).initComptime(.{
+    .{ "checkpoint", {} },
     .{ "deinit", {} },
     .{ "destroy", {} },
     .{ "free", {} },
     .{ "init", {} },
     .{ "new", {} },
+    .{ "release", {} },
     .{ "reset", {} },
+    .{ "restore", {} },
     .{ "rewind", {} },
     .{ "with_capacity", {} },
 });
@@ -1649,6 +1654,7 @@ const ARENA_LIFECYCLE_METHOD_MAP = std.StaticStringMap(void).initComptime(.{
 const SCRATCH_RESET_METHOD_MAP = std.StaticStringMap(void).initComptime(.{
     .{ "clear", {} },
     .{ "reset", {} },
+    .{ "restore", {} },
     .{ "rewind", {} },
     .{ "scratch_reset", {} },
     .{ "scratch_rewind", {} },
@@ -1658,6 +1664,45 @@ const SCRATCH_RESET_METHOD_MAP = std.StaticStringMap(void).initComptime(.{
 const SCRATCH_SELECT_METHOD_MAP = std.StaticStringMap(void).initComptime(.{
     .{ "scratch_scope", {} },
     .{ "select_scratch", {} },
+    .{ "with_scratch", {} },
+});
+
+/// $O(1)$ static map of inherent container methods that preserve `self.alloc` without swapping headers (`STD-01`).
+const SAFE_CONTAINER_MUT_METHOD_MAP = std.StaticStringMap(void).initComptime(.{
+    .{ "as_mut_bytes", {} },
+    .{ "as_mut_slice", {} },
+    .{ "as_mut_soa_slice", {} },
+    .{ "capacity", {} },
+    .{ "clear", {} },
+    .{ "extend", {} },
+    .{ "get", {} },
+    .{ "get_mut", {} },
+    .{ "insert", {} },
+    .{ "is_empty", {} },
+    .{ "len", {} },
+    .{ "pop", {} },
+    .{ "push", {} },
+    .{ "push_bytes", {} },
+    .{ "push_char", {} },
+    .{ "push_str", {} },
+    .{ "remove", {} },
+    .{ "reserve", {} },
+    .{ "resize", {} },
+    .{ "retain", {} },
+    .{ "reverse", {} },
+    .{ "truncate", {} },
+    .{ "try_insert", {} },
+    .{ "try_push", {} },
+    .{ "try_reserve", {} },
+});
+
+/// $O(1)$ static map of `context.allocator`-backed container constructors (`STD-01`).
+const CONTAINER_CTX_CTOR_NAME_MAP = std.StaticStringMap(void).initComptime(.{
+    .{ "from_bytes", {} },
+    .{ "from_str", {} },
+    .{ "new", {} },
+    .{ "try_with_capacity", {} },
+    .{ "with_capacity", {} },
 });
 
 /// $O(1)$ static map of dynamic heap-growing container methods (`alloc = true` when receiver is not `Arena`).
@@ -1680,12 +1725,13 @@ const HEAP_GROWTH_METHOD_MAP = std.StaticStringMap(void).initComptime(.{
 /// $O(1)$ static map of nominal carrier type names holding `Context` handles or owned heap pointers (`SE-08`).
 const CONTEXT_ALLOC_CARRIER_NAME_MAP = std.StaticStringMap(void).initComptime(.{
     .{ "Allocator", {} },
+    .{ "AllocatorHandle", {} },
     .{ "Box", {} },
     .{ "CancelToken", {} },
     .{ "DiagSink", {} },
     .{ "Diagnostics", {} },
+    .{ "FixedBuffer", {} },
     .{ "Logger", {} },
-    .{ "OwnPtr", {} },
 });
 
 /// $O(1)$ static map from `Context` handle type names to their 3-bit `SE-08` carrier mask (`Logger`/`DiagSink`/`CancelToken`).
@@ -2044,7 +2090,8 @@ fn isArenaType(pool: *const InternPool, sym_table: *const SymbolTable, type_id: 
     if (base_node.tag != .struct_ty) return false;
     const sym_idx = SymbolIndex.fromInt(base_node.rhs);
     if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return false;
-    return ARENA_TYPE_NAME_MAP.has(sym_table.getSymbol(sym_idx).name_text);
+    const sym_name = sym_table.getSymbol(sym_idx).name_text;
+    return ARENA_TYPE_NAME_MAP.has(sym_name) or std.mem.eql(u8, sym_name, "FixedBuffer");
 }
 
 /// Returns `true` if `type_id` is an owned `Arena` or `BumpArena` value (excluding `&` / `&mut` references).
@@ -2055,10 +2102,11 @@ fn isOwnedArenaType(pool: *const InternPool, sym_table: *const SymbolTable, type
     if (base_node.tag != .struct_ty) return false;
     const sym_idx = SymbolIndex.fromInt(base_node.rhs);
     if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return false;
-    return ARENA_TYPE_NAME_MAP.has(sym_table.getSymbol(sym_idx).name_text);
+    const sym_name = sym_table.getSymbol(sym_idx).name_text;
+    return ARENA_TYPE_NAME_MAP.has(sym_name) or std.mem.eql(u8, sym_name, "FixedBuffer");
 }
 
-/// Returns `true` if `type_id` (peeling `&` / `&mut`) is `PoolAllocator`.
+/// Returns `true` if `type_id` (peeling `&` / `&mut`) is `Pool` or `PoolAllocator`.
 fn isPoolAllocatorType(pool: *const InternPool, sym_table: *const SymbolTable, type_id: TypeId) bool {
     if (type_id.isError()) return false;
     var cur_ty = pool.unwrapUnderlyingType(type_id);
@@ -2070,7 +2118,8 @@ fn isPoolAllocatorType(pool: *const InternPool, sym_table: *const SymbolTable, t
     if (base_node.tag != .struct_ty) return false;
     const sym_idx = SymbolIndex.fromInt(base_node.rhs);
     if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return false;
-    return std.mem.eql(u8, sym_table.getSymbol(sym_idx).name_text, "PoolAllocator");
+    const sym_name = sym_table.getSymbol(sym_idx).name_text;
+    return std.mem.eql(u8, sym_name, "Pool") or std.mem.eql(u8, sym_name, "PoolAllocator");
 }
 
 /// Returns the `SymbolIndex` of an explicit `fn drop` on nominal `type_id` (`SymbolIndex.none` if none).
@@ -2158,6 +2207,20 @@ fn collectDropGlueTargetsBounded(
     const node = pool.getNode(unwrapped);
     switch (node.tag) {
         .dyn_trait_ty => has_heap_free_out.* = true,
+        .soa_vec_ty => {
+            has_heap_free_out.* = true;
+            try collectDropGlueTargetsBounded(
+                allocator,
+                pool,
+                sym_table,
+                TypeId.fromInt(node.lhs),
+                subst,
+                depth + 1,
+                drop_syms_out,
+                has_heap_free_out,
+                visited_memo,
+            );
+        },
         .array_ty, .soa_array_ty => {
             try collectDropGlueTargetsBounded(
                 allocator,
@@ -3402,6 +3465,8 @@ const TrackedLoan = struct {
     is_partial: bool,
     /// `true` for `&mut` / `inout` exclusive loans; `false` for `&` / `let` shared loans.
     is_mut: bool,
+    /// `true` when this loan reborrows a reference/slice pointee (`*r`) rather than `r`'s stack slot.
+    is_pointee_reborrow: bool = false,
     /// `true` when `MAX_TRACKED_LOANS` saturated and this slot conservatively conflicts with every path.
     is_overflow_wildcard: bool = false,
     /// Non-zero (`0b01`/`0b10`/`0b11`) when this loan borrows a `Context.scratch[0..2]` arena slot (`D-04`).
@@ -3884,12 +3949,25 @@ fn setLoanBitAlloc(
     mask.set(loan_idx);
 }
 
+/// Returns `true` if `raw_ty` is a pure borrowed reference, slice, `str`, or raw pointer (owning zero stack payload).
+fn isPureBorrowedRefOrSliceType(pool: *const InternPool, raw_ty: TypeId) bool {
+    if (raw_ty.isError()) return false;
+    const unwrapped = pool.unwrapUnderlyingType(raw_ty);
+    if (unwrapped == .str_ty or unwrapped == .fmt_args_ty) return true;
+    if (unwrapped.isPrimitive()) return false;
+    return switch (pool.getNode(unwrapped).tag) {
+        .ref_ty, .mut_ref_ty, .slice_ty, .soa_slice_ty, .raw_ptr_ty => true,
+        else => false,
+    };
+}
+
 /// Appends a `TrackedLoan` or coalesces into the fail-closed wildcard slot when `MAX_TRACKED_LOANS` saturates.
 fn mintOrCoarsenLoan(
     loan_list: *std.ArrayListUnmanaged(TrackedLoan),
     arena_alloc: std.mem.Allocator,
     lookup: PlacePathLookup,
     is_mut: bool,
+    is_pointee_reborrow: bool,
     scratch_slot_mask: u2,
     open_token: TokenIndex,
 ) !u32 {
@@ -3899,6 +3977,7 @@ fn mintOrCoarsenLoan(
             .path_id = lookup.id,
             .is_partial = lookup.is_partial,
             .is_mut = is_mut,
+            .is_pointee_reborrow = is_pointee_reborrow,
             .is_overflow_wildcard = false,
             .scratch_slot_mask = scratch_slot_mask,
             .open_token = open_token,
@@ -3934,6 +4013,35 @@ fn computeBodyProvenanceAndNllHorizon(
     sym_to_slot: *const std.AutoHashMapUnmanaged(u32, u32),
     config: SastConfig,
 ) !BodyProvenanceHorizon {
+    return computeBodyProvenanceAndNllHorizonExt(
+        arena_alloc,
+        body,
+        dom,
+        trie,
+        pool,
+        sym_table,
+        summaries,
+        key_to_slot,
+        sym_to_slot,
+        config,
+        0,
+    );
+}
+
+/// Extended provenance and NLL horizon builder supporting `param0_scratch_seed` for `with_scratch` closures (`STD-01`).
+fn computeBodyProvenanceAndNllHorizonExt(
+    arena_alloc: std.mem.Allocator,
+    body: *const MirBody,
+    dom: *const DominatorTree,
+    trie: *const MovePathTrie,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    summaries: []const FnRegionSummary,
+    key_to_slot: *const std.AutoHashMapUnmanaged(u32, u32),
+    sym_to_slot: *const std.AutoHashMapUnmanaged(u32, u32),
+    config: SastConfig,
+    param0_scratch_seed: u2,
+) !BodyProvenanceHorizon {
     const inst_count = body.insts.len;
     const local_count = body.locals.items.len;
     const block_count = body.blocks.items.len;
@@ -3950,6 +4058,11 @@ fn computeBodyProvenanceAndNllHorizon(
     const has_exact_scope_depths = body.local_scope_depths.items.len == local_count;
 
     // [1] Initialize formal parameter provenance and true lexical `scope_depth` per local:
+    var last_arg_loc: usize = 0;
+    for (body.locals.items, 0..) |loc_scan, scan_i| {
+        if (scan_i > 0 and loc_scan.flags().is_arg) last_arg_loc = scan_i;
+    }
+
     for (body.locals.items, 0..) |loc, loc_i| {
         if (loc_i == 0) {
             local_decl_depth[0] = DEPTH_CALLER_PARAM;
@@ -3967,6 +4080,7 @@ fn computeBodyProvenanceAndNllHorizon(
             local_decl_depth[loc_i] = param_depth;
             local_prov[loc_i] = .{
                 .param_mask = param_bit,
+                .scratch_mask = if (loc_i == last_arg_loc and is_caller_arena) param0_scratch_seed else 0,
                 .max_depth = param_depth,
                 .min_target_depth = param_depth,
                 .raw_ptr_state = if (is_raw_ptr) .maybe_null else .unknown_or_non_ptr,
@@ -4041,17 +4155,29 @@ fn computeBodyProvenanceAndNllHorizon(
                 inst.operands.lhs < trie.place_map.len)
             {
                 const lookup = trie.place_map[inst.operands.lhs];
-                const scratch_bits = detectContextScratchAccess(
+                var scratch_bits = detectContextScratchAccess(
                     body,
                     pool,
                     sym_table,
                     PlaceId.fromInt(inst.operands.lhs),
                 );
+                if (scratch_bits == 0 and param0_scratch_seed != 0 and last_arg_loc > 0 and
+                    body.places.items[inst.operands.lhs].base == last_arg_loc and
+                    isArenaType(pool, sym_table, body.locals.items[last_arg_loc].type_id))
+                {
+                    scratch_bits = param0_scratch_seed;
+                }
+                const projs = body.getPlaceProjections(PlaceId.fromInt(inst.operands.lhs));
+                const base_loc = body.places.items[inst.operands.lhs].base;
+                const is_pointee_reb = (projs.len > 0 and projs[0].kind == .deref) or
+                    (inst.op == .soa_column_slice and base_loc < local_count and
+                        isPureBorrowedRefOrSliceType(pool, body.locals.items[base_loc].type_id));
                 const lid_idx = try mintOrCoarsenLoan(
                     &loan_list,
                     arena_alloc,
                     lookup,
                     inst.op == .place_addr and inst.operands.rhs == 1,
+                    is_pointee_reb,
                     scratch_bits,
                     tok,
                 );
@@ -4072,12 +4198,24 @@ fn computeBodyProvenanceAndNllHorizon(
                 config,
             );
             const has_ret_prov = hasProvenanceCarrier(pool, sym_table, call_site.ret_ty);
-            const ret_mask: u64 = if (callee_sum_opt) |csum|
+            const can_ret_carry = has_ret_prov or isContextAllocCarrier(pool, sym_table, call_site.ret_ty);
+            const is_arg0_arena = can_ret_carry and call_site.args_len >= 1 and
+                isArenaArgPlaceOrVal(
+                    body,
+                    pool,
+                    sym_table,
+                    body.call_arg_modes.items[call_site.modes_start],
+                    body.extra_args.items[call_site.args_start],
+                );
+            var ret_mask: u64 = if (!can_ret_carry)
+                0
+            else if (callee_sum_opt) |csum|
                 csum.ret_provenance_mask
             else if (has_ret_prov)
                 0xFFFF_FFFF_FFFF_FFFF
             else
                 0;
+            if (is_arg0_arena) ret_mask |= 1;
 
             if (ret_mask != 0 and call_site.call_borrows_len > 0) {
                 var bor_cursor: usize = 0;
@@ -4117,17 +4255,31 @@ fn computeBodyProvenanceAndNllHorizon(
                     if (!has_arg_flow_to_ret) continue;
 
                     const lookup = trie.place_map[ghost_inst.operands.lhs];
-                    const scratch_bits = detectContextScratchAccess(
+                    var scratch_bits = detectContextScratchAccess(
                         body,
                         pool,
                         sym_table,
                         PlaceId.fromInt(ghost_inst.operands.lhs),
                     );
+                    if (scratch_bits == 0 and param0_scratch_seed != 0 and last_arg_loc > 0 and
+                        body.places.items[ghost_inst.operands.lhs].base == last_arg_loc and
+                        isArenaType(pool, sym_table, body.locals.items[last_arg_loc].type_id))
+                    {
+                        scratch_bits = param0_scratch_seed;
+                    }
+                    const ghost_pl_id = PlaceId.fromInt(ghost_inst.operands.lhs);
+                    const ghost_projs = body.getPlaceProjections(ghost_pl_id);
+                    const ghost_base = body.places.items[ghost_inst.operands.lhs].base;
+                    const is_pointee_reb = (ghost_projs.len > 0 and ghost_projs[0].kind == .deref) or
+                        (ghost_inst.op == .ghost_access_let and ghost_projs.len == 0 and
+                            ghost_base < local_count and
+                            isPureBorrowedRefOrSliceType(pool, body.locals.items[ghost_base].type_id));
                     const lid_idx = try mintOrCoarsenLoan(
                         &loan_list,
                         arena_alloc,
                         lookup,
                         ghost_inst.op == .ghost_access_inout,
+                        is_pointee_reb,
                         scratch_bits,
                         call_site.origin_token,
                     );
@@ -4146,17 +4298,30 @@ fn computeBodyProvenanceAndNllHorizon(
                     const ghost_inst = body.getInst(MirValueId.fromInt(ghost_raw));
                     if (!ghost_inst.op.isGhostAccessOpen() or ghost_inst.operands.lhs >= trie.place_map.len) continue;
                     const lookup = trie.place_map[ghost_inst.operands.lhs];
-                    const scratch_bits = detectContextScratchAccess(
+                    var scratch_bits = detectContextScratchAccess(
                         body,
                         pool,
                         sym_table,
                         PlaceId.fromInt(ghost_inst.operands.lhs),
                     );
+                    if (scratch_bits == 0 and param0_scratch_seed != 0 and last_arg_loc > 0 and
+                        body.places.items[ghost_inst.operands.lhs].base == last_arg_loc and
+                        isArenaType(pool, sym_table, body.locals.items[last_arg_loc].type_id))
+                    {
+                        scratch_bits = param0_scratch_seed;
+                    }
+                    const fb_projs = body.getPlaceProjections(PlaceId.fromInt(ghost_inst.operands.lhs));
+                    const fb_base = body.places.items[ghost_inst.operands.lhs].base;
+                    const fb_pointee_reb = (fb_projs.len > 0 and fb_projs[0].kind == .deref) or
+                        (ghost_inst.op == .ghost_access_let and fb_projs.len == 0 and
+                            fb_base < local_count and
+                            isPureBorrowedRefOrSliceType(pool, body.locals.items[fb_base].type_id));
                     const lid_idx = try mintOrCoarsenLoan(
                         &loan_list,
                         arena_alloc,
                         lookup,
                         ghost_inst.op == .ghost_access_inout,
+                        fb_pointee_reb,
                         scratch_bits,
                         call_site.origin_token,
                     );
@@ -4260,9 +4425,14 @@ fn computeBodyProvenanceAndNllHorizon(
                 switch (inst.op) {
                     .fn_addr => {
                         const unwrapped = pool.unwrapUnderlyingType(inst.type_id);
-                        if (!unwrapped.isError() and pool.getNode(unwrapped).tag == .raw_ptr_ty) {
-                            next_p.raw_ptr_state = .valid_live;
-                            next_p.max_depth = DEPTH_STATIC;
+                        if (!unwrapped.isError()) {
+                            const addr_tag = pool.getNode(unwrapped).tag;
+                            if (addr_tag == .raw_ptr_ty) {
+                                next_p.raw_ptr_state = .valid_live;
+                                next_p.max_depth = DEPTH_STATIC;
+                            } else if (addr_tag == .ref_ty) {
+                                next_p.max_depth = DEPTH_STATIC;
+                            }
                         }
                     },
                     .const_scalar => {
@@ -4384,12 +4554,15 @@ fn computeBodyProvenanceAndNllHorizon(
                                 }
 
                                 if (!is_user_raw_addr) {
-                                    const scratch_m = detectContextScratchAccess(
+                                    var scratch_m = detectContextScratchAccess(
                                         body,
                                         pool,
                                         sym_table,
                                         PlaceId.fromInt(inst.operands.lhs),
                                     );
+                                    if (scratch_m == 0) {
+                                        scratch_m = local_prov[place_rec.base].scratch_mask;
+                                    }
                                     if (scratch_m != 0) {
                                         next_p.scratch_mask |= scratch_m;
                                         if (next_p.scratch_open_token.isNone()) next_p.scratch_open_token = tok;
@@ -4407,7 +4580,8 @@ fn computeBodyProvenanceAndNllHorizon(
                             const place_rec = body.places.items[inst.operands.lhs];
                             if (place_rec.base < local_count and
                                 (hasProvenanceCarrier(pool, sym_table, inst.type_id) or
-                                    (local_prov[place_rec.base].max_depth >= DEPTH_FN_FRAME and
+                                    ((local_prov[place_rec.base].max_depth >= DEPTH_FN_FRAME or
+                                        local_prov[place_rec.base].scratch_mask != 0) and
                                         isContextAllocCarrier(pool, sym_table, inst.type_id))))
                             {
                                 next_p = try ValueProvenance.merge(
@@ -4484,7 +4658,8 @@ fn computeBodyProvenanceAndNllHorizon(
                     .aggregate_extract => {
                         if (inst.operands.lhs < inst_count and
                             (hasProvenanceCarrier(pool, sym_table, inst.type_id) or
-                                (val_prov[inst.operands.lhs].max_depth >= DEPTH_FN_FRAME and
+                                ((val_prov[inst.operands.lhs].max_depth >= DEPTH_FN_FRAME or
+                                    val_prov[inst.operands.lhs].scratch_mask != 0) and
                                     isContextAllocCarrier(pool, sym_table, inst.type_id))))
                         {
                             next_p = try ValueProvenance.merge(next_p, val_prov[inst.operands.lhs], arena_alloc);
@@ -4504,13 +4679,37 @@ fn computeBodyProvenanceAndNllHorizon(
                     .intrinsic_op => {
                         const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
                         if (ikind == .as_bytes or ikind == .view_bytes or
-                            ikind == .from_bytes or ikind == .subslice_make)
+                            ikind == .from_bytes or ikind == .subslice_make or
+                            ikind == .slice_split_at or ikind == .soa_vec_as_slice or
+                            ikind == .soa_vec_col_slice or ikind == .slice_from_raw_parts or
+                            ikind == .str_from_utf8_unchecked)
                         {
                             if (inst.operands.rhs > 0 and inst.operands.lhs < body.extra_args.items.len) {
                                 const src_v = body.extra_args.items[inst.operands.lhs];
                                 if (src_v < inst_count) {
                                     next_p = try ValueProvenance.merge(next_p, val_prov[src_v], arena_alloc);
                                 }
+                            }
+                        } else if (ikind == .soa_vec_new) {
+                            if (inst.operands.rhs > 0 and inst.operands.lhs < body.extra_args.items.len) {
+                                const src_v = body.extra_args.items[inst.operands.lhs];
+                                if (src_v < inst_count) {
+                                    next_p = try ValueProvenance.merge(next_p, val_prov[src_v], arena_alloc);
+                                }
+                            } else if (cur_ctx_stack.len > 0) {
+                                next_p = try ValueProvenance.merge(
+                                    next_p,
+                                    cur_ctx_stack.resolveAllocProvForMask(0b01, val_prov),
+                                    arena_alloc,
+                                );
+                            }
+                        } else if (ikind == .soa_vec_with_cap) {
+                            if (cur_ctx_stack.len > 0) {
+                                next_p = try ValueProvenance.merge(
+                                    next_p,
+                                    cur_ctx_stack.resolveAllocProvForMask(0b01, val_prov),
+                                    arena_alloc,
+                                );
                             }
                         } else if (ikind == .async_future_make or ikind == .async_spawn) {
                             // Skip metadata/group slots (`[0..2]`) so `TaskGroup` `&mut group` does not pin `TaskHandle`:
@@ -4600,7 +4799,21 @@ fn computeBodyProvenanceAndNllHorizon(
                         const word = body.extra_args.items[call_site.args_start + arg_i];
                         var arg_p = ValueProvenance{};
                         if (mode == .let_mode or mode == .sink_mode) {
-                            if (word < inst_count) arg_p = val_prov[word];
+                            if (word < inst_count) {
+                                arg_p = val_prov[word];
+                                const arg_val_ty = body.getInst(MirValueId.fromInt(word)).type_id;
+                                if (!arg_val_ty.isError() and
+                                    arg_p.raw_ptr_state == .unknown_or_non_ptr and
+                                    !hasProvenanceCarrier(pool, sym_table, arg_val_ty) and
+                                    !isContextAllocCarrier(pool, sym_table, arg_val_ty) and
+                                    !isAllocatorArgPlaceOrVal(body, pool, sym_table, mode, word) and
+                                    !isArenaArgPlaceOrVal(body, pool, sym_table, mode, word) and
+                                    !isContextArgPlaceOrVal(body, pool, sym_table, mode, word))
+                                {
+                                    arg_p.max_depth = 0;
+                                    arg_p.origin_local = .none;
+                                }
+                            }
                         } else if (word < body.places.items.len) {
                             const pl_rec = body.places.items[word];
                             if (pl_rec.base < local_count) {
@@ -4628,18 +4841,13 @@ fn computeBodyProvenanceAndNllHorizon(
                             }
                         }
 
-                        if (arg_i < 64 and ((ret_mask >> @intCast(arg_i)) & 1) != 0) {
-                            ret_p = try ValueProvenance.merge(ret_p, arg_p, arena_alloc);
-                        } else if (arg_p.scratch_mask != 0 and
-                            has_ret_prov and
-                            !isScratchResetCall(sym_table, call_site))
+                        if (arg_i < 64 and ((ret_mask >> @intCast(arg_i)) & 1) != 0 and
+                            (has_ret_prov or isContextAllocCarrier(pool, sym_table, call_site.ret_ty)))
                         {
-                            ret_p.scratch_mask |= arg_p.scratch_mask;
-                            if (ret_p.scratch_open_token.isNone()) {
-                                ret_p.scratch_open_token = call_site.origin_token;
-                            }
+                            ret_p = try ValueProvenance.merge(ret_p, arg_p, arena_alloc);
                         } else if (arg_i == 0 and isArenaArgPlaceOrVal(body, pool, sym_table, mode, word) and
-                            has_ret_prov)
+                            (has_ret_prov or isContextAllocCarrier(pool, sym_table, call_site.ret_ty) or
+                                hasRawPtrOrErrorPayload(pool, call_site.ret_ty)))
                         {
                             ret_p = try ValueProvenance.merge(ret_p, arg_p, arena_alloc);
                         } else if (arg_i == 0 and isAllocatorArgPlaceOrVal(body, pool, sym_table, mode, word) and
@@ -4647,6 +4855,14 @@ fn computeBodyProvenanceAndNllHorizon(
                             isContextAllocCarrier(pool, sym_table, call_site.ret_ty))
                         {
                             ret_p = try ValueProvenance.merge(ret_p, arg_p, arena_alloc);
+                        } else if (arg_p.scratch_mask != 0 and
+                            (has_ret_prov or isContextAllocCarrier(pool, sym_table, call_site.ret_ty)) and
+                            !isScratchResetCall(sym_table, call_site))
+                        {
+                            ret_p.scratch_mask |= arg_p.scratch_mask;
+                        }
+                        if (ret_p.scratch_mask != 0 and ret_p.scratch_open_token.isNone()) {
+                            ret_p.scratch_open_token = call_site.origin_token;
                         }
                     }
 
@@ -4682,19 +4898,44 @@ fn computeBodyProvenanceAndNllHorizon(
                         }
                     }
 
-                    // Special-case `scratch_scope(&mut ctx, conflict_mask)` -> selects complement `1 - i`:
-                    if (isScratchScopeHelperCall(sym_table, call_site) and call_site.args_len >= 2) {
-                        const mask_arg_mode = body.call_arg_modes.items[call_site.modes_start + 1];
-                        const mask_word = body.extra_args.items[call_site.args_start + 1];
-                        if ((mask_arg_mode == .let_mode or mask_arg_mode == .sink_mode) and mask_word < inst_count) {
-                            const conflict_bits = extractConstSmallU2(body, MirValueId.fromInt(mask_word)) orelse
-                                val_prov[mask_word].scratch_mask;
-                            ret_p.scratch_mask = switch (conflict_bits) {
-                                0b01 => 0b10,
-                                0b10 => 0b01,
-                                else => 0b01,
-                            };
+                    // Special-case `scratch_scope(&mut ctx, conflict_mask)` / `with_scratch(conflict, body)` -> complement `1 - i`:
+                    if (isScratchScopeHelperCall(sym_table, call_site) and call_site.args_len >= 1) {
+                        const selected_slot = resolveScratchScopeSelectedSlot(
+                            body,
+                            pool,
+                            sym_table,
+                            call_site,
+                            val_prov,
+                            local_prov,
+                        );
+                        if (!isScratchClosureHelperCall(body, pool, sym_table, call_site)) {
+                            ret_p.scratch_mask = selected_slot;
                             ret_p.scratch_open_token = call_site.origin_token;
+                        } else if (hasProvenanceCarrier(pool, sym_table, call_site.ret_ty) or
+                            isContextAllocCarrier(pool, sym_table, call_site.ret_ty))
+                        {
+                            const cb_arg_idx: usize = if (call_site.args_len >= 2) 1 else 0;
+                            const cb_word = body.extra_args.items[call_site.args_start + cb_arg_idx];
+                            if (resolveClosureInfoFromValue(body, cb_word, 0)) |clos_info| {
+                                const cb_sum_opt = try lookupCalleeSummary(
+                                    clos_info.def_id,
+                                    .none,
+                                    summaries,
+                                    key_to_slot,
+                                    sym_to_slot,
+                                    config,
+                                );
+                                if (cb_sum_opt) |cb_sum| {
+                                    const arena_bit: u64 = if (clos_info.capture_len < 64)
+                                        (@as(u64, 1) << @intCast(clos_info.capture_len))
+                                    else
+                                        0;
+                                    if ((cb_sum.ret_provenance_mask & arena_bit) != 0) {
+                                        ret_p.scratch_mask |= selected_slot;
+                                        ret_p.scratch_open_token = call_site.origin_token;
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -5148,17 +5389,27 @@ fn computeBodyProvenanceAndNllHorizon(
                                     }
                                 }
                                 const base_loc = body.places.items[word].base;
-                                if (base_loc < local_count and
-                                    body.getPlaceProjections(PlaceId.fromInt(word)).len > 0 and
-                                    body.getPlaceProjections(PlaceId.fromInt(word))[0].kind == .deref)
-                                {
-                                    cur_loans.unionInPlace(local_prov[base_loc].loan_mask);
-                                    cur_scratch |= local_prov[base_loc].scratch_mask;
-                                    recordLastUseTokens(
-                                        loan_list.items,
-                                        local_prov[base_loc].loan_mask,
-                                        call_site.origin_token,
-                                    );
+                                if (base_loc < local_count) {
+                                    const projs = body.getPlaceProjections(PlaceId.fromInt(word));
+                                    if (projs.len > 0 and projs[0].kind == .deref) {
+                                        cur_loans.unionInPlace(local_prov[base_loc].loan_mask);
+                                        cur_scratch |= local_prov[base_loc].scratch_mask;
+                                        recordLastUseTokens(
+                                            loan_list.items,
+                                            local_prov[base_loc].loan_mask,
+                                            call_site.origin_token,
+                                        );
+                                    } else if (mode != .set_mode and
+                                        !body.locals.items[base_loc].flags().is_arg and
+                                        local_prov[base_loc].scratch_mask != 0)
+                                    {
+                                        cur_loans.unionInPlace(local_prov[base_loc].loan_mask);
+                                        recordLastUseTokens(
+                                            loan_list.items,
+                                            local_prov[base_loc].loan_mask,
+                                            call_site.origin_token,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -5198,6 +5449,16 @@ fn computeBodyProvenanceAndNllHorizon(
                         PlaceId.fromInt(inst.operands.lhs),
                     );
                     if (scratch_m != 0) cur_scratch &= ~scratch_m;
+                    if (inst.operands.lhs < body.places.items.len) {
+                        const addr_base = body.places.items[inst.operands.lhs].base;
+                        if (addr_base < local_count and
+                            !body.locals.items[addr_base].flags().is_arg and
+                            local_prov[addr_base].scratch_mask != 0)
+                        {
+                            cur_loans.unionInPlace(local_prov[addr_base].loan_mask);
+                            recordLastUseTokens(loan_list.items, local_prov[addr_base].loan_mask, tok);
+                        }
+                    }
                 }
 
                 // Dereference read/write uses loans stored in the base reference local:
@@ -5211,6 +5472,13 @@ fn computeBodyProvenanceAndNllHorizon(
                         if (projs.len > 0 and projs[0].kind == .deref and base_loc < local_count) {
                             cur_loans.unionInPlace(local_prov[base_loc].loan_mask);
                             cur_scratch |= local_prov[base_loc].scratch_mask;
+                            recordLastUseTokens(loan_list.items, local_prov[base_loc].loan_mask, tok);
+                        } else if ((inst.op == .place_load or inst.op == .place_discriminant) and
+                            base_loc < local_count and
+                            !body.locals.items[base_loc].flags().is_arg and
+                            local_prov[base_loc].scratch_mask != 0)
+                        {
+                            cur_loans.unionInPlace(local_prov[base_loc].loan_mask);
                             recordLastUseTokens(loan_list.items, local_prov[base_loc].loan_mask, tok);
                         }
                     }
@@ -5397,9 +5665,20 @@ fn hasProvenanceCarrierBounded(
             const sym_idx = SymbolIndex.fromInt(node.rhs);
             if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) break :blk false;
             const sym = sym_table.getSymbol(sym_idx).*;
+            if (isStdCoreOrBuiltinNominal(sym_table, sym, "ArenaCheckpoint")) break :blk false;
             if (isStdCoreOrBuiltinNominal(sym_table, sym, "TaskHandle")) break :blk true;
             if (sym.target_scope.isNone()) break :blk false;
             const child_subst = type_system.NominalTypeSubst.fromNominal(pool, sym_table, unwrapped, sym, subst);
+            if (isStdCoreOrBuiltinNominal(sym_table, sym, "OwnPtr")) {
+                break :blk child_subst.len > 0 and hasProvenanceCarrierBounded(
+                    pool,
+                    sym_table,
+                    child_subst.vals[0],
+                    subst,
+                    depth + 1,
+                    memo,
+                );
+            }
             const active_subst = if (child_subst.len > 0) &child_subst else subst;
             for (sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
                 const mem_sym = sym_table.getSymbol(mem_idx).*;
@@ -5559,7 +5838,7 @@ fn isAllocatorType(pool: *const InternPool, sym_table: *const SymbolTable, type_
     if (base_node.tag != .struct_ty) return false;
     const sym_idx = SymbolIndex.fromInt(base_node.rhs);
     if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return false;
-    return std.mem.eql(u8, sym_table.getSymbol(sym_idx).name_text, "Allocator");
+    return type_system.CONTEXT_ALLOCATOR_NOMINAL_MAP.has(sym_table.getSymbol(sym_idx).name_text);
 }
 
 /// Returns `true` if call argument `(mode, word)` has `Allocator` type.
@@ -5657,9 +5936,21 @@ fn isContextAllocCarrierBounded(
             const sym_idx = SymbolIndex.fromInt(node.rhs);
             if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) break :blk false;
             const sym = sym_table.getSymbol(sym_idx).*;
+            if (isStdCoreOrBuiltinNominal(sym_table, sym, "ArenaCheckpoint")) break :blk false;
             if (CONTEXT_ALLOC_CARRIER_NAME_MAP.has(sym.name_text)) break :blk true;
             if (sym.target_scope.isNone()) break :blk false;
             const child_subst = type_system.NominalTypeSubst.fromNominal(pool, sym_table, unwrapped, sym, subst);
+            if (isStdCoreOrBuiltinNominal(sym_table, sym, "OwnPtr")) {
+                break :blk child_subst.len > 0 and isContextAllocCarrierBounded(
+                    pool,
+                    sym_table,
+                    child_subst.vals[0],
+                    subst,
+                    depth + 1,
+                    alloc_memo,
+                    prov_memo,
+                );
+            }
             const active_subst = if (child_subst.len > 0) &child_subst else subst;
             for (sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
                 const mem_sym = sym_table.getSymbol(mem_idx).*;
@@ -5942,7 +6233,9 @@ fn detectInstCtxAllocSlotRead(
         },
         .intrinsic_op => {
             const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
-            if (ikind == .fmt_value) return 0b01;
+            if (ikind == .fmt_value or
+                (ikind == .soa_vec_new and inst.operands.rhs == 0) or
+                ikind == .soa_vec_with_cap) return 0b01;
             if (ikind == .ctx_get) {
                 if (extractConstCtxSlotOrd(body, inst)) |slot_ord| {
                     if (slot_ord == 0) {
@@ -6010,18 +6303,323 @@ fn hasCallCtxAllocEffect(
 
 /// Returns `true` if `call_site` invokes a scratch reset/rewind method.
 fn isScratchResetCall(sym_table: *const SymbolTable, call_site: mir.MirCallSite) bool {
-    if (call_site.direct_symbol.isNone() or call_site.direct_symbol.asInt() >= sym_table.symbols.items.len) {
-        return false;
+    var sym_idx = call_site.direct_symbol;
+    if (sym_idx.isNone() and !call_site.direct_def_id.isNone()) {
+        sym_idx = sym_table.def_to_symbol.get(call_site.direct_def_id.asInt()) orelse .none;
     }
-    return SCRATCH_RESET_METHOD_MAP.has(sym_table.getSymbol(call_site.direct_symbol).name_text);
+    if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return false;
+    return SCRATCH_RESET_METHOD_MAP.has(sym_table.getSymbol(sym_idx).name_text);
+}
+
+/// Returns `true` if `call_site` is a 1-arg `with_scratch(closure)` or 2-arg `with_scratch(conflict, closure)` invocation.
+fn isScratchClosureHelperCall(
+    body: *const MirBody,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    call_site: mir.MirCallSite,
+) bool {
+    if (!isScratchScopeHelperCall(sym_table, call_site) or call_site.args_len == 0) return false;
+    const mode0 = body.call_arg_modes.items[call_site.modes_start];
+    const word0 = body.extra_args.items[call_site.args_start];
+    if (call_site.args_len == 1) {
+        return (mode0 == .let_mode or mode0 == .sink_mode) and word0 < body.insts.len and
+            (isClosureOrFnValueType(pool, body.getInst(MirValueId.fromInt(word0)).type_id) or
+                resolveClosureDefIdFromValue(body, word0, 0) != null);
+    }
+    if (isContextArgPlaceOrVal(body, pool, sym_table, mode0, word0)) return false;
+    const mode1 = body.call_arg_modes.items[call_site.modes_start + 1];
+    const word1 = body.extra_args.items[call_site.args_start + 1];
+    if ((mode1 == .let_mode or mode1 == .sink_mode) and word1 < body.insts.len) {
+        return isClosureOrFnValueType(pool, body.getInst(MirValueId.fromInt(word1)).type_id) or
+            resolveClosureDefIdFromValue(body, word1, 0) != null;
+    }
+    return false;
+}
+
+/// Resolves the complement scratch slot (`0b01`, `0b10`, `0b11`) selected by `scratch_scope` / `with_scratch`.
+fn resolveScratchScopeSelectedSlot(
+    body: *const MirBody,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    call_site: mir.MirCallSite,
+    val_prov: []const ValueProvenance,
+    local_prov: []const ValueProvenance,
+) u2 {
+    if (call_site.args_len == 0) return 0b01;
+    if (call_site.args_len == 1 and isScratchClosureHelperCall(body, pool, sym_table, call_site)) {
+        return 0b01;
+    }
+    const mode0 = body.call_arg_modes.items[call_site.modes_start];
+    const word0 = body.extra_args.items[call_site.args_start];
+    const conflict_idx: usize = if (call_site.args_len >= 2 and
+        isContextArgPlaceOrVal(body, pool, sym_table, mode0, word0)) 1 else 0;
+    if (conflict_idx >= call_site.args_len) return 0b01;
+    const cmode = body.call_arg_modes.items[call_site.modes_start + conflict_idx];
+    const cword = body.extra_args.items[call_site.args_start + conflict_idx];
+    var conflict_bits: u2 = 0;
+    if (cmode == .let_mode or cmode == .sink_mode) {
+        if (cword < val_prov.len) {
+            conflict_bits = extractConstSmallU2(body, MirValueId.fromInt(cword)) orelse
+                val_prov[cword].scratch_mask;
+        }
+    } else if (cword < body.places.items.len) {
+        conflict_bits = detectContextScratchAccess(body, pool, sym_table, PlaceId.fromInt(cword));
+        if (conflict_bits == 0) {
+            const base = body.places.items[cword].base;
+            if (base < local_prov.len) conflict_bits = local_prov[base].scratch_mask;
+        }
+    }
+    return switch (conflict_bits) {
+        0b01 => 0b10,
+        0b10 => 0b01,
+        0b11 => 0b11,
+        0 => 0b01,
+    };
+}
+
+/// Returns `true` if `call_site`'s callee declares an explicit `Context` formal parameter.
+fn calleeHasExplicitContextParam(
+    call_site: mir.MirCallSite,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+) bool {
+    var sym_idx = call_site.direct_symbol;
+    if (sym_idx.isNone() and !call_site.direct_def_id.isNone()) {
+        sym_idx = sym_table.def_to_symbol.get(call_site.direct_def_id.asInt()) orelse .none;
+    }
+    if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return false;
+    const fn_ty = pool.unwrapUnderlyingType(sym_table.getSymbol(sym_idx).type_id);
+    if (fn_ty.isError()) return false;
+    const sig = pool.getFnSignatureView(fn_ty) orelse return false;
+    for (0..sig.paramCount()) |p_i| {
+        if (type_system.isContextType(pool, sym_table, sig.getParamType(p_i))) return true;
+    }
+    return false;
+}
+
+/// Resolved closure `DefId` and capture count extracted from a `closure_make` SSA value.
+const ResolvedClosureInfo = struct {
+    def_id: DefId,
+    capture_len: u32,
+};
+
+/// Seeds `closure_scratch_seeds[slot_idx]` across `with_scratch(conflict, closure)` callbacks (`STD-01` §1.5).
+fn seedWithScratchClosureMasks(
+    bodies: []const MirBody,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    key_to_slot: *const std.AutoHashMapUnmanaged(u32, u32),
+    closure_scratch_seeds: []u2,
+) void {
+    var pass: usize = 0;
+    while (pass < 4) : (pass += 1) {
+        var changed = false;
+        for (bodies, 0..) |*body, slot_i| {
+            const self_seed = closure_scratch_seeds[slot_i];
+            var last_arena_arg_loc: usize = 0;
+            for (body.locals.items, 0..) |loc_item, loc_idx| {
+                if (loc_idx > 0 and loc_item.flags().is_arg) last_arena_arg_loc = loc_idx;
+            }
+            if (last_arena_arg_loc > 0 and
+                !isArenaType(pool, sym_table, body.locals.items[last_arena_arg_loc].type_id))
+            {
+                last_arena_arg_loc = 0;
+            }
+            for (body.calls.items) |cs| {
+                if (!isScratchClosureHelperCall(body, pool, sym_table, cs)) continue;
+                const selected: u2 = if (cs.args_len == 1)
+                    0b01
+                else switch (traceSimpleScratchMaskInBody(
+                    body,
+                    body.extra_args.items[cs.args_start],
+                    self_seed,
+                    last_arena_arg_loc,
+                    0,
+                )) {
+                    0b01 => 0b10,
+                    0b10 => 0b01,
+                    0b11 => 0b11,
+                    0 => 0b01,
+                };
+                const cb_idx: usize = if (cs.args_len >= 2) 1 else 0;
+                const cb_word = body.extra_args.items[cs.args_start + cb_idx];
+                if (resolveClosureDefIdFromValue(body, cb_word, 0)) |clos_def| {
+                    if (key_to_slot.get(clos_def.asInt())) |clos_slot| {
+                        const prev = closure_scratch_seeds[clos_slot];
+                        if ((prev | selected) != prev) {
+                            closure_scratch_seeds[clos_slot] = prev | selected;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (!changed) break;
+    }
+}
+
+/// Traces a value `val_raw` backward up to `10` SSA/local steps to detect `last_arena_arg_loc` (`self_seed`) provenance.
+fn traceSimpleScratchMaskInBody(
+    body: *const MirBody,
+    val_raw: u32,
+    self_seed: u2,
+    last_arena_arg_loc: usize,
+    depth: u8,
+) u2 {
+    if (depth > 10 or val_raw >= body.insts.len) return 0;
+    if (extractConstSmallU2(body, MirValueId.fromInt(val_raw))) |const_u2| return const_u2;
+    const inst = body.getInst(MirValueId.fromInt(val_raw));
+    switch (inst.op) {
+        .copy_val, .unary_op => return traceSimpleScratchMaskInBody(
+            body,
+            inst.operands.lhs,
+            self_seed,
+            last_arena_arg_loc,
+            depth + 1,
+        ),
+        .place_addr, .place_load => {
+            if (inst.operands.lhs < body.places.items.len) {
+                const pl = body.places.items[inst.operands.lhs];
+                if (last_arena_arg_loc > 0 and pl.base == last_arena_arg_loc and self_seed != 0) {
+                    return self_seed;
+                }
+                for (0..body.insts.len) |st_i| {
+                    const st = body.getInst(MirValueId.fromInt(@intCast(st_i)));
+                    if (st.op == .place_store and st.operands.lhs < body.places.items.len and
+                        body.places.items[st.operands.lhs].base == pl.base)
+                    {
+                        const scratch_mask = traceSimpleScratchMaskInBody(
+                            body,
+                            st.operands.rhs,
+                            self_seed,
+                            last_arena_arg_loc,
+                            depth + 1,
+                        );
+                        if (scratch_mask != 0) return scratch_mask;
+                    }
+                }
+            }
+            return 0;
+        },
+        .aggregate_make => {
+            const agg_k: AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+            if (agg_k == .tagged_variant) {
+                const elem_len = inst.operands.rhs & 0xFFFF;
+                var mask: u2 = 0;
+                for (body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + elem_len]) |sub_v| {
+                    mask |= traceSimpleScratchMaskInBody(
+                        body,
+                        sub_v,
+                        self_seed,
+                        last_arena_arg_loc,
+                        depth + 1,
+                    );
+                }
+                return mask;
+            }
+            return 0;
+        },
+        .block_param => {
+            const owner_bb = MirBlockId.fromInt(inst.operands.lhs);
+            if (owner_bb.asInt() >= body.blocks.items.len) return 0;
+            var mask: u2 = 0;
+            for (body.getPredEdges(owner_bb)) |peid| {
+                const edge = body.extra_edges.items[peid.asInt()];
+                if (edge.src_bb.asInt() >= body.blocks.items.len) continue;
+                const src_term = body.blocks.items[edge.src_bb.asInt()].terminator;
+                if (src_term.kind == .call and src_term.cond_or_val < body.calls.items.len and inst.operands.rhs == 0) {
+                    const cs = body.calls.items[src_term.cond_or_val];
+                    for (0..cs.args_len) |arg_i| {
+                        const arg_mode = body.call_arg_modes.items[cs.modes_start + arg_i];
+                        const arg_word = body.extra_args.items[cs.args_start + arg_i];
+                        if (arg_mode == .let_mode or arg_mode == .sink_mode) {
+                            mask |= traceSimpleScratchMaskInBody(
+                                body,
+                                arg_word,
+                                self_seed,
+                                last_arena_arg_loc,
+                                depth + 1,
+                            );
+                        } else if (arg_word < body.places.items.len and last_arena_arg_loc > 0 and
+                            body.places.items[arg_word].base == last_arena_arg_loc)
+                        {
+                            mask |= self_seed;
+                        }
+                    }
+                } else if (inst.operands.rhs < edge.args_len) {
+                    mask |= traceSimpleScratchMaskInBody(
+                        body,
+                        body.extra_args.items[edge.args_start + inst.operands.rhs],
+                        self_seed,
+                        last_arena_arg_loc,
+                        depth + 1,
+                    );
+                }
+            }
+            return mask;
+        },
+        else => return 0,
+    }
+}
+
+/// Resolves a closure SSA value `val_raw` to its underlying `closure_make` `DefId` and `capture_len` if unique.
+fn resolveClosureInfoFromValue(body: *const MirBody, val_raw: u32, depth: u8) ?ResolvedClosureInfo {
+    if (depth > 8 or val_raw >= body.insts.len) return null;
+    const inst = body.getInst(MirValueId.fromInt(val_raw));
+    switch (inst.op) {
+        .copy_val, .unary_op => return resolveClosureInfoFromValue(body, inst.operands.lhs, depth + 1),
+        .fn_addr => {
+            const fn_def = DefId.fromInt(inst.operands.lhs);
+            if (!fn_def.isNone()) return .{ .def_id = fn_def, .capture_len = 0 };
+            return null;
+        },
+        .aggregate_make => {
+            const agg_k: AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+            if (agg_k == .closure_make) {
+                const cap_len: u32 = if (inst.operands.rhs < body.extra_args.items.len)
+                    body.extra_args.items[inst.operands.rhs]
+                else
+                    0;
+                return .{
+                    .def_id = DefId.fromInt(inst.operands.lhs),
+                    .capture_len = cap_len,
+                };
+            }
+            return null;
+        },
+        .place_load => {
+            if (inst.operands.lhs < body.places.items.len) {
+                const base = body.places.items[inst.operands.lhs].base;
+                for (0..body.insts.len) |st_i| {
+                    const st = body.getInst(MirValueId.fromInt(@intCast(st_i)));
+                    if (st.op == .place_store and st.operands.lhs < body.places.items.len and
+                        body.places.items[st.operands.lhs].base == base)
+                    {
+                        if (resolveClosureInfoFromValue(body, st.operands.rhs, depth + 1)) |found| {
+                            return found;
+                        }
+                    }
+                }
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
+/// Resolves a closure SSA value `val_raw` to its underlying `closure_make` `DefId` if unique.
+fn resolveClosureDefIdFromValue(body: *const MirBody, val_raw: u32, depth: u8) ?DefId {
+    return if (resolveClosureInfoFromValue(body, val_raw, depth)) |info| info.def_id else null;
 }
 
 /// Returns `true` if `call_site` is a `scratch_scope` ping-pong selector helper.
 fn isScratchScopeHelperCall(sym_table: *const SymbolTable, call_site: mir.MirCallSite) bool {
-    if (call_site.direct_symbol.isNone() or call_site.direct_symbol.asInt() >= sym_table.symbols.items.len) {
-        return false;
+    var sym_idx = call_site.direct_symbol;
+    if (sym_idx.isNone() and !call_site.direct_def_id.isNone()) {
+        sym_idx = sym_table.def_to_symbol.get(call_site.direct_def_id.asInt()) orelse .none;
     }
-    return SCRATCH_SELECT_METHOD_MAP.has(sym_table.getSymbol(call_site.direct_symbol).name_text);
+    if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return false;
+    return SCRATCH_SELECT_METHOD_MAP.has(sym_table.getSymbol(sym_idx).name_text);
 }
 
 /// Returns `true` if call argument `(mode, word)` has `Arena` or `BumpArena` type.
@@ -6057,10 +6655,30 @@ fn extractConstSmallU2(body: *const MirBody, val_id: MirValueId) ?u2 {
 
 // --------------- Recursive SCC Summary Pre-Pass ---------------
 
+/// Returns `true` if `raw_ty` unwraps to `.raw_ptr_ty` or an optional/error-union wrapping `.raw_ptr_ty`.
+fn hasRawPtrOrErrorPayload(pool: *const InternPool, raw_ty: TypeId) bool {
+    if (raw_ty.isError()) return false;
+    const unwrapped = pool.unwrapUnderlyingType(raw_ty);
+    if (unwrapped.isPrimitive()) return false;
+    const node = pool.getNode(unwrapped);
+    return switch (node.tag) {
+        .raw_ptr_ty => true,
+        .optional_ty, .result_ty => hasRawPtrOrErrorPayload(pool, TypeId.fromInt(node.lhs)),
+        else => false,
+    };
+}
+
 /// Resolves whether `type_id` unwraps to a `.closure_ty`.
 fn isClosureType(pool: *const InternPool, type_id: TypeId) bool {
     if (type_id.isError()) return false;
     return pool.getNode(pool.unwrapUnderlyingType(type_id)).tag == .closure_ty;
+}
+
+/// Resolves whether `type_id` unwraps to a `.closure_ty` or `.fn_ty` callable value.
+fn isClosureOrFnValueType(pool: *const InternPool, type_id: TypeId) bool {
+    if (type_id.isError()) return false;
+    const tag = pool.getNode(pool.unwrapUnderlyingType(type_id)).tag;
+    return tag == .closure_ty or tag == .fn_ty;
 }
 
 /// Resolves a local variable's source identifier text (`""` for anonymous temporaries).
@@ -6234,6 +6852,23 @@ fn convergeRecursiveSccSummaries(
                                 next_touch |= csum.contractsScratch().scratch_touch_mask;
                                 next_rewind |= csum.contractsScratch().scratch_rewind_mask;
                             }
+                        }
+                    }
+                    if (isScratchClosureHelperCall(body, pool, sym_table, call_site)) {
+                        const sel = resolveScratchScopeSelectedSlot(
+                            body,
+                            pool,
+                            sym_table,
+                            call_site,
+                            horizon.val_prov,
+                            horizon.local_prov,
+                        );
+                        next_touch |= sel;
+                        next_rewind |= sel;
+                    } else if (callee_opt) |csum| {
+                        if (!calleeHasExplicitContextParam(call_site, pool, sym_table)) {
+                            next_touch |= csum.contractsScratch().scratch_touch_mask;
+                            next_rewind |= csum.contractsScratch().scratch_rewind_mask;
                         }
                     }
                     if (callee_opt) |csum| {
@@ -6708,17 +7343,57 @@ fn hasMovedUninitDescendant(
     return false;
 }
 
-/// Detects `cond_br` non-null pointer guard `ptr != null` / `ptr == null`, returning refined `(local_idx, nonnull_on_then)`.
+/// Detects `cond_br` non-null pointer guard (`ptr != null`, `ptr == null`, `ptr.is_null()`, `not ptr.is_null()`).
 fn detectRawPtrNullGuard(
     body: *const MirBody,
     pool: *const InternPool,
     cond_val: MirValueId,
 ) ?struct { local_idx: u32, is_nonnull_on_then: bool } {
-    if (cond_val.asInt() >= body.insts.len) return null;
-    const inst = body.getInst(cond_val);
-    if (inst.op != .bin_op) return null;
-    const bop: BinOpKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
-    if (bop != .ne and bop != .eq) return null;
+    var cur_id = cond_val.asInt();
+    var invert = false;
+    var hops: u8 = 0;
+    while (cur_id < body.insts.len and hops < 12) : (hops += 1) {
+        const step = body.getInst(MirValueId.fromInt(cur_id));
+        if (step.op == .copy_val) {
+            cur_id = step.operands.lhs;
+            continue;
+        }
+        if (step.op == .unary_op) {
+            const uop: UnaryOpKind = @fromBackingInt(@intCast(@as(u8, @truncate(step.aux_u16))));
+            if (uop == .bool_not) {
+                invert = !invert;
+                cur_id = step.operands.lhs;
+                continue;
+            }
+        }
+        if (step.op == .place_load and step.operands.lhs < body.places.items.len) {
+            const pl_rec = body.places.items[step.operands.lhs];
+            if (pl_rec.proj_len == 0) {
+                var unique_rhs: u32 = mir.NONE_U32;
+                var store_count: u32 = 0;
+                for (body.blocks.items, 0..) |_, b_i| {
+                    for (body.getBlockInsts(MirBlockId.fromInt(@intCast(b_i)))) |cand_vid| {
+                        const cand = body.getInst(cand_vid);
+                        if (cand.op == .place_store and cand.operands.lhs < body.places.items.len and
+                            body.places.items[cand.operands.lhs].base == pl_rec.base)
+                        {
+                            store_count += 1;
+                            if (body.places.items[cand.operands.lhs].proj_len == 0) {
+                                unique_rhs = cand.operands.rhs;
+                            }
+                        }
+                    }
+                }
+                if (store_count == 1 and unique_rhs < body.insts.len) {
+                    cur_id = unique_rhs;
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    if (cur_id >= body.insts.len) return null;
+    const inst = body.getInst(MirValueId.fromInt(cur_id));
 
     const isZeroPtrConst = struct {
         //! Local helper checking whether `val_raw` peels to a zero/null pointer constant.
@@ -6757,14 +7432,28 @@ fn detectRawPtrNullGuard(
         }
     }.check;
 
+    if (inst.op == .intrinsic_op and inst.aux_u16 == @backingInt(MirIntrinsicKind.ptr_is_null)) {
+        const ptr_arg = if (inst.operands.rhs == 1 and inst.operands.lhs < body.extra_args.items.len)
+            body.extra_args.items[inst.operands.lhs]
+        else
+            inst.operands.lhs;
+        if (extractLoadedPtrLocal(body, pool, ptr_arg)) |lid_idx| {
+            return .{ .local_idx = lid_idx, .is_nonnull_on_then = invert };
+        }
+        return null;
+    }
+    if (inst.op != .bin_op) return null;
+    const bop: BinOpKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+    if (bop != .ne and bop != .eq) return null;
+
     if (isZeroPtrConst(body, inst.operands.rhs)) {
         if (extractLoadedPtrLocal(body, pool, inst.operands.lhs)) |lid_idx| {
-            return .{ .local_idx = lid_idx, .is_nonnull_on_then = (bop == .ne) };
+            return .{ .local_idx = lid_idx, .is_nonnull_on_then = (bop == .ne) != invert };
         }
     }
     if (isZeroPtrConst(body, inst.operands.lhs)) {
         if (extractLoadedPtrLocal(body, pool, inst.operands.rhs)) |lid_idx| {
-            return .{ .local_idx = lid_idx, .is_nonnull_on_then = (bop == .ne) };
+            return .{ .local_idx = lid_idx, .is_nonnull_on_then = (bop == .ne) != invert };
         }
     }
     return null;
@@ -6968,6 +7657,15 @@ fn detectFfiNullBranchGuard(
                         cond_val = unique_rhs;
                         continue;
                     }
+                }
+            }
+            if (inst.op == .intrinsic_op and inst.aux_u16 == @backingInt(MirIntrinsicKind.ptr_is_null)) {
+                const ptr_arg = if (inst.operands.rhs == 1 and inst.operands.lhs < body.extra_args.items.len)
+                    body.extra_args.items[inst.operands.lhs]
+                else
+                    inst.operands.lhs;
+                if (resolveValueFfiSlot(body, val_to_ssa_ffi_slot, ptr_arg, true)) |slot_idx| {
+                    return .{ .slot_idx = slot_idx, .is_nonnull_edge = !is_true_branch };
                 }
             }
             if (inst.op == .bin_op) {
@@ -8291,6 +8989,11 @@ fn computeBlockStepHorizons(
                         if (projs.len > 0 and projs[0].kind == .deref and base_loc < local_count) {
                             cur_loans.unionInPlace(horizon.local_prov[base_loc].loan_mask);
                             cur_scratch |= horizon.local_prov[base_loc].scratch_mask;
+                        } else if (mode != .set_mode and base_loc < local_count and
+                            !body.locals.items[base_loc].flags().is_arg and
+                            horizon.local_prov[base_loc].scratch_mask != 0)
+                        {
+                            cur_loans.unionInPlace(horizon.local_prov[base_loc].loan_mask);
                         }
                     }
                 }
@@ -8334,6 +9037,18 @@ fn computeBlockStepHorizons(
         loans_before_out[pos_rev] = try cur_loans.clone(arena_alloc);
         scratch_before_out[pos_rev] = cur_scratch;
 
+        if ((inst.op == .place_addr or inst.op == .soa_column_slice) and
+            inst.operands.lhs < body.places.items.len)
+        {
+            const addr_base = body.places.items[inst.operands.lhs].base;
+            if (addr_base < local_count and
+                !body.locals.items[addr_base].flags().is_arg and
+                horizon.local_prov[addr_base].scratch_mask != 0)
+            {
+                cur_loans.unionInPlace(horizon.local_prov[addr_base].loan_mask);
+            }
+        }
+
         if (inst.op == .place_load or inst.op == .place_store or
             inst.op == .place_discriminant or inst.op == .place_set_discrim)
         {
@@ -8343,6 +9058,12 @@ fn computeBlockStepHorizons(
                 if (projs.len > 0 and projs[0].kind == .deref and base_loc < local_count) {
                     cur_loans.unionInPlace(horizon.local_prov[base_loc].loan_mask);
                     cur_scratch |= horizon.local_prov[base_loc].scratch_mask;
+                } else if ((inst.op == .place_load or inst.op == .place_discriminant) and
+                    base_loc < local_count and
+                    !body.locals.items[base_loc].flags().is_arg and
+                    horizon.local_prov[base_loc].scratch_mask != 0)
+                {
+                    cur_loans.unionInPlace(horizon.local_prov[base_loc].loan_mask);
                 }
             }
         }
@@ -8644,6 +9365,7 @@ fn isEveryLinearLeafTaskHandleType(
             const sym_idx = SymbolIndex.fromInt(node.rhs);
             if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) break :blk false;
             const sym = sym_table.getSymbol(sym_idx).*;
+            if (isStdCoreOrBuiltinNominal(sym_table, sym, "ArenaCheckpoint")) break :blk false;
             if (isStdCoreOrBuiltinNominal(sym_table, sym, "TaskHandle")) break :blk true;
             if (sym.contract_flags.is_linear or type_system.LINEAR_BUILTIN_TYPE_MAP.has(sym.name_text)) {
                 break :blk false;
@@ -8921,6 +9643,391 @@ fn doesSpawnedFutureHoldPrePollLinearCapture(
     return false;
 }
 
+/// Marks `MovePathFlags.is_arena_drop_elided` on local `AutoDrop` containers satisfying all 4 soundness conditions
+/// of `STD-01` §1.5: (1) `TrivialDrop` elements, (2) bump-arena construction (`.in_arena` or scoped `with context.allocator`),
+/// (3) every write to the local is bump-arena-proven, and (4) never passed by `&mut`/`&raw mut` to non-whitelisted functions.
+fn markSoundArenaContainerDropElisions(
+    body: *const MirBody,
+    trie: *MovePathTrie,
+    horizon: *const BodyProvenanceHorizon,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+) void {
+    const local_count = body.locals.items.len;
+    const limit = @min(local_count, trie.nodes.len);
+    for (1..limit) |loc_i| {
+        const loc = body.locals.items[loc_i];
+        if (loc.flags().is_arg or loc.flags().is_return_slot) continue;
+        if (trie.nodes[loc_i].proj_kind_raw != 0xFF) continue;
+        var fl = trie.nodes[loc_i].flags();
+        if (!fl.is_auto_drop) continue;
+
+        // [1] Container & `TrivialDrop` element check:
+        if (!isContainerWithTrivialDropElements(pool, sym_table, loc.type_id)) continue;
+
+        // [2] & [3] Every `place_store` rooted at `loc_i` must write the unprojected root (`proj_len == 0`)
+        // from an arena-proven constructor, and `>= 1` store must exist:
+        var store_count: u32 = 0;
+        var is_all_arena_init = true;
+        for (0..body.insts.len) |inst_i| {
+            const inst = body.getInst(MirValueId.fromInt(@intCast(inst_i)));
+            if (inst.op != .place_store or inst.operands.lhs >= body.places.items.len) continue;
+            const pl = body.places.items[inst.operands.lhs];
+            if (pl.base != loc_i) continue;
+            if (pl.proj_len != 0) {
+                is_all_arena_init = false;
+                break;
+            }
+            store_count += 1;
+            if (!isValueProvenBumpArenaContainerInit(body, horizon, pool, sym_table, loc, inst.operands.rhs, 0)) {
+                is_all_arena_init = false;
+                break;
+            }
+        }
+        if (store_count == 0 or !is_all_arena_init) continue;
+
+        // [4] `loc_i` (and all sub-projections) is never passed as `&mut` / `&out` / `&raw mut` to non-whitelisted operations:
+        if (hasUnsafeContainerHeaderMutAlias(body, sym_table, @intCast(loc_i))) continue;
+
+        fl.is_arena_drop_elided = true;
+        trie.nodes[loc_i].flags_raw = @bitCast(fl);
+    }
+}
+
+/// Resolves the nominal struct name of `raw_ty` (or `""` when `raw_ty` is not a `struct_ty`).
+fn lookupNominalStructName(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    raw_ty: TypeId,
+) []const u8 {
+    const unwrapped = pool.unwrapUnderlyingType(raw_ty);
+    if (unwrapped.isError()) return "";
+    const node = pool.getNode(unwrapped);
+    if (node.tag != .struct_ty) return "";
+    const sym_idx = SymbolIndex.fromInt(node.rhs);
+    if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return "";
+    return sym_table.getSymbol(sym_idx).name_text;
+}
+
+/// Returns `true` when `raw_ty` is `#soa Vec[S]` or a `std_core` / built-in container whose generic elements are `TrivialDrop`.
+fn isContainerWithTrivialDropElements(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    raw_ty: TypeId,
+) bool {
+    const unwrapped = pool.unwrapUnderlyingType(raw_ty);
+    if (unwrapped.isError() or unwrapped == .never_ty) return false;
+    const node = pool.getNode(unwrapped);
+    if (node.tag == .soa_vec_ty) {
+        const elem_ty = TypeId.fromInt(node.lhs);
+        return !elem_ty.isError() and elem_ty != .never_ty and
+            type_system.isTrivialDropType(pool, sym_table, elem_ty);
+    }
+    if (node.tag != .struct_ty) return false;
+    const sym_idx = SymbolIndex.fromInt(node.rhs);
+    if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return false;
+    const sym = sym_table.getSymbol(sym_idx).*;
+    if (!type_system.AUTO_DROP_CONTAINER_MAP.has(sym.name_text)) return false;
+
+    const raw_args = pool.getGenericTypeArgs(unwrapped);
+    if (!sym.target_scope.isNone()) {
+        var arg_idx: usize = 0;
+        var type_param_count: usize = 0;
+        for (sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
+            const mem_sym = sym_table.getSymbol(mem_idx).*;
+            if (mem_sym.kind == .type_param_sym) {
+                type_param_count += 1;
+                if (arg_idx >= raw_args.len) return false;
+                const arg_ty = TypeId.fromInt(raw_args[arg_idx]);
+                arg_idx += 1;
+                if (arg_ty.isError() or arg_ty == .never_ty or
+                    !type_system.isTrivialDropType(pool, sym_table, arg_ty))
+                {
+                    return false;
+                }
+            } else if (mem_sym.kind == .const_param_sym) {
+                if (arg_idx >= raw_args.len) return false;
+                arg_idx += 1;
+            }
+        }
+        if (type_param_count > 0) return true;
+    }
+
+    for (raw_args) |raw_arg| {
+        const arg_ty = TypeId.fromInt(raw_arg);
+        if (arg_ty.isError() or arg_ty == .never_ty or
+            !type_system.isTrivialDropType(pool, sym_table, arg_ty))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Checks whether SSA `val_raw` originates exclusively from `.in_arena` or a container constructor inside an arena `with` scope.
+fn isValueProvenBumpArenaContainerInit(
+    body: *const MirBody,
+    horizon: *const BodyProvenanceHorizon,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    loc: mir.LocalDecl,
+    val_raw: u32,
+    depth: u8,
+) bool {
+    if (depth > 8 or val_raw >= body.insts.len) return false;
+    const inst = body.getInst(MirValueId.fromInt(val_raw));
+    switch (inst.op) {
+        .copy_val => return isValueProvenBumpArenaContainerInit(
+            body,
+            horizon,
+            pool,
+            sym_table,
+            loc,
+            inst.operands.lhs,
+            depth + 1,
+        ),
+        .intrinsic_op => {
+            const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+            if (ikind == .soa_vec_new) {
+                if (inst.operands.rhs >= 1) return true;
+                return loc.region_raw != 0 or
+                    (val_raw < horizon.val_prov.len and horizon.val_prov[val_raw].max_depth >= DEPTH_LOCAL_REGION_BASE);
+            }
+            if (ikind == .soa_vec_with_cap) {
+                return loc.region_raw != 0 or
+                    (val_raw < horizon.val_prov.len and horizon.val_prov[val_raw].max_depth >= DEPTH_LOCAL_REGION_BASE);
+            }
+            return false;
+        },
+        .block_param => {
+            const owner_bb = MirBlockId.fromInt(inst.operands.lhs);
+            if (owner_bb.asInt() >= body.blocks.items.len) return false;
+            const preds = body.getPredEdges(owner_bb);
+            if (preds.len == 0) return false;
+            for (preds) |peid| {
+                const edge = body.extra_edges.items[peid.asInt()];
+                if (edge.src_bb.asInt() >= body.blocks.items.len) return false;
+                const src_bb = edge.src_bb.asInt();
+                const src_term = body.blocks.items[src_bb].terminator;
+                if (src_term.kind == .call and src_term.cond_or_val < body.calls.items.len and inst.operands.rhs == 0) {
+                    const cs = body.calls.items[src_term.cond_or_val];
+                    const callee_name = lookupCallSiteMethodName(sym_table, cs);
+                    if (std.mem.eql(u8, callee_name, "in_arena") and cs.args_len >= 1) {
+                        continue;
+                    }
+                    if (CONTAINER_CTX_CTOR_NAME_MAP.has(callee_name)) {
+                        const container_name = lookupNominalStructName(pool, sym_table, loc.type_id);
+                        if (!std.mem.eql(u8, container_name, "String") and
+                            !std.mem.eql(u8, container_name, "SmallVec"))
+                        {
+                            const is_scoped_arena_ctx = (src_bb < horizon.block_ctx_alloc0_prov_out.len and
+                                horizon.block_ctx_alloc0_prov_out[src_bb].max_depth >= DEPTH_LOCAL_REGION_BASE and
+                                isOriginLocalBumpArena(body, pool, sym_table, horizon.block_ctx_alloc0_prov_out[src_bb].origin_local)) or
+                                (loc.region_raw != 0 and val_raw < horizon.val_prov.len and
+                                    horizon.val_prov[val_raw].max_depth >= DEPTH_LOCAL_REGION_BASE and
+                                    isOriginLocalBumpArena(body, pool, sym_table, horizon.val_prov[val_raw].origin_local));
+                            if (is_scoped_arena_ctx) continue;
+                        }
+                    }
+                    return false;
+                }
+                if (inst.operands.rhs >= edge.args_len) return false;
+                const edge_val = body.extra_args.items[edge.args_start + inst.operands.rhs];
+                if (!isValueProvenBumpArenaContainerInit(body, horizon, pool, sym_table, loc, edge_val, depth + 1)) {
+                    return false;
+                }
+            }
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// Checks whether `origin_local` (from `with context.allocator = &mut arena`) originates from an `Arena` / `FixedBuffer`.
+fn isOriginLocalBumpArena(
+    body: *const MirBody,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    origin_lid: LocalId,
+) bool {
+    if (origin_lid.isNone() or origin_lid.asInt() >= body.locals.items.len) return false;
+    const orig_ty = body.locals.items[origin_lid.asInt()].type_id;
+    if (isArenaType(pool, sym_table, orig_ty)) return true;
+    for (0..body.insts.len) |inst_i| {
+        const inst = body.getInst(MirValueId.fromInt(@intCast(inst_i)));
+        if (inst.op == .place_store and inst.operands.lhs < body.places.items.len and
+            body.places.items[inst.operands.lhs].base == origin_lid.asInt())
+        {
+            const rhs_id = inst.operands.rhs;
+            if (rhs_id < body.insts.len) {
+                const rhs_inst = body.getInst(MirValueId.fromInt(rhs_id));
+                if (rhs_inst.op == .block_param) {
+                    const obb = MirBlockId.fromInt(rhs_inst.operands.lhs);
+                    if (obb.asInt() < body.blocks.items.len) {
+                        for (body.getPredEdges(obb)) |peid| {
+                            const ed = body.extra_edges.items[peid.asInt()];
+                            if (ed.src_bb.asInt() >= body.blocks.items.len) continue;
+                            const sterm = body.blocks.items[ed.src_bb.asInt()].terminator;
+                            if (sterm.kind == .call and sterm.cond_or_val < body.calls.items.len) {
+                                const cs = body.calls.items[sterm.cond_or_val];
+                                if (cs.args_len >= 1 and std.mem.eql(u8, lookupCallSiteMethodName(sym_table, cs), "as_handle")) {
+                                    const m0 = body.call_arg_modes.items[cs.modes_start];
+                                    const w0 = body.extra_args.items[cs.args_start];
+                                    if (isArenaArgPlaceOrVal(body, pool, sym_table, m0, w0)) return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/// Resolves the unmangled method identifier of `cs` (stripping `$monoN` suffix when monomorphized).
+fn lookupCallSiteMethodName(sym_table: *const SymbolTable, cs: mir.MirCallSite) []const u8 {
+    var sym_idx = cs.direct_symbol;
+    if (sym_idx.isNone() and !cs.direct_def_id.isNone()) {
+        sym_idx = sym_table.def_to_symbol.get(cs.direct_def_id.asInt()) orelse .none;
+    }
+    if (!sym_idx.isNone() and sym_idx.asInt() < sym_table.symbols.items.len) {
+        return sym_table.getSymbol(sym_idx).name_text;
+    }
+    return "";
+}
+
+/// Resolves the unmangled method name of `cs` across both `sym_table` and specialized `MirBody.name` (`Foo.push$mono0`).
+fn lookupCallSiteMethodNameInBody(
+    body: *const MirBody,
+    sym_table: *const SymbolTable,
+    cs: mir.MirCallSite,
+) []const u8 {
+    const direct = lookupCallSiteMethodName(sym_table, cs);
+    if (direct.len > 0) return direct;
+    _ = body;
+    return "";
+}
+
+/// Checks whether `loc_u32` (or any projected sub-place) ever escapes via `&mut`, `&out`, or `&raw mut` to a non-whitelisted sink.
+fn hasUnsafeContainerHeaderMutAlias(
+    body: *const MirBody,
+    sym_table: *const SymbolTable,
+    loc_u32: u32,
+) bool {
+    for (body.calls.items) |cs| {
+        for (0..cs.args_len) |arg_i| {
+            const mode = body.call_arg_modes.items[cs.modes_start + arg_i];
+            const word = body.extra_args.items[cs.args_start + arg_i];
+            if (mode == .set_mode and word < body.places.items.len) {
+                const pl = body.places.items[word];
+                if (pl.base == loc_u32) return true;
+            } else if (mode == .inout_mode and word < body.places.items.len) {
+                const pl = body.places.items[word];
+                if (pl.base == loc_u32) {
+                    if (pl.proj_len != 0) return true;
+                    const mname = lookupCallSiteMethodNameInBody(body, sym_table, cs);
+                    if (arg_i != 0 or !SAFE_CONTAINER_MUT_METHOD_MAP.has(mname)) return true;
+                }
+            }
+        }
+    }
+
+    for (0..body.insts.len) |inst_i| {
+        const inst = body.getInst(MirValueId.fromInt(@intCast(inst_i)));
+        if (inst.op != .place_addr or (inst.operands.rhs != 1 and inst.operands.rhs != 3)) continue;
+        if (inst.operands.lhs >= body.places.items.len) continue;
+        const pl = body.places.items[inst.operands.lhs];
+        if (pl.base != loc_u32) continue;
+        if (pl.proj_len != 0 or inst.operands.rhs == 3) return true;
+
+        // `&mut container` (`rhs == 1`): every SSA consumer must be arg `0` of a whitelisted method or `soa_vec_*` intrinsic:
+        const addr_raw: u32 = @intCast(inst_i);
+        if (!isMutContainerAddrUsedSafely(body, sym_table, addr_raw)) return true;
+    }
+    return false;
+}
+
+/// Verifies that `addr_raw` (`&mut container`) is exclusively consumed by whitelisted inherent container methods or `soa_vec_*`.
+fn isMutContainerAddrUsedSafely(
+    body: *const MirBody,
+    sym_table: *const SymbolTable,
+    addr_raw: u32,
+) bool {
+    for (0..body.insts.len) |u_i| {
+        if (u_i == addr_raw) continue;
+        const u_inst = body.getInst(MirValueId.fromInt(@intCast(u_i)));
+        switch (u_inst.op) {
+            .copy_val => {
+                if (u_inst.operands.lhs == addr_raw and !isMutContainerAddrUsedSafely(body, sym_table, @intCast(u_i))) {
+                    return false;
+                }
+            },
+            .intrinsic_op => {
+                const ikind: MirIntrinsicKind = @fromBackingInt(u_inst.aux_u16);
+                if (ikind.hasExtraArgs() and u_inst.operands.rhs > 0) {
+                    const args = body.extra_args.items[u_inst.operands.lhs .. u_inst.operands.lhs + u_inst.operands.rhs];
+                    for (args, 0..) |a_raw, a_idx| {
+                        if (a_raw == addr_raw) {
+                            const is_safe_soa = a_idx == 0 and switch (ikind) {
+                                .soa_vec_len,
+                                .soa_vec_cap,
+                                .soa_vec_push,
+                                .soa_vec_pop,
+                                .soa_vec_clear,
+                                .soa_vec_reserve,
+                                .soa_vec_as_slice,
+                                .soa_vec_col_slice,
+                                => true,
+                                else => false,
+                            };
+                            if (!is_safe_soa) return false;
+                        }
+                    }
+                }
+            },
+            .place_store, .aggregate_make, .aggregate_insert, .unary_op, .bin_op => {
+                if (u_inst.operands.lhs == addr_raw or u_inst.operands.rhs == addr_raw) return false;
+                if (u_inst.op == .aggregate_make) {
+                    const agg_k: AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(u_inst.aux_u16))));
+                    if (agg_k == .closure_make and u_inst.operands.rhs < body.extra_args.items.len) {
+                        const cap_len = body.extra_args.items[u_inst.operands.rhs];
+                        for (body.extra_args.items[u_inst.operands.rhs + 1 .. u_inst.operands.rhs + 1 + cap_len]) |cv| {
+                            if (cv == addr_raw) return false;
+                        }
+                    } else if (agg_k != .array_repeat and agg_k != .closure_make) {
+                        const elen = if (agg_k == .tagged_variant) (u_inst.operands.rhs & 0xFFFF) else u_inst.operands.rhs;
+                        for (body.extra_args.items[u_inst.operands.lhs .. u_inst.operands.lhs + elen]) |ev| {
+                            if (ev == addr_raw) return false;
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    for (body.extra_edges.items) |edge| {
+        if (edge.src_bb.asInt() < body.blocks.items.len and
+            body.blocks.items[edge.src_bb.asInt()].terminator.kind != .call)
+        {
+            for (body.extra_args.items[edge.args_start .. edge.args_start + edge.args_len]) |ev| {
+                if (ev == addr_raw) return false;
+            }
+        }
+    }
+    for (body.calls.items) |cs| {
+        for (0..cs.args_len) |arg_i| {
+            const mode = body.call_arg_modes.items[cs.modes_start + arg_i];
+            const word = body.extra_args.items[cs.args_start + arg_i];
+            if ((mode == .let_mode or mode == .sink_mode) and word == addr_raw) {
+                const mname = lookupCallSiteMethodNameInBody(body, sym_table, cs);
+                if (arg_i != 0 or !SAFE_CONTAINER_MUT_METHOD_MAP.has(mname)) return false;
+            }
+        }
+    }
+    return true;
+}
+
 /// Queues `drop_in_place` / `drop_if_live` insertions for `m_idx` (and reverse-order fields on partial struct states).
 fn planDropsForMovePath(
     arena_alloc: std.mem.Allocator,
@@ -8940,6 +10047,7 @@ fn planDropsForMovePath(
     if (m_idx >= trie.nodes.len) return;
     const node = trie.nodes[m_idx];
     const fl = node.flags();
+    if (fl.is_arena_drop_elided) return;
     const is_decomposed_linear_struct = !fl.is_auto_drop and fl.is_linear and
         !fl.is_custom_drop_struct and !node.first_child.isNone() and
         trie.nodes[node.first_child.asInt()].proj_kind_raw == @backingInt(mir.ProjKind.field) and
@@ -9240,8 +10348,30 @@ fn runPass2TypestateNllAndDrops(
             }
         }
     }
-    // Pre-scan all reachable `.call` terminators before `[2.2]` so loop-body arena allocations dominate exit blocks:
+    // Pre-scan all reachable blocks before `[2.2]` so `&mut arena` borrows and loop-body allocations mark `is_arena_local_used`:
     for (dom.rpo_blocks) |pre_bb_idx| {
+        for (body.getBlockInsts(MirBlockId.fromInt(pre_bb_idx))) |pre_vid| {
+            const pre_inst = body.getInst(pre_vid);
+            if (pre_inst.op == .intrinsic_op) {
+                const cand_val: u32 = if (pre_inst.aux_u16 == @backingInt(MirIntrinsicKind.ctx_set))
+                    pre_inst.operands.rhs
+                else if (pre_inst.aux_u16 == @backingInt(MirIntrinsicKind.soa_vec_new) and
+                    pre_inst.operands.rhs == 1 and
+                    pre_inst.operands.lhs < body.extra_args.items.len)
+                    body.extra_args.items[pre_inst.operands.lhs]
+                else
+                    mir.NONE_U32;
+                if (cand_val < body.insts.len) {
+                    const rhs_i = body.getInst(MirValueId.fromInt(cand_val));
+                    if (rhs_i.op == .place_addr and rhs_i.operands.lhs < body.places.items.len) {
+                        const ab = body.places.items[rhs_i.operands.lhs].base;
+                        if (ab < local_count and isOwnedArenaType(pool, sym_table, body.locals.items[ab].type_id)) {
+                            is_arena_local_used[ab] = true;
+                        }
+                    }
+                }
+            }
+        }
         const pre_term = body.blocks.items[pre_bb_idx].terminator;
         if (pre_term.kind != .call or pre_term.cond_or_val >= body.calls.items.len) continue;
         const pre_call = body.calls.items[pre_term.cond_or_val];
@@ -9253,8 +10383,29 @@ fn runPass2TypestateNllAndDrops(
             const mode = body.call_arg_modes.items[pre_call.modes_start + arg_i];
             const word = body.extra_args.items[pre_call.args_start + arg_i];
             if (extractArgBaseLocal(body, mode, word)) |arg_base| {
-                if (arg_base < local_count and isArenaType(pool, sym_table, body.locals.items[arg_base].type_id)) {
-                    is_arena_local_used[arg_base] = true;
+                if (arg_base < local_count) {
+                    if (isOwnedArenaType(pool, sym_table, body.locals.items[arg_base].type_id)) {
+                        is_arena_local_used[arg_base] = true;
+                    } else {
+                        const scan_end = @min(@as(usize, word), body.insts.len);
+                        for (0..scan_end) |st_idx| {
+                            const st = body.getInst(MirValueId.fromInt(@intCast(st_idx)));
+                            if (st.op == .place_store and st.operands.lhs < body.places.items.len and
+                                body.places.items[st.operands.lhs].base == arg_base and
+                                st.operands.rhs < body.insts.len)
+                            {
+                                const rhs_st = body.getInst(MirValueId.fromInt(st.operands.rhs));
+                                if (rhs_st.op == .place_addr and rhs_st.operands.lhs < body.places.items.len) {
+                                    const orig_b = body.places.items[rhs_st.operands.lhs].base;
+                                    if (orig_b < local_count and
+                                        isOwnedArenaType(pool, sym_table, body.locals.items[orig_b].type_id))
+                                    {
+                                        is_arena_local_used[orig_b] = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -9400,6 +10551,7 @@ fn runPass2TypestateNllAndDrops(
                                 if (is_escaping_via_ret) continue;
                             }
                             const loan = horizon.loans[l_idx];
+                            if (loan.is_pointee_reborrow and !loan.is_overflow_wildcard) continue;
                             const is_hitting_local = loan.is_overflow_wildcard or
                                 (!loan.path_id.isNone() and trie.subtree[eff_lid].isSet(loan.path_id.asInt()));
                             if (is_hitting_local and !has_reported_path_diag[eff_lid]) {
@@ -10636,17 +11788,23 @@ fn runPass2TypestateNllAndDrops(
             var arg_live_scratch: u2 = 0;
             var is_forwarding_ctx = false;
             const is_reset_call = isScratchResetCall(sym_table, call_site);
+            const is_with_scratch_cb = isScratchClosureHelperCall(body, pool, sym_table, call_site);
             for (0..call_site.args_len) |arg_i| {
                 const mode = body.call_arg_modes.items[call_site.modes_start + arg_i];
                 const word = body.extra_args.items[call_site.args_start + arg_i];
                 const is_ctx_arg = isContextArgPlaceOrVal(body, pool, sym_table, mode, word);
                 if (is_ctx_arg) is_forwarding_ctx = true;
+                const is_conflict_arg = is_with_scratch_cb and call_site.args_len >= 2 and arg_i == 0;
                 if (mode != .let_mode and mode != .sink_mode and word < body.places.items.len) {
-                    const sm = detectContextScratchAccess(body, pool, sym_table, PlaceId.fromInt(word));
+                    var sm = detectContextScratchAccess(body, pool, sym_table, PlaceId.fromInt(word));
+                    if (sm == 0) {
+                        const base_loc = body.places.items[word].base;
+                        if (base_loc < local_count) sm = horizon.local_prov[base_loc].scratch_mask;
+                    }
                     scratch_touch |= sm;
                     if (arg_i == 0 and sm != 0 and is_reset_call) {
                         call_rewind_mask |= sm;
-                    } else if (!is_ctx_arg) {
+                    } else if (!is_ctx_arg and !is_conflict_arg) {
                         const projs = body.getPlaceProjections(PlaceId.fromInt(word));
                         const base_loc = body.places.items[word].base;
                         if (projs.len > 0 and projs[0].kind == .deref and base_loc < local_count) {
@@ -10657,12 +11815,49 @@ fn runPass2TypestateNllAndDrops(
                     const sm = horizon.val_prov[word].scratch_mask;
                     if (arg_i == 0 and sm != 0 and is_reset_call) {
                         call_rewind_mask |= sm;
-                    } else if (!is_ctx_arg) {
+                    } else if (!is_ctx_arg and !is_conflict_arg) {
                         arg_live_scratch |= sm;
                     }
                 }
             }
-            if (is_forwarding_ctx) {
+            var has_escaped_with_scratch_ret = false;
+            if (is_with_scratch_cb) {
+                const sel = resolveScratchScopeSelectedSlot(
+                    body,
+                    pool,
+                    sym_table,
+                    call_site,
+                    horizon.val_prov,
+                    horizon.local_prov,
+                );
+                scratch_touch |= sel;
+                call_rewind_mask |= sel;
+                if (hasProvenanceCarrier(pool, sym_table, call_site.ret_ty) or
+                    isContextAllocCarrier(pool, sym_table, call_site.ret_ty))
+                {
+                    const cb_arg_idx: usize = if (call_site.args_len >= 2) 1 else 0;
+                    const cb_word = body.extra_args.items[call_site.args_start + cb_arg_idx];
+                    if (resolveClosureInfoFromValue(body, cb_word, 0)) |clos_info| {
+                        const cb_sum_opt = try lookupCalleeSummary(
+                            clos_info.def_id,
+                            .none,
+                            summaries,
+                            key_to_slot,
+                            sym_to_slot,
+                            eff_config,
+                        );
+                        if (cb_sum_opt) |cb_sum| {
+                            const arena_bit: u64 = if (clos_info.capture_len < 64)
+                                (@as(u64, 1) << @intCast(clos_info.capture_len))
+                            else
+                                0;
+                            if ((cb_sum.ret_provenance_mask & arena_bit) != 0) {
+                                has_escaped_with_scratch_ret = true;
+                            }
+                        }
+                    }
+                }
+            } else if (is_forwarding_ctx or !calleeHasExplicitContextParam(call_site, pool, sym_table)) {
                 if (callee_opt) |csum| {
                     scratch_touch |= csum.contractsScratch().scratch_touch_mask;
                     call_rewind_mask |= csum.contractsScratch().scratch_rewind_mask;
@@ -10670,13 +11865,31 @@ fn runPass2TypestateNllAndDrops(
             }
             scratch_rewind |= call_rewind_mask;
 
-            if ((call_rewind_mask & (term_scratch | arg_live_scratch)) != 0) {
+            var active_term_scratch: u2 = term_scratch;
+            for (0..horizon.loans.len) |loan_i| {
+                if (term_loans.isSet(loan_i)) {
+                    active_term_scratch |= horizon.loans[loan_i].scratch_slot_mask;
+                }
+            }
+
+            if (has_escaped_with_scratch_ret or (call_rewind_mask & (active_term_scratch | arg_live_scratch)) != 0) {
                 outcome.emitted_error_count += 1;
                 var open_tok: TokenIndex = .none;
-                for (horizon.val_prov) |vp| {
-                    if ((vp.scratch_mask & call_rewind_mask) != 0 and !vp.scratch_open_token.isNone()) {
-                        open_tok = vp.scratch_open_token;
+                for (0..horizon.loans.len) |loan_i| {
+                    if (term_loans.isSet(loan_i) and
+                        (horizon.loans[loan_i].scratch_slot_mask & call_rewind_mask) != 0 and
+                        !horizon.loans[loan_i].open_token.isNone())
+                    {
+                        open_tok = horizon.loans[loan_i].open_token;
                         break;
+                    }
+                }
+                if (open_tok.isNone()) {
+                    for (horizon.val_prov) |vp| {
+                        if ((vp.scratch_mask & call_rewind_mask) != 0 and !vp.scratch_open_token.isNone()) {
+                            open_tok = vp.scratch_open_token;
+                            break;
+                        }
                     }
                 }
                 const sec_open: ?LabeledSpan = if (!open_tok.isNone()) .{
@@ -11695,6 +12908,7 @@ fn verifyParallelAssignmentGroups(
             solved.val_overrides,
             solved.local_overrides,
             solved.slice_len_overrides,
+            &solved.dom_dirty,
         );
 
         const group_places = body.parallel_assign_places.items[grp.places_start..end_idx];
@@ -13064,11 +14278,21 @@ const LoadedPlaceKey = struct {
     }
 };
 
-/// Returns `true` if `base_local` in `body` is a shared immutable reference (`&T` / `.ref_ty`).
+/// Returns `true` if `base_local` is `&T` or `&mut [T]` / `&mut #soa [T]` whose fat-pointer length lives in `base_local`.
 inline fn isSharedRefLocal(body: *const MirBody, pool: *const InternPool, base_local: u32) bool {
     if (base_local >= body.locals.items.len) return false;
     const unwrapped = pool.unwrapUnderlyingType(body.locals.items[base_local].type_id);
-    return !unwrapped.isError() and pool.getNode(unwrapped).tag == .ref_ty;
+    if (unwrapped.isError()) return false;
+    const node = pool.getNode(unwrapped);
+    if (node.tag == .ref_ty) return true;
+    if (node.tag == .mut_ref_ty) {
+        const inner_ty = pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+        if (!inner_ty.isError()) {
+            const inner_tag = pool.getNode(inner_ty).tag;
+            return inner_tag == .slice_ty or inner_tag == .soa_slice_ty;
+        }
+    }
+    return false;
 }
 
 /// Extracts a `LoadedPlaceKey` when `val_raw` is a `place_load` of a root local or `.slice_len`.
@@ -13347,6 +14571,94 @@ fn clearMutAddrTakenLocalOverrides(
     }
 }
 
+/// Tracks modified indices in `val_overrides`, `local_overrides`, and `slice_len_overrides`
+/// so `populateBlockDomOverrides` clears dirty slots in $O(\text{dirty})$ instead of $O(I)$ `@memset`.
+const DomOverrideDirtyTracker = struct {
+    /// Modified indices inside `val_overrides`.
+    val_idxs: [128]u32 = undefined,
+    /// Active count in `val_idxs`.
+    val_len: usize = 0,
+    /// `true` if `val_idxs` overflowed `128` entries (falls back to `@memset`).
+    val_overflow: bool = false,
+    /// Modified indices inside `local_overrides`.
+    local_idxs: [128]u32 = undefined,
+    /// Active count in `local_idxs`.
+    local_len: usize = 0,
+    /// `true` if `local_idxs` overflowed `128` entries (falls back to `@memset`).
+    local_overflow: bool = false,
+    /// Modified indices inside `slice_len_overrides`.
+    slice_idxs: [128]u32 = undefined,
+    /// Active count in `slice_idxs`.
+    slice_len: usize = 0,
+    /// `true` if `slice_idxs` overflowed `128` entries (falls back to `@memset`).
+    slice_overflow: bool = false,
+
+    /// Records a write to `val_overrides[idx]` when previously `null`.
+    inline fn recordVal(self: *DomOverrideDirtyTracker, idx: u32, was_null: bool) void {
+        if (!was_null or self.val_overflow) return;
+        if (self.val_len < self.val_idxs.len) {
+            self.val_idxs[self.val_len] = idx;
+            self.val_len += 1;
+        } else {
+            self.val_overflow = true;
+        }
+    }
+
+    /// Records a write to `local_overrides[idx]` when previously `null`.
+    inline fn recordLocal(self: *DomOverrideDirtyTracker, idx: u32, was_null: bool) void {
+        if (!was_null or self.local_overflow) return;
+        if (self.local_len < self.local_idxs.len) {
+            self.local_idxs[self.local_len] = idx;
+            self.local_len += 1;
+        } else {
+            self.local_overflow = true;
+        }
+    }
+
+    /// Records a write to `slice_len_overrides[idx]` when previously `null`.
+    inline fn recordSliceLen(self: *DomOverrideDirtyTracker, idx: u32, was_null: bool) void {
+        if (!was_null or self.slice_overflow) return;
+        if (self.slice_len < self.slice_idxs.len) {
+            self.slice_idxs[self.slice_len] = idx;
+            self.slice_len += 1;
+        } else {
+            self.slice_overflow = true;
+        }
+    }
+
+    /// Clears all dirty entries across `val_overrides`, `local_overrides`, and `slice_len_overrides`.
+    fn clearDirty(
+        self: *DomOverrideDirtyTracker,
+        val_overrides: []?Intv,
+        local_overrides: []?Intv,
+        slice_len_overrides: []?Intv,
+    ) void {
+        if (self.val_overflow) {
+            @memset(val_overrides, null);
+            self.val_overflow = false;
+        } else {
+            for (self.val_idxs[0..self.val_len]) |idx| val_overrides[idx] = null;
+        }
+        self.val_len = 0;
+
+        if (self.local_overflow) {
+            @memset(local_overrides, null);
+            self.local_overflow = false;
+        } else {
+            for (self.local_idxs[0..self.local_len]) |idx| local_overrides[idx] = null;
+        }
+        self.local_len = 0;
+
+        if (self.slice_overflow) {
+            @memset(slice_len_overrides, null);
+            self.slice_overflow = false;
+        } else {
+            for (self.slice_idxs[0..self.slice_len]) |idx| slice_len_overrides[idx] = null;
+        }
+        self.slice_len = 0;
+    }
+};
+
 /// Populates dominating `cond_br` refinements for `bb_idx` into `val_overrides`, `local_overrides`, and `slice_len_overrides`.
 fn populateBlockDomOverrides(
     body: *const MirBody,
@@ -13360,14 +14672,13 @@ fn populateBlockDomOverrides(
     val_overrides: []?Intv,
     local_overrides: []?Intv,
     slice_len_overrides: []?Intv,
+    dirty: *DomOverrideDirtyTracker,
 ) void {
     const block_count = body.blocks.items.len;
     const inst_count = body.insts.len;
     const local_count = body.locals.items.len;
 
-    @memset(val_overrides, null);
-    @memset(local_overrides, null);
-    @memset(slice_len_overrides, null);
+    dirty.clearDirty(val_overrides, local_overrides, slice_len_overrides);
 
     var all_cmps: [32]DecodedBranchCmp = undefined;
     var cmp_len: usize = 0;
@@ -13414,10 +14725,12 @@ fn populateBlockDomOverrides(
                         slice_len_store_counts,
                     );
                     const refined = refineIntvPairFromCmp(cmp, base_l, base_r, cdom);
+                    dirty.recordVal(cmp.lhs_val, val_overrides[cmp.lhs_val] == null);
                     val_overrides[cmp.lhs_val] = if (val_overrides[cmp.lhs_val]) |prev|
                         prev.meet(refined.lhs_out)
                     else
                         refined.lhs_out;
+                    dirty.recordVal(cmp.rhs_val, val_overrides[cmp.rhs_val] == null);
                     val_overrides[cmp.rhs_val] = if (val_overrides[cmp.rhs_val]) |prev|
                         prev.meet(refined.rhs_out)
                     else
@@ -13429,6 +14742,7 @@ fn populateBlockDomOverrides(
                         if (is_immut_len and lkey.base_local < local_count and
                             slice_len_store_counts[lkey.base_local] <= 1)
                         {
+                            dirty.recordSliceLen(lkey.base_local, slice_len_overrides[lkey.base_local] == null);
                             slice_len_overrides[lkey.base_local] = if (slice_len_overrides[lkey.base_local]) |prev|
                                 prev.meet(refined.lhs_out)
                             else
@@ -13436,6 +14750,7 @@ fn populateBlockDomOverrides(
                         } else if (!lkey.isSliceLen() and lkey.base_local < local_count and
                             local_store_counts[lkey.base_local] <= 1)
                         {
+                            dirty.recordLocal(lkey.base_local, local_overrides[lkey.base_local] == null);
                             local_overrides[lkey.base_local] = if (local_overrides[lkey.base_local]) |prev|
                                 prev.meet(refined.lhs_out)
                             else
@@ -13448,6 +14763,7 @@ fn populateBlockDomOverrides(
                         if (is_immut_len and rkey.base_local < local_count and
                             slice_len_store_counts[rkey.base_local] <= 1)
                         {
+                            dirty.recordSliceLen(rkey.base_local, slice_len_overrides[rkey.base_local] == null);
                             slice_len_overrides[rkey.base_local] = if (slice_len_overrides[rkey.base_local]) |prev|
                                 prev.meet(refined.rhs_out)
                             else
@@ -13455,6 +14771,7 @@ fn populateBlockDomOverrides(
                         } else if (!rkey.isSliceLen() and rkey.base_local < local_count and
                             local_store_counts[rkey.base_local] <= 1)
                         {
+                            dirty.recordLocal(rkey.base_local, local_overrides[rkey.base_local] == null);
                             local_overrides[rkey.base_local] = if (local_overrides[rkey.base_local]) |prev|
                                 prev.meet(refined.rhs_out)
                             else
@@ -14042,6 +15359,10 @@ fn runPass4IntervalsAndPentagonBce(
     const val_overrides = try arena_alloc.alloc(?Intv, inst_count);
     const local_overrides = try arena_alloc.alloc(?Intv, local_count);
     const slice_len_overrides = try arena_alloc.alloc(?Intv, local_count);
+    @memset(val_overrides, null);
+    @memset(local_overrides, null);
+    @memset(slice_len_overrides, null);
+    var dom_dirty = DomOverrideDirtyTracker{};
 
     var has_intv_changed = true;
     var intv_iters: usize = 0;
@@ -14150,6 +15471,7 @@ fn runPass4IntervalsAndPentagonBce(
                 val_overrides,
                 local_overrides,
                 slice_len_overrides,
+                &dom_dirty,
             );
 
             // Evaluate block instructions sequentially:
@@ -14228,6 +15550,7 @@ fn runPass4IntervalsAndPentagonBce(
                                     slice_len_overrides[pl_rec.base] = null;
                                 }
                                 if (pl_rec.proj_len == 0 and inst.operands.rhs < inst_count) {
+                                    dom_dirty.recordLocal(pl_rec.base, true);
                                     local_overrides[pl_rec.base] = readDomRefinedIntv(
                                         body,
                                         inst.operands.rhs,
@@ -14472,6 +15795,7 @@ fn runPass4IntervalsAndPentagonBce(
             val_overrides,
             local_overrides,
             slice_len_overrides,
+            &dom_dirty,
         );
         for (body.getBlockInsts(MirBlockId.fromInt(bb_idx))) |inst_vid| {
             const v_idx = inst_vid.asInt();
@@ -14815,6 +16139,7 @@ fn runPass4IntervalsAndPentagonBce(
             val_overrides,
             local_overrides,
             slice_len_overrides,
+            &dom_dirty,
         );
 
         const param_lim = @min(@as(usize, call_site.args_len), ffi_call.contract.param_contracts.len);
@@ -15228,6 +16553,7 @@ fn runPass4IntervalsAndPentagonBce(
                     val_overrides,
                     local_overrides,
                     slice_len_overrides,
+                    &dom_dirty,
                 );
 
                 var chosen_slot: ?usize = null;
@@ -15503,6 +16829,39 @@ fn runPass4IntervalsAndPentagonBce(
                                                 if (rb.lo >= 1) {
                                                     cur_rows[lhs_pid].insert(@intCast(dst_pid));
                                                     cur_rows[lhs_pid] = cur_rows[lhs_pid].unionWith(cur_rows[dst_pid]);
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else if (bk == .udiv_checked and lhs_pid < sub_var_count) {
+                                    if (val_domains[rhs_raw]) |r_dom| {
+                                        if (!r_iv.isBottom() and !l_iv.isBottom()) {
+                                            const rb = decodeIntvToI128(r_iv, r_dom);
+                                            const lb = decodeIntvToI128(l_iv, val_domains[lhs_raw] orelse r_dom);
+                                            if (rb.lo >= 1) {
+                                                cur_leq_rows[dst_pid].insert(@intCast(lhs_pid));
+                                                cur_leq_rows[dst_pid] = cur_leq_rows[dst_pid].unionWith(cur_leq_rows[lhs_pid]);
+                                            }
+                                            if (lb.lo >= 1 and rb.lo >= 2) {
+                                                cur_rows[dst_pid].insert(@intCast(lhs_pid));
+                                                cur_rows[dst_pid] = cur_rows[dst_pid].unionWith(cur_rows[lhs_pid]);
+                                            }
+                                        }
+                                    }
+                                } else if (bk == .lshr_checked and lhs_pid < sub_var_count) {
+                                    if (val_domains[rhs_raw]) |r_dom| {
+                                        const l_dom = val_domains[lhs_raw] orelse r_dom;
+                                        if (!r_iv.isBottom() and !l_iv.isBottom()) {
+                                            const rb = decodeIntvToI128(r_iv, r_dom);
+                                            const lb = decodeIntvToI128(l_iv, l_dom);
+                                            if (!l_dom.is_signed or lb.lo >= 0) {
+                                                if (rb.lo >= 0) {
+                                                    cur_leq_rows[dst_pid].insert(@intCast(lhs_pid));
+                                                    cur_leq_rows[dst_pid] = cur_leq_rows[dst_pid].unionWith(cur_leq_rows[lhs_pid]);
+                                                }
+                                                if (lb.lo >= 1 and rb.lo >= 1) {
+                                                    cur_rows[dst_pid].insert(@intCast(lhs_pid));
+                                                    cur_rows[dst_pid] = cur_rows[dst_pid].unionWith(cur_rows[lhs_pid]);
                                                 }
                                             }
                                         }
@@ -15847,6 +17206,7 @@ fn runPass4IntervalsAndPentagonBce(
             val_overrides,
             local_overrides,
             slice_len_overrides,
+            &dom_dirty,
         );
         var has_block_panic = false;
         const term = body.blocks.items[bb_idx].terminator;
@@ -18433,6 +19793,10 @@ fn runPass3SummaryContractsAndSandbox(
                             },
                         ));
                     } else if (!canon_addr_sym.isNone() and canon_addr_sym.asInt() < sym_table.symbols.items.len and
+                        sym_table.getSymbol(canon_addr_sym).kind == .const_sym)
+                    {
+                        // Immutable `.rodata` global `const_sym` references carry zero runtime effects.
+                    } else if (!canon_addr_sym.isNone() and canon_addr_sym.asInt() < sym_table.symbols.items.len and
                         sym_table.getSymbol(canon_addr_sym).extra_flags.is_thread_local)
                     {
                         direct_concurrency_bits |= FnRegionSummary.INFERRED_THREAD_LOCAL_BIT;
@@ -20761,6 +22125,11 @@ pub fn analyzeAndElaborateMirModule(
     var max_pentagon_bytes: usize = 0;
 
     // [3] Bottom-up SCC execution: Recursive Pre-Pass -> Pass 1 -> Horizon -> Pass 2 -> Pass 4:
+    const closure_scratch_seeds = try allocator.alloc(u2, fn_count);
+    defer allocator.free(closure_scratch_seeds);
+    @memset(closure_scratch_seeds, 0);
+    seedWithScratchClosureMasks(bodies, pool, sym_table, &key_to_slot, closure_scratch_seeds);
+
     const primary_limit = config.primary_body_count orelse fn_count;
     for (0..scc_sched.is_recursive.len) |scc_i| {
         const m_start = scc_sched.offsets[scc_i];
@@ -20791,8 +22160,8 @@ pub fn analyzeAndElaborateMirModule(
             var body_cfg = config;
             if (!is_primary_slot or body.is_sast_default_probe) body_cfg.diagnostic_sink = null;
 
-            const trie = try buildMovePathTrie(arena_alloc, body, pool, sym_table);
-            const horizon = try computeBodyProvenanceAndNllHorizon(
+            var trie = try buildMovePathTrie(arena_alloc, body, pool, sym_table);
+            const horizon = try computeBodyProvenanceAndNllHorizonExt(
                 arena_alloc,
                 body,
                 &dom_trees[slot_u32],
@@ -20803,7 +22172,9 @@ pub fn analyzeAndElaborateMirModule(
                 &key_to_slot,
                 &sym_to_slot,
                 body_cfg,
+                closure_scratch_seeds[slot_u32],
             );
+            markSoundArenaContainerDropElisions(body, &trie, &horizon, pool, sym_table);
 
             pass2_outcomes[slot_u32] = try runPass2TypestateNllAndDrops(
                 arena_alloc,
@@ -21084,6 +22455,8 @@ const SolvedBodyIntervals = struct {
     local_overrides: []?Intv,
     /// Temporary per-edge slice `.len` interval refinements scratch buffer (`len == local_count`).
     slice_len_overrides: []?Intv,
+    /// Sparse dirty-index tracker avoiding $O(I)$ `@memset` across blocks.
+    dom_dirty: DomOverrideDirtyTracker = .{},
 };
 
 /// Solves Steps 1 & 2 of the $O(V)$ 16-byte Sign-Biased `Intv` RPO fixpoint without mutating `body`.
@@ -21234,6 +22607,10 @@ fn solveBodySignBiasedIntervals(
     const val_overrides = try arena_alloc.alloc(?Intv, inst_count);
     const local_overrides = try arena_alloc.alloc(?Intv, local_count);
     const slice_len_overrides = try arena_alloc.alloc(?Intv, local_count);
+    @memset(val_overrides, null);
+    @memset(local_overrides, null);
+    @memset(slice_len_overrides, null);
+    var dom_dirty = DomOverrideDirtyTracker{};
 
     var has_intv_changed = block_count > 0;
     var intv_iters: usize = 0;
@@ -21338,6 +22715,7 @@ fn solveBodySignBiasedIntervals(
                 val_overrides,
                 local_overrides,
                 slice_len_overrides,
+                &dom_dirty,
             );
 
             for (body.getBlockInsts(bb_id)) |inst_vid| {
@@ -21415,6 +22793,7 @@ fn solveBodySignBiasedIntervals(
                                     slice_len_overrides[pl_rec.base] = null;
                                 }
                                 if (pl_rec.proj_len == 0 and inst.operands.rhs < inst_count) {
+                                    dom_dirty.recordLocal(pl_rec.base, true);
                                     local_overrides[pl_rec.base] = readDomRefinedIntv(
                                         body,
                                         inst.operands.rhs,
@@ -21649,6 +23028,7 @@ fn solveBodySignBiasedIntervals(
         .val_overrides = val_overrides,
         .local_overrides = local_overrides,
         .slice_len_overrides = slice_len_overrides,
+        .dom_dirty = dom_dirty,
     };
 }
 
@@ -21825,7 +23205,7 @@ pub fn computeBodyProvenRanges(
     defer scratch_arena.deinit();
     const arena_alloc = scratch_arena.asAllocator();
 
-    const solved = try solveBodySignBiasedIntervals(arena_alloc, body, &dom, pool, sym_table);
+    var solved = try solveBodySignBiasedIntervals(arena_alloc, body, &dom, pool, sym_table);
 
     const per_val_opt = try arena_alloc.alloc(?ProvenValueRange, body.insts.len);
     @memset(per_val_opt, null);
@@ -21845,6 +23225,7 @@ pub fn computeBodyProvenRanges(
             solved.val_overrides,
             solved.local_overrides,
             solved.slice_len_overrides,
+            &solved.dom_dirty,
         );
 
         for (body.getBlockParams(bb_id)) |param_vid| {

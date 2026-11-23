@@ -209,6 +209,26 @@ pub const LspFlagDescriptor = struct {
     summary: []const u8,
 };
 
+/// Subcommand-specific CLI option identifiers for `corex test` (`TEST_FLAGS`).
+pub const TestFlagId = enum(u8) {
+    /// `--seed=<u64>` – seed deterministic `context.rng_seed` PRNG (`0`).
+    seed = 0,
+    /// `--sim` – execute tests under deterministic simulation mode (`1`).
+    sim = 1,
+};
+
+/// Static metadata entry in `TEST_FLAGS` describing `corex test` flags.
+pub const TestFlagDescriptor = struct {
+    /// Strongly typed `corex test` flag enum tag.
+    id: TestFlagId,
+    /// Canonical long flag token (e.g., `"--sim"`).
+    long_flag: []const u8,
+    /// Optional value placeholder suffix (e.g., `"=<u64>"`).
+    value_suffix: ?[]const u8 = null,
+    /// Concise one-line summary displayed in `corex test --help`.
+    summary: []const u8,
+};
+
 /// Subcommand-specific CLI option identifiers for `corex translate-c` (`TRANSLATE_C_FLAGS`).
 pub const TranslateCFlagId = enum(u8) {
     /// `--define=<name[=val]>` / `-D` – define C preprocessor macro (`0`).
@@ -407,6 +427,10 @@ pub const ExecuteSubcommandAction = struct {
     accept_caps_csv: ?[]const u8 = null,
     /// Whether `corex lsp --stdio` was requested (`true` by default).
     is_lsp_stdio: bool = true,
+    /// Whether `corex test --sim` deterministic simulation mode was requested.
+    is_sim_mode: bool = false,
+    /// Optional explicit deterministic seed passed via `corex test --seed=<u64>`.
+    sim_seed: ?u64 = null,
 };
 
 /// Resolved CLI action produced by `parseArgs`.
@@ -515,6 +539,10 @@ pub const ParsedCommand = struct {
     accept_caps_csv: ?[]const u8 = null,
     /// Whether `corex lsp --stdio` was requested (`true` by default).
     is_lsp_stdio: bool = true,
+    /// Whether `corex test --sim` deterministic simulation mode was requested.
+    is_sim_mode: bool = false,
+    /// Optional explicit deterministic seed passed via `corex test --seed=<u64>`.
+    sim_seed: ?u64 = null,
     /// Arguments passed after `--` (forwarded to the child executable on `corex run`).
     run_args: []const []const u8 = &.{},
 };
@@ -749,6 +777,30 @@ const UPGRADE_FLAG_MAP = std.StaticStringMap(UpgradeFlagId).initComptime(blk: {
 const LSP_FLAG_MAP = std.StaticStringMap(LspFlagId).initComptime(blk: {
     var entries: [LSP_FLAGS.len]struct { []const u8, LspFlagId } = undefined;
     for (LSP_FLAGS, 0..) |descriptor, i| {
+        entries[i] = .{ descriptor.long_flag, descriptor.id };
+    }
+    break :blk entries;
+});
+
+/// Canonical alphabetical `corex test` option table (`DR-18` & `STD-01` §3.3).
+pub const TEST_FLAGS = [_]TestFlagDescriptor{
+    .{
+        .id = .seed,
+        .long_flag = "--seed",
+        .value_suffix = "=<u64>",
+        .summary = "Seed deterministic `context.rng_seed` PRNG (`0x…` hex or decimal)",
+    },
+    .{
+        .id = .sim,
+        .long_flag = "--sim",
+        .summary = "Execute tests under deterministic simulation mode",
+    },
+};
+
+/// $O(1)$ compile-time lookup table mapping `corex test` long flags to `TestFlagId`.
+const TEST_FLAG_MAP = std.StaticStringMap(TestFlagId).initComptime(blk: {
+    var entries: [TEST_FLAGS.len]struct { []const u8, TestFlagId } = undefined;
+    for (TEST_FLAGS, 0..) |descriptor, i| {
         entries[i] = .{ descriptor.long_flag, descriptor.id };
     }
     break :blk entries;
@@ -1005,6 +1057,17 @@ fn matchUpgradeFlag(arg_text: []const u8) ?UpgradeFlagId {
 /// Resolves `arg_text` in $O(1)$ against `LSP_FLAGS` via `LSP_FLAG_MAP` without hardcoded string drift.
 fn matchLspFlag(arg_text: []const u8) ?LspFlagId {
     return LSP_FLAG_MAP.get(arg_text);
+}
+
+/// Resolves `arg_text` in $O(1)$ against `TEST_FLAGS` via `TEST_FLAG_MAP` without hardcoded string drift.
+fn matchTestFlag(arg_text: []const u8) ?TestFlagId {
+    return TEST_FLAG_MAP.get(arg_text);
+}
+
+/// Parses a decimal or `0x`-prefixed unsigned 64-bit seed (supporting `_` separators).
+fn parseSimSeedValue(raw_val: []const u8) ?u64 {
+    if (raw_val.len == 0 or raw_val[0] == '+' or raw_val[0] == '-') return null;
+    return std.fmt.parseInt(u64, raw_val, 0) catch null;
 }
 
 /// Extracts a strictly positive ASCII decimal step count (`> 0`), rejecting empty, signed, or zero values.
@@ -1401,7 +1464,58 @@ fn discoverExternalSubmodulesRecursive(
     }
 }
 
-/// Registers `core/root.cx` (and its `core/` submodule tree) on `db` when available on disk.
+/// Resolves `core/root.cx` on disk (checking CWD first, then parent directories of the `corex` binary).
+fn resolveStdlibRepoPrefix(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_map: *vfs.VfsSourceMap,
+) !?struct { prefix: []u8, core_path: []u8, core_fid: mem.FileId } {
+    if (source_map.resolveOrCreatePath(io, "core/root.cx", .std_core)) |cwd_core_fid| {
+        const prefix_dup = try allocator.dupe(u8, "");
+        errdefer allocator.free(prefix_dup);
+        const core_dup = try allocator.dupe(u8, "core/root.cx");
+        return .{ .prefix = prefix_dup, .core_path = core_dup, .core_fid = cwd_core_fid };
+    } else |_| {}
+
+    const exe_dir = std.process.executableDirPathAlloc(io, allocator) catch return null;
+    defer allocator.free(exe_dir);
+
+    const rel_parents = [_][]const u8{ "..", "../..", "../../.." };
+    for (rel_parents) |rel_up| {
+        const cand_prefix = try std.fmt.allocPrint(allocator, "{s}/{s}/", .{ exe_dir, rel_up });
+        errdefer allocator.free(cand_prefix);
+        const cand_core = try std.fmt.allocPrint(allocator, "{s}core/root.cx", .{cand_prefix});
+        errdefer allocator.free(cand_core);
+        if (source_map.resolveOrCreatePath(io, cand_core, .std_core)) |found_fid| {
+            return .{ .prefix = cand_prefix, .core_path = cand_core, .core_fid = found_fid };
+        } else |_| {
+            allocator.free(cand_core);
+            allocator.free(cand_prefix);
+        }
+    }
+    return null;
+}
+
+/// Returns `true` when `path` resolves inside the internal `core/` kernel source tree.
+fn isCoreKernelTargetPath(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "core/") or
+        std.mem.startsWith(u8, path, "core\\") or
+        std.mem.startsWith(u8, path, "./core/") or
+        std.mem.startsWith(u8, path, ".\\core\\") or
+        std.mem.indexOf(u8, path, "/core/") != null or
+        std.mem.indexOf(u8, path, "\\core\\") != null;
+}
+
+/// Returns `true` when `paths` is non-empty and every entry resolves inside `core/`.
+fn areAllCoreKernelTargetPaths(paths: []const []const u8) bool {
+    if (paths.len == 0) return false;
+    for (paths) |target_path| {
+        if (!isCoreKernelTargetPath(target_path)) return false;
+    }
+    return true;
+}
+
+/// Registers `core/root.cx` and optional `stdlib/cx/mod.cx` (`PackageId.std_core`) on `db` when available on disk.
 fn registerWorkspaceCoreModuleIfNeeded(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1409,8 +1523,25 @@ fn registerWorkspaceCoreModuleIfNeeded(
     db: *query_db.CompilerDb,
     visited_fids: *std.AutoHashMapUnmanaged(u32, void),
 ) !void {
-    const core_root_path = "core/root.cx";
-    const core_fid = source_map.resolveOrCreatePath(io, core_root_path, .std_core) catch return;
+    return registerWorkspaceCoreModuleWithOptions(allocator, io, source_map, db, visited_fids, false);
+}
+
+/// Registers `core/root.cx` and (unless `skip_cx_stdlib` is `true`) `stdlib/cx/mod.cx` on `db`.
+fn registerWorkspaceCoreModuleWithOptions(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source_map: *vfs.VfsSourceMap,
+    db: *query_db.CompilerDb,
+    visited_fids: *std.AutoHashMapUnmanaged(u32, void),
+    skip_cx_stdlib: bool,
+) !void {
+    const resolved = (try resolveStdlibRepoPrefix(allocator, io, source_map)) orelse return;
+    defer {
+        allocator.free(resolved.prefix);
+        allocator.free(resolved.core_path);
+    }
+
+    const core_fid = resolved.core_fid;
     _ = try source_map.getLineIndex(core_fid);
     var has_dummy_core_mention = true;
     try discoverExternalSubmodulesRecursive(
@@ -1419,7 +1550,7 @@ fn registerWorkspaceCoreModuleIfNeeded(
         source_map,
         db,
         core_fid,
-        core_root_path,
+        resolved.core_path,
         .high,
         .std_core,
         visited_fids,
@@ -1428,7 +1559,35 @@ fn registerWorkspaceCoreModuleIfNeeded(
         0,
     );
     try db.registerRootModule("core", core_fid);
-    try db.registerRootModule("cx", core_fid);
+
+    if (skip_cx_stdlib) {
+        try db.registerRootModule("cx", core_fid);
+        return;
+    }
+
+    const cx_mod_path = try std.fmt.allocPrint(allocator, "{s}stdlib/cx/mod.cx", .{resolved.prefix});
+    defer allocator.free(cx_mod_path);
+    if (source_map.resolveOrCreatePath(io, cx_mod_path, .std_core)) |cx_fid| {
+        _ = try source_map.getLineIndex(cx_fid);
+        var has_dummy_cx_mention = true;
+        try discoverExternalSubmodulesRecursive(
+            allocator,
+            io,
+            source_map,
+            db,
+            cx_fid,
+            cx_mod_path,
+            .high,
+            .std_core,
+            visited_fids,
+            null,
+            &has_dummy_cx_mention,
+            0,
+        );
+        try db.registerCxStdlibPreludeRoot(cx_fid);
+    } else |_| {
+        try db.registerRootModule("cx", core_fid);
+    }
 }
 
 /// Returns `true` if `file_id` declares a top-level `fn main` entrypoint.
@@ -1458,6 +1617,7 @@ fn verifyAndRenderModuleDiagnosticsWithWarnings(
     root_files: []const mem.FileId,
     diag_renderer: DiagnosticRenderer,
     stderr_writer: *std.Io.Writer,
+    is_check_only: bool,
 ) !struct { has_errors: bool, warning_count: u32 } {
     var reachable_files: std.ArrayListUnmanaged(mem.FileId) = .empty;
     defer reachable_files.deinit(allocator);
@@ -1484,49 +1644,84 @@ fn verifyAndRenderModuleDiagnosticsWithWarnings(
             if (sig_sink.hasErrors()) has_errors = true;
         }
         if (sig_err_count > 0) has_errors = true;
+    }
 
-        var entry_idx: usize = 0;
-        while (entry_idx < (try db.extractItemTree(mod_fid)).entries.len) : (entry_idx += 1) {
-            const entry = (try db.extractItemTree(mod_fid)).entries[entry_idx];
-            const body_err_count = (try db.typecheckBody(entry.def_id)).error_count;
-            if (db.getBodyDiagnostics(entry.def_id)) |body_sink| {
-                if (body_sink.diagnostics.items.len > 0) {
-                    try diag_renderer.renderAll(stderr_writer, body_sink);
-                    warning_count +|= countWarningsInSink(body_sink);
-                }
-                if (body_sink.hasErrors()) has_errors = true;
+    var active_defs: std.ArrayListUnmanaged(query_db.DefId) = .empty;
+    defer active_defs.deinit(allocator);
+    if (is_check_only) {
+        var has_std_core_root = false;
+        for (root_files) |rfid| {
+            if (db.getFilePackageId(rfid) == .std_core) {
+                has_std_core_root = true;
+                break;
             }
-            if (body_err_count > 0) has_errors = true;
-
-            const is_verified_sound = (try db.verifySastMir(entry.def_id)).is_verified_sound;
-            if (db.getSastDiagnostics(entry.def_id)) |sast_sink| {
-                if (sast_sink.diagnostics.items.len > 0) {
-                    try diag_renderer.renderAll(stderr_writer, sast_sink);
-                    warning_count +|= countWarningsInSink(sast_sink);
+        }
+        if (has_std_core_root) {
+            var explicit_files: std.ArrayListUnmanaged(mem.FileId) = .empty;
+            defer explicit_files.deinit(allocator);
+            try db.collectExplicitModSubtreeFiles(root_files, &explicit_files);
+            for (explicit_files.items) |target_fid| {
+                const tree = try db.extractItemTree(target_fid);
+                try active_defs.ensureUnusedCapacity(allocator, tree.entries.len);
+                for (tree.entries) |entry| {
+                    active_defs.appendAssumeCapacity(entry.def_id);
                 }
-                if (sast_sink.hasErrors()) has_errors = true;
             }
-            if (!is_verified_sound) has_errors = true;
+        } else {
+            for (reachable_files.items) |mod_fid| {
+                if (db.getFilePackageId(mod_fid) == .std_core) continue;
+                const tree = try db.extractItemTree(mod_fid);
+                try active_defs.ensureUnusedCapacity(allocator, tree.entries.len);
+                for (tree.entries) |entry| {
+                    active_defs.appendAssumeCapacity(entry.def_id);
+                }
+            }
+        }
+    } else {
+        try db.collectActiveModuleDefIds(allocator, root_files, reachable_files.items, &active_defs);
+    }
 
-            if (!has_errors and (entry.kind == .const_decl or entry.kind == .extern_block)) {
-                const ct_art_opt: ?query_db.ComptimeEvalArtifact =
-                    db.evalComptimeDef(entry.def_id) catch |ct_err| switch (ct_err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => blk: {
-                            has_errors = true;
-                            break :blk null;
-                        },
-                    };
-                if (db.getComptimeDiagnostics(entry.def_id)) |ct_sink| {
-                    if (ct_sink.diagnostics.items.len > 0) {
-                        try diag_renderer.renderAll(stderr_writer, ct_sink);
-                        warning_count +|= countWarningsInSink(ct_sink);
-                    }
-                    if (ct_sink.hasErrors()) has_errors = true;
+    for (active_defs.items) |active_def_id| {
+        const item_tree = try db.extractItemTree(active_def_id.fileId());
+        const entry = item_tree.getEntry(active_def_id) orelse continue;
+        const body_err_count = (try db.typecheckBody(entry.def_id)).error_count;
+        if (db.getBodyDiagnostics(entry.def_id)) |body_sink| {
+            if (body_sink.diagnostics.items.len > 0) {
+                try diag_renderer.renderAll(stderr_writer, body_sink);
+                warning_count +|= countWarningsInSink(body_sink);
+            }
+            if (body_sink.hasErrors()) has_errors = true;
+        }
+        if (body_err_count > 0) has_errors = true;
+
+        const is_verified_sound = (try db.verifySastMir(entry.def_id)).is_verified_sound;
+        if (db.getSastDiagnostics(entry.def_id)) |sast_sink| {
+            if (sast_sink.diagnostics.items.len > 0) {
+                try diag_renderer.renderAll(stderr_writer, sast_sink);
+                warning_count +|= countWarningsInSink(sast_sink);
+            }
+            if (sast_sink.hasErrors()) has_errors = true;
+        }
+        if (!is_verified_sound) has_errors = true;
+
+        if (!has_errors and (entry.kind == .const_decl or entry.kind == .extern_block)) {
+            const ct_art_opt: ?query_db.ComptimeEvalArtifact =
+                db.evalComptimeDef(entry.def_id) catch |ct_err| switch (ct_err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => blk: {
+                        has_errors = true;
+                        break :blk null;
+                    },
+                };
+            if (db.getComptimeDiagnostics(entry.def_id)) |ct_sink| {
+                if (ct_sink.diagnostics.items.len > 0) {
+                    try diag_renderer.renderAll(stderr_writer, ct_sink);
+                    warning_count +|= countWarningsInSink(ct_sink);
                 }
-                if (ct_art_opt) |ct_art| {
-                    if (ct_art.has_errors) has_errors = true;
-                }
+                if (ct_sink.hasErrors()) has_errors = true;
+            }
+            if (ct_art_opt) |ct_art| {
+                if (ct_art.has_errors) has_errors = true;
             }
         }
     }
@@ -1547,6 +1742,7 @@ fn verifyAndRenderModuleDiagnostics(
         root_files,
         diag_renderer,
         stderr_writer,
+        false,
     )).has_errors;
 }
 
@@ -1569,7 +1765,10 @@ fn buildConfiguredBackend(
         .llvm => .{
             .tier_b_llvm = .{
                 .target = target_spec,
-                .opt_level = if (is_release_mode) .release_fast_o2 else .debug_o0,
+                .opt_level = if (is_release_mode)
+                    (if (target_spec.isFreestanding()) .release_small_oz else .release_fast_o2)
+                else
+                    .debug_o0,
                 .is_release_mode = is_release_mode,
                 .is_fuzz_instrumented = is_fuzz_enabled,
             },
@@ -2941,6 +3140,7 @@ fn executePackageOrScriptWorkflow(
         all_verify_slices.items,
         diag_renderer,
         stderr_writer,
+        exec_info.subcommand == .check,
     );
     if (mod_diag.has_errors and
         !(exec_info.subcommand == .check and (exec_info.is_check_caps or exec_info.is_explain_caps)))
@@ -3388,6 +3588,8 @@ fn executePackageOrScriptWorkflow(
             };
         },
         .@"test" => {
+            const active_sim_seed: u64 = exec_info.sim_seed orelse
+                if (exec_info.is_sim_mode) @as(u64, 0x9E37_79B9_7F4A_7C15) else 0;
             if (exec_info.is_diff_backends) {
                 var tested_main_count: usize = 0;
                 for (root_verify_slices.items) |test_fid| {
@@ -3403,6 +3605,7 @@ fn executePackageOrScriptWorkflow(
                             .vfs_source_map = source_map,
                             .workspace_root = manifest_bundle.workspace_root_dir,
                             .comptime_step_limit = exec_info.comptime_step_limit,
+                            .sim_seed = active_sim_seed,
                             .diagnostic_sink = sink,
                         },
                     ) catch |oracle_err| switch (oracle_err) {
@@ -3435,6 +3638,43 @@ fn executePackageOrScriptWorkflow(
                 );
                 try stdout_writer.writeByte('\n');
                 return 0;
+            }
+            if (exec_info.is_sim_mode or exec_info.sim_seed != null) {
+                for (root_verify_slices.items) |test_fid| {
+                    if (!(try fileDeclaresMainEntrypoint(&db, test_fid))) continue;
+                    var sim_out = diff_oracle.runSimulatedVmOnDb(
+                        allocator,
+                        &db,
+                        test_fid,
+                        exec_info.is_release_mode,
+                        .{
+                            .io = io,
+                            .environ_map = environ_map,
+                            .vfs_source_map = source_map,
+                            .workspace_root = manifest_bundle.workspace_root_dir,
+                            .comptime_step_limit = exec_info.comptime_step_limit,
+                            .sim_seed = active_sim_seed,
+                            .diagnostic_sink = sink,
+                        },
+                    ) catch |sim_err| switch (sim_err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => {
+                            if (sink.hasErrors()) {
+                                try diag_renderer.renderAll(stderr_writer, sink);
+                            }
+                            return 1;
+                        },
+                    };
+                    defer sim_out.deinit(allocator);
+                    if (sim_out.stdout_bytes.len > 0) try stdout_writer.writeAll(sim_out.stdout_bytes);
+                    if (sim_out.stderr_bytes.len > 0) try stderr_writer.writeAll(sim_out.stderr_bytes);
+                    if (sim_out.has_trapped or sim_out.exit_code != 0) {
+                        return if (sim_out.exit_code > 0 and sim_out.exit_code <= 255)
+                            @intCast(sim_out.exit_code)
+                        else
+                            1;
+                    }
+                }
             }
             try stdout_style.writeStatusHeader(
                 stdout_writer,
@@ -4757,6 +4997,14 @@ pub fn suggestFlagForSubcommand(unknown_flag: []const u8, subcommand: ?Subcomman
                     best_match = chk_desc.long_flag;
                 }
             }
+        } else if (sub_id == .@"test") {
+            for (TEST_FLAGS) |tst_desc| {
+                const tst_dist = computeLevenshteinDistance(flag_name, tst_desc.long_flag);
+                if (tst_dist < best_distance) {
+                    best_distance = tst_dist;
+                    best_match = tst_desc.long_flag;
+                }
+            }
         }
         if (isCompileSubcommand(sub_id)) {
             for (COMPILE_FLAGS) |comp_desc| {
@@ -4824,6 +5072,8 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
     var has_accept_caps = false;
     var accept_caps_csv: ?[]const u8 = null;
     var is_lsp_stdio = true;
+    var is_sim_mode = false;
+    var sim_seed: ?u64 = null;
     var selected_subcommand: ?SubcommandId = null;
     var positional_list: std.ArrayListUnmanaged([]const u8) = .empty;
     var is_after_double_dash = false;
@@ -4916,6 +5166,40 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                     break :blk_chk true;
                 }
                 break :blk_chk false;
+            }) {} else if (selected_subcommand == .@"test" and try tryExtractStringFlagValue(
+                raw_args,
+                &arg_idx,
+                "--seed",
+                "",
+                "missing seed integer for `--seed`",
+                "help: pass `--seed=0x5EED_CAFE` or `--seed=12345`",
+                sink,
+                &extracted_str,
+            )) {
+                if (extracted_str) |raw_seed| {
+                    if (parseSimSeedValue(raw_seed)) |valid_seed| {
+                        sim_seed = valid_seed;
+                    } else {
+                        try sink.emit(.{
+                            .code = .e0001_unknown_cli_flag,
+                            .severity = .err,
+                            .message = try std.fmt.allocPrint(
+                                arena_alloc,
+                                "invalid `--seed` value `{s}`; expected unsigned 64-bit decimal or `0x…` literal",
+                                .{raw_seed},
+                            ),
+                        });
+                    }
+                }
+            } else if (selected_subcommand == .@"test" and blk_tst: {
+                if (matchTestFlag(arg_text)) |tst_flag| {
+                    switch (tst_flag) {
+                        .sim => is_sim_mode = true,
+                        .seed => break :blk_tst false,
+                    }
+                    break :blk_tst true;
+                }
+                break :blk_tst false;
             }) {} else if (selected_subcommand == .upgrade and std.mem.startsWith(u8, arg_text, "--accept-caps=")) {
                 has_accept_caps = true;
                 const raw_caps = arg_text["--accept-caps=".len..];
@@ -5304,6 +5588,8 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
             .has_accept_caps = has_accept_caps,
             .accept_caps_csv = accept_caps_csv,
             .is_lsp_stdio = is_lsp_stdio,
+            .is_sim_mode = is_sim_mode,
+            .sim_seed = sim_seed,
             .run_args = forwarded_run_args,
             .action = .{
                 .execute_subcommand = .{
@@ -5348,6 +5634,8 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                     .has_accept_caps = has_accept_caps,
                     .accept_caps_csv = accept_caps_csv,
                     .is_lsp_stdio = is_lsp_stdio,
+                    .is_sim_mode = is_sim_mode,
+                    .sim_seed = sim_seed,
                 },
             },
         };
@@ -5437,6 +5725,21 @@ pub fn renderSubcommandHelp(
                 chk_desc.value_suffix,
                 34,
                 chk_desc.summary,
+            );
+        }
+        try writer.writeByte('\n');
+    } else if (subcommand == .@"test") {
+        try style_config.writeStyled(writer, .bold, "Test Options:");
+        try writer.writeByte('\n');
+        for (TEST_FLAGS) |tst_desc| {
+            try renderOptionLine(
+                writer,
+                style_config,
+                null,
+                tst_desc.long_flag,
+                tst_desc.value_suffix,
+                34,
+                tst_desc.summary,
             );
         }
         try writer.writeByte('\n');
@@ -5941,6 +6244,14 @@ pub fn runCli(
                 defer visited_fids.deinit(allocator);
                 var has_core_mention = false;
 
+                try registerWorkspaceCoreModuleWithOptions(
+                    allocator,
+                    io,
+                    &source_map,
+                    &db,
+                    &visited_fids,
+                    areAllCoreKernelTargetPaths(cx_file_paths.items),
+                );
                 for (cx_file_ids.items, cx_file_paths.items) |cx_fid, cx_path| {
                     try discoverExternalSubmodulesRecursive(
                         allocator,
@@ -5955,15 +6266,6 @@ pub fn runCli(
                         null,
                         &has_core_mention,
                         0,
-                    );
-                }
-                if (has_core_mention) {
-                    try registerWorkspaceCoreModuleIfNeeded(
-                        allocator,
-                        io,
-                        &source_map,
-                        &db,
-                        &visited_fids,
                     );
                 }
 
@@ -5985,6 +6287,7 @@ pub fn runCli(
                     cx_file_ids.items,
                     diag_renderer,
                     stderr_writer,
+                    effective_exec_info.subcommand == .check,
                 );
                 if (mod_diag.has_errors and
                     !(effective_exec_info.subcommand == .check and
@@ -6252,6 +6555,8 @@ pub fn runCli(
                         };
                     },
                     .@"test" => {
+                        const active_sim_seed: u64 = exec_info.sim_seed orelse
+                            if (exec_info.is_sim_mode) @as(u64, 0x9E37_79B9_7F4A_7C15) else 0;
                         if (exec_info.is_diff_backends) {
                             var tested_main_count: usize = 0;
                             for (cx_file_ids.items) |test_fid| {
@@ -6267,6 +6572,7 @@ pub fn runCli(
                                         .vfs_source_map = &source_map,
                                         .workspace_root = embed_sandbox_root,
                                         .comptime_step_limit = exec_info.comptime_step_limit,
+                                        .sim_seed = active_sim_seed,
                                         .diagnostic_sink = &sink,
                                     },
                                 ) catch |oracle_err| switch (oracle_err) {
@@ -6299,6 +6605,43 @@ pub fn runCli(
                             );
                             try stdout_writer.writeByte('\n');
                             return 0;
+                        }
+                        if (exec_info.is_sim_mode or exec_info.sim_seed != null) {
+                            for (cx_file_ids.items) |test_fid| {
+                                if (!(try fileDeclaresMainEntrypoint(&db, test_fid))) continue;
+                                var sim_out = diff_oracle.runSimulatedVmOnDb(
+                                    allocator,
+                                    &db,
+                                    test_fid,
+                                    exec_info.is_release_mode,
+                                    .{
+                                        .io = io,
+                                        .environ_map = environ_map,
+                                        .vfs_source_map = &source_map,
+                                        .workspace_root = embed_sandbox_root,
+                                        .comptime_step_limit = exec_info.comptime_step_limit,
+                                        .sim_seed = active_sim_seed,
+                                        .diagnostic_sink = &sink,
+                                    },
+                                ) catch |sim_err| switch (sim_err) {
+                                    error.OutOfMemory => return error.OutOfMemory,
+                                    else => {
+                                        if (sink.hasErrors()) {
+                                            try diag_renderer.renderAll(stderr_writer, &sink);
+                                        }
+                                        return 1;
+                                    },
+                                };
+                                defer sim_out.deinit(allocator);
+                                if (sim_out.stdout_bytes.len > 0) try stdout_writer.writeAll(sim_out.stdout_bytes);
+                                if (sim_out.stderr_bytes.len > 0) try stderr_writer.writeAll(sim_out.stderr_bytes);
+                                if (sim_out.has_trapped or sim_out.exit_code != 0) {
+                                    return if (sim_out.exit_code > 0 and sim_out.exit_code <= 255)
+                                        @intCast(sim_out.exit_code)
+                                    else
+                                        1;
+                                }
+                            }
                         }
                         try stdout_style.writeStatusHeader(
                             stdout_writer,
@@ -6360,6 +6703,13 @@ comptime {
         std.debug.assert(@backingInt(lsp_desc.id) == i);
         if (i > 0) {
             std.debug.assert(std.mem.order(u8, LSP_FLAGS[i - 1].long_flag, lsp_desc.long_flag) == .lt);
+        }
+    }
+    std.debug.assert(TEST_FLAGS.len == 2);
+    for (TEST_FLAGS, 0..) |tst_desc, i| {
+        std.debug.assert(@backingInt(tst_desc.id) == i);
+        if (i > 0) {
+            std.debug.assert(std.mem.order(u8, TEST_FLAGS[i - 1].long_flag, tst_desc.long_flag) == .lt);
         }
     }
     std.debug.assert(TRANSLATE_C_FLAGS.len == 5);

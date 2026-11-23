@@ -62,7 +62,7 @@ const PHASE5_SEED_ITEMS = [_][]const u8{
     "pub const ENABLE_FAST_PATH: bool = true;\n",
     "pub struct IoFault { pub code: i32 }\n",
     "@derive(From)\npub enum PipelineErr { Io(IoFault), BadInput, }\n",
-    "@derive(Eq, Clone)\npub struct RowPoint { pub x: i32, pub y: i32 }\n",
+    "@derive(Equatable, Clone)\npub struct RowPoint { pub x: i32, pub y: i32 }\n",
     "pub bit_field RegControl: u16 { pub is_active: bool | 1, pub mode_bits: u16 | 15 }\n",
     "pub fn scale_pipe(val: i32, factor: i32) -> i32 = val * factor + 1;\n",
     "pub fn generic_mix(lhs: Number, rhs: Number) -> Number = lhs + rhs;\n",
@@ -252,7 +252,7 @@ fn generateWellTypedDifferentialProgram(
         allocator,
         "pub struct AccPair {\n    pub left: i64,\n    pub right: i64,\n}\n" ++
             "pub enum StepMode {\n    Idle,\n    Shift(i64),\n    Scale(i64),\n}\n" ++
-            "@derive(Copy, Eq)\npub enum FsmPhase: u8 {\n    Init = 0,\n    Next = 1,\n    Done = 2,\n}\n" ++
+            "@derive(Copy, Equatable)\npub enum FsmPhase: u8 {\n    Init = 0,\n    Next = 1,\n    Done = 2,\n}\n" ++
             "pub fn bump_defer_log(slot: &mut i64, delta: i64) {\n    slot.* = slot.* + delta;\n}\n" ++
             "pub fn write_out_slot(dst: &out i64, val_in: i64, /) {\n    dst.* = val_in + (b'B' as i64);\n}\n" ++
             "pub fn generic_combine(lhs: Number, rhs: Number) -> Number = lhs + rhs;\n" ++

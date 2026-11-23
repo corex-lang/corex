@@ -756,7 +756,7 @@ test "test_query_db_comptime_derive_impl_methods_memo_isolation_and_invalidation
     const file_id = FileId.fromInt(1);
 
     const rev1_src =
-        "@derive(Eq, Hash, Clone)\n" ++
+        "@derive(Equatable, Hash, Clone)\n" ++
         "pub struct Pt {\n" ++
         "    pub px: i64,\n" ++
         "    pub py: i64,\n" ++
@@ -791,7 +791,7 @@ test "test_query_db_comptime_derive_impl_methods_memo_isolation_and_invalidation
         "}\n";
 
     const rev2_src =
-        "@derive(Eq, Hash, Clone)\n" ++
+        "@derive(Equatable, Hash, Clone)\n" ++
         "pub struct Pt {\n" ++
         "    pub px: i64,\n" ++
         "    pub py: i64,\n" ++

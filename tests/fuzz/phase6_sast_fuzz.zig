@@ -184,7 +184,7 @@ const PHASE6_SEED_ITEMS = [_][]const u8{
         "        inout { yield &mut self.lanes[lane_idx % 4]; }\n" ++
         "    }\n" ++
         "}\n",
-    "@derive(Copy, Eq)\n" ++
+    "@derive(Copy, Equatable)\n" ++
         "pub enum FsmTag: u8 {\n    First = 0,\n    Second = 1,\n}\n" ++
         "pub struct GuardPair {\n    pub primary: TrackedBuf,\n    pub secondary: TrackedBuf,\n}\n" ++
         "pub fn init_out_buf(out_buf: &out TrackedBuf, tag_v: i64, /) {\n" ++

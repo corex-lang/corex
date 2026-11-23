@@ -1010,6 +1010,8 @@ pub const VfsSourceMap = struct {
     lazy_pager: ?*LazyCxTreePager = null,
     /// Most recent `std.Io` handle observed by `VfsSourceMap` for `mmap` teardown and disk reloads.
     last_io: ?std.Io = null,
+    /// When `false` (Windows `corex lsp`), reads `>= 16 KiB` mutable files into `small_file_arena` to avoid locking saves.
+    allow_mutable_mmap: bool = true,
 
     /// Initializes an empty `VfsSourceMap` bound to `backing_allocator` and `interner`.
     pub fn init(backing_allocator: std.mem.Allocator, interner: *StringInterner) VfsSourceMap {
@@ -1062,7 +1064,7 @@ pub const VfsSourceMap = struct {
         errdefer if (!is_file_transferred) opened_file.close(io);
 
         // [1] Attempt zero-copy OS `mmap` for `>= 16 KiB` files not landing on a 4096-byte page boundary:
-        if (file_size >= SMALL_FILE_THRESHOLD and (file_size % OS_PAGE_SIZE) != 0) {
+        if (self.allow_mutable_mmap and file_size >= SMALL_FILE_THRESHOLD and (file_size % OS_PAGE_SIZE) != 0) {
             if (opened_file.createMemoryMap(io, .{
                 .len = file_size,
                 .protection = .{ .read = true, .write = false },

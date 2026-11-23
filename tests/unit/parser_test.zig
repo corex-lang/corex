@@ -720,15 +720,15 @@ test "test_parser_all_four_dr03_showcase_programs_lossless_and_zero_diagnostics"
 
     const showcase_3_avl =
         \\mod avl_tree;
-        \\use cx.cmp.Ord;
+        \\use cx.cmp.Comparable;
         \\use cx.mem.OwnPtr;
-        \\pub struct AvlNode[K: Ord, V] {
+        \\pub struct AvlNode[K: Comparable, V] {
         \\    pub key: K,
         \\    pub value: V,
         \\    pub left: OwnPtr[AvlNode[K, V]]?,
         \\    pub right: OwnPtr[AvlNode[K, V]]?,
         \\}
-        \\impl[K: Ord, V] AvlNode[K, V] {
+        \\impl[K: Comparable, V] AvlNode[K, V] {
         \\    fn rotate_right(var y_node: own OwnPtr[AvlNode[K, V]]) -> OwnPtr[AvlNode[K, V]] {
         \\        var x_node = y_node.left.take() orelse return y_node;
         \\        y_node.left = x_node.right.take();

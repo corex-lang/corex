@@ -241,6 +241,21 @@ const BodyEmitState = struct {
     /// Maximum coroutine frame alignment in bytes required across locals and `%_scratch_*` slots.
     coro_max_align: u32 = 16,
 
+    /// Initializes an empty `BodyEmitState` for a synthetic helper function without MIR locals/edges.
+    fn initSynthetic(allocator: std.mem.Allocator, ptr_int_name: []const u8) !BodyEmitState {
+        return .{
+            .allocator = allocator,
+            .cur_label = try allocator.dupe(u8, "entry"),
+            .local_ptrs = try allocator.alloc([]u8, 0),
+            .local_aligns = try allocator.alloc(u32, 0),
+            .edge_pred_labels = try allocator.alloc([]u8, 0),
+            .edge_call_ret_vals = try allocator.alloc([]u8, 0),
+            .edge_trampoline = try allocator.alloc(?u32, 0),
+            .block_access_group = try allocator.alloc(u32, 0),
+            .ptr_int_name = ptr_int_name,
+        };
+    }
+
     /// Releases all per-function buffers and owned label slices.
     fn deinit(self: *BodyEmitState) void {
         self.entry_allocas.deinit(self.allocator);
@@ -501,6 +516,16 @@ const LlvmModuleEmitter = struct {
     res_err_check_set: std.AutoHashMapUnmanaged(u32, void) = .empty,
     /// Ordered `Result` `TypeId`s requiring `@_cx_res_is_err_<id>` helpers for `TaskGroup` `Err` cascade.
     ordered_res_err_types: std.ArrayListUnmanaged(TypeId) = .empty,
+    /// `true` when `@tls_scratch_ptr()` is referenced (`64 B` zero-initialized TLS).
+    has_tls_scratch: bool = false,
+    /// `true` when `@tls_alloc_state()` is referenced (`256 B` zero-initialized TLS).
+    has_tls_alloc: bool = false,
+    /// `true` when `@sys_mmap` / `@sys_munmap` virtual memory helpers are referenced.
+    has_sys_mmap: bool = false,
+    /// `true` when `#soa Vec[S]` slab helpers (`@_cx_soa_zalloc` / `@_cx_soa_free`) are needed.
+    has_soa_vec: bool = false,
+    /// `true` when `@fmt_write` streaming formatting is referenced.
+    has_fmt_write: bool = false,
 
     /// Initializes `LlvmModuleEmitter` for `cfg` and `input`.
     fn init(
@@ -856,6 +881,7 @@ fn isNamedCompositeType(emitter: *LlvmModuleEmitter, raw_ty: TypeId) !bool {
         .struct_ty,
         .tuple_ty,
         .soa_array_ty,
+        .soa_vec_ty,
         .union_ty,
         .enum_ty,
         .optional_ty,
@@ -864,6 +890,24 @@ fn isNamedCompositeType(emitter: *LlvmModuleEmitter, raw_ty: TypeId) !bool {
         => true,
         else => false,
     };
+}
+
+/// Formats the LLVM slice value struct (`{ ptr, i64 }` vs 4-word `{ ptr, i64, i64, i64 }` for `#soa [S]`).
+fn formatSliceLlvmStructType(emitter: *LlvmModuleEmitter, raw_ty: TypeId) ![]u8 {
+    const ptr_int = ptrIntType(emitter);
+    if (emitter.input.pool.isSoaSliceOrRefType(raw_ty)) {
+        return std.fmt.allocPrint(
+            emitter.allocator,
+            "{{ ptr, {s}, {s}, {s} }}",
+            .{ ptr_int, ptr_int, ptr_int },
+        );
+    }
+    return std.fmt.allocPrint(emitter.allocator, "{{ ptr, {s} }}", .{ptr_int});
+}
+
+/// Returns the pointer-sized word count (`4` for `#soa [S]` / `&#soa [S]`, `2` for `[T]` / `&[T]` / `str`).
+inline fn sliceDescriptorWordCount(pool: *const type_system.InternPool, raw_ty: TypeId) u32 {
+    return if (pool.isSoaSliceOrRefType(raw_ty)) 4 else 2;
 }
 
 /// Formats the canonical LLVM SSA value type for `raw_ty` (caller owns returned slice).
@@ -904,7 +948,11 @@ fn formatLlvmValueType(emitter: *LlvmModuleEmitter, raw_ty: TypeId) ![]u8 {
 
     const node = emitter.input.pool.getNode(ty);
     return switch (node.tag) {
-        .ref_ty, .mut_ref_ty, .raw_ptr_ty, .fn_ty => emitter.allocator.dupe(u8, "ptr"),
+        .ref_ty, .mut_ref_ty => if (emitter.input.pool.isSliceRefType(ty))
+            formatSliceLlvmStructType(emitter, ty)
+        else
+            emitter.allocator.dupe(u8, "ptr"),
+        .raw_ptr_ty, .fn_ty => emitter.allocator.dupe(u8, "ptr"),
         .closure_ty => emitter.allocator.dupe(
             u8,
             if (codegen_abi.isThreeWordClosureType(emitter.input.pool, ty))
@@ -912,11 +960,7 @@ fn formatLlvmValueType(emitter: *LlvmModuleEmitter, raw_ty: TypeId) ![]u8 {
             else
                 "{ ptr, ptr }",
         ),
-        .slice_ty, .soa_slice_ty => std.fmt.allocPrint(
-            emitter.allocator,
-            "{{ ptr, {s} }}",
-            .{ptrIntType(emitter)},
-        ),
+        .slice_ty, .soa_slice_ty => formatSliceLlvmStructType(emitter, ty),
         .array_ty => {
             const elem_ty = TypeId.fromInt(node.lhs);
             const elem_count: u64 = node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
@@ -984,11 +1028,19 @@ fn collectCompositeType(emitter: *LlvmModuleEmitter, raw_ty: TypeId, depth: u32)
             }
             try emitter.ordered_composites.append(emitter.allocator, ty);
         },
-        .soa_array_ty, .union_ty, .enum_ty, .optional_ty, .result_ty, .future_ty => {
+        .soa_array_ty, .soa_vec_ty, .union_ty, .enum_ty, .optional_ty, .result_ty, .future_ty => {
             if (emitter.composite_set.contains(ty.toU32())) return;
             try emitter.composite_set.put(emitter.allocator, ty.toU32(), {});
-            if (node.tag == .soa_array_ty) {
+            if (node.tag == .soa_array_ty or node.tag == .soa_vec_ty) {
+                if (node.tag == .soa_vec_ty) emitter.has_soa_vec = true;
                 try collectCompositeType(emitter, TypeId.fromInt(node.lhs), depth + 1);
+                const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+                const elem_lay = try emitter.resolver.resolveType(elem_struct);
+                var fld_i: u32 = 0;
+                while (fld_i < elem_lay.aux_len) : (fld_i += 1) {
+                    const fld = emitter.resolver.fields_by_decl.items[elem_lay.aux_start + fld_i];
+                    if (fld.size_bytes > 0) try collectCompositeType(emitter, fld.field_ty, depth + 1);
+                }
             } else if (node.tag == .optional_ty) {
                 try collectCompositeType(emitter, TypeId.fromInt(node.lhs), depth + 1);
             } else if (node.tag == .future_ty) {
@@ -1072,6 +1124,11 @@ fn emitCompositeTypeDeclarations(emitter: *LlvmModuleEmitter) !void {
                 try emitter.print("[{d} x i8]", .{lay.size_bytes});
             }
             try emitter.writeAll(" }>\n");
+        } else if (node.tag == .soa_vec_ty) {
+            try emitter.print(
+                "%_cx_ty_{d} = type <{{ ptr, i32, i32, {s} }}>\n",
+                .{ ty.toU32(), ptrIntType(emitter) },
+            );
         } else {
             try emitter.print("%_cx_ty_{d} = type <{{ [{d} x i8] }}>\n", .{ ty.toU32(), lay.size_bytes });
         }
@@ -1308,7 +1365,8 @@ fn registerDropTypeRecursive(emitter: *LlvmModuleEmitter, raw_ty: TypeId, depth:
         .array_ty => {
             try registerDropTypeRecursive(emitter, TypeId.fromInt(node.lhs), depth + 1);
         },
-        .soa_array_ty => {
+        .soa_array_ty, .soa_vec_ty => {
+            if (node.tag == .soa_vec_ty) emitter.has_soa_vec = true;
             const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
             const lay = try emitter.resolver.resolveType(elem_struct);
             var fld_i: u32 = 0;
@@ -1364,6 +1422,15 @@ fn registerFmtTypeRecursive(emitter: *LlvmModuleEmitter, raw_ty: TypeId, depth: 
             },
             .slice_ty, .array_ty => {
                 try registerFmtTypeRecursive(emitter, TypeId.fromInt(node.lhs), depth + 1);
+            },
+            .soa_array_ty, .soa_slice_ty, .soa_vec_ty => {
+                const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+                const lay = try emitter.resolver.resolveType(elem_struct);
+                var fld_i: u32 = 0;
+                while (fld_i < lay.aux_len) : (fld_i += 1) {
+                    const fld = emitter.resolver.fields_by_decl.items[lay.aux_start + fld_i];
+                    try registerFmtTypeRecursive(emitter, fld.field_ty, depth + 1);
+                }
             },
             .struct_ty, .tuple_ty => {
                 const lay = try emitter.resolver.resolveType(ty);
@@ -1427,7 +1494,15 @@ fn maybeRegisterExternSymbol(
                 }
             }
         }
-    } else if (sym_rec.kind == .extern_static_sym or sym_rec.flags.is_extern) {
+    } else if (sym_rec.kind == .extern_static_sym or sym_rec.flags.is_extern or
+        (sym_rec.kind == .const_sym and blk_unbacked_const: {
+            const resolved_def = if (!def_id.isNone()) def_id else sym_rec.def_id;
+            if (emitter.input.const_rodata_map) |crm| {
+                break :blk_unbacked_const !crm.contains(resolved_def.asInt());
+            }
+            break :blk_unbacked_const true;
+        }))
+    {
         if (!(try emitter.extern_global_sym_set.getOrPut(emitter.allocator, sym_idx.asInt())).found_existing) {
             try emitter.extern_global_syms.append(emitter.allocator, sym_idx);
             try collectCompositeType(emitter, sym_rec.type_id, 0);
@@ -1826,9 +1901,10 @@ fn indexModuleEntities(emitter: *LlvmModuleEmitter) !void {
                                     body_ptr.getInst(MirValueId.fromInt(href_raw)).type_id,
                                 );
                                 const href_node = emitter.input.pool.getNode(href_ty);
-                                const hval_ty = if (href_node.tag == .ref_ty or
+                                const hval_ty = if ((href_node.tag == .ref_ty or
                                     href_node.tag == .mut_ref_ty or
-                                    href_node.tag == .raw_ptr_ty)
+                                    href_node.tag == .raw_ptr_ty) and
+                                    !emitter.input.pool.isSliceRefType(href_ty))
                                     TypeId.fromInt(href_node.lhs)
                                 else
                                     href_ty;
@@ -1859,6 +1935,68 @@ fn indexModuleEntities(emitter: *LlvmModuleEmitter) !void {
                     else
                         place_ty;
                     try registerDropTypeRecursive(emitter, dropped_ty, 0);
+                } else if (ikind == .ptr_drop_in_place) {
+                    const drop_args = body_ptr.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs];
+                    if (drop_args.len >= 1) {
+                        const ptr_ty = emitter.input.pool.unwrapUnderlyingType(
+                            body_ptr.getInst(MirValueId.fromInt(drop_args[0])).type_id,
+                        );
+                        if (!ptr_ty.isPrimitiveOrSentinel()) {
+                            try registerDropTypeRecursive(
+                                emitter,
+                                TypeId.fromInt(emitter.input.pool.getNode(ptr_ty).lhs),
+                                0,
+                            );
+                        }
+                    }
+                } else if (ikind == .soa_vec_clear) {
+                    emitter.has_soa_vec = true;
+                    const clr_args = body_ptr.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs];
+                    if (clr_args.len >= 1) {
+                        const ref_ty = emitter.input.pool.unwrapUnderlyingType(
+                            body_ptr.getInst(MirValueId.fromInt(clr_args[0])).type_id,
+                        );
+                        if (!ref_ty.isPrimitiveOrSentinel()) {
+                            try registerDropTypeRecursive(
+                                emitter,
+                                TypeId.fromInt(emitter.input.pool.getNode(ref_ty).lhs),
+                                0,
+                            );
+                        }
+                    }
+                } else if (ikind == .soa_vec_new or
+                    ikind == .soa_vec_with_cap or
+                    ikind == .soa_vec_push or
+                    ikind == .soa_vec_reserve or
+                    ikind == .soa_vec_as_slice)
+                {
+                    emitter.has_soa_vec = true;
+                    if (ikind == .soa_vec_push) {
+                        const push_args = body_ptr.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs];
+                        if (push_args.len >= 2) {
+                            try registerDropTypeRecursive(
+                                emitter,
+                                body_ptr.getInst(MirValueId.fromInt(push_args[1])).type_id,
+                                0,
+                            );
+                        }
+                    }
+                } else if (ikind == .ctx_next_rng_seed) {
+                    if (emitter.cfg.target.ptrBytes() < 8) {
+                        emitter.ctx_wide_slot_sizes[2] = @max(emitter.ctx_wide_slot_sizes[2], 8);
+                        emitter.ctx_wide_slot_aligns[2] = @max(emitter.ctx_wide_slot_aligns[2], 8);
+                    }
+                } else if (ikind == .tls_scratch_ptr) {
+                    emitter.has_tls_scratch = true;
+                } else if (ikind == .tls_alloc_state) {
+                    emitter.has_tls_alloc = true;
+                } else if (ikind == .sys_mmap or ikind == .sys_munmap) {
+                    emitter.has_sys_mmap = true;
+                } else if (ikind == .fmt_write) {
+                    emitter.has_fmt_write = true;
+                    if (!emitter.cfg.target.isFreestanding()) {
+                        emitter.has_fmt_rt_helpers = true;
+                    }
                 } else if (ikind == .type_name) {
                     const refl_raw = inst.operands.lhs;
                     var has_tn = false;
@@ -2012,11 +2150,15 @@ fn formatAbiParamOrRetType(
             }
             if (!ty.isPrimitiveOrSentinel()) {
                 const tag = emitter.input.pool.getNode(ty).tag;
-                if (tag == .ref_ty or tag == .mut_ref_ty or tag == .raw_ptr_ty or tag == .fn_ty) {
+                if ((tag == .ref_ty or tag == .mut_ref_ty or tag == .raw_ptr_ty or tag == .fn_ty) and
+                    !emitter.input.pool.isSliceRefType(ty))
+                {
                     return emitter.allocator.dupe(u8, "ptr");
                 }
                 if (emitter.cfg.target.isWasm() and
-                    (tag == .slice_ty or tag == .soa_slice_ty or tag == .closure_ty))
+                    !emitter.input.pool.isSoaSliceOrRefType(ty) and
+                    (tag == .slice_ty or tag == .closure_ty or
+                        emitter.input.pool.isSliceRefType(ty)))
                 {
                     return emitter.allocator.dupe(u8, "i64");
                 }
@@ -2054,7 +2196,9 @@ fn formatAbiParamOrRetType(
                 if (ty == .str_ty or ty == .bencher_ty) return emitter.allocator.dupe(u8, "{ ptr, i64 }");
                 if (!ty.isPrimitiveOrSentinel()) {
                     const tag = emitter.input.pool.getNode(ty).tag;
-                    if (tag == .slice_ty or tag == .soa_slice_ty) {
+                    if (!emitter.input.pool.isSoaSliceOrRefType(ty) and
+                        (tag == .slice_ty or emitter.input.pool.isSliceRefType(ty)))
+                    {
                         return emitter.allocator.dupe(u8, "{ ptr, i64 }");
                     }
                     if (tag == .closure_ty) {
@@ -2337,10 +2481,12 @@ fn emitCoerceAbiToValue(
     defer emitter.allocator.free(slot);
 
     try emitMemsetZero(emitter, state, slot, scratch_sz, eff_align);
-    try state.print(
-        "  store {s} {s}, ptr {s}, align {d}\n",
-        .{ abi_ty, abi_val_str, slot, eff_align },
-    );
+    if (abi_ty.len > 0 and !std.mem.eql(u8, abi_ty, "void")) {
+        try state.print(
+            "  store {s} {s}, ptr {s}, align {d}\n",
+            .{ abi_ty, abi_val_str, slot, eff_align },
+        );
+    }
     return emitLoadValueFromPtr(emitter, state, raw_ty, slot, eff_align, null, 0, 0, 0);
 }
 
@@ -2843,8 +2989,572 @@ fn emitRodataAndRuntimeHelpers(
         );
     }
 
+    if (emitter.has_tls_scratch) {
+        const tls_kw = if (emitter.cfg.target.isWasm()) "internal global" else "internal thread_local global";
+        try emitter.print("@_cx_tls_scratch_buf = {s} [8 x i64] zeroinitializer, align 16\n", .{tls_kw});
+    }
+    if (emitter.has_tls_alloc) {
+        const tls_kw = if (emitter.cfg.target.isWasm()) "internal global" else "internal thread_local global";
+        try emitter.print("@_cx_tls_alloc_buf = {s} [32 x i64] zeroinitializer, align 16\n", .{tls_kw});
+    }
+    if (emitter.has_sys_mmap) {
+        try emitSysMmapHelpersLlvm(emitter);
+    }
+    if (emitter.has_soa_vec) {
+        try emitSoaSlabHelpersLlvm(emitter);
+    }
     if (emitter.has_async_ops) {
         try emitAsyncRuntimeHelpersLlvm(emitter);
+    }
+}
+
+/// Emits OS-specific anonymous page mapping helpers (`@_cx_sys_mmap` / `@_cx_sys_munmap`) in LLVM IR.
+fn emitSysMmapHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
+    const ptr_int = ptrIntType(emitter);
+    const fn_attrs = fnUnwindAttrs(emitter);
+    if (emitter.cfg.target.isWasm()) {
+        try emitter.requireIntrinsicDecl("declare i32 @llvm.wasm.memory.grow.i32(i32, i32) nounwind");
+        try emitter.print(
+            "define internal ptr @_cx_sys_mmap(i32 %_len) {s} {{\n" ++
+                "entry:\n" ++
+                "  %_isz = icmp eq i32 %_len, 0\n" ++
+                "  br i1 %_isz, label %ret_null, label %grow\n" ++
+                "grow:\n" ++
+                "  %_add = add i32 %_len, 65535\n" ++
+                "  %_pgs = lshr i32 %_add, 16\n" ++
+                "  %_prv = call i32 @llvm.wasm.memory.grow.i32(i32 0, i32 %_pgs)\n" ++
+                "  %_bad = icmp eq i32 %_prv, -1\n" ++
+                "  br i1 %_bad, label %ret_null, label %ok\n" ++
+                "ok:\n" ++
+                "  %_off = shl i32 %_prv, 16\n" ++
+                "  %_out = inttoptr i32 %_off to ptr\n" ++
+                "  ret ptr %_out\n" ++
+                "ret_null:\n" ++
+                "  ret ptr null\n" ++
+                "}}\n\n" ++
+                "define internal void @_cx_sys_munmap(ptr %_p, i32 %_l) {s} {{\nentry:\n  ret void\n}}\n\n",
+            .{ fn_attrs, fn_attrs },
+        );
+    } else if (emitter.cfg.target.isWindows()) {
+        if (try emitter.markExternDeclared("VirtualAlloc")) {
+            try emitter.writeAll("declare ptr @VirtualAlloc(ptr, i64, i32, i32) nounwind\n");
+        }
+        if (try emitter.markExternDeclared("VirtualFree")) {
+            try emitter.writeAll("declare i32 @VirtualFree(ptr, i64, i32) nounwind\n");
+        }
+        try emitter.print(
+            "define internal ptr @_cx_sys_mmap(i64 %_len) {s} {{\n" ++
+                "entry:\n" ++
+                "  %_isz = icmp eq i64 %_len, 0\n" ++
+                "  br i1 %_isz, label %ret_null, label %map\n" ++
+                "map:\n" ++
+                "  %_res = call ptr @VirtualAlloc(ptr null, i64 %_len, i32 12288, i32 4)\n" ++
+                "  ret ptr %_res\n" ++
+                "ret_null:\n" ++
+                "  ret ptr null\n" ++
+                "}}\n\n" ++
+                "define internal void @_cx_sys_munmap(ptr %_p, i64 %_len) {s} {{\n" ++
+                "entry:\n" ++
+                "  %_nn = icmp ne ptr %_p, null\n" ++
+                "  br i1 %_nn, label %do_free, label %done\n" ++
+                "do_free:\n" ++
+                "  %_vf = call i32 @VirtualFree(ptr %_p, i64 0, i32 32768)\n" ++
+                "  br label %done\n" ++
+                "done:\n" ++
+                "  ret void\n" ++
+                "}}\n\n",
+            .{ fn_attrs, fn_attrs },
+        );
+    } else {
+        const map_flags: u32 = if (emitter.cfg.target.isDarwin()) 0x1002 else 0x22;
+        if (try emitter.markExternDeclared("mmap")) {
+            try emitter.print("declare ptr @mmap(ptr, {s}, i32, i32, i32, i64) nounwind\n", .{ptr_int});
+        }
+        if (try emitter.markExternDeclared("munmap")) {
+            try emitter.print("declare i32 @munmap(ptr, {s}) nounwind\n", .{ptr_int});
+        }
+        try emitter.print(
+            "define internal ptr @_cx_sys_mmap({s} %_len) {s} {{\n" ++
+                "entry:\n" ++
+                "  %_isz = icmp eq {s} %_len, 0\n" ++
+                "  br i1 %_isz, label %ret_null, label %map\n" ++
+                "map:\n" ++
+                "  %_res = call ptr @mmap(ptr null, {s} %_len, i32 3, i32 {d}, i32 -1, i64 0)\n" ++
+                "  %_ri = ptrtoint ptr %_res to {s}\n" ++
+                "  %_bad = icmp eq {s} %_ri, -1\n" ++
+                "  %_out = select i1 %_bad, ptr null, ptr %_res\n" ++
+                "  ret ptr %_out\n" ++
+                "ret_null:\n" ++
+                "  ret ptr null\n" ++
+                "}}\n\n" ++
+                "define internal void @_cx_sys_munmap(ptr %_p, {s} %_len) {s} {{\n" ++
+                "entry:\n" ++
+                "  %_nn = icmp ne ptr %_p, null\n" ++
+                "  %_nz = icmp ne {s} %_len, 0\n" ++
+                "  %_ok = and i1 %_nn, %_nz\n" ++
+                "  br i1 %_ok, label %do_un, label %done\n" ++
+                "do_un:\n" ++
+                "  %_u = call i32 @munmap(ptr %_p, {s} %_len)\n" ++
+                "  br label %done\n" ++
+                "done:\n" ++
+                "  ret void\n" ++
+                "}}\n\n",
+            .{ ptr_int, fn_attrs, ptr_int, ptr_int, map_flags, ptr_int, ptr_int, ptr_int, fn_attrs, ptr_int, ptr_int },
+        );
+    }
+}
+
+/// Resolves `AllocatorHandle.alloc` and `AllocatorHandle.dealloc` body indices inside `emitter.input.bodies`.
+fn lookupAllocatorHandleBodiesLlvm(emitter: *const LlvmModuleEmitter) ?struct {
+    alloc_b: u32,
+    dealloc_b: u32,
+    handle_ty: TypeId,
+    layout_ty: TypeId,
+    ptr_ty: TypeId,
+    res_ty: TypeId,
+} {
+    var alloc_b_opt: ?u32 = null;
+    var dealloc_b_opt: ?u32 = null;
+    for (emitter.input.sym_table.symbols.items) |cand_sym| {
+        if (cand_sym.kind == .struct_sym and
+            std.mem.eql(u8, cand_sym.name_text, "AllocatorHandle") and
+            !cand_sym.target_scope.isNone())
+        {
+            for (emitter.input.sym_table.getScopeMembers(cand_sym.target_scope)) |mem_idx| {
+                const mem_sym = emitter.input.sym_table.getSymbol(mem_idx).*;
+                if (mem_sym.kind != .fn_sym) continue;
+                if (std.mem.eql(u8, mem_sym.name_text, "alloc")) {
+                    if (resolveBodyIndex(emitter, mem_sym.def_id, mem_idx)) |found_b| {
+                        if (emitter.input.bodies[found_b].param_count == 2) alloc_b_opt = found_b;
+                    }
+                } else if (std.mem.eql(u8, mem_sym.name_text, "dealloc")) {
+                    if (resolveBodyIndex(emitter, mem_sym.def_id, mem_idx)) |found_b| {
+                        if (emitter.input.bodies[found_b].param_count == 3) dealloc_b_opt = found_b;
+                    }
+                }
+            }
+            break;
+        }
+    }
+    const alloc_b = alloc_b_opt orelse return null;
+    const dealloc_b = dealloc_b_opt orelse return null;
+    const alloc_body = &emitter.input.bodies[alloc_b];
+    const dealloc_body = &emitter.input.bodies[dealloc_b];
+    if (alloc_body.locals.items.len < 3 or dealloc_body.locals.items.len < 4) return null;
+    return .{
+        .alloc_b = alloc_b,
+        .dealloc_b = dealloc_b,
+        .handle_ty = emitter.input.pool.unwrapUnderlyingType(alloc_body.locals.items[1].type_id),
+        .layout_ty = emitter.input.pool.unwrapUnderlyingType(alloc_body.locals.items[2].type_id),
+        .ptr_ty = emitter.input.pool.unwrapUnderlyingType(dealloc_body.locals.items[2].type_id),
+        .res_ty = emitter.input.pool.unwrapUnderlyingType(alloc_body.ret_ty),
+    };
+}
+
+/// Formats and appends ABI call argument pieces from stack slots `slot_ptrs[0..param_count]` into `call_args`.
+fn appendAbiArgsFromStackSlotsLlvm(
+    emitter: *LlvmModuleEmitter,
+    state: *BodyEmitState,
+    recipe: *const AbiFnRecipe,
+    param_types: []const TypeId,
+    slot_ptrs: []const []const u8,
+    call_args: *std.ArrayListUnmanaged(u8),
+    arg_cnt: *usize,
+) !void {
+    const ptr_bytes: u32 = emitter.cfg.target.ptrBytes();
+    for (param_types, 0..) |p_ty, idx| {
+        if (idx >= recipe.param_recipes.len) break;
+        const p_rec = recipe.param_recipes[idx];
+        if (p_rec.pass_mode == .ignore_zst) continue;
+        const slot_p = slot_ptrs[idx];
+        const op_s = if (p_rec.pass_mode == .indirect_by_ref or p_rec.pass_mode == .indirect_byval)
+            try emitter.allocator.dupe(u8, slot_p)
+        else blk_ld: {
+            const p_abi_ty = try formatAbiParamOrRetType(emitter, p_ty, p_rec);
+            defer emitter.allocator.free(p_abi_ty);
+            const ld_id = state.nextTmp();
+            try state.print(
+                "  %_sah_ld_{d} = load {s}, ptr {s}, align {d}\n",
+                .{ ld_id, p_abi_ty, slot_p, @max(ptr_bytes, 8) },
+            );
+            break :blk_ld try std.fmt.allocPrint(emitter.allocator, "%_sah_ld_{d}", .{ld_id});
+        };
+        defer emitter.allocator.free(op_s);
+        const piece = try formatAbiParamDeclPiece(emitter, p_ty, p_rec, op_s);
+        defer emitter.allocator.free(piece);
+        if (arg_cnt.* > 0) try call_args.appendSlice(emitter.allocator, ", ");
+        try call_args.appendSlice(emitter.allocator, piece);
+        arg_cnt.* += 1;
+    }
+}
+
+/// Emits over-aligned zeroed slab helpers (`@_cx_soa_zalloc` / `@_cx_soa_free`) for `#soa Vec[S]` in LLVM IR.
+fn emitSoaSlabHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
+    const ptr_int = ptrIntType(emitter);
+    const ptr_bytes: u32 = emitter.cfg.target.ptrBytes();
+    const fn_attrs = fnUnwindAttrs(emitter);
+    if (lookupAllocatorHandleBodiesLlvm(emitter)) |ah| {
+        try emitter.requireIntrinsicDecl(
+            "declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg)",
+        );
+        // [1] `@_cx_soa_zalloc` routing through `AllocatorHandle.alloc`:
+        {
+            var state = try BodyEmitState.initSynthetic(emitter.allocator, ptr_int);
+            defer state.deinit();
+            try emitter.print(
+                "define internal ptr @_cx_soa_zalloc({s} %_alloc, {s} %_raw_n, {s} %_raw_al, i1 %_is_try) {s} {{\n" ++
+                    "entry:\n",
+                .{ ptr_int, ptr_int, ptr_int, fn_attrs },
+            );
+            const h_slot = try state.allocEntryBytes(ptr_bytes, @max(ptr_bytes, 8));
+            defer emitter.allocator.free(h_slot);
+            const ly_slot = try state.allocEntryBytes(2 * ptr_bytes, @max(ptr_bytes, 8));
+            defer emitter.allocator.free(ly_slot);
+            const res_lay = try emitter.resolver.resolveType(ah.res_ty);
+            const res_align = @max(res_lay.alignBytes(), 8);
+            const res_slot = try state.allocEntryBytes(@max(res_lay.size_bytes, 8), res_align);
+            defer emitter.allocator.free(res_slot);
+            try emitMemsetZero(emitter, &state, res_slot, @max(res_lay.size_bytes, 8), res_align);
+
+            try state.print(
+                "  %_lt = icmp ult {s} %_raw_al, 16\n" ++
+                    "  %_al = select i1 %_lt, {s} 16, {s} %_raw_al\n" ++
+                    "  store {s} %_alloc, ptr {s}, align {d}\n" ++
+                    "  store {s} %_raw_n, ptr {s}, align {d}\n" ++
+                    "  %_ly_a = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                    "  store {s} %_al, ptr %_ly_a, align {d}\n",
+                .{
+                    ptr_int, ptr_int,   ptr_int,
+                    ptr_int, h_slot,    ptr_bytes,
+                    ptr_int, ly_slot,   ptr_bytes,
+                    ly_slot, ptr_int,   ptr_bytes,
+                    ptr_int, ptr_bytes,
+                },
+            );
+
+            const alloc_rec = &emitter.body_recipes.items[ah.alloc_b];
+            const alloc_ident = try formatLlvmGlobalIdent(emitter.allocator, emitter.body_llvm_names.items[ah.alloc_b]);
+            defer emitter.allocator.free(alloc_ident);
+
+            var call_args: std.ArrayListUnmanaged(u8) = .empty;
+            defer call_args.deinit(emitter.allocator);
+            var arg_cnt: usize = 0;
+
+            var sret_slot: ?[]u8 = null;
+            defer if (sret_slot) |sret_buf| emitter.allocator.free(sret_buf);
+            if (alloc_rec.has_sret) {
+                sret_slot = try state.allocEntryBytes(
+                    res_lay.size_bytes,
+                    @max(res_lay.alignBytes(), alloc_rec.sret_recipe.pointee_align_bytes),
+                );
+                const sret_p = try formatAbiParamDeclPiece(emitter, ah.res_ty, alloc_rec.sret_recipe, sret_slot.?);
+                defer emitter.allocator.free(sret_p);
+                try call_args.appendSlice(emitter.allocator, sret_p);
+                arg_cnt += 1;
+            }
+            if (alloc_rec.has_implicit_context) {
+                const ctx_p = try formatAbiParamDeclPiece(emitter, .usize_ty, alloc_rec.context_recipe, "@_cx_default_ctx");
+                defer emitter.allocator.free(ctx_p);
+                if (arg_cnt > 0) try call_args.appendSlice(emitter.allocator, ", ");
+                try call_args.appendSlice(emitter.allocator, ctx_p);
+                arg_cnt += 1;
+            }
+            try appendAbiArgsFromStackSlotsLlvm(
+                emitter,
+                &state,
+                alloc_rec,
+                &[2]TypeId{ ah.handle_ty, ah.layout_ty },
+                &[2][]const u8{ h_slot, ly_slot },
+                &call_args,
+                &arg_cnt,
+            );
+            if (alloc_rec.swifterror_kind != .none) {
+                try state.ensureSwifterrorCallSlot();
+                if (arg_cnt > 0) try call_args.appendSlice(emitter.allocator, ", ");
+                try call_args.appendSlice(emitter.allocator, "ptr swifterror %_cx_call_err");
+                try state.writeAll("  store ptr null, ptr %_cx_call_err, align 8\n");
+            }
+
+            const ret_decl = try formatAbiReturnDecl(emitter, ah.res_ty, alloc_rec);
+            defer emitter.allocator.free(ret_decl.full_decl);
+            defer emitter.allocator.free(ret_decl.bare_ty);
+            const is_void = std.mem.eql(u8, ret_decl.bare_ty, "void");
+            if (is_void) {
+                try state.print(
+                    "  call {s}void {s}({s})\n",
+                    .{ resolveCallingConvPrefix(alloc_rec), alloc_ident, call_args.items },
+                );
+            } else {
+                try state.print(
+                    "  %_ah_rv = call {s}{s} {s}({s})\n",
+                    .{ resolveCallingConvPrefix(alloc_rec), ret_decl.full_decl, alloc_ident, call_args.items },
+                );
+            }
+
+            const sum_detail = (try emitter.resolver.getSumDetail(ah.res_ty)).?;
+            if (alloc_rec.swifterror_kind != .none) {
+                try state.writeAll(
+                    "  %_ah_ce = load ptr, ptr %_cx_call_err, align 8\n" ++
+                        "  %_ah_he = icmp ne ptr %_ah_ce, null\n" ++
+                        "  br i1 %_ah_he, label %oom, label %ok\n" ++
+                        "ok:\n",
+                );
+                state.setLabelOwned(try emitter.allocator.dupe(u8, "ok"));
+                const unpacked_ok = try emitCoerceAbiToValue(emitter, &state, alloc_rec.ok_ty, ret_decl.bare_ty, "%_ah_rv");
+                defer emitter.allocator.free(unpacked_ok);
+                const ok_pay = if (sum_detail.payload_offset == 0)
+                    try emitter.allocator.dupe(u8, res_slot)
+                else blk_op: {
+                    try state.print("  %_ah_op = getelementptr inbounds i8, ptr {s}, {s} {d}\n", .{ res_slot, ptr_int, sum_detail.payload_offset });
+                    break :blk_op try emitter.allocator.dupe(u8, "%_ah_op");
+                };
+                defer emitter.allocator.free(ok_pay);
+                try emitStoreValueToPtr(emitter, &state, alloc_rec.ok_ty, unpacked_ok, ok_pay, ptr_bytes, 0, 0, 0);
+            } else {
+                if (alloc_rec.has_sret) {
+                    try emitMemcpyBytes(emitter, &state, res_slot, res_align, sret_slot.?, res_align, res_lay.size_bytes);
+                } else if (!is_void) {
+                    const unpacked = try emitCoerceAbiToValue(emitter, &state, ah.res_ty, ret_decl.bare_ty, "%_ah_rv");
+                    defer emitter.allocator.free(unpacked);
+                    try emitStoreValueToPtr(emitter, &state, ah.res_ty, unpacked, res_slot, res_align, 0, 0, 0);
+                }
+                const discr_s = try emitReadSumDiscriminantFromPtr(emitter, &state, ah.res_ty, res_slot, res_align);
+                defer emitter.allocator.free(discr_s);
+                try state.print(
+                    "  %_ah_ie = icmp ne i32 {s}, 0\n" ++
+                        "  br i1 %_ah_ie, label %oom, label %ok\n" ++
+                        "ok:\n",
+                    .{discr_s},
+                );
+                state.setLabelOwned(try emitter.allocator.dupe(u8, "ok"));
+            }
+            const pay_p = if (sum_detail.payload_offset == 0)
+                try emitter.allocator.dupe(u8, res_slot)
+            else blk_pp: {
+                try state.print("  %_ah_pp = getelementptr inbounds i8, ptr {s}, {s} {d}\n", .{ res_slot, ptr_int, sum_detail.payload_offset });
+                break :blk_pp try emitter.allocator.dupe(u8, "%_ah_pp");
+            };
+            defer emitter.allocator.free(pay_p);
+            try state.print("  %_out = load ptr, ptr {s}, align {d}\n", .{ pay_p, ptr_bytes });
+            if (ptr_bytes == 4) {
+                try state.writeAll("  %_n64 = zext i32 %_raw_n to i64\n");
+            } else {
+                try state.writeAll("  %_n64 = add i64 %_raw_n, 0\n");
+            }
+            try state.writeAll(
+                "  %_hz = icmp ugt i64 %_n64, 0\n" ++
+                    "  %_hn = icmp ne ptr %_out, null\n" ++
+                    "  %_dz = and i1 %_hz, %_hn\n" ++
+                    "  br i1 %_dz, label %do_zero, label %ret_ok\n" ++
+                    "do_zero:\n" ++
+                    "  call void @llvm.memset.p0.i64(ptr align 1 %_out, i8 0, i64 %_n64, i1 false)\n" ++
+                    "  br label %ret_ok\n" ++
+                    "ret_ok:\n" ++
+                    "  ret ptr %_out\n" ++
+                    "oom:\n" ++
+                    "  br i1 %_is_try, label %ret_null, label %trap\n" ++
+                    "trap:\n",
+            );
+            if (emitter.cfg.target.isFreestanding()) {
+                try state.writeAll("  call void @llvm.trap()\n  unreachable\n");
+            } else {
+                try state.writeAll("  call void @_cx_rt_trap(i32 0)\n  unreachable\n");
+            }
+            try state.writeAll("ret_null:\n  ret ptr null\n");
+            if (state.entry_allocas.items.len > 0) try emitter.writeAll(state.entry_allocas.items);
+            try emitter.writeAll(state.cur_buf.items);
+            try emitter.writeAll("}\n\n");
+        }
+
+        // [2] `@_cx_soa_free` routing through `AllocatorHandle.dealloc`:
+        {
+            var state = try BodyEmitState.initSynthetic(emitter.allocator, ptr_int);
+            defer state.deinit();
+            try emitter.print(
+                "define internal void @_cx_soa_free({s} %_alloc, ptr %_p, {s} %_old_n, {s} %_raw_al) {s} {{\n" ++
+                    "entry:\n",
+                .{ ptr_int, ptr_int, ptr_int, fn_attrs },
+            );
+            const h_slot = try state.allocEntryBytes(ptr_bytes, @max(ptr_bytes, 8));
+            defer emitter.allocator.free(h_slot);
+            const p_slot = try state.allocEntryBytes(ptr_bytes, @max(ptr_bytes, 8));
+            defer emitter.allocator.free(p_slot);
+            const ly_slot = try state.allocEntryBytes(2 * ptr_bytes, @max(ptr_bytes, 8));
+            defer emitter.allocator.free(ly_slot);
+
+            try state.print(
+                "  %_nn = icmp ne ptr %_p, null\n" ++
+                    "  %_nz = icmp ugt {s} %_old_n, 0\n" ++
+                    "  %_tg = and {s} %_alloc, 7\n" ++
+                    "  %_ig = icmp eq {s} %_tg, 0\n" ++
+                    "  %_c1 = and i1 %_nn, %_nz\n" ++
+                    "  %_go = and i1 %_c1, %_ig\n" ++
+                    "  br i1 %_go, label %do_f, label %done\n" ++
+                    "do_f:\n" ++
+                    "  %_lt = icmp ult {s} %_raw_al, 16\n" ++
+                    "  %_al = select i1 %_lt, {s} 16, {s} %_raw_al\n" ++
+                    "  store {s} %_alloc, ptr {s}, align {d}\n" ++
+                    "  store ptr %_p, ptr {s}, align {d}\n" ++
+                    "  store {s} %_old_n, ptr {s}, align {d}\n" ++
+                    "  %_ly_a = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                    "  store {s} %_al, ptr %_ly_a, align {d}\n",
+                .{
+                    ptr_int,   ptr_int,   ptr_int,
+                    ptr_int,   ptr_int,   ptr_int,
+                    ptr_int,   h_slot,    ptr_bytes,
+                    p_slot,    ptr_bytes, ptr_int,
+                    ly_slot,   ptr_bytes, ly_slot,
+                    ptr_int,   ptr_bytes, ptr_int,
+                    ptr_bytes,
+                },
+            );
+
+            const dealloc_rec = &emitter.body_recipes.items[ah.dealloc_b];
+            const dealloc_ident = try formatLlvmGlobalIdent(emitter.allocator, emitter.body_llvm_names.items[ah.dealloc_b]);
+            defer emitter.allocator.free(dealloc_ident);
+
+            var call_args: std.ArrayListUnmanaged(u8) = .empty;
+            defer call_args.deinit(emitter.allocator);
+            var arg_cnt: usize = 0;
+            if (dealloc_rec.has_implicit_context) {
+                const ctx_p = try formatAbiParamDeclPiece(emitter, .usize_ty, dealloc_rec.context_recipe, "@_cx_default_ctx");
+                defer emitter.allocator.free(ctx_p);
+                try call_args.appendSlice(emitter.allocator, ctx_p);
+                arg_cnt += 1;
+            }
+            try appendAbiArgsFromStackSlotsLlvm(
+                emitter,
+                &state,
+                dealloc_rec,
+                &[3]TypeId{ ah.handle_ty, ah.ptr_ty, ah.layout_ty },
+                &[3][]const u8{ h_slot, p_slot, ly_slot },
+                &call_args,
+                &arg_cnt,
+            );
+            try state.print(
+                "  call {s}void {s}({s})\n" ++
+                    "  br label %done\n" ++
+                    "done:\n" ++
+                    "  ret void\n",
+                .{ resolveCallingConvPrefix(dealloc_rec), dealloc_ident, call_args.items },
+            );
+            if (state.entry_allocas.items.len > 0) try emitter.writeAll(state.entry_allocas.items);
+            try emitter.writeAll(state.cur_buf.items);
+            try emitter.writeAll("}\n\n");
+        }
+        return;
+    }
+
+    if (emitter.cfg.target.isFreestanding()) {
+        try emitter.requireIntrinsicDecl("declare i32 @llvm.wasm.memory.grow.i32(i32, i32) nounwind");
+        try emitter.requireIntrinsicDecl(
+            "declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg)",
+        );
+        try emitter.print(
+            "define internal ptr @_cx_soa_zalloc(i32 %_alloc, i32 %_raw_n, i32 %_raw_al, i1 %_is_try) {s} {{\n" ++
+                "entry:\n" ++
+                "  %_z0 = icmp eq i32 %_raw_n, 0\n" ++
+                "  %_n = select i1 %_z0, i32 16, i32 %_raw_n\n" ++
+                "  %_lt = icmp ult i32 %_raw_al, 16\n" ++
+                "  %_al = select i1 %_lt, i32 16, i32 %_raw_al\n" ++
+                "  %_s1 = add i32 %_n, %_al\n" ++
+                "  %_s2 = add i32 %_s1, 65535\n" ++
+                "  %_pgs = lshr i32 %_s2, 16\n" ++
+                "  %_prv = call i32 @llvm.wasm.memory.grow.i32(i32 0, i32 %_pgs)\n" ++
+                "  %_bad = icmp eq i32 %_prv, -1\n" ++
+                "  br i1 %_bad, label %oom, label %ok\n" ++
+                "oom:\n" ++
+                "  br i1 %_is_try, label %ret_null, label %trap\n" ++
+                "trap:\n" ++
+                "  call void @llvm.trap()\n" ++
+                "  unreachable\n" ++
+                "ret_null:\n" ++
+                "  ret ptr null\n" ++
+                "ok:\n" ++
+                "  %_base = shl i32 %_prv, 16\n" ++
+                "  %_m1 = sub i32 %_al, 1\n" ++
+                "  %_nm1 = xor i32 %_m1, -1\n" ++
+                "  %_ad = add i32 %_base, %_m1\n" ++
+                "  %_ap = and i32 %_ad, %_nm1\n" ++
+                "  %_out = inttoptr i32 %_ap to ptr\n" ++
+                "  %_n64 = zext i32 %_n to i64\n" ++
+                "  call void @llvm.memset.p0.i64(ptr align 16 %_out, i8 0, i64 %_n64, i1 false)\n" ++
+                "  ret ptr %_out\n" ++
+                "}}\n\n" ++
+                "define internal void @_cx_soa_free(i32 %_alloc, ptr %_p, i32 %_old_n, i32 %_raw_al) {s} {{\nentry:\n  ret void\n}}\n\n",
+            .{ fn_attrs, fn_attrs },
+        );
+    } else {
+        if (!emitter.declared_externs.contains("calloc")) {
+            try emitter.requireIntrinsicDecl(
+                if (emitter.cfg.target.isWasm())
+                    "declare ptr @calloc(i32, i32) nounwind"
+                else
+                    "declare ptr @calloc(i64, i64) nounwind",
+            );
+        }
+        if (!emitter.declared_externs.contains("free")) {
+            try emitter.requireIntrinsicDecl("declare void @free(ptr) nounwind");
+        }
+        try emitter.print(
+            "define internal ptr @_cx_soa_zalloc({s} %_alloc, {s} %_raw_n, {s} %_raw_al, i1 %_is_try) {s} {{\n" ++
+                "entry:\n" ++
+                "  %_z0 = icmp eq {s} %_raw_n, 0\n" ++
+                "  %_n = select i1 %_z0, {s} 16, {s} %_raw_n\n" ++
+                "  %_lt = icmp ult {s} %_raw_al, 16\n" ++
+                "  %_al = select i1 %_lt, {s} 16, {s} %_raw_al\n" ++
+                "  %_tot1 = add {s} %_n, %_al\n" ++
+                "  %_tot = add {s} %_tot1, %_al\n" ++
+                "  %_ov = icmp ult {s} %_tot, %_n\n" ++
+                "  br i1 %_ov, label %oom, label %do_alloc\n" ++
+                "do_alloc:\n" ++
+                "  %_raw = call ptr @calloc({s} 1, {s} %_tot)\n" ++
+                "  %_is_null = icmp eq ptr %_raw, null\n" ++
+                "  br i1 %_is_null, label %oom, label %ok\n" ++
+                "oom:\n" ++
+                "  br i1 %_is_try, label %ret_null, label %trap\n" ++
+                "trap:\n" ++
+                "  call void @_cx_rt_trap(i32 0)\n" ++
+                "  unreachable\n" ++
+                "ret_null:\n" ++
+                "  ret ptr null\n" ++
+                "ok:\n" ++
+                "  %_ri = ptrtoint ptr %_raw to {s}\n" ++
+                "  %_rh = add {s} %_ri, %_al\n" ++
+                "  %_m1 = sub {s} %_al, 1\n" ++
+                "  %_nm1 = xor {s} %_m1, -1\n" ++
+                "  %_ad = add {s} %_rh, %_m1\n" ++
+                "  %_ap = and {s} %_ad, %_nm1\n" ++
+                "  %_out = inttoptr {s} %_ap to ptr\n" ++
+                "  %_hp = getelementptr inbounds i8, ptr %_out, {s} -{d}\n" ++
+                "  store ptr %_raw, ptr %_hp, align {d}\n" ++
+                "  ret ptr %_out\n" ++
+                "}}\n\n",
+            .{
+                ptr_int,   ptr_int, ptr_int, fn_attrs,
+                ptr_int,   ptr_int, ptr_int, ptr_int,
+                ptr_int,   ptr_int, ptr_int, ptr_int,
+                ptr_int,   ptr_int, ptr_int, ptr_int,
+                ptr_int,   ptr_int, ptr_int, ptr_int,
+                ptr_int,   ptr_int, ptr_int, ptr_bytes,
+                ptr_bytes,
+            },
+        );
+        try emitter.print(
+            "define internal void @_cx_soa_free({s} %_alloc, ptr %_p, {s} %_old_n, {s} %_raw_al) {s} {{\n" ++
+                "entry:\n" ++
+                "  %_nn = icmp ne ptr %_p, null\n" ++
+                "  br i1 %_nn, label %do_f, label %done\n" ++
+                "do_f:\n" ++
+                "  %_hp = getelementptr inbounds i8, ptr %_p, {s} -{d}\n" ++
+                "  %_raw = load ptr, ptr %_hp, align {d}\n" ++
+                "  call void @free(ptr %_raw)\n" ++
+                "  br label %done\n" ++
+                "done:\n" ++
+                "  ret void\n" ++
+                "}}\n\n",
+            .{ ptr_int, ptr_int, ptr_int, fn_attrs, ptr_int, ptr_bytes, ptr_bytes },
+        );
     }
 }
 
@@ -4223,7 +4933,9 @@ fn resolveEnumVariantPayloadType(
                 if (mem_sym.kind != .enum_variant_sym) continue;
                 if (cur_ord == tag_ord) {
                     if (mem_sym.type_id.isNone()) return .unit_ty;
-                    return emitter.input.pool.unwrapUnderlyingType(subst.resolve(mem_sym.type_id));
+                    return emitter.input.pool.unwrapUnderlyingType(
+                        subst.lookupExisting(emitter.input.pool, mem_sym.type_id),
+                    );
                 }
                 cur_ord += 1;
             }
@@ -4235,10 +4947,13 @@ fn resolveEnumVariantPayloadType(
 
 /// Resolves field `field_ord` of `.union_ty` `union_ty`.
 fn resolveUnionFieldType(
-    emitter: *const LlvmModuleEmitter,
+    emitter: *LlvmModuleEmitter,
     union_ty: TypeId,
     field_ord: u32,
 ) TypeId {
+    if (emitter.resolver.getFieldByDeclOrdinal(union_ty, field_ord) catch null) |fld| {
+        return emitter.input.pool.unwrapUnderlyingType(fld.field_ty);
+    }
     const sym_idx = SymbolIndex.fromInt(emitter.input.pool.getNode(union_ty).rhs);
     if (sym_idx.isNone() or sym_idx.asInt() >= emitter.input.sym_table.symbols.items.len) return .unit_ty;
     const un_sym = emitter.input.sym_table.getSymbol(sym_idx).*;
@@ -4253,7 +4968,9 @@ fn resolveUnionFieldType(
         const mem_sym = emitter.input.sym_table.getSymbol(mem_idx).*;
         if (mem_sym.kind != .field_sym) continue;
         if (cur_ord == field_ord) {
-            return emitter.input.pool.unwrapUnderlyingType(subst.resolve(mem_sym.type_id));
+            return emitter.input.pool.unwrapUnderlyingType(
+                subst.lookupExisting(emitter.input.pool, mem_sym.type_id),
+            );
         }
         cur_ord += 1;
     }
@@ -4523,7 +5240,9 @@ fn lookupDropBodyIndexForType(emitter: *const LlvmModuleEmitter, drop_ty: TypeId
     const ty = emitter.input.pool.unwrapUnderlyingType(drop_ty);
     if (!ty.isPrimitiveOrSentinel()) {
         const node = emitter.input.pool.getNode(ty);
-        if (node.tag == .struct_ty or node.tag == .enum_ty or node.tag == .union_ty) {
+        if ((node.tag == .struct_ty or node.tag == .enum_ty or node.tag == .union_ty) and
+            emitter.input.pool.getGenericTypeArgs(ty).len == 0)
+        {
             const sym_idx = SymbolIndex.fromInt(node.rhs);
             if (!sym_idx.isNone() and sym_idx.asInt() < emitter.input.sym_table.symbols.items.len) {
                 const nom_sym = emitter.input.sym_table.getSymbol(sym_idx).*;
@@ -4543,8 +5262,12 @@ fn lookupDropBodyIndexForType(emitter: *const LlvmModuleEmitter, drop_ty: TypeId
     for (emitter.input.bodies, 0..) |*cand_body, b_idx| {
         if (cand_body.param_count != 1 or cand_body.locals.items.len < 2) continue;
         const fn_name = emitter.input.interner.get(cand_body.name);
-        if (!std.mem.eql(u8, fn_name, "drop") and
-            !std.mem.endsWith(u8, fn_name, ".drop")) continue;
+        const base_fn_name = if (std.mem.indexOfScalar(u8, fn_name, '$')) |dollar_idx|
+            fn_name[0..dollar_idx]
+        else
+            fn_name;
+        if (!std.mem.eql(u8, base_fn_name, "drop") and
+            !std.mem.endsWith(u8, base_fn_name, ".drop")) continue;
         const raw_param_ty = emitter.input.pool.unwrapUnderlyingType(cand_body.locals.items[1].type_id);
         const param_node = emitter.input.pool.getNode(raw_param_ty);
         const self_ty = if (param_node.tag == .ref_ty or
@@ -5894,6 +6617,7 @@ fn emitFmtHelperForType(emitter: *LlvmModuleEmitter, raw_ty: TypeId) !void {
     switch (node.tag) {
         .ref_ty, .mut_ref_ty => {
             const pointee_ty = try unwrapTransparentType(emitter, TypeId.fromInt(node.lhs));
+            const val_arg_s = if (emitter.input.pool.isSliceRefType(fmt_ty)) "%_val_p" else "%_rp";
             try emitter.print(
                 "  %_rp = load ptr, ptr %_val_p, align 1\n" ++
                     "  %_vsh = lshr i32 %_spec_lo, 27\n" ++
@@ -5904,9 +6628,9 @@ fn emitFmtHelperForType(emitter: *LlvmModuleEmitter, raw_ty: TypeId) !void {
                     "  call void @_cx_rt_fmt_ptr_spec(ptr %_out_b, ptr %_rp, i32 %_spec_lo, i32 %_spec_hi)\n" ++
                     "  ret void\n" ++
                     "_as_val:\n" ++
-                    "  call void @_cx_fmt_ty_{d}(ptr %_out_b, ptr %_rp, i32 %_spec_lo, i32 %_spec_hi)\n" ++
+                    "  call void @_cx_fmt_ty_{d}(ptr %_out_b, ptr {s}, i32 %_spec_lo, i32 %_spec_hi)\n" ++
                     "  ret void\n}}\n\n",
-                .{pointee_ty.toU32()},
+                .{ pointee_ty.toU32(), val_arg_s },
             );
         },
         .raw_ptr_ty, .fn_ty => {
@@ -6503,6 +7227,155 @@ fn emitDropHelpersAndClosureThunks(emitter: *LlvmModuleEmitter) !void {
                     }
                 }
             },
+            .soa_vec_ty => {
+                const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+                const st_lay = try emitter.resolver.resolveType(elem_struct);
+                const ptr_bytes: u32 = emitter.cfg.target.ptrBytes();
+                const t_id = state.nextTmp();
+                try state.print(
+                    "  %_svp_{d} = load ptr, ptr %_self_ptr, align 1\n" ++
+                        "  %_svlp_{d} = getelementptr inbounds i8, ptr %_self_ptr, {s} {d}\n" ++
+                        "  %_svl32_{d} = load i32, ptr %_svlp_{d}, align 1\n" ++
+                        "  %_svcp_{d} = getelementptr inbounds i8, ptr %_self_ptr, {s} {d}\n" ++
+                        "  %_svc32_{d} = load i32, ptr %_svcp_{d}, align 1\n" ++
+                        "  %_svap_{d} = getelementptr inbounds i8, ptr %_self_ptr, {s} {d}\n" ++
+                        "  %_sva_{d} = load {s}, ptr %_svap_{d}, align 1\n",
+                    .{
+                        t_id,
+                        t_id,
+                        ptr_int,
+                        ptr_bytes,
+                        t_id,
+                        t_id,
+                        t_id,
+                        ptr_int,
+                        ptr_bytes + 4,
+                        t_id,
+                        t_id,
+                        t_id,
+                        ptr_int,
+                        ptr_bytes + 8,
+                        t_id,
+                        ptr_int,
+                        t_id,
+                    },
+                );
+                if (!type_system.isTrivialDropType(emitter.input.pool, emitter.input.sym_table, elem_struct)) {
+                    const idx_slot = try state.allocEntryBytes(4, 4);
+                    defer emitter.allocator.free(idx_slot);
+                    const cap_ssa = if (ptr_bytes == 4)
+                        try std.fmt.allocPrint(emitter.allocator, "%_svc32_{d}", .{t_id})
+                    else blk_z: {
+                        try state.print("  %_svcz_{d} = zext i32 %_svc32_{d} to i64\n", .{ t_id, t_id });
+                        break :blk_z try std.fmt.allocPrint(emitter.allocator, "%_svcz_{d}", .{t_id});
+                    };
+                    defer emitter.allocator.free(cap_ssa);
+                    try state.print(
+                        "  %_sv_hn_{d} = icmp ne ptr %_svp_{d}, null\n" ++
+                            "  %_sv_hl_{d} = icmp ugt i32 %_svl32_{d}, 0\n" ++
+                            "  %_sv_go_{d} = and i1 %_sv_hn_{d}, %_sv_hl_{d}\n" ++
+                            "  store i32 %_svl32_{d}, ptr {s}, align 4\n" ++
+                            "  br i1 %_sv_go_{d}, label %_svd_lp_{d}, label %_svd_fr_{d}\n" ++
+                            "_svd_lp_{d}:\n" ++
+                            "  %_svd_cur_{d} = load i32, ptr {s}, align 4\n" ++
+                            "  %_svd_more_{d} = icmp ugt i32 %_svd_cur_{d}, 0\n" ++
+                            "  br i1 %_svd_more_{d}, label %_svd_bd_{d}, label %_svd_fr_{d}\n" ++
+                            "_svd_bd_{d}:\n" ++
+                            "  %_svd_nx_{d} = sub i32 %_svd_cur_{d}, 1\n" ++
+                            "  store i32 %_svd_nx_{d}, ptr {s}, align 4\n",
+                        .{
+                            t_id,     t_id,     t_id, t_id,     t_id, t_id, t_id,
+                            t_id,     idx_slot, t_id, t_id,     t_id, t_id, t_id,
+                            idx_slot, t_id,     t_id, t_id,     t_id, t_id, t_id,
+                            t_id,     t_id,     t_id, idx_slot,
+                        },
+                    );
+                    state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svd_bd_{d}", .{t_id}));
+                    const elem_i_ssa = if (ptr_bytes == 4)
+                        try std.fmt.allocPrint(emitter.allocator, "%_svd_nx_{d}", .{t_id})
+                    else blk_i64: {
+                        try state.print("  %_svd_i64_{d} = zext i32 %_svd_nx_{d} to i64\n", .{ t_id, t_id });
+                        break :blk_i64 try std.fmt.allocPrint(emitter.allocator, "%_svd_i64_{d}", .{t_id});
+                    };
+                    defer emitter.allocator.free(elem_i_ssa);
+                    var rev_col: u32 = st_lay.aux_len;
+                    while (rev_col > 0) {
+                        rev_col -= 1;
+                        const fld = emitter.resolver.fields_by_decl.items[st_lay.aux_start + rev_col];
+                        const fld_ty = try unwrapTransparentType(emitter, fld.field_ty);
+                        if (fld.size_bytes == 0 or !emitter.drop_type_set.contains(fld_ty.toU32())) continue;
+                        const dyn_col = try emitDynamicSoaColByteOffset(emitter, &state, elem_struct, rev_col, cap_ssa);
+                        defer emitter.allocator.free(dyn_col.off_ssa);
+                        const sub_t = state.nextTmp();
+                        try state.print(
+                            "  %_svd_co_{d} = mul {s} {s}, {d}\n" ++
+                                "  %_svd_bo_{d} = add {s} {s}, %_svd_co_{d}\n" ++
+                                "  %_svd_fp_{d} = getelementptr inbounds i8, ptr %_svp_{d}, {s} %_svd_bo_{d}\n" ++
+                                "  call void @_cx_drop_ty_{d}(ptr %_svd_fp_{d})\n",
+                            .{
+                                sub_t,          ptr_int, elem_i_ssa,      fld.size_bytes,
+                                sub_t,          ptr_int, dyn_col.off_ssa, sub_t,
+                                sub_t,          t_id,    ptr_int,         sub_t,
+                                fld_ty.toU32(), sub_t,
+                            },
+                        );
+                    }
+                    try state.print("  br label %_svd_lp_{d}\n_svd_fr_{d}:\n", .{ t_id, t_id });
+                    state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svd_fr_{d}", .{t_id}));
+                }
+                const slab_align: u32 = @max(
+                    @as(u32, 1) << @intCast(@max(st_lay.align_log2, emitter.target_layout.simd_align_log2)),
+                    16,
+                );
+                try state.print(
+                    "  %_sv_nn_{d} = icmp ne ptr %_svp_{d}, null\n" ++
+                        "  %_sv_hc_{d} = icmp ugt i32 %_svc32_{d}, 0\n" ++
+                        "  %_sv_df_{d} = and i1 %_sv_nn_{d}, %_sv_hc_{d}\n" ++
+                        "  br i1 %_sv_df_{d}, label %_svd_cf_{d}, label %_svd_zr_{d}\n" ++
+                        "_svd_cf_{d}:\n",
+                    .{
+                        t_id, t_id, t_id, t_id, t_id,
+                        t_id, t_id, t_id, t_id, t_id,
+                        t_id,
+                    },
+                );
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svd_cf_{d}", .{t_id}));
+                const free_cap_ssa = if (ptr_bytes == 4)
+                    try std.fmt.allocPrint(emitter.allocator, "%_svc32_{d}", .{t_id})
+                else blk_fcz: {
+                    try state.print("  %_sv_fcz_{d} = zext i32 %_svc32_{d} to i64\n", .{ t_id, t_id });
+                    break :blk_fcz try std.fmt.allocPrint(emitter.allocator, "%_sv_fcz_{d}", .{t_id});
+                };
+                defer emitter.allocator.free(free_cap_ssa);
+                var old_tot_ssa: []u8 = try emitter.allocator.dupe(u8, "0");
+                defer emitter.allocator.free(old_tot_ssa);
+                if (st_lay.aux_len > 0) {
+                    const last_ord = st_lay.aux_len - 1;
+                    const last_col = try emitDynamicSoaColByteOffset(emitter, &state, elem_struct, last_ord, free_cap_ssa);
+                    defer emitter.allocator.free(last_col.off_ssa);
+                    const last_fld = emitter.resolver.fields_by_decl.items[st_lay.aux_start + last_ord];
+                    try state.print(
+                        "  %_svd_lm_{d} = mul {s} {s}, {d}\n" ++
+                            "  %_svd_tot_{d} = add {s} {s}, %_svd_lm_{d}\n",
+                        .{ t_id, ptr_int, free_cap_ssa, last_fld.size_bytes, t_id, ptr_int, last_col.off_ssa, t_id },
+                    );
+                    emitter.allocator.free(old_tot_ssa);
+                    old_tot_ssa = try std.fmt.allocPrint(emitter.allocator, "%_svd_tot_{d}", .{t_id});
+                }
+                try state.print(
+                    "  call void @_cx_soa_free({s} %_sva_{d}, ptr %_svp_{d}, {s} {s}, {s} {d})\n" ++
+                        "  br label %_svd_zr_{d}\n" ++
+                        "_svd_zr_{d}:\n" ++
+                        "  store ptr null, ptr %_self_ptr, align 1\n" ++
+                        "  store i32 0, ptr %_svlp_{d}, align 1\n" ++
+                        "  store i32 0, ptr %_svcp_{d}, align 1\n",
+                    .{
+                        ptr_int, t_id, t_id, ptr_int, old_tot_ssa, ptr_int, slab_align,
+                        t_id,    t_id, t_id, t_id,
+                    },
+                );
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svd_zr_{d}", .{t_id}));
+            },
             .optional_ty, .result_ty, .enum_ty => {
                 if (try emitter.resolver.getSumDetail(drop_ty)) |sum_detail| {
                     const discr_s = try emitReadSumDiscriminantFromPtr(emitter, &state, drop_ty, "%_self_ptr", 1);
@@ -6736,6 +7609,101 @@ fn emitSingleClosureEnvDropThunk(
     );
 }
 
+/// Emits ABI-adapted return forwarding from `callee_ret_val` (`callee_ret_bare`) to `thunk_ret_bare`.
+fn emitThunkAdaptedReturnLlvm(
+    emitter: *LlvmModuleEmitter,
+    state: *BodyEmitState,
+    callee_ret_ty: TypeId,
+    callee_has_sret: bool,
+    callee_sret_slot: ?[]const u8,
+    callee_ret_bare: []const u8,
+    callee_ret_val: []const u8,
+    thunk_has_sret: bool,
+    thunk_ret_bare: []const u8,
+) !void {
+    if (thunk_has_sret) {
+        if (!callee_has_sret and !std.mem.eql(u8, callee_ret_bare, "void")) {
+            const lay = try emitter.resolver.resolveType(callee_ret_ty);
+            const unpacked = try emitCoerceAbiToValue(
+                emitter,
+                state,
+                callee_ret_ty,
+                callee_ret_bare,
+                callee_ret_val,
+            );
+            defer emitter.allocator.free(unpacked);
+            try emitStoreValueToPtr(
+                emitter,
+                state,
+                callee_ret_ty,
+                unpacked,
+                "%_sret",
+                @max(lay.alignBytes(), 1),
+                0,
+                0,
+                0,
+            );
+        }
+        try state.writeAll("  ret void\n");
+        return;
+    }
+
+    if (std.mem.eql(u8, thunk_ret_bare, "void")) {
+        try state.writeAll("  ret void\n");
+        return;
+    }
+
+    if (callee_has_sret) {
+        const sret_slot = callee_sret_slot orelse "%_sret";
+        const lay = try emitter.resolver.resolveType(callee_ret_ty);
+        const loaded = try emitLoadValueFromPtr(
+            emitter,
+            state,
+            callee_ret_ty,
+            sret_slot,
+            @max(lay.alignBytes(), 8),
+            null,
+            0,
+            0,
+            0,
+        );
+        defer emitter.allocator.free(loaded);
+        const coerced = try emitCoerceValueToAbi(
+            emitter,
+            state,
+            callee_ret_ty,
+            loaded,
+            thunk_ret_bare,
+        );
+        defer emitter.allocator.free(coerced);
+        try state.print("  ret {s} {s}\n", .{ thunk_ret_bare, coerced });
+        return;
+    }
+
+    if (std.mem.eql(u8, callee_ret_bare, thunk_ret_bare)) {
+        try state.print("  ret {s} {s}\n", .{ thunk_ret_bare, callee_ret_val });
+        return;
+    }
+
+    const unpacked = try emitCoerceAbiToValue(
+        emitter,
+        state,
+        callee_ret_ty,
+        callee_ret_bare,
+        callee_ret_val,
+    );
+    defer emitter.allocator.free(unpacked);
+    const coerced = try emitCoerceValueToAbi(
+        emitter,
+        state,
+        callee_ret_ty,
+        unpacked,
+        thunk_ret_bare,
+    );
+    defer emitter.allocator.free(coerced);
+    try state.print("  ret {s} {s}\n", .{ thunk_ret_bare, coerced });
+}
+
 /// Emits a synthesized closure forwarding thunk `@_cx_cthunk_<idx>(ptr %_env, …)`.
 fn emitSingleClosureThunk(
     emitter: *LlvmModuleEmitter,
@@ -6804,12 +7772,23 @@ fn emitSingleClosureThunk(
     defer call_args.deinit(emitter.allocator);
     var emitted_args: usize = 0;
 
+    var callee_sret_tmp: ?[]u8 = null;
+    defer if (callee_sret_tmp) |slot_s| emitter.allocator.free(slot_s);
     if (callee_rec.has_sret) {
+        const sret_target: []const u8 = if (clos_recipe.has_sret) "%_sret" else blk_sret: {
+            const c_lay = try emitter.resolver.resolveType(callee_body.ret_ty);
+            const tmp_slot = try state.allocEntryBytes(
+                @max(c_lay.size_bytes, 1),
+                @max(@max(c_lay.alignBytes(), callee_rec.sret_recipe.pointee_align_bytes), 8),
+            );
+            callee_sret_tmp = tmp_slot;
+            break :blk_sret tmp_slot;
+        };
         const sret_s = try formatAbiParamDeclPiece(
             emitter,
             callee_body.ret_ty,
             callee_rec.sret_recipe,
-            "%_sret",
+            sret_target,
         );
         defer emitter.allocator.free(sret_s);
         try call_args.appendSlice(emitter.allocator, sret_s);
@@ -6944,11 +7923,17 @@ fn emitSingleClosureThunk(
         );
     }
 
-    if (std.mem.eql(u8, ret_decl.bare_ty, "void")) {
-        try state.writeAll("  ret void\n");
-    } else {
-        try state.print("  ret {s} %_thk_res\n", .{ret_decl.bare_ty});
-    }
+    try emitThunkAdaptedReturnLlvm(
+        emitter,
+        &state,
+        callee_body.ret_ty,
+        callee_rec.has_sret,
+        callee_sret_tmp,
+        callee_ret.bare_ty,
+        "%_thk_res",
+        clos_recipe.has_sret,
+        ret_decl.bare_ty,
+    );
 
     if (state.entry_allocas.items.len > 0) {
         try emitter.writeAll(state.entry_allocas.items);
@@ -7040,12 +8025,23 @@ fn emitSingleFnCtxWrapper(
     defer call_args.deinit(emitter.allocator);
     var emitted_args: usize = 0;
 
+    var wrap_sret_tmp: ?[]u8 = null;
+    defer if (wrap_sret_tmp) |slot_s| emitter.allocator.free(slot_s);
     if (callee_rec.has_sret) {
+        const sret_target: []const u8 = if (wrap_recipe.has_sret) "%_sret" else blk_sret: {
+            const c_lay = try emitter.resolver.resolveType(callee_body.ret_ty);
+            const tmp_slot = try state.allocEntryBytes(
+                @max(c_lay.size_bytes, 1),
+                @max(@max(c_lay.alignBytes(), callee_rec.sret_recipe.pointee_align_bytes), 8),
+            );
+            wrap_sret_tmp = tmp_slot;
+            break :blk_sret tmp_slot;
+        };
         const sret_s = try formatAbiParamDeclPiece(
             emitter,
             callee_body.ret_ty,
             callee_rec.sret_recipe,
-            "%_sret",
+            sret_target,
         );
         defer emitter.allocator.free(sret_s);
         try call_args.appendSlice(emitter.allocator, sret_s);
@@ -7141,11 +8137,17 @@ fn emitSingleFnCtxWrapper(
         );
     }
 
-    if (std.mem.eql(u8, ret_decl.bare_ty, "void")) {
-        try state.writeAll("  ret void\n");
-    } else {
-        try state.print("  ret {s} %_wres\n", .{ret_decl.bare_ty});
-    }
+    try emitThunkAdaptedReturnLlvm(
+        emitter,
+        &state,
+        callee_body.ret_ty,
+        callee_rec.has_sret,
+        wrap_sret_tmp,
+        callee_ret.bare_ty,
+        "%_wres",
+        wrap_recipe.has_sret,
+        ret_decl.bare_ty,
+    );
 
     if (state.entry_allocas.items.len > 0) {
         try emitter.writeAll(state.entry_allocas.items);
@@ -7636,26 +8638,31 @@ fn lowerPlaceLlvm(
                 active_downcast = null;
                 const pointee_ty = try unwrapTransparentType(emitter, TypeId.fromInt(node.lhs));
                 const p_lay = try emitter.resolver.resolveType(pointee_ty);
-                const ptr_load_align = @min(@max(cur_align, 1), @max(emitter.cfg.target.ptrBytes(), 1));
-                const t_id = state.nextTmp();
-                try state.print(
-                    "  %_deref_{d} = load ptr, ptr {s}, align {d}\n",
-                    .{ t_id, cur_ptr, ptr_load_align },
-                );
-                emitter.allocator.free(cur_ptr);
-                cur_ptr = try std.fmt.allocPrint(emitter.allocator, "%_deref_{d}", .{t_id});
-                cur_ty = pointee_ty;
-                if (node.tag == .raw_ptr_ty) {
-                    cur_align = 1;
-                    active_mvs_param = 0;
-                    can_enter_param_ptr = false;
+                if (emitter.input.pool.isSliceRefType(cur_ty)) {
+                    cur_ty = pointee_ty;
+                    cur_align = @min(@max(cur_align, 1), p_lay.alignBytes());
                 } else {
-                    cur_align = p_lay.alignBytes();
-                    if (can_enter_param_ptr) {
-                        active_mvs_param = base_local;
+                    const ptr_load_align = @min(@max(cur_align, 1), @max(emitter.cfg.target.ptrBytes(), 1));
+                    const t_id = state.nextTmp();
+                    try state.print(
+                        "  %_deref_{d} = load ptr, ptr {s}, align {d}\n",
+                        .{ t_id, cur_ptr, ptr_load_align },
+                    );
+                    emitter.allocator.free(cur_ptr);
+                    cur_ptr = try std.fmt.allocPrint(emitter.allocator, "%_deref_{d}", .{t_id});
+                    cur_ty = pointee_ty;
+                    if (node.tag == .raw_ptr_ty) {
+                        cur_align = 1;
+                        active_mvs_param = 0;
                         can_enter_param_ptr = false;
                     } else {
-                        active_mvs_param = 0;
+                        cur_align = p_lay.alignBytes();
+                        if (can_enter_param_ptr) {
+                            active_mvs_param = base_local;
+                            can_enter_param_ptr = false;
+                        } else {
+                            active_mvs_param = 0;
+                        }
                     }
                 }
             },
@@ -7844,38 +8851,37 @@ fn lowerPlaceLlvm(
                         .fixed_cap = cap,
                         .slice_base_ptr = try emitter.allocator.dupe(u8, cur_ptr),
                     };
-                } else {
-                    const hdr_align = @min(@max(cur_align, 1), emitter.cfg.target.ptrBytes());
+                } else if (node.tag == .soa_vec_ty) {
+                    const ptr_bytes: u32 = emitter.cfg.target.ptrBytes();
+                    const hdr_align = @min(@max(cur_align, 1), ptr_bytes);
                     const t_id = state.nextTmp();
                     try state.print(
                         "  %_ssl_dp_{d} = load ptr, ptr {s}, align {d}\n" ++
-                            "  %_ssl_lp_{d} = getelementptr inbounds {{ ptr, {s} }}, ptr {s}, i32 0, i32 1\n" ++
-                            "  %_ssl_ln_{d} = load {s}, ptr %_ssl_lp_{d}, align {d}\n",
+                            "  %_ssl_cp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                            "  %_ssl_c32_{d} = load i32, ptr %_ssl_cp_{d}, align 4\n",
                         .{
-                            t_id,
-                            cur_ptr,
-                            hdr_align,
-                            t_id,
-                            ptr_int,
-                            cur_ptr,
-                            t_id,
-                            ptr_int,
-                            t_id,
-                            hdr_align,
+                            t_id,          cur_ptr, hdr_align,
+                            t_id,          cur_ptr, ptr_int,
+                            ptr_bytes + 4, t_id,    t_id,
                         },
                     );
                     if (can_enter_param_ptr) {
                         active_mvs_param = base_local;
                         can_enter_param_ptr = false;
                     }
-                    const len_s = try std.fmt.allocPrint(emitter.allocator, "%_ssl_ln_{d}", .{t_id});
-                    defer emitter.allocator.free(len_s);
+                    const cap_s = if (ptr_bytes == 4)
+                        try std.fmt.allocPrint(emitter.allocator, "%_ssl_c32_{d}", .{t_id})
+                    else blk_cz: {
+                        try state.print("  %_ssl_cz_{d} = zext i32 %_ssl_c32_{d} to i64\n", .{ t_id, t_id });
+                        break :blk_cz try std.fmt.allocPrint(emitter.allocator, "%_ssl_cz_{d}", .{t_id});
+                    };
+                    defer emitter.allocator.free(cap_s);
                     const dyn_col = try emitDynamicSoaColByteOffset(
                         emitter,
                         state,
                         elem_struct,
                         proj.payload,
-                        len_s,
+                        cap_s,
                     );
                     defer emitter.allocator.free(dyn_col.off_ssa);
                     try state.print(
@@ -7886,6 +8892,62 @@ fn lowerPlaceLlvm(
                         .col_ptr = try std.fmt.allocPrint(emitter.allocator, "%_scol_{d}", .{t_id}),
                         .field_ty = fld_ty,
                         .col_align = dyn_col.col_align_bytes,
+                        .is_fixed = false,
+                        .fixed_cap = 0,
+                        .slice_base_ptr = try emitter.allocator.dupe(u8, cur_ptr),
+                    };
+                } else {
+                    const ptr_bytes: u32 = emitter.cfg.target.ptrBytes();
+                    const hdr_align = @min(@max(cur_align, 1), ptr_bytes);
+                    const t_id = state.nextTmp();
+                    try state.print(
+                        "  %_ssl_dp_{d} = load ptr, ptr {s}, align {d}\n" ++
+                            "  %_ssl_sp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                            "  %_ssl_st_{d} = load {s}, ptr %_ssl_sp_{d}, align {d}\n" ++
+                            "  %_ssl_ep_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                            "  %_ssl_eo_{d} = load {s}, ptr %_ssl_ep_{d}, align {d}\n",
+                        .{
+                            t_id,          cur_ptr,   hdr_align,
+                            t_id,          cur_ptr,   ptr_int,
+                            ptr_bytes * 2, t_id,      ptr_int,
+                            t_id,          hdr_align, t_id,
+                            cur_ptr,       ptr_int,   ptr_bytes * 3,
+                            t_id,          ptr_int,   t_id,
+                            hdr_align,
+                        },
+                    );
+                    if (can_enter_param_ptr) {
+                        active_mvs_param = base_local;
+                        can_enter_param_ptr = false;
+                    }
+                    const stride_s = try std.fmt.allocPrint(emitter.allocator, "%_ssl_st_{d}", .{t_id});
+                    defer emitter.allocator.free(stride_s);
+                    const dyn_col = try emitDynamicSoaColByteOffset(
+                        emitter,
+                        state,
+                        elem_struct,
+                        proj.payload,
+                        stride_s,
+                    );
+                    defer emitter.allocator.free(dyn_col.off_ssa);
+                    try state.print(
+                        "  %_ssl_em_{d} = mul {s} %_ssl_eo_{d}, {d}\n" ++
+                            "  %_ssl_bo_{d} = add {s} {s}, %_ssl_em_{d}\n" ++
+                            "  %_scol_{d} = getelementptr inbounds i8, ptr %_ssl_dp_{d}, {s} %_ssl_bo_{d}\n",
+                        .{
+                            t_id, ptr_int, t_id,            fld.size_bytes,
+                            t_id, ptr_int, dyn_col.off_ssa, t_id,
+                            t_id, t_id,    ptr_int,         t_id,
+                        },
+                    );
+                    const col_align_b: u32 = if (fld.size_bytes == 0)
+                        dyn_col.col_align_bytes
+                    else
+                        @min(dyn_col.col_align_bytes, @as(u32, 1) << @intCast(fld.align_log2));
+                    pending_soa = .{
+                        .col_ptr = try std.fmt.allocPrint(emitter.allocator, "%_scol_{d}", .{t_id}),
+                        .field_ty = fld_ty,
+                        .col_align = col_align_b,
                         .is_fixed = false,
                         .fixed_cap = 0,
                         .slice_base_ptr = try emitter.allocator.dupe(u8, cur_ptr),
@@ -7902,8 +8964,8 @@ fn lowerPlaceLlvm(
                 }
                 const t_id = state.nextTmp();
                 try state.print(
-                    "  %_len_p_{d} = getelementptr inbounds {{ ptr, {s} }}, ptr {s}, i32 0, i32 1\n",
-                    .{ t_id, ptr_int, cur_ptr },
+                    "  %_len_p_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n",
+                    .{ t_id, cur_ptr, ptr_int, emitter.cfg.target.ptrBytes() },
                 );
                 emitter.allocator.free(cur_ptr);
                 return .{
@@ -8031,7 +9093,7 @@ fn emitExtractByteSpanLlvm(
         };
     }
     const node = emitter.input.pool.getNode(arg_ty);
-    if (node.tag == .slice_ty) {
+    if (node.tag == .slice_ty or emitter.input.pool.isSliceRefType(arg_ty)) {
         const tmp_id = state.nextTmp();
         try state.print(
             "  %_bsp_{d} = extractvalue {{ ptr, {s} }} %_v_{d}, 0\n" ++
@@ -8055,9 +9117,14 @@ fn emitExtractByteSpanLlvm(
             .len_ssa = try std.fmt.allocPrint(emitter.allocator, "{d}", .{cap}),
         };
     }
-    if (node.tag == .ref_ty or node.tag == .mut_ref_ty or node.tag == .raw_ptr_ty) {
+    if ((node.tag == .ref_ty or node.tag == .mut_ref_ty or node.tag == .raw_ptr_ty) and
+        !emitter.input.pool.isSliceRefType(arg_ty))
+    {
         const pointee = try unwrapTransparentType(emitter, TypeId.fromInt(node.lhs));
-        if (pointee == .str_ty or emitter.input.pool.getNode(pointee).tag == .slice_ty) {
+        if (pointee == .str_ty or
+            emitter.input.pool.getNode(pointee).tag == .slice_ty or
+            emitter.input.pool.isSliceRefType(pointee))
+        {
             const tmp_id = state.nextTmp();
             try state.print(
                 "  %_bsfat_{d} = load {{ ptr, {s} }}, ptr %_v_{d}, align {d}\n" ++
@@ -8232,22 +9299,32 @@ fn tryEmitSliceArrayPtrCoercionLlvm(
 
     const ptr_int = ptrIntType(emitter);
     const ptr_bytes = emitter.cfg.target.ptrBytes();
-    const src_is_ptr_like = if (src_ty == .str_ty) false else blk: {
+    const src_is_ptr_like = if (src_ty == .str_ty or emitter.input.pool.isSliceRefType(src_ty)) false else blk: {
         const sn = emitter.input.pool.getNode(src_ty);
         break :blk sn.tag == .ref_ty or sn.tag == .mut_ref_ty or sn.tag == .raw_ptr_ty;
     };
-    const dst_is_ptr_like = if (dst_ty == .str_ty) false else blk: {
+    const dst_is_ptr_like = if (dst_ty == .str_ty or emitter.input.pool.isSliceRefType(dst_ty)) false else blk: {
         const dn = emitter.input.pool.getNode(dst_ty);
         break :blk dn.tag == .ref_ty or dn.tag == .mut_ref_ty or dn.tag == .raw_ptr_ty;
     };
-    const dst_is_fat_slice = if (dst_ty == .str_ty) true else blk: {
+    const dst_is_fat_slice = if (dst_ty == .str_ty or emitter.input.pool.isSliceRefType(dst_ty)) true else blk: {
         const dn = emitter.input.pool.getNode(dst_ty);
         break :blk dn.tag == .slice_ty or dn.tag == .soa_slice_ty;
     };
-    const src_is_fat_slice = if (src_ty == .str_ty) true else blk: {
+    const src_is_fat_slice = if (src_ty == .str_ty or emitter.input.pool.isSliceRefType(src_ty)) true else blk: {
         const sn = emitter.input.pool.getNode(src_ty);
         break :blk sn.tag == .slice_ty or sn.tag == .soa_slice_ty;
     };
+
+    if (src_is_fat_slice and dst_is_fat_slice) {
+        const dst_sl_ty = try formatSliceLlvmStructType(emitter, dst_ty);
+        defer emitter.allocator.free(dst_sl_ty);
+        try state.print(
+            "  %_v_{d} = select i1 true, {s} %_v_{d}, {s} %_v_{d}\n",
+            .{ dst_raw, dst_sl_ty, src_raw, dst_sl_ty, src_raw },
+        );
+        return true;
+    }
 
     if (src_is_ptr_like) {
         const src_pointee = try unwrapTransparentType(
@@ -8272,11 +9349,30 @@ fn tryEmitSliceArrayPtrCoercionLlvm(
 
                 if (dst_is_fat_slice) {
                     const tmp_id = state.nextTmp();
-                    try state.print(
-                        "  %_sac0_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr {s}, 0\n" ++
-                            "  %_v_{d} = insertvalue {{ ptr, {s} }} %_sac0_{d}, {s} {d}, 1\n",
-                        .{ tmp_id, ptr_int, data_ptr_s, dst_raw, ptr_int, tmp_id, ptr_int, cap },
-                    );
+                    const dst_sl_ty = try formatSliceLlvmStructType(emitter, dst_ty);
+                    defer emitter.allocator.free(dst_sl_ty);
+                    if (emitter.input.pool.isSoaSliceOrRefType(dst_ty)) {
+                        try state.print(
+                            "  %_sac0_{d} = insertvalue {s} zeroinitializer, ptr {s}, 0\n" ++
+                                "  %_sac1_{d} = insertvalue {s} %_sac0_{d}, {s} {d}, 1\n" ++
+                                "  %_sac2_{d} = insertvalue {s} %_sac1_{d}, {s} {d}, 2\n" ++
+                                "  %_v_{d} = insertvalue {s} %_sac2_{d}, {s} 0, 3\n",
+                            .{
+                                tmp_id,    dst_sl_ty, data_ptr_s,
+                                tmp_id,    dst_sl_ty, tmp_id,
+                                ptr_int,   cap,       tmp_id,
+                                dst_sl_ty, tmp_id,    ptr_int,
+                                cap,       dst_raw,   dst_sl_ty,
+                                tmp_id,    ptr_int,
+                            },
+                        );
+                    } else {
+                        try state.print(
+                            "  %_sac0_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr {s}, 0\n" ++
+                                "  %_v_{d} = insertvalue {{ ptr, {s} }} %_sac0_{d}, {s} {d}, 1\n",
+                            .{ tmp_id, ptr_int, data_ptr_s, dst_raw, ptr_int, tmp_id, ptr_int, cap },
+                        );
+                    }
                     return true;
                 }
                 if (dst_is_ptr_like) {
@@ -8284,48 +9380,68 @@ fn tryEmitSliceArrayPtrCoercionLlvm(
                         emitter,
                         TypeId.fromInt(emitter.input.pool.getNode(dst_ty).lhs),
                     );
-                    const dp_is_slice = if (dst_pointee == .str_ty) true else if (dst_pointee.isPrimitiveOrSentinel()) false else sub: {
+                    const dp_is_slice = if (dst_pointee == .str_ty or emitter.input.pool.isSliceRefType(dst_pointee))
+                        true
+                    else if (dst_pointee.isPrimitiveOrSentinel())
+                        false
+                    else sub: {
                         const dpn = emitter.input.pool.getNode(dst_pointee);
                         break :sub dpn.tag == .slice_ty or dpn.tag == .soa_slice_ty;
                     };
                     if (dp_is_slice) {
-                        const fat_slot = try state.allocEntryBytes(2 * ptr_bytes, ptr_bytes);
+                        const words = sliceDescriptorWordCount(emitter.input.pool, dst_pointee);
+                        const fat_slot = try state.allocEntryBytes(words * ptr_bytes, ptr_bytes);
                         defer emitter.allocator.free(fat_slot);
+                        try emitMemsetZero(emitter, state, fat_slot, words * ptr_bytes, ptr_bytes);
                         const tmp_id = state.nextTmp();
                         try state.print(
                             "  store ptr {s}, ptr {s}, align {d}\n" ++
-                                "  %_sacp_{d} = getelementptr inbounds {{ ptr, {s} }}, ptr {s}, i32 0, i32 1\n" ++
-                                "  store {s} {d}, ptr %_sacp_{d}, align {d}\n" ++
-                                "  %_v_{d} = select i1 true, ptr {s}, ptr {s}\n",
+                                "  %_sacp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                                "  store {s} {d}, ptr %_sacp_{d}, align {d}\n",
                             .{
                                 data_ptr_s,
                                 fat_slot,
                                 ptr_bytes,
                                 tmp_id,
-                                ptr_int,
                                 fat_slot,
+                                ptr_int,
+                                ptr_bytes,
                                 ptr_int,
                                 cap,
                                 tmp_id,
                                 ptr_bytes,
-                                dst_raw,
-                                fat_slot,
-                                fat_slot,
                             },
+                        );
+                        if (words == 4) {
+                            try state.print(
+                                "  %_sacs_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                                    "  store {s} {d}, ptr %_sacs_{d}, align {d}\n",
+                                .{ tmp_id, fat_slot, ptr_int, ptr_bytes * 2, ptr_int, cap, tmp_id, ptr_bytes },
+                            );
+                        }
+                        try state.print(
+                            "  %_v_{d} = select i1 true, ptr {s}, ptr {s}\n",
+                            .{ dst_raw, fat_slot, fat_slot },
                         );
                         return true;
                     }
                 }
             }
         }
-        const sp_is_slice = if (src_pointee == .str_ty) true else if (src_pointee.isPrimitiveOrSentinel()) false else sub: {
+        const sp_is_slice = if (src_pointee == .str_ty or emitter.input.pool.isSliceRefType(src_pointee))
+            true
+        else if (src_pointee.isPrimitiveOrSentinel())
+            false
+        else sub: {
             const spn = emitter.input.pool.getNode(src_pointee);
             break :sub spn.tag == .slice_ty or spn.tag == .soa_slice_ty;
         };
         if (sp_is_slice and dst_is_fat_slice) {
+            const dst_sl_ty = try formatSliceLlvmStructType(emitter, dst_ty);
+            defer emitter.allocator.free(dst_sl_ty);
             try state.print(
-                "  %_v_{d} = load {{ ptr, {s} }}, ptr %_v_{d}, align {d}\n",
-                .{ dst_raw, ptr_int, src_raw, ptr_bytes },
+                "  %_v_{d} = load {s}, ptr %_v_{d}, align {d}\n",
+                .{ dst_raw, dst_sl_ty, src_raw, ptr_bytes },
             );
             return true;
         }
@@ -8336,7 +9452,11 @@ fn tryEmitSliceArrayPtrCoercionLlvm(
             emitter,
             TypeId.fromInt(emitter.input.pool.getNode(dst_ty).lhs),
         );
-        const dp_is_slice = if (dst_pointee == .str_ty) true else if (dst_pointee.isPrimitiveOrSentinel()) false else sub: {
+        const dp_is_slice = if (dst_pointee == .str_ty or emitter.input.pool.isSliceRefType(dst_pointee))
+            true
+        else if (dst_pointee.isPrimitiveOrSentinel())
+            false
+        else sub: {
             const dpn = emitter.input.pool.getNode(dst_pointee);
             break :sub dpn.tag == .slice_ty or dpn.tag == .soa_slice_ty;
         };
@@ -8487,7 +9607,9 @@ fn emitMirInstLlvm(
                         try std.fmt.allocPrint(emitter.allocator, "@_cx_str_bytes_{d}", .{sym_id.asInt()});
                     defer emitter.allocator.free(ptr_expr);
 
-                    if (dst_node.tag == .ref_ty or dst_node.tag == .mut_ref_ty or dst_node.tag == .raw_ptr_ty) {
+                    if ((dst_node.tag == .ref_ty or dst_node.tag == .mut_ref_ty or dst_node.tag == .raw_ptr_ty) and
+                        !emitter.input.pool.isSliceRefType(dst_ty))
+                    {
                         const pointee = try unwrapTransparentType(emitter, TypeId.fromInt(dst_node.lhs));
                         if (emitter.input.pool.getNode(pointee).tag == .slice_ty or pointee == .str_ty) {
                             const sid = emitter.nextSynthGlobalId();
@@ -8533,7 +9655,9 @@ fn emitMirInstLlvm(
                 },
                 .raw_blob => |rb| {
                     const dst_node = emitter.input.pool.getNode(dst_ty);
-                    if (dst_node.tag == .ref_ty or dst_node.tag == .mut_ref_ty or dst_node.tag == .raw_ptr_ty) {
+                    if ((dst_node.tag == .ref_ty or dst_node.tag == .mut_ref_ty or dst_node.tag == .raw_ptr_ty) and
+                        !emitter.input.pool.isSliceRefType(dst_ty))
+                    {
                         const pointee = try unwrapTransparentType(emitter, TypeId.fromInt(dst_node.lhs));
                         if (emitter.input.pool.getNode(pointee).tag == .slice_ty) {
                             try state.print(
@@ -8698,8 +9822,12 @@ fn emitMirInstLlvm(
                 const elem_lay = try emitter.resolver.resolveType(inst.type_id);
                 elem_off = @as(u64, fld_ord) * elem_lay.stride_bytes;
                 elem_align = @min(src_lay.alignBytes(), effectiveOffsetAlign(elem_off, elem_lay.alignBytes()));
-            } else if (src_node.tag == .slice_ty or src_ty == .str_ty or src_node.tag == .soa_slice_ty) {
-                elem_off = if (fld_ord == 0) 0 else emitter.cfg.target.ptrBytes();
+            } else if (src_node.tag == .slice_ty or
+                src_ty == .str_ty or
+                src_node.tag == .soa_slice_ty or
+                emitter.input.pool.isSliceRefType(src_ty))
+            {
+                elem_off = @as(u64, fld_ord) * emitter.cfg.target.ptrBytes();
                 elem_align = emitter.cfg.target.ptrBytes();
             } else if (try emitter.resolver.getFieldByDeclOrdinal(src_ty, fld_ord)) |fld| {
                 elem_off = fld.byte_offset;
@@ -8767,6 +9895,13 @@ fn emitMirInstLlvm(
                     const elem_lay = try emitter.resolver.resolveType(elem_ty);
                     elem_off = @as(u64, fld_ord) * elem_lay.stride_bytes;
                     elem_align = @min(agg_lay.alignBytes(), effectiveOffsetAlign(elem_off, elem_lay.alignBytes()));
+                } else if (agg_node.tag == .slice_ty or
+                    agg_ty == .str_ty or
+                    agg_node.tag == .soa_slice_ty or
+                    emitter.input.pool.isSliceRefType(agg_ty))
+                {
+                    elem_off = @as(u64, fld_ord) * emitter.cfg.target.ptrBytes();
+                    elem_align = emitter.cfg.target.ptrBytes();
                 } else if (try emitter.resolver.getFieldByDeclOrdinal(agg_ty, fld_ord)) |fld| {
                     elem_off = fld.byte_offset;
                     const nat_align = @as(u32, 1) << @intCast(fld.align_log2);
@@ -9139,6 +10274,51 @@ fn emitMirInstLlvm(
                 }
             } else if (!sym_idx.isNone() and sym_idx.asInt() < emitter.input.sym_table.symbols.items.len) {
                 const sym_rec = emitter.input.sym_table.getSymbol(sym_idx).*;
+                if (sym_rec.kind == .const_sym) {
+                    const resolved_def = if (!def_id.isNone()) def_id else sym_rec.def_id;
+                    if (emitter.input.const_rodata_map) |crm| {
+                        if (crm.get(resolved_def.asInt())) |r_idx| {
+                            const sym_ty = try unwrapTransparentType(emitter, sym_rec.type_id);
+                            const inst_ty = try unwrapTransparentType(emitter, inst.type_id);
+                            const inst_node = emitter.input.pool.getNode(inst_ty);
+                            const is_addr_of_sym = (inst_node.tag == .ref_ty or inst_node.tag == .mut_ref_ty) and
+                                (try unwrapTransparentType(emitter, TypeId.fromInt(inst_node.lhs))) == sym_ty;
+                            if (!is_addr_of_sym) {
+                                if (try isZeroSizedType(emitter, inst.type_id)) {
+                                    try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+                                } else {
+                                    const ro_ident = try std.fmt.allocPrint(emitter.allocator, "@_cx_rodata_{d}", .{r_idx});
+                                    defer emitter.allocator.free(ro_ident);
+                                    const glob_lay = try emitter.resolver.resolveType(sym_ty);
+                                    const loaded_s = try emitLoadValueFromPtr(
+                                        emitter,
+                                        state,
+                                        inst.type_id,
+                                        ro_ident,
+                                        glob_lay.alignBytes(),
+                                        null,
+                                        0,
+                                        0,
+                                        0,
+                                    );
+                                    defer emitter.allocator.free(loaded_s);
+                                    const val_ty = try formatLlvmValueType(emitter, inst.type_id);
+                                    defer emitter.allocator.free(val_ty);
+                                    try state.print(
+                                        "  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n",
+                                        .{ dst_raw, val_ty, loaded_s, val_ty, loaded_s },
+                                    );
+                                }
+                            } else {
+                                try state.print(
+                                    "  %_v_{d} = select i1 true, ptr @_cx_rodata_{d}, ptr @_cx_rodata_{d}\n",
+                                    .{ dst_raw, r_idx, r_idx },
+                                );
+                            }
+                            return;
+                        }
+                    }
+                }
                 const ffi_meta = extractSymFfiMetaLlvm(emitter, sym_idx);
                 const ext_name = if (ffi_meta.link_name.len > 0) ffi_meta.link_name else sym_rec.name_text;
                 const ext_ident = try formatLlvmGlobalIdent(emitter.allocator, ext_name);
@@ -9146,7 +10326,10 @@ fn emitMirInstLlvm(
                 if (emitter.extern_global_sym_set.contains(sym_idx.asInt())) {
                     const sym_ty = try unwrapTransparentType(emitter, sym_rec.type_id);
                     const inst_ty = try unwrapTransparentType(emitter, inst.type_id);
-                    if (inst_ty == sym_ty) {
+                    const inst_node = emitter.input.pool.getNode(inst_ty);
+                    const is_addr_of_sym = (inst_node.tag == .ref_ty or inst_node.tag == .mut_ref_ty) and
+                        (try unwrapTransparentType(emitter, TypeId.fromInt(inst_node.lhs))) == sym_ty;
+                    if (!is_addr_of_sym) {
                         if (try isZeroSizedType(emitter, inst.type_id)) {
                             try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
                         } else {
@@ -9337,16 +10520,20 @@ fn emitMirInstLlvm(
 
                     const is_dst_slice_ref = (dst_node.tag == .ref_ty or
                         dst_node.tag == .mut_ref_ty or
-                        dst_node.tag == .raw_ptr_ty) and blk: {
+                        dst_node.tag == .raw_ptr_ty) and
+                        !emitter.input.pool.isSliceRefType(dst_unwrapped) and blk: {
                         const dp = try unwrapTransparentType(emitter, TypeId.fromInt(dst_node.lhs));
-                        if (dp == .str_ty) break :blk true;
+                        if (dp == .str_ty or emitter.input.pool.isSliceRefType(dp)) break :blk true;
                         if (dp.isPrimitiveOrSentinel()) break :blk false;
                         const dpn = emitter.input.pool.getNode(dp);
                         break :blk dpn.tag == .slice_ty or dpn.tag == .soa_slice_ty;
                     };
+                    const is_dst_fat_slice = dst_node.tag == .slice_ty or
+                        dst_node.tag == .soa_slice_ty or
+                        emitter.input.pool.isSliceRefType(dst_unwrapped);
 
-                    // Coercion `&[T; N]` / `&mut [T; N]` -> fat slice `[T]` or `&[T]`:
-                    if ((dst_node.tag == .slice_ty or dst_node.tag == .soa_slice_ty) and
+                    // Coercion `&[T; N]` / `&mut [T; N]` / `&*s` -> fat slice `[T]` or `&[T]`:
+                    if (is_dst_fat_slice and
                         (src_node.tag == .array_ty or src_node.tag == .soa_array_ty))
                     {
                         const cap: u64 = src_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
@@ -9362,10 +10549,39 @@ fn emitMirInstLlvm(
                             try emitter.allocator.dupe(u8, av.ptr_str);
                         defer emitter.allocator.free(data_ptr_s);
                         const tmp_id = state.nextTmp();
+                        const dst_sl_ty = try formatSliceLlvmStructType(emitter, dst_unwrapped);
+                        defer emitter.allocator.free(dst_sl_ty);
+                        if (emitter.input.pool.isSoaSliceOrRefType(dst_unwrapped)) {
+                            try state.print(
+                                "  %_paf0_{d} = insertvalue {s} zeroinitializer, ptr {s}, 0\n" ++
+                                    "  %_paf1_{d} = insertvalue {s} %_paf0_{d}, {s} {d}, 1\n" ++
+                                    "  %_paf2_{d} = insertvalue {s} %_paf1_{d}, {s} {d}, 2\n" ++
+                                    "  %_v_{d} = insertvalue {s} %_paf2_{d}, {s} 0, 3\n",
+                                .{
+                                    tmp_id,    dst_sl_ty, data_ptr_s,
+                                    tmp_id,    dst_sl_ty, tmp_id,
+                                    ptr_int,   cap,       tmp_id,
+                                    dst_sl_ty, tmp_id,    ptr_int,
+                                    cap,       dst_raw,   dst_sl_ty,
+                                    tmp_id,    ptr_int,
+                                },
+                            );
+                        } else {
+                            try state.print(
+                                "  %_paf_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr {s}, 0\n" ++
+                                    "  %_v_{d} = insertvalue {{ ptr, {s} }} %_paf_{d}, {s} {d}, 1\n",
+                                .{ tmp_id, ptr_int, data_ptr_s, dst_raw, ptr_int, tmp_id, ptr_int, cap },
+                            );
+                        }
+                    } else if (is_dst_fat_slice and
+                        (src_node.tag == .slice_ty or src_node.tag == .soa_slice_ty))
+                    {
+                        const hdr_align = @min(@max(av.align_bytes, 1), emitter.cfg.target.ptrBytes());
+                        const dst_sl_ty = try formatSliceLlvmStructType(emitter, dst_unwrapped);
+                        defer emitter.allocator.free(dst_sl_ty);
                         try state.print(
-                            "  %_paf_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr {s}, 0\n" ++
-                                "  %_v_{d} = insertvalue {{ ptr, {s} }} %_paf_{d}, {s} {d}, 1\n",
-                            .{ tmp_id, ptr_int, data_ptr_s, dst_raw, ptr_int, tmp_id, ptr_int, cap },
+                            "  %_v_{d} = load {s}, ptr {s}, align {d}\n",
+                            .{ dst_raw, dst_sl_ty, av.ptr_str, hdr_align },
                         );
                     } else if (is_dst_slice_ref and
                         (src_node.tag == .array_ty or src_node.tag == .soa_array_ty))
@@ -9383,29 +10599,40 @@ fn emitMirInstLlvm(
                         else
                             try emitter.allocator.dupe(u8, av.ptr_str);
                         defer emitter.allocator.free(data_ptr_s);
-                        const fat_slot = try state.allocEntryBytes(2 * ptr_bytes, ptr_bytes);
+                        const dst_pt = try unwrapTransparentType(emitter, TypeId.fromInt(dst_node.lhs));
+                        const words = sliceDescriptorWordCount(emitter.input.pool, dst_pt);
+                        const fat_slot = try state.allocEntryBytes(words * ptr_bytes, ptr_bytes);
                         defer emitter.allocator.free(fat_slot);
+                        try emitMemsetZero(emitter, state, fat_slot, words * ptr_bytes, ptr_bytes);
                         const tmp_id = state.nextTmp();
                         try state.print(
                             "  store ptr {s}, ptr {s}, align {d}\n" ++
-                                "  %_pas_{d} = getelementptr inbounds {{ ptr, {s} }}, ptr {s}, i32 0, i32 1\n" ++
-                                "  store {s} {d}, ptr %_pas_{d}, align {d}\n" ++
-                                "  %_v_{d} = select i1 true, ptr {s}, ptr {s}\n",
+                                "  %_pas_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                                "  store {s} {d}, ptr %_pas_{d}, align {d}\n",
                             .{
                                 data_ptr_s,
                                 fat_slot,
                                 ptr_bytes,
                                 tmp_id,
-                                ptr_int,
                                 fat_slot,
+                                ptr_int,
+                                ptr_bytes,
                                 ptr_int,
                                 cap,
                                 tmp_id,
                                 ptr_bytes,
-                                dst_raw,
-                                fat_slot,
-                                fat_slot,
                             },
+                        );
+                        if (words == 4) {
+                            try state.print(
+                                "  %_pass_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                                    "  store {s} {d}, ptr %_pass_{d}, align {d}\n",
+                                .{ tmp_id, fat_slot, ptr_int, ptr_bytes * 2, ptr_int, cap, tmp_id, ptr_bytes },
+                            );
+                        }
+                        try state.print(
+                            "  %_v_{d} = select i1 true, ptr {s}, ptr {s}\n",
+                            .{ dst_raw, fat_slot, fat_slot },
                         );
                     } else {
                         try state.print(
@@ -9429,129 +10656,150 @@ fn emitMirInstLlvm(
         },
 
         .soa_column_slice => {
-            const base_raw = inst.operands.lhs;
             const field_ord = inst.operands.rhs;
-            const base_ty = try unwrapTransparentType(
-                emitter,
-                body.getInst(MirValueId.fromInt(base_raw)).type_id,
-            );
-            const base_node = emitter.input.pool.getNode(base_ty);
-            const unwrapped_src = if (base_node.tag == .ref_ty or
-                base_node.tag == .mut_ref_ty or
-                base_node.tag == .raw_ptr_ty)
-                try unwrapTransparentType(emitter, TypeId.fromInt(base_node.lhs))
-            else
-                base_ty;
-            const src_node = emitter.input.pool.getNode(unwrapped_src);
-            const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(src_node.lhs));
-            const fld = (try emitter.resolver.getFieldByDeclOrdinal(elem_struct, field_ord)).?;
-            const fld_align: u32 = @as(u32, 1) << @intCast(fld.align_log2);
+            const lowered = try lowerPlaceLlvm(emitter, state, body, PlaceId.fromInt(inst.operands.lhs));
+            switch (lowered) {
+                .const_len => {},
+                .addr_val => |av| {
+                    defer emitter.allocator.free(av.ptr_str);
+                    const unwrapped_src = if (emitter.input.pool.getSliceRefInner(av.pointee_ty)) |inner_sl|
+                        try unwrapTransparentType(emitter, inner_sl)
+                    else
+                        try unwrapTransparentType(emitter, av.pointee_ty);
+                    const src_node = emitter.input.pool.getNode(unwrapped_src);
+                    const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(src_node.lhs));
+                    const fld = (try emitter.resolver.getFieldByDeclOrdinal(elem_struct, field_ord)).?;
+                    const fld_align: u32 = @as(u32, 1) << @intCast(fld.align_log2);
+                    const ptr_bytes: u32 = emitter.cfg.target.ptrBytes();
+                    const hdr_align = @min(@max(av.align_bytes, 1), ptr_bytes);
 
-            if (src_node.tag == .soa_array_ty) {
-                const cap: u64 = src_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
-                const col_info = emitter.resolver.getSoaColumnOffset(elem_struct, field_ord, cap).?;
-                const base_ptr_s = if (base_node.tag == .ref_ty or
-                    base_node.tag == .mut_ref_ty or
-                    base_node.tag == .raw_ptr_ty)
-                    try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{base_raw})
-                else blk: {
-                    const arr_lay = try emitter.resolver.resolveType(unwrapped_src);
-                    const scratch = try state.allocEntryBytes(arr_lay.size_bytes, arr_lay.alignBytes());
-                    const val_ssa = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{base_raw});
-                    defer emitter.allocator.free(val_ssa);
-                    try emitStoreValueToPtr(emitter, state, unwrapped_src, val_ssa, scratch, arr_lay.alignBytes(), 0, 0, 0);
-                    break :blk scratch;
-                };
-                defer emitter.allocator.free(base_ptr_s);
-
-                const tmp_id = state.nextTmp();
-                if (cap == 0) {
-                    try state.print(
-                        "  %_scs0_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr inttoptr ({s} {d} to ptr), 0\n" ++
-                            "  %_v_{d} = insertvalue {{ ptr, {s} }} %_scs0_{d}, {s} 0, 1\n",
-                        .{ tmp_id, ptr_int, ptr_int, @max(fld_align, 1), dst_raw, ptr_int, tmp_id, ptr_int },
-                    );
-                } else {
-                    try state.print(
-                        "  %_scsp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
-                            "  %_scs0_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr %_scsp_{d}, 0\n" ++
-                            "  %_v_{d} = insertvalue {{ ptr, {s} }} %_scs0_{d}, {s} {d}, 1\n",
-                        .{
-                            tmp_id,
-                            base_ptr_s,
-                            ptr_int,
-                            col_info.byte_offset,
-                            tmp_id,
-                            ptr_int,
-                            tmp_id,
-                            dst_raw,
-                            ptr_int,
-                            tmp_id,
-                            ptr_int,
-                            cap,
-                        },
-                    );
-                }
-            } else {
-                const tmp_id = state.nextTmp();
-                if (base_node.tag == .ref_ty or base_node.tag == .mut_ref_ty or base_node.tag == .raw_ptr_ty) {
-                    try state.print(
-                        "  %_scsf_{d} = load {{ ptr, {s} }}, ptr %_v_{d}, align {d}\n" ++
-                            "  %_scsd_{d} = extractvalue {{ ptr, {s} }} %_scsf_{d}, 0\n" ++
-                            "  %_scsl_{d} = extractvalue {{ ptr, {s} }} %_scsf_{d}, 1\n",
-                        .{
-                            tmp_id,
-                            ptr_int,
-                            base_raw,
-                            emitter.cfg.target.ptrBytes(),
-                            tmp_id,
-                            ptr_int,
-                            tmp_id,
-                            tmp_id,
-                            ptr_int,
-                            tmp_id,
-                        },
-                    );
-                } else {
-                    try state.print(
-                        "  %_scsd_{d} = extractvalue {{ ptr, {s} }} %_v_{d}, 0\n" ++
-                            "  %_scsl_{d} = extractvalue {{ ptr, {s} }} %_v_{d}, 1\n",
-                        .{ tmp_id, ptr_int, base_raw, tmp_id, ptr_int, base_raw },
-                    );
-                }
-                const len_s = try std.fmt.allocPrint(emitter.allocator, "%_scsl_{d}", .{tmp_id});
-                defer emitter.allocator.free(len_s);
-                const dyn_col = try emitDynamicSoaColByteOffset(emitter, state, elem_struct, field_ord, len_s);
-                defer emitter.allocator.free(dyn_col.off_ssa);
-                try state.print(
-                    "  %_scsp_{d} = getelementptr inbounds i8, ptr %_scsd_{d}, {s} {s}\n" ++
-                        "  %_scsz_{d} = icmp eq {s} %_scsl_{d}, 0\n" ++
-                        "  %_scsnn_{d} = select i1 %_scsz_{d}, ptr inttoptr ({s} {d} to ptr), ptr %_scsp_{d}\n" ++
-                        "  %_scs0_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr %_scsnn_{d}, 0\n" ++
-                        "  %_v_{d} = insertvalue {{ ptr, {s} }} %_scs0_{d}, {s} %_scsl_{d}, 1\n",
-                    .{
-                        tmp_id,
-                        tmp_id,
-                        ptr_int,
-                        dyn_col.off_ssa,
-                        tmp_id,
-                        ptr_int,
-                        tmp_id,
-                        tmp_id,
-                        tmp_id,
-                        ptr_int,
-                        @max(fld_align, 1),
-                        tmp_id,
-                        tmp_id,
-                        ptr_int,
-                        tmp_id,
-                        dst_raw,
-                        ptr_int,
-                        tmp_id,
-                        ptr_int,
-                        tmp_id,
-                    },
-                );
+                    if (src_node.tag == .soa_array_ty) {
+                        const cap: u64 = src_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+                        const col_info = emitter.resolver.getSoaColumnOffset(elem_struct, field_ord, cap).?;
+                        const tmp_id = state.nextTmp();
+                        if (cap == 0) {
+                            try state.print(
+                                "  %_scs0_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr inttoptr ({s} {d} to ptr), 0\n" ++
+                                    "  %_v_{d} = insertvalue {{ ptr, {s} }} %_scs0_{d}, {s} 0, 1\n",
+                                .{ tmp_id, ptr_int, ptr_int, @max(fld_align, 1), dst_raw, ptr_int, tmp_id, ptr_int },
+                            );
+                        } else {
+                            try state.print(
+                                "  %_scsp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                                    "  %_scs0_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr %_scsp_{d}, 0\n" ++
+                                    "  %_v_{d} = insertvalue {{ ptr, {s} }} %_scs0_{d}, {s} {d}, 1\n",
+                                .{
+                                    tmp_id,  av.ptr_str, ptr_int, col_info.byte_offset,
+                                    tmp_id,  ptr_int,    tmp_id,  dst_raw,
+                                    ptr_int, tmp_id,     ptr_int, cap,
+                                },
+                            );
+                        }
+                    } else if (src_node.tag == .soa_vec_ty) {
+                        const tmp_id = state.nextTmp();
+                        try state.print(
+                            "  %_scsd_{d} = load ptr, ptr {s}, align {d}\n" ++
+                                "  %_scslp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                                "  %_scsl32_{d} = load i32, ptr %_scslp_{d}, align {d}\n" ++
+                                "  %_scscp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                                "  %_scsc32_{d} = load i32, ptr %_scscp_{d}, align {d}\n",
+                            .{
+                                tmp_id,             av.ptr_str,         hdr_align,
+                                tmp_id,             av.ptr_str,         ptr_int,
+                                ptr_bytes,          tmp_id,             tmp_id,
+                                @min(hdr_align, 4), tmp_id,             av.ptr_str,
+                                ptr_int,            ptr_bytes + 4,      tmp_id,
+                                tmp_id,             @min(hdr_align, 4),
+                            },
+                        );
+                        if (ptr_bytes == 4) {
+                            try state.print(
+                                "  %_scsl_{d} = add i32 %_scsl32_{d}, 0\n  %_scsc_{d} = add i32 %_scsc32_{d}, 0\n",
+                                .{ tmp_id, tmp_id, tmp_id, tmp_id },
+                            );
+                        } else {
+                            try state.print(
+                                "  %_scsl_{d} = zext i32 %_scsl32_{d} to i64\n  %_scsc_{d} = zext i32 %_scsc32_{d} to i64\n",
+                                .{ tmp_id, tmp_id, tmp_id, tmp_id },
+                            );
+                        }
+                        const cap_s = try std.fmt.allocPrint(emitter.allocator, "%_scsc_{d}", .{tmp_id});
+                        defer emitter.allocator.free(cap_s);
+                        const dyn_col = try emitDynamicSoaColByteOffset(emitter, state, elem_struct, field_ord, cap_s);
+                        defer emitter.allocator.free(dyn_col.off_ssa);
+                        try state.print(
+                            "  %_scsp_{d} = getelementptr inbounds i8, ptr %_scsd_{d}, {s} {s}\n" ++
+                                "  %_scsz_{d} = icmp eq {s} %_scsl_{d}, 0\n" ++
+                                "  %_scsn_{d} = icmp eq ptr %_scsd_{d}, null\n" ++
+                                "  %_scse_{d} = or i1 %_scsz_{d}, %_scsn_{d}\n" ++
+                                "  %_scsnn_{d} = select i1 %_scse_{d}, ptr inttoptr ({s} {d} to ptr), ptr %_scsp_{d}\n" ++
+                                "  %_scs0_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr %_scsnn_{d}, 0\n" ++
+                                "  %_v_{d} = insertvalue {{ ptr, {s} }} %_scs0_{d}, {s} %_scsl_{d}, 1\n",
+                            .{
+                                tmp_id,  tmp_id,  ptr_int, dyn_col.off_ssa,
+                                tmp_id,  ptr_int, tmp_id,  tmp_id,
+                                tmp_id,  tmp_id,  tmp_id,  tmp_id,
+                                tmp_id,  tmp_id,  ptr_int, @max(fld_align, 1),
+                                tmp_id,  tmp_id,  ptr_int, tmp_id,
+                                dst_raw, ptr_int, tmp_id,  ptr_int,
+                                tmp_id,
+                            },
+                        );
+                    } else {
+                        const tmp_id = state.nextTmp();
+                        const soa_sl_ty = try std.fmt.allocPrint(
+                            emitter.allocator,
+                            "{{ ptr, {s}, {s}, {s} }}",
+                            .{ ptr_int, ptr_int, ptr_int },
+                        );
+                        defer emitter.allocator.free(soa_sl_ty);
+                        try state.print(
+                            "  %_scsf_{d} = load {s}, ptr {s}, align {d}\n" ++
+                                "  %_scsd_{d} = extractvalue {s} %_scsf_{d}, 0\n" ++
+                                "  %_scsl_{d} = extractvalue {s} %_scsf_{d}, 1\n" ++
+                                "  %_scsst_{d} = extractvalue {s} %_scsf_{d}, 2\n" ++
+                                "  %_scseo_{d} = extractvalue {s} %_scsf_{d}, 3\n",
+                            .{
+                                tmp_id,    soa_sl_ty, av.ptr_str, hdr_align,
+                                tmp_id,    soa_sl_ty, tmp_id,     tmp_id,
+                                soa_sl_ty, tmp_id,    tmp_id,     soa_sl_ty,
+                                tmp_id,    tmp_id,    soa_sl_ty,  tmp_id,
+                            },
+                        );
+                        const stride_s = try std.fmt.allocPrint(emitter.allocator, "%_scsst_{d}", .{tmp_id});
+                        defer emitter.allocator.free(stride_s);
+                        const dyn_col = try emitDynamicSoaColByteOffset(emitter, state, elem_struct, field_ord, stride_s);
+                        defer emitter.allocator.free(dyn_col.off_ssa);
+                        try state.print(
+                            "  %_scsem_{d} = mul {s} %_scseo_{d}, {d}\n" ++
+                                "  %_scsbo_{d} = add {s} {s}, %_scsem_{d}\n" ++
+                                "  %_scsp_{d} = getelementptr inbounds i8, ptr %_scsd_{d}, {s} %_scsbo_{d}\n" ++
+                                "  %_scsz_{d} = icmp eq {s} %_scsl_{d}, 0\n" ++
+                                "  %_scsn_{d} = icmp eq ptr %_scsd_{d}, null\n",
+                            .{
+                                tmp_id, ptr_int, tmp_id,          fld.size_bytes,
+                                tmp_id, ptr_int, dyn_col.off_ssa, tmp_id,
+                                tmp_id, tmp_id,  ptr_int,         tmp_id,
+                                tmp_id, ptr_int, tmp_id,          tmp_id,
+                                tmp_id,
+                            },
+                        );
+                        try state.print(
+                            "  %_scse_{d} = or i1 %_scsz_{d}, %_scsn_{d}\n" ++
+                                "  %_scsnn_{d} = select i1 %_scse_{d}, ptr inttoptr ({s} {d} to ptr), ptr %_scsp_{d}\n" ++
+                                "  %_scs0_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr %_scsnn_{d}, 0\n" ++
+                                "  %_v_{d} = insertvalue {{ ptr, {s} }} %_scs0_{d}, {s} %_scsl_{d}, 1\n",
+                            .{
+                                tmp_id,             tmp_id, tmp_id,
+                                tmp_id,             tmp_id, ptr_int,
+                                @max(fld_align, 1), tmp_id, tmp_id,
+                                ptr_int,            tmp_id, dst_raw,
+                                ptr_int,            tmp_id, ptr_int,
+                                tmp_id,
+                            },
+                        );
+                    }
+                },
             }
         },
 
@@ -9812,7 +11060,20 @@ fn emitStructuralPtrEqLlvm(
     const node = emitter.input.pool.getNode(ty);
 
     switch (node.tag) {
-        .ref_ty, .mut_ref_ty, .raw_ptr_ty, .fn_ty => {
+        .ref_ty, .mut_ref_ty => {
+            if (emitter.input.pool.getSliceRefInner(ty)) |slice_inner| {
+                return emitStructuralPtrEqLlvm(emitter, state, slice_inner, lhs_ptr, rhs_ptr, depth + 1);
+            }
+            const tmp_id = state.nextTmp();
+            try state.print(
+                "  %_peqp_l_{d} = load ptr, ptr {s}, align 1\n" ++
+                    "  %_peqp_r_{d} = load ptr, ptr {s}, align 1\n" ++
+                    "  %_peqp_eq_{d} = icmp eq ptr %_peqp_l_{d}, %_peqp_r_{d}\n",
+                .{ tmp_id, lhs_ptr, tmp_id, rhs_ptr, tmp_id, tmp_id, tmp_id },
+            );
+            return std.fmt.allocPrint(emitter.allocator, "%_peqp_eq_{d}", .{tmp_id});
+        },
+        .raw_ptr_ty, .fn_ty => {
             const tmp_id = state.nextTmp();
             try state.print(
                 "  %_peqp_l_{d} = load ptr, ptr {s}, align 1\n" ++
@@ -10039,6 +11300,137 @@ fn emitStructuralPtrEqLlvm(
             }
             return acc_ssa;
         },
+        .soa_vec_ty => {
+            const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+            const st_lay = try emitter.resolver.resolveType(elem_struct);
+            const ptr_bytes: u32 = emitter.cfg.target.ptrBytes();
+            const res_slot = try state.allocEntryBytes(1, 1);
+            defer emitter.allocator.free(res_slot);
+            const tmp_id = state.nextTmp();
+            try state.print(
+                "  store i8 0, ptr {s}, align 1\n" ++
+                    "  %_peqsv_lp_{d} = load ptr, ptr {s}, align 1\n" ++
+                    "  %_peqsv_llp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                    "  %_peqsv_ll32_{d} = load i32, ptr %_peqsv_llp_{d}, align 1\n" ++
+                    "  %_peqsv_lcp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                    "  %_peqsv_lc32_{d} = load i32, ptr %_peqsv_lcp_{d}, align 1\n" ++
+                    "  %_peqsv_rp_{d} = load ptr, ptr {s}, align 1\n" ++
+                    "  %_peqsv_rlp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                    "  %_peqsv_rl32_{d} = load i32, ptr %_peqsv_rlp_{d}, align 1\n" ++
+                    "  %_peqsv_rcp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                    "  %_peqsv_rc32_{d} = load i32, ptr %_peqsv_rcp_{d}, align 1\n",
+                .{
+                    res_slot,
+                    tmp_id,
+                    lhs_ptr,
+                    tmp_id,
+                    lhs_ptr,
+                    ptr_int,
+                    ptr_bytes,
+                    tmp_id,
+                    tmp_id,
+                    tmp_id,
+                    lhs_ptr,
+                    ptr_int,
+                    ptr_bytes + 4,
+                    tmp_id,
+                    tmp_id,
+                    tmp_id,
+                    rhs_ptr,
+                    tmp_id,
+                    rhs_ptr,
+                    ptr_int,
+                    ptr_bytes,
+                    tmp_id,
+                    tmp_id,
+                    tmp_id,
+                    rhs_ptr,
+                    ptr_int,
+                    ptr_bytes + 4,
+                    tmp_id,
+                    tmp_id,
+                },
+            );
+            try state.print(
+                "  %_peqsv_le_{d} = icmp eq i32 %_peqsv_ll32_{d}, %_peqsv_rl32_{d}\n" ++
+                    "  br i1 %_peqsv_le_{d}, label %_peqsv_sm_{d}, label %_peqsv_dn_{d}\n" ++
+                    "_peqsv_sm_{d}:\n" ++
+                    "  %_peqsv_z_{d} = icmp eq i32 %_peqsv_ll32_{d}, 0\n" ++
+                    "  br i1 %_peqsv_z_{d}, label %_peqsv_ok_{d}, label %_peqsv_cl_{d}\n" ++
+                    "_peqsv_ok_{d}:\n" ++
+                    "  store i8 1, ptr {s}, align 1\n" ++
+                    "  br label %_peqsv_dn_{d}\n" ++
+                    "_peqsv_cl_{d}:\n",
+                .{
+                    tmp_id, tmp_id,   tmp_id,
+                    tmp_id, tmp_id,   tmp_id,
+                    tmp_id, tmp_id,   tmp_id,
+                    tmp_id, tmp_id,   tmp_id,
+                    tmp_id, res_slot, tmp_id,
+                    tmp_id,
+                },
+            );
+            state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_peqsv_cl_{d}", .{tmp_id}));
+            if (ptr_bytes == 4) {
+                try state.print(
+                    "  %_peqsv_ln_{d} = add i32 %_peqsv_ll32_{d}, 0\n" ++
+                        "  %_peqsv_lc_{d} = add i32 %_peqsv_lc32_{d}, 0\n" ++
+                        "  %_peqsv_rc_{d} = add i32 %_peqsv_rc32_{d}, 0\n",
+                    .{ tmp_id, tmp_id, tmp_id, tmp_id, tmp_id, tmp_id },
+                );
+            } else {
+                try state.print(
+                    "  %_peqsv_ln_{d} = zext i32 %_peqsv_ll32_{d} to i64\n" ++
+                        "  %_peqsv_lc_{d} = zext i32 %_peqsv_lc32_{d} to i64\n" ++
+                        "  %_peqsv_rc_{d} = zext i32 %_peqsv_rc32_{d} to i64\n",
+                    .{ tmp_id, tmp_id, tmp_id, tmp_id, tmp_id, tmp_id },
+                );
+            }
+            const len_s = try std.fmt.allocPrint(emitter.allocator, "%_peqsv_ln_{d}", .{tmp_id});
+            defer emitter.allocator.free(len_s);
+            const lcap_s = try std.fmt.allocPrint(emitter.allocator, "%_peqsv_lc_{d}", .{tmp_id});
+            defer emitter.allocator.free(lcap_s);
+            const rcap_s = try std.fmt.allocPrint(emitter.allocator, "%_peqsv_rc_{d}", .{tmp_id});
+            defer emitter.allocator.free(rcap_s);
+            var acc_ssa = try emitter.allocator.dupe(u8, "true");
+            errdefer emitter.allocator.free(acc_ssa);
+            var col_ord: u32 = 0;
+            while (col_ord < st_lay.aux_len) : (col_ord += 1) {
+                const fld = emitter.resolver.fields_by_decl.items[st_lay.aux_start + col_ord];
+                if (fld.size_bytes == 0) continue;
+                const d_l = try emitDynamicSoaColByteOffset(emitter, state, elem_struct, col_ord, lcap_s);
+                defer emitter.allocator.free(d_l.off_ssa);
+                const d_r = try emitDynamicSoaColByteOffset(emitter, state, elem_struct, col_ord, rcap_s);
+                defer emitter.allocator.free(d_r.off_ssa);
+                const sub_id = state.nextTmp();
+                try state.print(
+                    "  %_peqsv_cl_{d} = getelementptr inbounds i8, ptr %_peqsv_lp_{d}, {s} {s}\n" ++
+                        "  %_peqsv_cr_{d} = getelementptr inbounds i8, ptr %_peqsv_rp_{d}, {s} {s}\n",
+                    .{ sub_id, tmp_id, ptr_int, d_l.off_ssa, sub_id, tmp_id, ptr_int, d_r.off_ssa },
+                );
+                const col_l = try std.fmt.allocPrint(emitter.allocator, "%_peqsv_cl_{d}", .{sub_id});
+                defer emitter.allocator.free(col_l);
+                const col_r = try std.fmt.allocPrint(emitter.allocator, "%_peqsv_cr_{d}", .{sub_id});
+                defer emitter.allocator.free(col_r);
+                const col_eq = try emitStructuralSpanLoopEqLlvm(emitter, state, fld.field_ty, col_l, col_r, len_s, depth);
+                defer emitter.allocator.free(col_eq);
+                try state.print("  %_peqsv_a_{d} = and i1 {s}, {s}\n", .{ sub_id, acc_ssa, col_eq });
+                emitter.allocator.free(acc_ssa);
+                acc_ssa = try std.fmt.allocPrint(emitter.allocator, "%_peqsv_a_{d}", .{sub_id});
+            }
+            try state.print(
+                "  %_peqsv_b8_{d} = zext i1 {s} to i8\n" ++
+                    "  store i8 %_peqsv_b8_{d}, ptr {s}, align 1\n" ++
+                    "  br label %_peqsv_dn_{d}\n" ++
+                    "_peqsv_dn_{d}:\n" ++
+                    "  %_peqsv_rv_{d} = load i8, ptr {s}, align 1\n" ++
+                    "  %_peqsv_okb_{d} = icmp ne i8 %_peqsv_rv_{d}, 0\n",
+                .{ tmp_id, acc_ssa, tmp_id, res_slot, tmp_id, tmp_id, tmp_id, res_slot, tmp_id, tmp_id },
+            );
+            emitter.allocator.free(acc_ssa);
+            state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_peqsv_dn_{d}", .{tmp_id}));
+            return std.fmt.allocPrint(emitter.allocator, "%_peqsv_okb_{d}", .{tmp_id});
+        },
         .slice_ty => {
             const elem_ty = try unwrapTransparentType(emitter, TypeId.fromInt(node.lhs));
             const res_slot = try state.allocEntryBytes(1, 1);
@@ -10111,66 +11503,93 @@ fn emitStructuralPtrEqLlvm(
             const st_lay = try emitter.resolver.resolveType(elem_struct);
             const res_slot = try state.allocEntryBytes(1, 1);
             defer emitter.allocator.free(res_slot);
+            const soa_sl_ty = try std.fmt.allocPrint(
+                emitter.allocator,
+                "{{ ptr, {s}, {s}, {s} }}",
+                .{ ptr_int, ptr_int, ptr_int },
+            );
+            defer emitter.allocator.free(soa_sl_ty);
             const tmp_id = state.nextTmp();
             try state.print(
                 "  store i8 0, ptr {s}, align 1\n" ++
-                    "  %_peqss_l_{d} = load {{ ptr, {s} }}, ptr {s}, align 1\n" ++
-                    "  %_peqss_r_{d} = load {{ ptr, {s} }}, ptr {s}, align 1\n" ++
-                    "  %_peqss_lp_{d} = extractvalue {{ ptr, {s} }} %_peqss_l_{d}, 0\n" ++
-                    "  %_peqss_ll_{d} = extractvalue {{ ptr, {s} }} %_peqss_l_{d}, 1\n" ++
-                    "  %_peqss_rp_{d} = extractvalue {{ ptr, {s} }} %_peqss_r_{d}, 0\n" ++
-                    "  %_peqss_rl_{d} = extractvalue {{ ptr, {s} }} %_peqss_r_{d}, 1\n" ++
+                    "  %_peqss_l_{d} = load {s}, ptr {s}, align 1\n" ++
+                    "  %_peqss_r_{d} = load {s}, ptr {s}, align 1\n" ++
+                    "  %_peqss_lp_{d} = extractvalue {s} %_peqss_l_{d}, 0\n" ++
+                    "  %_peqss_ll_{d} = extractvalue {s} %_peqss_l_{d}, 1\n" ++
+                    "  %_peqss_ls_{d} = extractvalue {s} %_peqss_l_{d}, 2\n" ++
+                    "  %_peqss_lo_{d} = extractvalue {s} %_peqss_l_{d}, 3\n",
+                .{
+                    res_slot,
+                    tmp_id,
+                    soa_sl_ty,
+                    lhs_ptr,
+                    tmp_id,
+                    soa_sl_ty,
+                    rhs_ptr,
+                    tmp_id,
+                    soa_sl_ty,
+                    tmp_id,
+                    tmp_id,
+                    soa_sl_ty,
+                    tmp_id,
+                    tmp_id,
+                    soa_sl_ty,
+                    tmp_id,
+                    tmp_id,
+                    soa_sl_ty,
+                    tmp_id,
+                },
+            );
+            try state.print(
+                "  %_peqss_rp_{d} = extractvalue {s} %_peqss_r_{d}, 0\n" ++
+                    "  %_peqss_rl_{d} = extractvalue {s} %_peqss_r_{d}, 1\n" ++
+                    "  %_peqss_rsd_{d} = extractvalue {s} %_peqss_r_{d}, 2\n" ++
+                    "  %_peqss_ro_{d} = extractvalue {s} %_peqss_r_{d}, 3\n" ++
                     "  %_peqss_le_{d} = icmp eq {s} %_peqss_ll_{d}, %_peqss_rl_{d}\n" ++
                     "  br i1 %_peqss_le_{d}, label %_peqss_sm_{d}, label %_peqss_dn_{d}\n" ++
                     "_peqss_sm_{d}:\n",
                 .{
-                    res_slot,
-                    tmp_id,
-                    ptr_int,
-                    lhs_ptr,
-                    tmp_id,
-                    ptr_int,
-                    rhs_ptr,
-                    tmp_id,
-                    ptr_int,
-                    tmp_id,
-                    tmp_id,
-                    ptr_int,
-                    tmp_id,
-                    tmp_id,
-                    ptr_int,
-                    tmp_id,
-                    tmp_id,
-                    ptr_int,
-                    tmp_id,
-                    tmp_id,
-                    ptr_int,
-                    tmp_id,
-                    tmp_id,
-                    tmp_id,
-                    tmp_id,
-                    tmp_id,
-                    tmp_id,
+                    tmp_id, soa_sl_ty, tmp_id,
+                    tmp_id, soa_sl_ty, tmp_id,
+                    tmp_id, soa_sl_ty, tmp_id,
+                    tmp_id, soa_sl_ty, tmp_id,
+                    tmp_id, ptr_int,   tmp_id,
+                    tmp_id, tmp_id,    tmp_id,
+                    tmp_id, tmp_id,
                 },
             );
             state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_peqss_sm_{d}", .{tmp_id}));
             const ll_s = try std.fmt.allocPrint(emitter.allocator, "%_peqss_ll_{d}", .{tmp_id});
             defer emitter.allocator.free(ll_s);
+            const ls_s = try std.fmt.allocPrint(emitter.allocator, "%_peqss_ls_{d}", .{tmp_id});
+            defer emitter.allocator.free(ls_s);
+            const rs_s = try std.fmt.allocPrint(emitter.allocator, "%_peqss_rsd_{d}", .{tmp_id});
+            defer emitter.allocator.free(rs_s);
             var acc_ssa = try emitter.allocator.dupe(u8, "true");
             errdefer emitter.allocator.free(acc_ssa);
             var col_ord: u32 = 0;
             while (col_ord < st_lay.aux_len) : (col_ord += 1) {
                 const fld = emitter.resolver.fields_by_decl.items[st_lay.aux_start + col_ord];
                 if (fld.size_bytes == 0) continue;
-                const dyn_col = try emitDynamicSoaColByteOffset(emitter, state, elem_struct, col_ord, ll_s);
-                defer emitter.allocator.free(dyn_col.off_ssa);
+                const dyn_col_l = try emitDynamicSoaColByteOffset(emitter, state, elem_struct, col_ord, ls_s);
+                defer emitter.allocator.free(dyn_col_l.off_ssa);
+                const dyn_col_r = try emitDynamicSoaColByteOffset(emitter, state, elem_struct, col_ord, rs_s);
+                defer emitter.allocator.free(dyn_col_r.off_ssa);
                 const sub_id = state.nextTmp();
                 try state.print(
-                    "  %_peqss_cl_{d} = getelementptr inbounds i8, ptr %_peqss_lp_{d}, {s} {s}\n" ++
-                        "  %_peqss_cr_{d} = getelementptr inbounds i8, ptr %_peqss_rp_{d}, {s} {s}\n",
+                    "  %_peqss_lm_{d} = mul {s} %_peqss_lo_{d}, {d}\n" ++
+                        "  %_peqss_lb_{d} = add {s} {s}, %_peqss_lm_{d}\n" ++
+                        "  %_peqss_rm_{d} = mul {s} %_peqss_ro_{d}, {d}\n" ++
+                        "  %_peqss_rb_{d} = add {s} {s}, %_peqss_rm_{d}\n" ++
+                        "  %_peqss_cl_{d} = getelementptr inbounds i8, ptr %_peqss_lp_{d}, {s} %_peqss_lb_{d}\n" ++
+                        "  %_peqss_cr_{d} = getelementptr inbounds i8, ptr %_peqss_rp_{d}, {s} %_peqss_rb_{d}\n",
                     .{
-                        sub_id, tmp_id, ptr_int, dyn_col.off_ssa,
-                        sub_id, tmp_id, ptr_int, dyn_col.off_ssa,
+                        sub_id, ptr_int, tmp_id,            fld.size_bytes,
+                        sub_id, ptr_int, dyn_col_l.off_ssa, sub_id,
+                        sub_id, ptr_int, tmp_id,            fld.size_bytes,
+                        sub_id, ptr_int, dyn_col_r.off_ssa, sub_id,
+                        sub_id, tmp_id,  ptr_int,           sub_id,
+                        sub_id, tmp_id,  ptr_int,           sub_id,
                     },
                 );
                 const col_l = try std.fmt.allocPrint(emitter.allocator, "%_peqss_cl_{d}", .{sub_id});
@@ -10358,7 +11777,9 @@ fn emitBinOpLlvm(
     }
     if (!op_ty.isPrimitiveOrSentinel()) {
         const op_tag = emitter.input.pool.getNode(op_ty).tag;
-        if (op_tag == .ref_ty or op_tag == .mut_ref_ty or op_tag == .raw_ptr_ty or op_tag == .fn_ty) {
+        if ((op_tag == .ref_ty or op_tag == .mut_ref_ty or op_tag == .raw_ptr_ty or op_tag == .fn_ty) and
+            !emitter.input.pool.isSliceRefType(op_ty))
+        {
             const pred = switch (kind) {
                 .eq => "eq",
                 .ne => "ne",
@@ -11364,9 +12785,10 @@ fn emitAggregateMakeLlvm(
                         body.getInst(MirValueId.fromInt(href_raw)).type_id,
                     );
                     const href_node = emitter.input.pool.getNode(href_ty);
-                    const is_ptr_arg = href_node.tag == .ref_ty or
+                    const is_ptr_arg = (href_node.tag == .ref_ty or
                         href_node.tag == .mut_ref_ty or
-                        href_node.tag == .raw_ptr_ty;
+                        href_node.tag == .raw_ptr_ty) and
+                        !emitter.input.pool.isSliceRefType(href_ty);
                     const hval_ty = try unwrapTransparentType(
                         emitter,
                         if (is_ptr_arg) TypeId.fromInt(href_node.lhs) else href_ty,
@@ -11695,6 +13117,40 @@ fn emitAggregateMakeLlvm(
                         elem_ssa,
                         scratch,
                         @min(agg_lay.alignBytes(), elem_lay.alignBytes()),
+                        0,
+                        0,
+                        0,
+                    );
+                }
+            } else if (agg_ty == .fmt_spec_ty) {
+                for (elems, 0..) |elem_raw, fld_i| {
+                    const elem_ty = body.getInst(MirValueId.fromInt(elem_raw)).type_id;
+                    const byte_off: u64 = switch (fld_i) {
+                        0 => 0,
+                        1 => 4,
+                        else => 6,
+                    };
+                    const fld_align: u32 = if (fld_i == 0) 4 else 2;
+                    const fld_ptr = if (byte_off == 0)
+                        try emitter.allocator.dupe(u8, scratch)
+                    else blk: {
+                        const tmp_id = state.nextTmp();
+                        try state.print(
+                            "  %_agp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n",
+                            .{ tmp_id, scratch, ptr_int, byte_off },
+                        );
+                        break :blk try std.fmt.allocPrint(emitter.allocator, "%_agp_{d}", .{tmp_id});
+                    };
+                    defer emitter.allocator.free(fld_ptr);
+                    const elem_ssa = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{elem_raw});
+                    defer emitter.allocator.free(elem_ssa);
+                    try emitStoreValueToPtr(
+                        emitter,
+                        state,
+                        elem_ty,
+                        elem_ssa,
+                        fld_ptr,
+                        fld_align,
                         0,
                         0,
                         0,
@@ -12347,7 +13803,9 @@ fn emitIntrinsicOpLlvm(
             const ref_val = MirValueId.fromInt(args[0]);
             const ref_ty = try unwrapTransparentType(emitter, body.getInst(ref_val).type_id);
             const ref_node = emitter.input.pool.getNode(ref_ty);
-            const is_ptr_src = ref_node.tag == .ref_ty or ref_node.tag == .mut_ref_ty or ref_node.tag == .raw_ptr_ty;
+            const is_ptr_src = (ref_node.tag == .ref_ty or
+                ref_node.tag == .mut_ref_ty or
+                ref_node.tag == .raw_ptr_ty) and !emitter.input.pool.isSliceRefType(ref_ty);
             const val_ty = if (is_ptr_src)
                 try unwrapTransparentType(emitter, TypeId.fromInt(ref_node.lhs))
             else
@@ -12370,7 +13828,9 @@ fn emitIntrinsicOpLlvm(
             const dst_unwrapped = try unwrapTransparentType(emitter, inst.type_id);
             const dst_node = emitter.input.pool.getNode(dst_unwrapped);
             const tmp_id = state.nextTmp();
-            if (dst_node.tag == .ref_ty or dst_node.tag == .mut_ref_ty or dst_node.tag == .raw_ptr_ty) {
+            if ((dst_node.tag == .ref_ty or dst_node.tag == .mut_ref_ty or dst_node.tag == .raw_ptr_ty) and
+                !emitter.input.pool.isSliceRefType(dst_unwrapped))
+            {
                 const fat_slot = try state.allocEntryBytes(
                     2 * emitter.cfg.target.ptrBytes(),
                     emitter.cfg.target.ptrBytes(),
@@ -13824,12 +15284,15 @@ fn emitIntrinsicOpLlvm(
             const base_node = emitter.input.pool.getNode(base_ty);
             const base_data_ptr: []u8 = if (base_ty == .str_ty or
                 base_node.tag == .slice_ty or
-                base_node.tag == .soa_slice_ty)
+                base_node.tag == .soa_slice_ty or
+                emitter.input.pool.isSliceRefType(base_ty))
             blk_fat: {
                 const bp_id = state.nextTmp();
+                const base_sl_ty = try formatSliceLlvmStructType(emitter, base_ty);
+                defer emitter.allocator.free(base_sl_ty);
                 try state.print(
-                    "  %_sm_bp_{d} = extractvalue {{ ptr, {s} }} %_v_{d}, 0\n",
-                    .{ bp_id, ptr_int, args[0] },
+                    "  %_sm_bp_{d} = extractvalue {s} %_v_{d}, 0\n",
+                    .{ bp_id, base_sl_ty, args[0] },
                 );
                 break :blk_fat try std.fmt.allocPrint(emitter.allocator, "%_sm_bp_{d}", .{bp_id});
             } else if (base_node.tag == .ref_ty or
@@ -13838,7 +15301,11 @@ fn emitIntrinsicOpLlvm(
             blk_ref: {
                 const pt_ty = try unwrapTransparentType(emitter, TypeId.fromInt(base_node.lhs));
                 const pt_tag = emitter.input.pool.getNode(pt_ty).tag;
-                if (pt_ty == .str_ty or pt_tag == .slice_ty or pt_tag == .soa_slice_ty) {
+                if (pt_ty == .str_ty or
+                    pt_tag == .slice_ty or
+                    pt_tag == .soa_slice_ty or
+                    emitter.input.pool.isSliceRefType(pt_ty))
+                {
                     const bp_id = state.nextTmp();
                     try state.print(
                         "  %_sm_bp_{d} = load ptr, ptr %_v_{d}, align {d}\n",
@@ -13876,59 +15343,152 @@ fn emitIntrinsicOpLlvm(
 
             const dst_unwrapped = try unwrapTransparentType(emitter, inst.type_id);
             const dst_node = emitter.input.pool.getNode(dst_unwrapped);
-            const is_ref_dst = dst_node.tag == .ref_ty or
+            const is_thin_ref_dst = (dst_node.tag == .ref_ty or
                 dst_node.tag == .mut_ref_ty or
-                dst_node.tag == .raw_ptr_ty;
-            const sl_ty = if (is_ref_dst)
+                dst_node.tag == .raw_ptr_ty) and !emitter.input.pool.isSliceRefType(dst_unwrapped);
+            const sl_ty = if (emitter.input.pool.getSliceRefInner(dst_unwrapped)) |slice_inner|
+                try unwrapTransparentType(emitter, slice_inner)
+            else if (is_thin_ref_dst)
                 try unwrapTransparentType(emitter, TypeId.fromInt(dst_node.lhs))
             else
                 dst_unwrapped;
-            const elem_stride: u64 = if (sl_ty == .str_ty)
-                1
-            else blk_st: {
-                const elem_ty = try unwrapTransparentType(
-                    emitter,
-                    TypeId.fromInt(emitter.input.pool.getNode(sl_ty).lhs),
-                );
-                break :blk_st (try emitter.resolver.resolveType(elem_ty)).stride_bytes;
-            };
 
             const tmp_id = state.nextTmp();
-            try state.print(
-                "  %_sm_off_{d} = mul {s} {s}, {d}\n" ++
-                    "  %_sm_ptr_{d} = getelementptr i8, ptr {s}, {s} %_sm_off_{d}\n" ++
-                    "  %_sm_len_{d} = sub {s} {s}, {s}\n",
-                .{
-                    tmp_id, ptr_int,       lo_ssa,  elem_stride,
-                    tmp_id, base_data_ptr, ptr_int, tmp_id,
-                    tmp_id, ptr_int,       hi_ssa,  lo_ssa,
-                },
-            );
-            if (is_ref_dst) {
-                const fat_slot = try state.allocEntryBytes(
-                    2 * emitter.cfg.target.ptrBytes(),
-                    emitter.cfg.target.ptrBytes(),
-                );
-                defer emitter.allocator.free(fat_slot);
+            if (emitter.input.pool.isSoaSliceOrRefType(sl_ty)) {
+                const ptr_bytes = emitter.cfg.target.ptrBytes();
+                const soa_sl_ty = try formatSliceLlvmStructType(emitter, sl_ty);
+                defer emitter.allocator.free(soa_sl_ty);
+                var base_stride_ssa: []u8 = undefined;
+                var base_eoff_ssa: []u8 = undefined;
+                if (emitter.input.pool.isSoaSliceOrRefType(base_ty)) {
+                    try state.print(
+                        "  %_sm_bst_{d} = extractvalue {s} %_v_{d}, 2\n" ++
+                            "  %_sm_beo_{d} = extractvalue {s} %_v_{d}, 3\n",
+                        .{ tmp_id, soa_sl_ty, args[0], tmp_id, soa_sl_ty, args[0] },
+                    );
+                    base_stride_ssa = try std.fmt.allocPrint(emitter.allocator, "%_sm_bst_{d}", .{tmp_id});
+                    base_eoff_ssa = try std.fmt.allocPrint(emitter.allocator, "%_sm_beo_{d}", .{tmp_id});
+                } else if (base_node.tag == .ref_ty or base_node.tag == .mut_ref_ty or base_node.tag == .raw_ptr_ty) {
+                    const pt_ty = try unwrapTransparentType(emitter, TypeId.fromInt(base_node.lhs));
+                    if (emitter.input.pool.isSoaSliceOrRefType(pt_ty)) {
+                        try state.print(
+                            "  %_sm_sp_{d} = getelementptr inbounds i8, ptr %_v_{d}, {s} {d}\n" ++
+                                "  %_sm_bst_{d} = load {s}, ptr %_sm_sp_{d}, align {d}\n" ++
+                                "  %_sm_ep_{d} = getelementptr inbounds i8, ptr %_v_{d}, {s} {d}\n" ++
+                                "  %_sm_beo_{d} = load {s}, ptr %_sm_ep_{d}, align {d}\n",
+                            .{
+                                tmp_id, args[0], ptr_int, ptr_bytes * 2,
+                                tmp_id, ptr_int, tmp_id,  ptr_bytes,
+                                tmp_id, args[0], ptr_int, ptr_bytes * 3,
+                                tmp_id, ptr_int, tmp_id,  ptr_bytes,
+                            },
+                        );
+                        base_stride_ssa = try std.fmt.allocPrint(emitter.allocator, "%_sm_bst_{d}", .{tmp_id});
+                        base_eoff_ssa = try std.fmt.allocPrint(emitter.allocator, "%_sm_beo_{d}", .{tmp_id});
+                    } else {
+                        const arr_cap: u64 = emitter.input.pool.getNode(pt_ty).rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+                        base_stride_ssa = try std.fmt.allocPrint(emitter.allocator, "{d}", .{arr_cap});
+                        base_eoff_ssa = try emitter.allocator.dupe(u8, "0");
+                    }
+                } else {
+                    const arr_cap: u64 = base_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+                    base_stride_ssa = try std.fmt.allocPrint(emitter.allocator, "{d}", .{arr_cap});
+                    base_eoff_ssa = try emitter.allocator.dupe(u8, "0");
+                }
+                defer emitter.allocator.free(base_stride_ssa);
+                defer emitter.allocator.free(base_eoff_ssa);
                 try state.print(
-                    "  store ptr %_sm_ptr_{d}, ptr {s}, align {d}\n" ++
-                        "  %_sm_lp_{d} = getelementptr inbounds {{ ptr, {s} }}, ptr {s}, i32 0, i32 1\n" ++
-                        "  store {s} %_sm_len_{d}, ptr %_sm_lp_{d}, align {d}\n" ++
-                        "  %_v_{d} = select i1 true, ptr {s}, ptr {s}\n",
+                    "  %_sm_len_{d} = sub {s} {s}, {s}\n" ++
+                        "  %_sm_neo_{d} = add {s} {s}, {s}\n",
+                    .{ tmp_id, ptr_int, hi_ssa, lo_ssa, tmp_id, ptr_int, base_eoff_ssa, lo_ssa },
+                );
+                if (is_thin_ref_dst) {
+                    const fat_slot = try state.allocEntryBytes(4 * ptr_bytes, ptr_bytes);
+                    defer emitter.allocator.free(fat_slot);
+                    try state.print(
+                        "  store ptr {s}, ptr {s}, align {d}\n" ++
+                            "  %_sm_lp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                            "  store {s} %_sm_len_{d}, ptr %_sm_lp_{d}, align {d}\n" ++
+                            "  %_sm_stp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                            "  store {s} {s}, ptr %_sm_stp_{d}, align {d}\n" ++
+                            "  %_sm_eop_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                            "  store {s} %_sm_neo_{d}, ptr %_sm_eop_{d}, align {d}\n" ++
+                            "  %_v_{d} = select i1 true, ptr {s}, ptr {s}\n",
+                        .{
+                            base_data_ptr, fat_slot,        ptr_bytes,
+                            tmp_id,        fat_slot,        ptr_int,
+                            ptr_bytes,     ptr_int,         tmp_id,
+                            tmp_id,        ptr_bytes,       tmp_id,
+                            fat_slot,      ptr_int,         ptr_bytes * 2,
+                            ptr_int,       base_stride_ssa, tmp_id,
+                            ptr_bytes,     tmp_id,          fat_slot,
+                            ptr_int,       ptr_bytes * 3,   ptr_int,
+                            tmp_id,        tmp_id,          ptr_bytes,
+                            dst_raw,       fat_slot,        fat_slot,
+                        },
+                    );
+                } else {
+                    try state.print(
+                        "  %_sm_a0_{d} = insertvalue {s} zeroinitializer, ptr {s}, 0\n" ++
+                            "  %_sm_a1_{d} = insertvalue {s} %_sm_a0_{d}, {s} %_sm_len_{d}, 1\n" ++
+                            "  %_sm_a2_{d} = insertvalue {s} %_sm_a1_{d}, {s} {s}, 2\n" ++
+                            "  %_v_{d} = insertvalue {s} %_sm_a2_{d}, {s} %_sm_neo_{d}, 3\n",
+                        .{
+                            tmp_id,          soa_sl_ty, base_data_ptr,
+                            tmp_id,          soa_sl_ty, tmp_id,
+                            ptr_int,         tmp_id,    tmp_id,
+                            soa_sl_ty,       tmp_id,    ptr_int,
+                            base_stride_ssa, dst_raw,   soa_sl_ty,
+                            tmp_id,          ptr_int,   tmp_id,
+                        },
+                    );
+                }
+            } else {
+                const elem_stride: u64 = if (sl_ty == .str_ty)
+                    1
+                else blk_st: {
+                    const elem_ty = try unwrapTransparentType(
+                        emitter,
+                        TypeId.fromInt(emitter.input.pool.getNode(sl_ty).lhs),
+                    );
+                    break :blk_st (try emitter.resolver.resolveType(elem_ty)).stride_bytes;
+                };
+                try state.print(
+                    "  %_sm_off_{d} = mul {s} {s}, {d}\n" ++
+                        "  %_sm_ptr_{d} = getelementptr i8, ptr {s}, {s} %_sm_off_{d}\n" ++
+                        "  %_sm_len_{d} = sub {s} {s}, {s}\n",
                     .{
-                        tmp_id,                        fat_slot, emitter.cfg.target.ptrBytes(),
-                        tmp_id,                        ptr_int,  fat_slot,
-                        ptr_int,                       tmp_id,   tmp_id,
-                        emitter.cfg.target.ptrBytes(), dst_raw,  fat_slot,
-                        fat_slot,
+                        tmp_id, ptr_int,       lo_ssa,  elem_stride,
+                        tmp_id, base_data_ptr, ptr_int, tmp_id,
+                        tmp_id, ptr_int,       hi_ssa,  lo_ssa,
                     },
                 );
-            } else {
-                try state.print(
-                    "  %_sm_agg_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr %_sm_ptr_{d}, 0\n" ++
-                        "  %_v_{d} = insertvalue {{ ptr, {s} }} %_sm_agg_{d}, {s} %_sm_len_{d}, 1\n",
-                    .{ tmp_id, ptr_int, tmp_id, dst_raw, ptr_int, tmp_id, ptr_int, tmp_id },
-                );
+                if (is_thin_ref_dst) {
+                    const fat_slot = try state.allocEntryBytes(
+                        2 * emitter.cfg.target.ptrBytes(),
+                        emitter.cfg.target.ptrBytes(),
+                    );
+                    defer emitter.allocator.free(fat_slot);
+                    try state.print(
+                        "  store ptr %_sm_ptr_{d}, ptr {s}, align {d}\n" ++
+                            "  %_sm_lp_{d} = getelementptr inbounds {{ ptr, {s} }}, ptr {s}, i32 0, i32 1\n" ++
+                            "  store {s} %_sm_len_{d}, ptr %_sm_lp_{d}, align {d}\n" ++
+                            "  %_v_{d} = select i1 true, ptr {s}, ptr {s}\n",
+                        .{
+                            tmp_id,                        fat_slot, emitter.cfg.target.ptrBytes(),
+                            tmp_id,                        ptr_int,  fat_slot,
+                            ptr_int,                       tmp_id,   tmp_id,
+                            emitter.cfg.target.ptrBytes(), dst_raw,  fat_slot,
+                            fat_slot,
+                        },
+                    );
+                } else {
+                    try state.print(
+                        "  %_sm_agg_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr %_sm_ptr_{d}, 0\n" ++
+                            "  %_v_{d} = insertvalue {{ ptr, {s} }} %_sm_agg_{d}, {s} %_sm_len_{d}, 1\n",
+                        .{ tmp_id, ptr_int, tmp_id, dst_raw, ptr_int, tmp_id, ptr_int, tmp_id },
+                    );
+                }
             }
         },
 
@@ -14358,8 +15918,2584 @@ fn emitIntrinsicOpLlvm(
                 }
             }
         },
+
+        .implements,
+        .int_min,
+        .int_max,
+        .int_bits,
+        .scalar_clz,
+        .scalar_ctz,
+        .scalar_popcnt,
+        .scalar_bswap,
+        .scalar_rotl,
+        .scalar_rotr,
+        .ptr_is_null,
+        .ptr_offset,
+        .slice_split_at,
+        .slice_reverse,
+        .soa_vec_new,
+        .soa_vec_with_cap,
+        .soa_vec_len,
+        .soa_vec_cap,
+        .soa_vec_push,
+        .soa_vec_pop,
+        .soa_vec_clear,
+        .soa_vec_reserve,
+        .soa_vec_as_slice,
+        .soa_vec_col_slice,
+        .ctx_next_rng_seed,
+        .tls_scratch_ptr,
+        .tls_alloc_state,
+        .fmt_write,
+        .memcpy,
+        .memmove,
+        .memset,
+        .ptr_copy,
+        .ptr_copy_nonoverlapping,
+        .ptr_read,
+        .ptr_write,
+        .ptr_drop_in_place,
+        .forget,
+        .slice_from_raw_parts,
+        .str_from_utf8_unchecked,
+        .from_le_bytes,
+        .from_be_bytes,
+        .to_le_bytes,
+        .to_be_bytes,
+        .sqrt,
+        .sys_mmap,
+        .sys_munmap,
+        .wasm_memory_grow,
+        .simd_load_unaligned,
+        .simd_and,
+        .simd_or,
+        .simd_xor,
+        .simd_eq,
+        .simd_gt_s8,
+        .simd_lt_s8,
+        .simd_swizzle,
+        .simd_shl_u8,
+        .simd_shr_u8,
+        .simd_bitmask,
+        => try emitStd01IntrinsicOpLlvm(emitter, state, body, dst_raw, ikind, inst, args),
     }
     _ = access_grp;
+}
+
+/// Evaluates compile-time `@implements[T, Bound]()` statically for unoptimized MIR fallback in LLVM.
+fn evalImplementsStaticLlvm(emitter: *const LlvmModuleEmitter, raw_ty: TypeId, raw_bound: TypeId) bool {
+    return type_system.evalStaticImplements(
+        emitter.input.pool,
+        emitter.input.sym_table,
+        emitter.target_layout,
+        raw_ty,
+        raw_bound,
+    );
+}
+
+/// Extracts `<ptr_int>` allocator handle bits from SSA `arg_raw` (`0` for ZST `System`).
+fn emitExtractAllocRawLlvm(
+    emitter: *LlvmModuleEmitter,
+    state: *BodyEmitState,
+    body: *const MirBody,
+    arg_raw: u32,
+) ![]u8 {
+    const ptr_int = ptrIntType(emitter);
+    const ptr_bytes: u32 = emitter.cfg.target.ptrBytes();
+    const arg_ty = try unwrapTransparentType(emitter, body.getInst(MirValueId.fromInt(arg_raw)).type_id);
+    if (try isZeroSizedType(emitter, arg_ty)) {
+        return emitter.allocator.dupe(u8, "0");
+    }
+    if (!arg_ty.isPrimitiveOrSentinel()) {
+        const node = emitter.input.pool.getNode(arg_ty);
+        if (node.tag == .ref_ty or node.tag == .mut_ref_ty or node.tag == .raw_ptr_ty) {
+            const pointee_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+            const t_id = state.nextTmp();
+            if (pointee_ty == .u8_ty) {
+                try state.print("  %_arp_{d} = ptrtoint ptr %_v_{d} to {s}\n", .{ t_id, arg_raw, ptr_int });
+                return std.fmt.allocPrint(emitter.allocator, "%_arp_{d}", .{t_id});
+            }
+            try state.print(
+                "  %_arp_{d} = ptrtoint ptr %_v_{d} to {s}\n" ++
+                    "  %_aro_{d} = or {s} %_arp_{d}, 1\n",
+                .{ t_id, arg_raw, ptr_int, t_id, ptr_int, t_id },
+            );
+            return std.fmt.allocPrint(emitter.allocator, "%_aro_{d}", .{t_id});
+        }
+    }
+    const lay = try emitter.resolver.resolveType(arg_ty);
+    const slot_sz = @max(lay.size_bytes, ptr_bytes);
+    const slot_al = @max(lay.alignBytes(), ptr_bytes);
+    const slot = try state.allocEntryBytes(slot_sz, slot_al);
+    defer emitter.allocator.free(slot);
+    try emitMemsetZero(emitter, state, slot, slot_sz, slot_al);
+    const val_s = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{arg_raw});
+    defer emitter.allocator.free(val_s);
+    try emitStoreValueToPtr(emitter, state, arg_ty, val_s, slot, slot_al, 0, 0, 0);
+    const t_id = state.nextTmp();
+    try state.print("  %_arl_{d} = load {s}, ptr {s}, align {d}\n", .{ t_id, ptr_int, slot, ptr_bytes });
+    return std.fmt.allocPrint(emitter.allocator, "%_arl_{d}", .{t_id});
+}
+
+/// Emits LLVM IR ensuring `#soa Vec[S]` at `vec_ptr_ssa` has capacity `>= min_cap_u64_ssa`, returning `i1` success SSA.
+fn emitSoaVecEnsureCapLlvm(
+    emitter: *LlvmModuleEmitter,
+    state: *BodyEmitState,
+    vec_ptr_ssa: []const u8,
+    elem_struct: TypeId,
+    min_cap_u64_ssa: []const u8,
+    is_try: bool,
+) ![]u8 {
+    const ptr_int = ptrIntType(emitter);
+    const ptr_bytes: u32 = emitter.cfg.target.ptrBytes();
+    const lay = try emitter.resolver.resolveType(elem_struct);
+    const slab_align: u32 = @max(
+        @as(u32, 1) << @intCast(@max(lay.align_log2, emitter.target_layout.simd_align_log2)),
+        16,
+    );
+    const ok_slot = try state.allocEntryBytes(1, 1);
+    defer emitter.allocator.free(ok_slot);
+    const tmp_id = state.nextTmp();
+    try state.print(
+        "  store i8 1, ptr {s}, align 1\n" ++
+            "  %_seg_cp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+            "  %_seg_c32_{d} = load i32, ptr %_seg_cp_{d}, align 1\n" ++
+            "  %_seg_c64_{d} = zext i32 %_seg_c32_{d} to i64\n" ++
+            "  %_seg_nd_{d} = icmp ugt i64 {s}, %_seg_c64_{d}\n" ++
+            "  br i1 %_seg_nd_{d}, label %_seg_chk_{d}, label %_seg_dn_{d}\n" ++
+            "_seg_chk_{d}:\n" ++
+            "  %_seg_ov_{d} = icmp ugt i64 {s}, 4294967295\n" ++
+            "  br i1 %_seg_ov_{d}, label %_seg_bad_{d}, label %_seg_gr_{d}\n" ++
+            "_seg_bad_{d}:\n",
+        .{
+            ok_slot,         tmp_id, vec_ptr_ssa,     ptr_int, ptr_bytes + 4,
+            tmp_id,          tmp_id, tmp_id,          tmp_id,  tmp_id,
+            min_cap_u64_ssa, tmp_id, tmp_id,          tmp_id,  tmp_id,
+            tmp_id,          tmp_id, min_cap_u64_ssa, tmp_id,  tmp_id,
+            tmp_id,          tmp_id,
+        },
+    );
+    if (is_try) {
+        try state.print("  store i8 0, ptr {s}, align 1\n  br label %_seg_dn_{d}\n", .{ ok_slot, tmp_id });
+    } else {
+        try state.writeAll("  call void @_cx_rt_trap(i32 0)\n  unreachable\n");
+    }
+    try state.print(
+        "_seg_gr_{d}:\n" ++
+            "  %_seg_d1_{d} = mul i64 %_seg_c64_{d}, 2\n" ++
+            "  %_seg_lt8_{d} = icmp ult i64 %_seg_d1_{d}, 8\n" ++
+            "  %_seg_d2_{d} = select i1 %_seg_lt8_{d}, i64 8, i64 %_seg_d1_{d}\n" ++
+            "  %_seg_ltm_{d} = icmp ult i64 %_seg_d2_{d}, {s}\n" ++
+            "  %_seg_d3_{d} = select i1 %_seg_ltm_{d}, i64 {s}, i64 %_seg_d2_{d}\n" ++
+            "  %_seg_gtu_{d} = icmp ugt i64 %_seg_d3_{d}, 4294967295\n" ++
+            "  %_seg_nc64_{d} = select i1 %_seg_gtu_{d}, i64 {s}, i64 %_seg_d3_{d}\n" ++
+            "  %_seg_nc32_{d} = trunc i64 %_seg_nc64_{d} to i32\n",
+        .{
+            tmp_id,          tmp_id, tmp_id, tmp_id,          tmp_id,
+            tmp_id,          tmp_id, tmp_id, tmp_id,          tmp_id,
+            min_cap_u64_ssa, tmp_id, tmp_id, min_cap_u64_ssa, tmp_id,
+            tmp_id,          tmp_id, tmp_id, tmp_id,          min_cap_u64_ssa,
+            tmp_id,          tmp_id, tmp_id,
+        },
+    );
+    state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_seg_gr_{d}", .{tmp_id}));
+    const nc_pt = if (ptr_bytes == 4)
+        try std.fmt.allocPrint(emitter.allocator, "%_seg_nc32_{d}", .{tmp_id})
+    else
+        try std.fmt.allocPrint(emitter.allocator, "%_seg_nc64_{d}", .{tmp_id});
+    defer emitter.allocator.free(nc_pt);
+
+    var tot_ssa: []u8 = try emitter.allocator.dupe(u8, "0");
+    defer emitter.allocator.free(tot_ssa);
+    if (lay.aux_len > 0) {
+        const last_ord = lay.aux_len - 1;
+        const last_col = try emitDynamicSoaColByteOffset(emitter, state, elem_struct, last_ord, nc_pt);
+        defer emitter.allocator.free(last_col.off_ssa);
+        const last_fld = emitter.resolver.fields_by_decl.items[lay.aux_start + last_ord];
+        try state.print(
+            "  %_seg_lm_{d} = mul {s} {s}, {d}\n" ++
+                "  %_seg_tot_{d} = add {s} {s}, %_seg_lm_{d}\n",
+            .{ tmp_id, ptr_int, nc_pt, last_fld.size_bytes, tmp_id, ptr_int, last_col.off_ssa, tmp_id },
+        );
+        emitter.allocator.free(tot_ssa);
+        tot_ssa = try std.fmt.allocPrint(emitter.allocator, "%_seg_tot_{d}", .{tmp_id});
+    }
+
+    try state.print(
+        "  %_seg_ap0_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+            "  %_seg_av0_{d} = load {s}, ptr %_seg_ap0_{d}, align 1\n" ++
+            "  %_seg_np_{d} = call ptr @_cx_soa_zalloc({s} %_seg_av0_{d}, {s} {s}, {s} {d}, i1 {s})\n" ++
+            "  %_seg_nn_{d} = icmp eq ptr %_seg_np_{d}, null\n" ++
+            "  br i1 %_seg_nn_{d}, label %_seg_oom_{d}, label %_seg_cpb_{d}\n" ++
+            "_seg_oom_{d}:\n" ++
+            "  store i8 0, ptr {s}, align 1\n" ++
+            "  br label %_seg_dn_{d}\n" ++
+            "_seg_cpb_{d}:\n",
+        .{
+            tmp_id,  vec_ptr_ssa, ptr_int,                         ptr_bytes + 8,
+            tmp_id,  ptr_int,     tmp_id,                          tmp_id,
+            ptr_int, tmp_id,      ptr_int,                         tot_ssa,
+            ptr_int, slab_align,  if (is_try) "true" else "false", tmp_id,
+            tmp_id,  tmp_id,      tmp_id,                          tmp_id,
+            tmp_id,  ok_slot,     tmp_id,                          tmp_id,
+        },
+    );
+    try state.print(
+        "  %_seg_op_{d} = load ptr, ptr {s}, align 1\n" ++
+            "  %_seg_lp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+            "  %_seg_l32_{d} = load i32, ptr %_seg_lp_{d}, align 1\n" ++
+            "  %_seg_ho_{d} = icmp ne ptr %_seg_op_{d}, null\n" ++
+            "  %_seg_hl_{d} = icmp ugt i32 %_seg_l32_{d}, 0\n" ++
+            "  %_seg_dc_{d} = and i1 %_seg_ho_{d}, %_seg_hl_{d}\n" ++
+            "  br i1 %_seg_dc_{d}, label %_seg_mc_{d}, label %_seg_up_{d}\n" ++
+            "_seg_mc_{d}:\n",
+        .{
+            tmp_id,  vec_ptr_ssa,
+            tmp_id,  vec_ptr_ssa,
+            ptr_int, ptr_bytes,
+            tmp_id,  tmp_id,
+            tmp_id,  tmp_id,
+            tmp_id,  tmp_id,
+            tmp_id,  tmp_id,
+            tmp_id,  tmp_id,
+            tmp_id,  tmp_id,
+            tmp_id,
+        },
+    );
+    state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_seg_mc_{d}", .{tmp_id}));
+    const oc_pt = if (ptr_bytes == 4)
+        try std.fmt.allocPrint(emitter.allocator, "%_seg_c32_{d}", .{tmp_id})
+    else
+        try std.fmt.allocPrint(emitter.allocator, "%_seg_c64_{d}", .{tmp_id});
+    defer emitter.allocator.free(oc_pt);
+    try state.print("  %_seg_l64_{d} = zext i32 %_seg_l32_{d} to i64\n", .{ tmp_id, tmp_id });
+    try emitter.requireIntrinsicDecl(
+        "declare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, " ++
+            "ptr noalias nocapture readonly, i64, i1 immarg)",
+    );
+    var col_i: u32 = 0;
+    while (col_i < lay.aux_len) : (col_i += 1) {
+        const fld = emitter.resolver.fields_by_decl.items[lay.aux_start + col_i];
+        if (fld.size_bytes == 0) continue;
+        const old_c = try emitDynamicSoaColByteOffset(emitter, state, elem_struct, col_i, oc_pt);
+        defer emitter.allocator.free(old_c.off_ssa);
+        const new_c = try emitDynamicSoaColByteOffset(emitter, state, elem_struct, col_i, nc_pt);
+        defer emitter.allocator.free(new_c.off_ssa);
+        const sub_t = state.nextTmp();
+        try state.print(
+            "  %_seg_sp_{d} = getelementptr inbounds i8, ptr %_seg_op_{d}, {s} {s}\n" ++
+                "  %_seg_dp_{d} = getelementptr inbounds i8, ptr %_seg_np_{d}, {s} {s}\n" ++
+                "  %_seg_cb_{d} = mul i64 %_seg_l64_{d}, {d}\n" ++
+                "  call void @llvm.memcpy.p0.p0.i64(ptr align 1 %_seg_dp_{d}, ptr align 1 %_seg_sp_{d}, i64 %_seg_cb_{d}, i1 false)\n",
+            .{
+                sub_t, tmp_id, ptr_int,        old_c.off_ssa,
+                sub_t, tmp_id, ptr_int,        new_c.off_ssa,
+                sub_t, tmp_id, fld.size_bytes, sub_t,
+                sub_t, sub_t,
+            },
+        );
+    }
+    try state.print(
+        "  br label %_seg_up_{d}\n" ++
+            "_seg_up_{d}:\n" ++
+            "  %_seg_hc_{d} = icmp ugt i32 %_seg_c32_{d}, 0\n" ++
+            "  %_seg_df_{d} = and i1 %_seg_ho_{d}, %_seg_hc_{d}\n" ++
+            "  br i1 %_seg_df_{d}, label %_seg_fo_{d}, label %_seg_st_{d}\n" ++
+            "_seg_fo_{d}:\n",
+        .{
+            tmp_id, tmp_id,
+            tmp_id, tmp_id,
+            tmp_id, tmp_id,
+            tmp_id, tmp_id,
+            tmp_id, tmp_id,
+            tmp_id,
+        },
+    );
+    state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_seg_fo_{d}", .{tmp_id}));
+    var old_tot_ssa: []u8 = try emitter.allocator.dupe(u8, "0");
+    defer emitter.allocator.free(old_tot_ssa);
+    if (lay.aux_len > 0) {
+        const last_ord = lay.aux_len - 1;
+        const old_last = try emitDynamicSoaColByteOffset(emitter, state, elem_struct, last_ord, oc_pt);
+        defer emitter.allocator.free(old_last.off_ssa);
+        const last_fld = emitter.resolver.fields_by_decl.items[lay.aux_start + last_ord];
+        try state.print(
+            "  %_seg_olm_{d} = mul {s} {s}, {d}\n" ++
+                "  %_seg_ot_{d} = add {s} {s}, %_seg_olm_{d}\n",
+            .{ tmp_id, ptr_int, oc_pt, last_fld.size_bytes, tmp_id, ptr_int, old_last.off_ssa, tmp_id },
+        );
+        emitter.allocator.free(old_tot_ssa);
+        old_tot_ssa = try std.fmt.allocPrint(emitter.allocator, "%_seg_ot_{d}", .{tmp_id});
+    }
+    try state.print(
+        "  call void @_cx_soa_free({s} %_seg_av0_{d}, ptr %_seg_op_{d}, {s} {s}, {s} {d})\n" ++
+            "  br label %_seg_st_{d}\n" ++
+            "_seg_st_{d}:\n" ++
+            "  store ptr %_seg_np_{d}, ptr {s}, align 1\n" ++
+            "  store i32 %_seg_nc32_{d}, ptr %_seg_cp_{d}, align 1\n" ++
+            "  br label %_seg_dn_{d}\n" ++
+            "_seg_dn_{d}:\n" ++
+            "  %_seg_ok8_{d} = load i8, ptr {s}, align 1\n" ++
+            "  %_seg_ok1_{d} = icmp ne i8 %_seg_ok8_{d}, 0\n",
+        .{
+            ptr_int, tmp_id, tmp_id,  ptr_int,     old_tot_ssa, ptr_int, slab_align,
+            tmp_id,  tmp_id, tmp_id,  vec_ptr_ssa, tmp_id,      tmp_id,  tmp_id,
+            tmp_id,  tmp_id, ok_slot, tmp_id,      tmp_id,
+        },
+    );
+    state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_seg_dn_{d}", .{tmp_id}));
+    return std.fmt.allocPrint(emitter.allocator, "%_seg_ok1_{d}", .{tmp_id});
+}
+
+/// Finds a 3-parameter `Display.fmt` (`is_debug == false`) or `Debug.fmt_debug` (`is_debug == true`) body in LLVM.
+fn lookupCustomFmtBodyIndexLlvm(emitter: *const LlvmModuleEmitter, ty: TypeId, is_debug: bool) ?u32 {
+    const target_method = if (is_debug) "fmt_debug" else "fmt";
+    const ty_node = emitter.input.pool.getNode(ty);
+    if (ty_node.tag == .struct_ty or ty_node.tag == .enum_ty or ty_node.tag == .union_ty or ty_node.tag == .distinct_ty) {
+        const sym_idx = SymbolIndex.fromInt(ty_node.rhs);
+        if (!sym_idx.isNone() and sym_idx.asInt() < emitter.input.sym_table.symbols.items.len) {
+            const nom_sym = emitter.input.sym_table.getSymbol(sym_idx).*;
+            if (!nom_sym.target_scope.isNone()) {
+                for (emitter.input.sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
+                    const mem_sym = emitter.input.sym_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind == .fn_sym and std.mem.eql(u8, mem_sym.name_text, target_method)) {
+                        if (resolveBodyIndex(emitter, mem_sym.def_id, mem_idx)) |found_b| {
+                            if (emitter.input.bodies[found_b].param_count == 3) return found_b;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    const dot_suffix = if (is_debug) ".fmt_debug" else ".fmt";
+    for (emitter.input.bodies, 0..) |*cand_b, b_idx| {
+        if (cand_b.param_count != 3 or cand_b.locals.items.len < 4) continue;
+        const fn_name = emitter.input.interner.get(cand_b.name);
+        if (!std.mem.eql(u8, fn_name, target_method) and !std.mem.endsWith(u8, fn_name, dot_suffix)) continue;
+        const p1_ty = emitter.input.pool.unwrapUnderlyingType(cand_b.locals.items[1].type_id);
+        const p1_node = emitter.input.pool.getNode(p1_ty);
+        const recv_ty = if (p1_node.tag == .ref_ty or p1_node.tag == .mut_ref_ty or p1_node.tag == .raw_ptr_ty)
+            emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(p1_node.lhs))
+        else
+            p1_ty;
+        if (recv_ty == ty) return @intCast(b_idx);
+    }
+    return null;
+}
+
+/// Invokes `FmtWriter.write_fn(ctx, &chunk_slice)` with exact CoreX ABI (`swiftcc` + `swifterror` / `wasm_mvp`).
+fn emitInvokeWriteFnChunkLlvm(
+    emitter: *LlvmModuleEmitter,
+    state: *BodyEmitState,
+    ctx_ptr_ssa: []const u8,
+    write_fn_ssa: []const u8,
+    write_fn_ty: TypeId,
+    chunk_ptr_ssa: []const u8,
+    chunk_len_ssa: []const u8,
+    res_slot: []const u8,
+    res_ty: TypeId,
+    res_align: u32,
+    err_label: []const u8,
+) !void {
+    const ptr_int = ptrIntType(emitter);
+    const ptr_bytes: u32 = emitter.cfg.target.ptrBytes();
+    const sig = emitter.input.pool.getFnSignatureView(write_fn_ty) orelse return;
+    var w_rec = try classifyFnTypeAbi(emitter, write_fn_ty, false, false);
+    defer w_rec.deinit(emitter.allocator);
+
+    const chunk_slot = try state.allocEntryBytes(2 * ptr_bytes, @max(ptr_bytes, 8));
+    defer emitter.allocator.free(chunk_slot);
+    const t_id = state.nextTmp();
+    try state.print(
+        "  store ptr {s}, ptr {s}, align {d}\n" ++
+            "  %_fw_clp_{d} = getelementptr inbounds {{ ptr, {s} }}, ptr {s}, i32 0, i32 1\n" ++
+            "  store {s} {s}, ptr %_fw_clp_{d}, align {d}\n",
+        .{ chunk_ptr_ssa, chunk_slot, ptr_bytes, t_id, ptr_int, chunk_slot, ptr_int, chunk_len_ssa, t_id, ptr_bytes },
+    );
+
+    var call_args: std.ArrayListUnmanaged(u8) = .empty;
+    defer call_args.deinit(emitter.allocator);
+    var arg_cnt: usize = 0;
+
+    var sret_slot: ?[]u8 = null;
+    defer if (sret_slot) |slot_buf| emitter.allocator.free(slot_buf);
+    if (w_rec.has_sret) {
+        const r_lay = try emitter.resolver.resolveType(res_ty);
+        sret_slot = try state.allocEntryBytes(r_lay.size_bytes, @max(r_lay.alignBytes(), w_rec.sret_recipe.pointee_align_bytes));
+        const sret_p = try formatAbiParamDeclPiece(emitter, res_ty, w_rec.sret_recipe, sret_slot.?);
+        defer emitter.allocator.free(sret_p);
+        try call_args.appendSlice(emitter.allocator, sret_p);
+        arg_cnt += 1;
+    }
+    if (w_rec.has_implicit_context) {
+        const ctx_op = if (state.has_ctx_param) "%_cx_ctx" else "@_cx_default_ctx";
+        const ctx_p = try formatAbiParamDeclPiece(emitter, .usize_ty, w_rec.context_recipe, ctx_op);
+        defer emitter.allocator.free(ctx_p);
+        if (arg_cnt > 0) try call_args.appendSlice(emitter.allocator, ", ");
+        try call_args.appendSlice(emitter.allocator, ctx_p);
+        arg_cnt += 1;
+    }
+    if (w_rec.param_recipes.len >= 2) {
+        const p0 = try formatAbiParamDeclPiece(emitter, sig.getParamType(0), w_rec.param_recipes[0], ctx_ptr_ssa);
+        defer emitter.allocator.free(p0);
+        if (arg_cnt > 0) try call_args.appendSlice(emitter.allocator, ", ");
+        try call_args.appendSlice(emitter.allocator, p0);
+        arg_cnt += 1;
+
+        const p1_ty = sig.getParamType(1);
+        const p1_rec = w_rec.param_recipes[1];
+        const p1_op = if (p1_rec.pass_mode == .indirect_by_ref or p1_rec.pass_mode == .indirect_byval)
+            try emitter.allocator.dupe(u8, chunk_slot)
+        else blk_p1: {
+            const p1_abi_ty = try formatAbiParamOrRetType(emitter, p1_ty, p1_rec);
+            defer emitter.allocator.free(p1_abi_ty);
+            try state.print(
+                "  %_fw_p1_{d} = load {s}, ptr {s}, align {d}\n",
+                .{ t_id, p1_abi_ty, chunk_slot, @max(ptr_bytes, 8) },
+            );
+            break :blk_p1 try std.fmt.allocPrint(emitter.allocator, "%_fw_p1_{d}", .{t_id});
+        };
+        defer emitter.allocator.free(p1_op);
+        const p1 = try formatAbiParamDeclPiece(emitter, p1_ty, p1_rec, p1_op);
+        defer emitter.allocator.free(p1);
+        if (arg_cnt > 0) try call_args.appendSlice(emitter.allocator, ", ");
+        try call_args.appendSlice(emitter.allocator, p1);
+        arg_cnt += 1;
+    }
+    if (w_rec.swifterror_kind != .none) {
+        try state.ensureSwifterrorCallSlot();
+        if (arg_cnt > 0) try call_args.appendSlice(emitter.allocator, ", ");
+        try call_args.appendSlice(emitter.allocator, "ptr swifterror %_cx_call_err");
+        try state.writeAll("  store ptr null, ptr %_cx_call_err, align 8\n");
+    }
+
+    const ret_decl = try formatAbiReturnDecl(emitter, sig.ret_ty, &w_rec);
+    defer emitter.allocator.free(ret_decl.full_decl);
+    defer emitter.allocator.free(ret_decl.bare_ty);
+    const is_void = std.mem.eql(u8, ret_decl.bare_ty, "void");
+
+    if (is_void) {
+        try state.print(
+            "  call {s}void {s}({s})\n",
+            .{ resolveCallingConvPrefix(&w_rec), write_fn_ssa, call_args.items },
+        );
+    } else {
+        try state.print(
+            "  %_fw_rv_{d} = call {s}{s} {s}({s})\n",
+            .{ t_id, resolveCallingConvPrefix(&w_rec), ret_decl.full_decl, write_fn_ssa, call_args.items },
+        );
+    }
+
+    if (w_rec.swifterror_kind != .none) {
+        const sum_detail = (try emitter.resolver.getSumDetail(res_ty)).?;
+        try state.print(
+            "  %_fw_ce_{d} = load ptr, ptr %_cx_call_err, align 8\n" ++
+                "  %_fw_he_{d} = icmp ne ptr %_fw_ce_{d}, null\n" ++
+                "  br i1 %_fw_he_{d}, label %_fw_se_{d}, label %_fw_ok_{d}\n" ++
+                "_fw_se_{d}:\n",
+            .{ t_id, t_id, t_id, t_id, t_id, t_id, t_id },
+        );
+        const pay_ptr = if (sum_detail.payload_offset == 0)
+            try emitter.allocator.dupe(u8, res_slot)
+        else blk_p: {
+            try state.print(
+                "  %_fw_pp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n",
+                .{ t_id, res_slot, ptr_int, sum_detail.payload_offset },
+            );
+            break :blk_p try std.fmt.allocPrint(emitter.allocator, "%_fw_pp_{d}", .{t_id});
+        };
+        defer emitter.allocator.free(pay_ptr);
+        const ce_s = try std.fmt.allocPrint(emitter.allocator, "%_fw_ce_{d}", .{t_id});
+        defer emitter.allocator.free(ce_s);
+        try emitDecodeSwifterrorToPayloadPtr(emitter, state, &w_rec, ce_s, pay_ptr);
+        try emitWriteSumDiscriminantToPtr(emitter, state, res_ty, res_slot, res_align, 1);
+        try state.print("  br label %{s}\n_fw_ok_{d}:\n", .{ err_label, t_id });
+        state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_fw_ok_{d}", .{t_id}));
+    } else {
+        if (w_rec.has_sret) {
+            const r_lay = try emitter.resolver.resolveType(res_ty);
+            try emitMemcpyBytes(emitter, state, res_slot, res_align, sret_slot.?, res_align, r_lay.size_bytes);
+        } else if (!is_void) {
+            const rv_s = try std.fmt.allocPrint(emitter.allocator, "%_fw_rv_{d}", .{t_id});
+            defer emitter.allocator.free(rv_s);
+            const unpacked = try emitCoerceAbiToValue(emitter, state, res_ty, ret_decl.bare_ty, rv_s);
+            defer emitter.allocator.free(unpacked);
+            try emitStoreValueToPtr(emitter, state, res_ty, unpacked, res_slot, res_align, 0, 0, 0);
+        }
+        const discr_s = try emitReadSumDiscriminantFromPtr(emitter, state, res_ty, res_slot, res_align);
+        defer emitter.allocator.free(discr_s);
+        try state.print(
+            "  %_fw_ie_{d} = icmp ne i32 {s}, 0\n" ++
+                "  br i1 %_fw_ie_{d}, label %{s}, label %_fw_ok_{d}\n" ++
+                "_fw_ok_{d}:\n",
+            .{ t_id, discr_s, t_id, err_label, t_id, t_id },
+        );
+        state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_fw_ok_{d}", .{t_id}));
+    }
+}
+
+/// Invokes a 3-parameter `Display.fmt` / `Debug.fmt_debug` body `target_b` directly in LLVM.
+fn emitInvokeCustomFmtBodyLlvm(
+    emitter: *LlvmModuleEmitter,
+    state: *BodyEmitState,
+    target_b: u32,
+    cand_ty: TypeId,
+    data_ptr_ssa: []const u8,
+    writer_ptr_ssa: []const u8,
+    spec_val_ssa: []const u8,
+    res_slot: []const u8,
+    res_ty: TypeId,
+    res_align: u32,
+    err_label: []const u8,
+    done_hole_label: []const u8,
+) !void {
+    const ptr_int = ptrIntType(emitter);
+    const fn_body = &emitter.input.bodies[target_b];
+    const fn_rec = &emitter.body_recipes.items[target_b];
+    const t_id = state.nextTmp();
+
+    var call_args: std.ArrayListUnmanaged(u8) = .empty;
+    defer call_args.deinit(emitter.allocator);
+    var arg_cnt: usize = 0;
+
+    var sret_slot: ?[]u8 = null;
+    defer if (sret_slot) |slot_buf| emitter.allocator.free(slot_buf);
+    if (fn_rec.has_sret) {
+        const r_lay = try emitter.resolver.resolveType(res_ty);
+        sret_slot = try state.allocEntryBytes(r_lay.size_bytes, @max(r_lay.alignBytes(), fn_rec.sret_recipe.pointee_align_bytes));
+        const sret_p = try formatAbiParamDeclPiece(emitter, res_ty, fn_rec.sret_recipe, sret_slot.?);
+        defer emitter.allocator.free(sret_p);
+        try call_args.appendSlice(emitter.allocator, sret_p);
+        arg_cnt += 1;
+    }
+    if (fn_rec.has_implicit_context) {
+        const ctx_op = if (state.has_ctx_param) "%_cx_ctx" else "@_cx_default_ctx";
+        const ctx_p = try formatAbiParamDeclPiece(emitter, .usize_ty, fn_rec.context_recipe, ctx_op);
+        defer emitter.allocator.free(ctx_p);
+        if (arg_cnt > 0) try call_args.appendSlice(emitter.allocator, ", ");
+        try call_args.appendSlice(emitter.allocator, ctx_p);
+        arg_cnt += 1;
+    }
+    if (fn_rec.param_recipes.len >= 3) {
+        // [1] Marshal param 0 (`&Self` or `Self`):
+        const p0_decl = fn_body.locals.items[1];
+        const p0_rec = fn_rec.param_recipes[0];
+        if (p0_rec.pass_mode != .ignore_zst) {
+            const p0_unwrapped = emitter.input.pool.unwrapUnderlyingType(p0_decl.type_id);
+            const p0_tag = emitter.input.pool.getNode(p0_unwrapped).tag;
+            const is_ptr_self = p0_decl.mode() == .inout_mode or
+                p0_tag == .ref_ty or p0_tag == .mut_ref_ty or p0_tag == .raw_ptr_ty or
+                p0_rec.pass_mode == .indirect_by_ref or p0_rec.pass_mode == .indirect_byval;
+            const p0_op = if (is_ptr_self) blk_ptr: {
+                if (p0_rec.pointee_align_bytes > 1) {
+                    const c_lay = try emitter.resolver.resolveType(cand_ty);
+                    if (c_lay.size_bytes > 0) {
+                        const b_al = @max(c_lay.alignBytes(), p0_rec.pointee_align_bytes);
+                        const b_slot = try state.allocEntryBytes(c_lay.size_bytes, b_al);
+                        try emitMemcpyBytes(emitter, state, b_slot, b_al, data_ptr_ssa, 1, c_lay.size_bytes);
+                        break :blk_ptr b_slot;
+                    }
+                }
+                break :blk_ptr try emitter.allocator.dupe(u8, data_ptr_ssa);
+            } else blk_val: {
+                const loaded = try emitLoadValueFromPtr(emitter, state, cand_ty, data_ptr_ssa, 1, null, 0, 0, 0);
+                defer emitter.allocator.free(loaded);
+                const abi_ty = try formatAbiParamOrRetType(emitter, p0_decl.type_id, p0_rec);
+                defer emitter.allocator.free(abi_ty);
+                break :blk_val try emitCoerceValueToAbi(emitter, state, cand_ty, loaded, abi_ty);
+            };
+            defer emitter.allocator.free(p0_op);
+            const p0_piece = try formatAbiParamDeclPiece(emitter, p0_decl.type_id, p0_rec, p0_op);
+            defer emitter.allocator.free(p0_piece);
+            if (arg_cnt > 0) try call_args.appendSlice(emitter.allocator, ", ");
+            try call_args.appendSlice(emitter.allocator, p0_piece);
+            arg_cnt += 1;
+        }
+        // [2] Marshal param 1 (`&mut FmtWriter`):
+        const p1_decl = fn_body.locals.items[2];
+        const p1_rec = fn_rec.param_recipes[1];
+        if (p1_rec.pass_mode != .ignore_zst) {
+            const p1_piece = try formatAbiParamDeclPiece(emitter, p1_decl.type_id, p1_rec, writer_ptr_ssa);
+            defer emitter.allocator.free(p1_piece);
+            if (arg_cnt > 0) try call_args.appendSlice(emitter.allocator, ", ");
+            try call_args.appendSlice(emitter.allocator, p1_piece);
+            arg_cnt += 1;
+        }
+        // [3] Marshal param 2 (`FmtSpec`):
+        const p2_decl = fn_body.locals.items[3];
+        const p2_rec = fn_rec.param_recipes[2];
+        if (p2_rec.pass_mode != .ignore_zst) {
+            const p2_abi_ty = try formatAbiParamOrRetType(emitter, p2_decl.type_id, p2_rec);
+            defer emitter.allocator.free(p2_abi_ty);
+            const p2_coerced = try emitCoerceValueToAbi(emitter, state, .fmt_spec_ty, spec_val_ssa, p2_abi_ty);
+            defer emitter.allocator.free(p2_coerced);
+            const p2_piece = try formatAbiParamDeclPiece(emitter, p2_decl.type_id, p2_rec, p2_coerced);
+            defer emitter.allocator.free(p2_piece);
+            if (arg_cnt > 0) try call_args.appendSlice(emitter.allocator, ", ");
+            try call_args.appendSlice(emitter.allocator, p2_piece);
+            arg_cnt += 1;
+        }
+    }
+    if (fn_rec.swifterror_kind != .none) {
+        try state.ensureSwifterrorCallSlot();
+        if (arg_cnt > 0) try call_args.appendSlice(emitter.allocator, ", ");
+        try call_args.appendSlice(emitter.allocator, "ptr swifterror %_cx_call_err");
+        try state.writeAll("  store ptr null, ptr %_cx_call_err, align 8\n");
+    }
+
+    const ret_decl = try formatAbiReturnDecl(emitter, fn_body.ret_ty, fn_rec);
+    defer emitter.allocator.free(ret_decl.full_decl);
+    defer emitter.allocator.free(ret_decl.bare_ty);
+    const is_void = std.mem.eql(u8, ret_decl.bare_ty, "void");
+    const fn_ident = try formatLlvmGlobalIdent(emitter.allocator, emitter.body_llvm_names.items[target_b]);
+    defer emitter.allocator.free(fn_ident);
+
+    if (is_void) {
+        try state.print("  call {s}void {s}({s})\n", .{ resolveCallingConvPrefix(fn_rec), fn_ident, call_args.items });
+    } else {
+        try state.print(
+            "  %_cf_rv_{d} = call {s}{s} {s}({s})\n",
+            .{ t_id, resolveCallingConvPrefix(fn_rec), ret_decl.full_decl, fn_ident, call_args.items },
+        );
+    }
+
+    if (fn_rec.swifterror_kind != .none) {
+        const sum_detail = (try emitter.resolver.getSumDetail(res_ty)).?;
+        try state.print(
+            "  %_cf_ce_{d} = load ptr, ptr %_cx_call_err, align 8\n" ++
+                "  %_cf_he_{d} = icmp ne ptr %_cf_ce_{d}, null\n" ++
+                "  br i1 %_cf_he_{d}, label %_cf_se_{d}, label %{s}\n" ++
+                "_cf_se_{d}:\n",
+            .{ t_id, t_id, t_id, t_id, t_id, done_hole_label, t_id },
+        );
+        const pay_ptr = if (sum_detail.payload_offset == 0)
+            try emitter.allocator.dupe(u8, res_slot)
+        else blk_p: {
+            try state.print(
+                "  %_cf_pp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n",
+                .{ t_id, res_slot, ptr_int, sum_detail.payload_offset },
+            );
+            break :blk_p try std.fmt.allocPrint(emitter.allocator, "%_cf_pp_{d}", .{t_id});
+        };
+        defer emitter.allocator.free(pay_ptr);
+        const ce_s = try std.fmt.allocPrint(emitter.allocator, "%_cf_ce_{d}", .{t_id});
+        defer emitter.allocator.free(ce_s);
+        try emitDecodeSwifterrorToPayloadPtr(emitter, state, fn_rec, ce_s, pay_ptr);
+        try emitWriteSumDiscriminantToPtr(emitter, state, res_ty, res_slot, res_align, 1);
+        try state.print("  br label %{s}\n", .{err_label});
+    } else {
+        if (fn_rec.has_sret) {
+            const r_lay = try emitter.resolver.resolveType(res_ty);
+            try emitMemcpyBytes(emitter, state, res_slot, res_align, sret_slot.?, res_align, r_lay.size_bytes);
+        } else if (!is_void) {
+            const rv_s = try std.fmt.allocPrint(emitter.allocator, "%_cf_rv_{d}", .{t_id});
+            defer emitter.allocator.free(rv_s);
+            const unpacked = try emitCoerceAbiToValue(emitter, state, res_ty, ret_decl.bare_ty, rv_s);
+            defer emitter.allocator.free(unpacked);
+            try emitStoreValueToPtr(emitter, state, res_ty, unpacked, res_slot, res_align, 0, 0, 0);
+        }
+        const discr_s = try emitReadSumDiscriminantFromPtr(emitter, state, res_ty, res_slot, res_align);
+        defer emitter.allocator.free(discr_s);
+        try state.print(
+            "  %_cf_ie_{d} = icmp ne i32 {s}, 0\n" ++
+                "  br i1 %_cf_ie_{d}, label %{s}, label %{s}\n",
+            .{ t_id, discr_s, t_id, err_label, done_hole_label },
+        );
+    }
+}
+
+/// Emits streaming `@fmt_write(out, fmt_args) -> unit!FmtError` in LLVM IR.
+fn emitFmtWriteOpLlvm(
+    emitter: *LlvmModuleEmitter,
+    state: *BodyEmitState,
+    body: *const MirBody,
+    dst_raw: u32,
+    inst: mir.MirInst,
+    args: []const u32,
+) !void {
+    const ptr_int = ptrIntType(emitter);
+    const ptr_bytes: u32 = emitter.cfg.target.ptrBytes();
+    const res_ty = try unwrapTransparentType(emitter, inst.type_id);
+    const res_lay = try emitter.resolver.resolveType(res_ty);
+    const res_align = @max(res_lay.alignBytes(), 1);
+    const res_slot = try state.allocEntryBytes(@max(res_lay.size_bytes, 1), res_align);
+    defer emitter.allocator.free(res_slot);
+    try emitMemsetZero(emitter, state, res_slot, res_lay.size_bytes, res_align);
+    try emitWriteSumDiscriminantToPtr(emitter, state, res_ty, res_slot, res_align, 0);
+
+    if (args.len >= 2) {
+        const writer_ref_ty = try unwrapTransparentType(emitter, body.getInst(MirValueId.fromInt(args[0])).type_id);
+        const writer_ty = try unwrapTransparentType(emitter, TypeId.fromInt(emitter.input.pool.getNode(writer_ref_ty).lhs));
+        const ctx_fld_opt = try emitter.resolver.getFieldByDeclOrdinal(writer_ty, 0);
+        const ctx_off: u64 = if (ctx_fld_opt) |cf| cf.byte_offset else 0;
+        if (try emitter.resolver.getFieldByDeclOrdinal(writer_ty, 1)) |wfn_fld| {
+            const wfn_off: u64 = wfn_fld.byte_offset;
+            const write_fn_ty = wfn_fld.field_ty;
+            const idx_slot = try state.allocEntryBytes(ptr_bytes, ptr_bytes);
+            defer emitter.allocator.free(idx_slot);
+            const tmp_id = state.nextTmp();
+            const done_lbl = try std.fmt.allocPrint(emitter.allocator, "_fwo_done_{d}", .{tmp_id});
+            defer emitter.allocator.free(done_lbl);
+            const w_ptr_s = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
+            defer emitter.allocator.free(w_ptr_s);
+            const ctx_ssa = try std.fmt.allocPrint(emitter.allocator, "%_fwo_ctx_{d}", .{tmp_id});
+            defer emitter.allocator.free(ctx_ssa);
+            const wfn_ssa = try std.fmt.allocPrint(emitter.allocator, "%_fwo_wfn_{d}", .{tmp_id});
+            defer emitter.allocator.free(wfn_ssa);
+
+            try state.print(
+                "  store {s} 0, ptr {s}, align {d}\n" ++
+                    "  %_fwo_ctxp_{d} = getelementptr inbounds i8, ptr %_v_{d}, {s} {d}\n" ++
+                    "  %_fwo_ctx_{d} = load ptr, ptr %_fwo_ctxp_{d}, align {d}\n" ++
+                    "  %_fwo_wfnp_{d} = getelementptr inbounds i8, ptr %_v_{d}, {s} {d}\n" ++
+                    "  %_fwo_wfn_{d} = load ptr, ptr %_fwo_wfnp_{d}, align {d}\n" ++
+                    "  %_fwo_pp_{d} = extractvalue {{ ptr, {s}, ptr, {s} }} %_v_{d}, 0\n" ++
+                    "  %_fwo_pl_{d} = extractvalue {{ ptr, {s}, ptr, {s} }} %_v_{d}, 1\n" ++
+                    "  %_fwo_ap_{d} = extractvalue {{ ptr, {s}, ptr, {s} }} %_v_{d}, 2\n",
+                .{
+                    ptr_int,   idx_slot,  ptr_bytes,
+                    tmp_id,    args[0],   ptr_int,
+                    ctx_off,   tmp_id,    tmp_id,
+                    ptr_bytes, tmp_id,    args[0],
+                    ptr_int,   wfn_off,   tmp_id,
+                    tmp_id,    ptr_bytes, tmp_id,
+                    ptr_int,   ptr_int,   args[1],
+                    tmp_id,    ptr_int,   ptr_int,
+                    args[1],   tmp_id,    ptr_int,
+                    ptr_int,   args[1],
+                },
+            );
+            try state.print(
+                "  %_fwo_al_{d} = extractvalue {{ ptr, {s}, ptr, {s} }} %_v_{d}, 3\n" ++
+                    "  br label %_fwo_lp_{d}\n" ++
+                    "_fwo_lp_{d}:\n" ++
+                    "  %_fwo_i_{d} = load {s}, ptr {s}, align {d}\n" ++
+                    "  %_fwo_lt_{d} = icmp ult {s} %_fwo_i_{d}, %_fwo_pl_{d}\n" ++
+                    "  br i1 %_fwo_lt_{d}, label %_fwo_bd_{d}, label %{s}\n" ++
+                    "_fwo_bd_{d}:\n" ++
+                    "  %_fwo_pep_{d} = getelementptr inbounds {{ ptr, {s} }}, ptr %_fwo_pp_{d}, {s} %_fwo_i_{d}\n",
+                .{
+                    tmp_id,   ptr_int,   ptr_int, args[1],
+                    tmp_id,   tmp_id,    tmp_id,  ptr_int,
+                    idx_slot, ptr_bytes, tmp_id,  ptr_int,
+                    tmp_id,   tmp_id,    tmp_id,  tmp_id,
+                    done_lbl, tmp_id,    tmp_id,  ptr_int,
+                    tmp_id,   ptr_int,   tmp_id,
+                },
+            );
+            try state.print(
+                "  %_fwo_pc_{d} = load {{ ptr, {s} }}, ptr %_fwo_pep_{d}, align {d}\n" ++
+                    "  %_fwo_pcp_{d} = extractvalue {{ ptr, {s} }} %_fwo_pc_{d}, 0\n" ++
+                    "  %_fwo_pcl_{d} = extractvalue {{ ptr, {s} }} %_fwo_pc_{d}, 1\n" ++
+                    "  %_fwo_pnz_{d} = icmp ne {s} %_fwo_pcl_{d}, 0\n" ++
+                    "  br i1 %_fwo_pnz_{d}, label %_fwo_wp_{d}, label %_fwo_ah_{d}\n" ++
+                    "_fwo_wp_{d}:\n",
+                .{
+                    tmp_id,  ptr_int, tmp_id, ptr_bytes,
+                    tmp_id,  ptr_int, tmp_id, tmp_id,
+                    ptr_int, tmp_id,  tmp_id, ptr_int,
+                    tmp_id,  tmp_id,  tmp_id, tmp_id,
+                    tmp_id,
+                },
+            );
+            state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_fwo_wp_{d}", .{tmp_id}));
+            const pcp_s = try std.fmt.allocPrint(emitter.allocator, "%_fwo_pcp_{d}", .{tmp_id});
+            defer emitter.allocator.free(pcp_s);
+            const pcl_s = try std.fmt.allocPrint(emitter.allocator, "%_fwo_pcl_{d}", .{tmp_id});
+            defer emitter.allocator.free(pcl_s);
+            try emitInvokeWriteFnChunkLlvm(
+                emitter,
+                state,
+                ctx_ssa,
+                wfn_ssa,
+                write_fn_ty,
+                pcp_s,
+                pcl_s,
+                res_slot,
+                res_ty,
+                res_align,
+                done_lbl,
+            );
+            try state.print("  br label %_fwo_ah_{d}\n_fwo_ah_{d}:\n", .{ tmp_id, tmp_id });
+            state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_fwo_ah_{d}", .{tmp_id}));
+
+            const arg_stride: u64 = std.mem.alignForward(u64, 2 * @as(u64, ptr_bytes) + 8, ptr_bytes);
+            const next_lbl = try std.fmt.allocPrint(emitter.allocator, "_fwo_nx_{d}", .{tmp_id});
+            defer emitter.allocator.free(next_lbl);
+            try state.print(
+                "  %_fwo_ha_{d} = icmp ult {s} %_fwo_i_{d}, %_fwo_al_{d}\n" ++
+                    "  br i1 %_fwo_ha_{d}, label %_fwo_do_a_{d}, label %{s}\n" ++
+                    "_fwo_do_a_{d}:\n" ++
+                    "  %_fwo_abo_{d} = mul {s} %_fwo_i_{d}, {d}\n" ++
+                    "  %_fwo_aep_{d} = getelementptr inbounds i8, ptr %_fwo_ap_{d}, {s} %_fwo_abo_{d}\n" ++
+                    "  %_fwo_ad_{d} = load ptr, ptr %_fwo_aep_{d}, align {d}\n" ++
+                    "  %_fwo_afp_{d} = getelementptr inbounds i8, ptr %_fwo_aep_{d}, {s} {d}\n" ++
+                    "  %_fwo_afn_{d} = load ptr, ptr %_fwo_afp_{d}, align {d}\n",
+                .{
+                    tmp_id, ptr_int,   tmp_id,    tmp_id,
+                    tmp_id, tmp_id,    next_lbl,  tmp_id,
+                    tmp_id, ptr_int,   tmp_id,    arg_stride,
+                    tmp_id, tmp_id,    ptr_int,   tmp_id,
+                    tmp_id, tmp_id,    ptr_bytes, tmp_id,
+                    tmp_id, ptr_int,   ptr_bytes, tmp_id,
+                    tmp_id, ptr_bytes,
+                },
+            );
+            try state.print(
+                "  %_fwo_asp_{d} = getelementptr inbounds i8, ptr %_fwo_aep_{d}, {s} {d}\n" ++
+                    "  %_fwo_asv_{d} = load {{ i32, i16, i16 }}, ptr %_fwo_asp_{d}, align 2\n" ++
+                    "  %_fwo_slo_{d} = extractvalue {{ i32, i16, i16 }} %_fwo_asv_{d}, 0\n" ++
+                    "  %_fwo_sw_{d} = extractvalue {{ i32, i16, i16 }} %_fwo_asv_{d}, 1\n" ++
+                    "  %_fwo_sp_{d} = extractvalue {{ i32, i16, i16 }} %_fwo_asv_{d}, 2\n" ++
+                    "  %_fwo_vb1_{d} = lshr i32 %_fwo_slo_{d}, 27\n" ++
+                    "  %_fwo_vb_{d} = and i32 %_fwo_vb1_{d}, 15\n" ++
+                    "  %_fwo_de_{d} = lshr i32 %_fwo_slo_{d}, 31\n",
+                .{
+                    tmp_id, tmp_id, ptr_int, 2 * ptr_bytes,
+                    tmp_id, tmp_id, tmp_id,  tmp_id,
+                    tmp_id, tmp_id, tmp_id,  tmp_id,
+                    tmp_id, tmp_id, tmp_id,  tmp_id,
+                    tmp_id, tmp_id,
+                },
+            );
+            state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_fwo_do_a_{d}", .{tmp_id}));
+            const ad_ssa = try std.fmt.allocPrint(emitter.allocator, "%_fwo_ad_{d}", .{tmp_id});
+            defer emitter.allocator.free(ad_ssa);
+            const asv_ssa = try std.fmt.allocPrint(emitter.allocator, "%_fwo_asv_{d}", .{tmp_id});
+            defer emitter.allocator.free(asv_ssa);
+
+            if (!emitter.cfg.target.isFreestanding()) {
+                for (emitter.fmt_type_list.items) |raw_cand_ty| {
+                    const cand_ty = try unwrapTransparentType(emitter, raw_cand_ty);
+                    const disp_b = lookupCustomFmtBodyIndexLlvm(emitter, cand_ty, false);
+                    const dbg_b = lookupCustomFmtBodyIndexLlvm(emitter, cand_ty, true);
+                    if (disp_b == null and dbg_b == null) continue;
+
+                    if (disp_b) |db_idx| {
+                        const ct_id = state.nextTmp();
+                        try state.print(
+                            "  %_fwo_mfn_{d} = icmp eq ptr %_fwo_afn_{d}, @_cx_fmt_ty_{d}\n" ++
+                                "  %_fwo_v0_{d} = icmp eq i32 %_fwo_vb_{d}, 0\n" ++
+                                "  %_fwo_d0_{d} = icmp eq i32 %_fwo_de_{d}, 0\n" ++
+                                "  %_fwo_c1_{d} = and i1 %_fwo_mfn_{d}, %_fwo_v0_{d}\n" ++
+                                "  %_fwo_cd_{d} = and i1 %_fwo_c1_{d}, %_fwo_d0_{d}\n" ++
+                                "  br i1 %_fwo_cd_{d}, label %_fwo_cd_do_{d}, label %_fwo_cd_nx_{d}\n" ++
+                                "_fwo_cd_do_{d}:\n",
+                            .{
+                                ct_id,  tmp_id, cand_ty.toU32(),
+                                ct_id,  tmp_id, ct_id,
+                                tmp_id, ct_id,  ct_id,
+                                ct_id,  ct_id,  ct_id,
+                                ct_id,  ct_id,  ct_id,
+                                ct_id,  ct_id,
+                            },
+                        );
+                        state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_fwo_cd_do_{d}", .{ct_id}));
+                        try emitInvokeCustomFmtBodyLlvm(
+                            emitter,
+                            state,
+                            db_idx,
+                            cand_ty,
+                            ad_ssa,
+                            w_ptr_s,
+                            asv_ssa,
+                            res_slot,
+                            res_ty,
+                            res_align,
+                            done_lbl,
+                            next_lbl,
+                        );
+                        try state.print("_fwo_cd_nx_{d}:\n", .{ct_id});
+                        state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_fwo_cd_nx_{d}", .{ct_id}));
+                    }
+                    if (dbg_b) |gb_idx| {
+                        const ct_id = state.nextTmp();
+                        try state.print(
+                            "  %_fwo_mfn_{d} = icmp eq ptr %_fwo_afn_{d}, @_cx_fmt_ty_{d}\n" ++
+                                "  %_fwo_v1_{d} = icmp eq i32 %_fwo_vb_{d}, 1\n" ++
+                                "  %_fwo_d1_{d} = icmp ne i32 %_fwo_de_{d}, 0\n" ++
+                                "  %_fwo_isd_{d} = or i1 %_fwo_v1_{d}, %_fwo_d1_{d}\n" ++
+                                "  %_fwo_cg_{d} = and i1 %_fwo_mfn_{d}, %_fwo_isd_{d}\n" ++
+                                "  br i1 %_fwo_cg_{d}, label %_fwo_cg_do_{d}, label %_fwo_cg_nx_{d}\n" ++
+                                "_fwo_cg_do_{d}:\n",
+                            .{
+                                ct_id,  tmp_id, cand_ty.toU32(),
+                                ct_id,  tmp_id, ct_id,
+                                tmp_id, ct_id,  ct_id,
+                                ct_id,  ct_id,  ct_id,
+                                ct_id,  ct_id,  ct_id,
+                                ct_id,  ct_id,
+                            },
+                        );
+                        state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_fwo_cg_do_{d}", .{ct_id}));
+                        try emitInvokeCustomFmtBodyLlvm(
+                            emitter,
+                            state,
+                            gb_idx,
+                            cand_ty,
+                            ad_ssa,
+                            w_ptr_s,
+                            asv_ssa,
+                            res_slot,
+                            res_ty,
+                            res_align,
+                            done_lbl,
+                            next_lbl,
+                        );
+                        try state.print("_fwo_cg_nx_{d}:\n", .{ct_id});
+                        state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_fwo_cg_nx_{d}", .{ct_id}));
+                    }
+                }
+
+                // Fallback: format into `{ ptr, i64, i64 }` scratch buffer via `%_fwo_afn` and stream:
+                const hb_slot = try state.allocEntryBytes(24, 8);
+                defer emitter.allocator.free(hb_slot);
+                if (!emitter.declared_externs.contains("free")) {
+                    try emitter.requireIntrinsicDecl("declare void @free(ptr) nounwind");
+                }
+                try state.print(
+                    "  %_fwo_hfn_{d} = icmp ne ptr %_fwo_afn_{d}, null\n" ++
+                        "  br i1 %_fwo_hfn_{d}, label %_fwo_fb_{d}, label %{s}\n" ++
+                        "_fwo_fb_{d}:\n" ++
+                        "  store {{ ptr, i64, i64 }} zeroinitializer, ptr {s}, align 8\n" ++
+                        "  %_fwo_sw32_{d} = zext i16 %_fwo_sw_{d} to i32\n" ++
+                        "  %_fwo_sp32_{d} = zext i16 %_fwo_sp_{d} to i32\n" ++
+                        "  %_fwo_spsh_{d} = shl i32 %_fwo_sp32_{d}, 16\n" ++
+                        "  %_fwo_shi_{d} = or i32 %_fwo_sw32_{d}, %_fwo_spsh_{d}\n",
+                    .{
+                        tmp_id,   tmp_id,
+                        tmp_id,   tmp_id,
+                        next_lbl, tmp_id,
+                        hb_slot,  tmp_id,
+                        tmp_id,   tmp_id,
+                        tmp_id,   tmp_id,
+                        tmp_id,   tmp_id,
+                        tmp_id,   tmp_id,
+                    },
+                );
+                try state.print(
+                    "  call void %_fwo_afn_{d}(ptr {s}, ptr %_fwo_ad_{d}, i32 %_fwo_slo_{d}, i32 %_fwo_shi_{d})\n" ++
+                        "  %_fwo_hbd_{d} = load ptr, ptr {s}, align 8\n" ++
+                        "  %_fwo_hblp_{d} = getelementptr inbounds {{ ptr, i64, i64 }}, ptr {s}, i32 0, i32 1\n" ++
+                        "  %_fwo_hbl64_{d} = load i64, ptr %_fwo_hblp_{d}, align 8\n" ++
+                        "  %_fwo_hbnz_{d} = icmp ne i64 %_fwo_hbl64_{d}, 0\n" ++
+                        "  br i1 %_fwo_hbnz_{d}, label %_fwo_hbw_{d}, label %_fwo_hbf_{d}\n" ++
+                        "_fwo_hbw_{d}:\n",
+                    .{
+                        tmp_id, hb_slot, tmp_id, tmp_id,  tmp_id,
+                        tmp_id, hb_slot, tmp_id, hb_slot, tmp_id,
+                        tmp_id, tmp_id,  tmp_id, tmp_id,  tmp_id,
+                        tmp_id, tmp_id,
+                    },
+                );
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_fwo_hbw_{d}", .{tmp_id}));
+                const hbl_pt = if (ptr_bytes == 4) blk_tr: {
+                    try state.print("  %_fwo_hbl32_{d} = trunc i64 %_fwo_hbl64_{d} to i32\n", .{ tmp_id, tmp_id });
+                    break :blk_tr try std.fmt.allocPrint(emitter.allocator, "%_fwo_hbl32_{d}", .{tmp_id});
+                } else try std.fmt.allocPrint(emitter.allocator, "%_fwo_hbl64_{d}", .{tmp_id});
+                defer emitter.allocator.free(hbl_pt);
+                const hbd_s = try std.fmt.allocPrint(emitter.allocator, "%_fwo_hbd_{d}", .{tmp_id});
+                defer emitter.allocator.free(hbd_s);
+                const free_err_lbl = try std.fmt.allocPrint(emitter.allocator, "_fwo_hbfe_{d}", .{tmp_id});
+                defer emitter.allocator.free(free_err_lbl);
+                try emitInvokeWriteFnChunkLlvm(
+                    emitter,
+                    state,
+                    ctx_ssa,
+                    wfn_ssa,
+                    write_fn_ty,
+                    hbd_s,
+                    hbl_pt,
+                    res_slot,
+                    res_ty,
+                    res_align,
+                    free_err_lbl,
+                );
+                try state.print(
+                    "  br label %_fwo_hbf_{d}\n" ++
+                        "_fwo_hbfe_{d}:\n" ++
+                        "  call void @free(ptr %_fwo_hbd_{d})\n" ++
+                        "  br label %{s}\n" ++
+                        "_fwo_hbf_{d}:\n" ++
+                        "  call void @free(ptr %_fwo_hbd_{d})\n" ++
+                        "  br label %{s}\n",
+                    .{ tmp_id, tmp_id, tmp_id, done_lbl, tmp_id, tmp_id, next_lbl },
+                );
+            } else {
+                try state.print("  br label %{s}\n", .{next_lbl});
+            }
+
+            try state.print(
+                "{s}:\n" ++
+                    "  %_fwo_ni_{d} = add {s} %_fwo_i_{d}, 1\n" ++
+                    "  store {s} %_fwo_ni_{d}, ptr {s}, align {d}\n" ++
+                    "  br label %_fwo_lp_{d}\n" ++
+                    "{s}:\n",
+                .{ next_lbl, tmp_id, ptr_int, tmp_id, ptr_int, tmp_id, idx_slot, ptr_bytes, tmp_id, done_lbl },
+            );
+            state.setLabelOwned(try emitter.allocator.dupe(u8, done_lbl));
+        }
+    }
+
+    const loaded = try emitLoadValueFromPtr(emitter, state, res_ty, res_slot, res_align, null, 0, 0, 0);
+    defer emitter.allocator.free(loaded);
+    const val_ty = try formatLlvmValueType(emitter, res_ty);
+    defer emitter.allocator.free(val_ty);
+    try state.print("  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n", .{ dst_raw, val_ty, loaded, val_ty, loaded });
+}
+
+/// Emits `STD-01` (`MirIntrinsicKind` `52..109`) operations in LLVM IR.
+fn emitStd01IntrinsicOpLlvm(
+    emitter: *LlvmModuleEmitter,
+    state: *BodyEmitState,
+    body: *const MirBody,
+    dst_raw: u32,
+    kind: mir.MirIntrinsicKind,
+    inst: mir.MirInst,
+    args: []const u32,
+) !void {
+    const ptr_int = ptrIntType(emitter);
+    const ptr_bytes: u32 = emitter.cfg.target.ptrBytes();
+
+    switch (kind) {
+        .implements => {
+            const is_impl = evalImplementsStaticLlvm(
+                emitter,
+                TypeId.fromInt(inst.operands.lhs),
+                TypeId.fromInt(inst.operands.rhs),
+            );
+            try state.print("  %_v_{d} = or i1 false, {s}\n", .{ dst_raw, if (is_impl) "true" else "false" });
+        },
+        .int_min, .int_max, .int_bits => {
+            const target_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(inst.operands.lhs));
+            const info = resolveIntegerInfo(emitter, target_ty) orelse IntScalarInfo{ .bits = 32, .is_signed = false };
+            const dst_info = resolveIntegerInfo(emitter, inst.type_id) orelse info;
+            if (kind == .int_bits) {
+                try state.print("  %_v_{d} = add i{d} 0, {d}\n", .{ dst_raw, dst_info.bits, info.bits });
+            } else if (kind == .int_min) {
+                const min_i128: i128 = if (!info.is_signed)
+                    0
+                else if (info.bits >= 128)
+                    std.math.minInt(i128)
+                else
+                    -(@as(i128, 1) << @intCast(info.bits - 1));
+                try state.print("  %_v_{d} = add i{d} 0, {d}\n", .{ dst_raw, dst_info.bits, min_i128 });
+            } else {
+                if (!info.is_signed) {
+                    const max_u128: u128 = if (info.bits >= 128)
+                        std.math.maxInt(u128)
+                    else
+                        (@as(u128, 1) << @intCast(info.bits)) - 1;
+                    try state.print("  %_v_{d} = add i{d} 0, {d}\n", .{ dst_raw, dst_info.bits, @as(i128, @bitCast(max_u128)) });
+                } else {
+                    const max_i128: i128 = if (info.bits >= 128)
+                        std.math.maxInt(i128)
+                    else
+                        (@as(i128, 1) << @intCast(info.bits - 1)) - 1;
+                    try state.print("  %_v_{d} = add i{d} 0, {d}\n", .{ dst_raw, dst_info.bits, max_i128 });
+                }
+            }
+        },
+        .scalar_clz, .scalar_ctz, .scalar_popcnt => {
+            if (args.len < 1) {
+                try state.print("  %_v_{d} = add i32 0, 0\n", .{dst_raw});
+                return;
+            }
+            const val_ty = body.getInst(MirValueId.fromInt(args[0])).type_id;
+            const info = resolveIntegerInfo(emitter, val_ty).?;
+            const t_id = state.nextTmp();
+            if (kind == .scalar_clz or kind == .scalar_ctz) {
+                const intr_n = if (kind == .scalar_clz) "ctlz" else "cttz";
+                const decl_s = try std.fmt.allocPrint(
+                    emitter.allocator,
+                    "declare i{d} @llvm.{s}.i{d}(i{d}, i1 immarg)",
+                    .{ info.bits, intr_n, info.bits, info.bits },
+                );
+                defer emitter.allocator.free(decl_s);
+                try emitter.requireIntrinsicDecl(decl_s);
+                try state.print(
+                    "  %_bit_r_{d} = call i{d} @llvm.{s}.i{d}(i{d} %_v_{d}, i1 false)\n",
+                    .{ t_id, info.bits, intr_n, info.bits, info.bits, args[0] },
+                );
+            } else {
+                const decl_s = try std.fmt.allocPrint(
+                    emitter.allocator,
+                    "declare i{d} @llvm.ctpop.i{d}(i{d})",
+                    .{ info.bits, info.bits, info.bits },
+                );
+                defer emitter.allocator.free(decl_s);
+                try emitter.requireIntrinsicDecl(decl_s);
+                try state.print(
+                    "  %_bit_r_{d} = call i{d} @llvm.ctpop.i{d}(i{d} %_v_{d})\n",
+                    .{ t_id, info.bits, info.bits, info.bits, args[0] },
+                );
+            }
+            if (info.bits == 32) {
+                try state.print("  %_v_{d} = add i32 %_bit_r_{d}, 0\n", .{ dst_raw, t_id });
+            } else if (info.bits < 32) {
+                try state.print("  %_v_{d} = zext i{d} %_bit_r_{d} to i32\n", .{ dst_raw, info.bits, t_id });
+            } else {
+                try state.print("  %_v_{d} = trunc i{d} %_bit_r_{d} to i32\n", .{ dst_raw, info.bits, t_id });
+            }
+        },
+        .scalar_bswap => {
+            if (args.len < 1) return;
+            const info = resolveIntegerInfo(emitter, inst.type_id).?;
+            if (info.bits <= 8) {
+                try state.print("  %_v_{d} = add i8 %_v_{d}, 0\n", .{ dst_raw, args[0] });
+            } else {
+                const decl_s = try std.fmt.allocPrint(
+                    emitter.allocator,
+                    "declare i{d} @llvm.bswap.i{d}(i{d})",
+                    .{ info.bits, info.bits, info.bits },
+                );
+                defer emitter.allocator.free(decl_s);
+                try emitter.requireIntrinsicDecl(decl_s);
+                try state.print(
+                    "  %_v_{d} = call i{d} @llvm.bswap.i{d}(i{d} %_v_{d})\n",
+                    .{ dst_raw, info.bits, info.bits, info.bits, args[0] },
+                );
+            }
+        },
+        .scalar_rotl, .scalar_rotr => {
+            if (args.len < 2) return;
+            const info = resolveIntegerInfo(emitter, inst.type_id).?;
+            const sh_info = resolveIntegerInfo(emitter, body.getInst(MirValueId.fromInt(args[1])).type_id).?;
+            const intr_n = if (kind == .scalar_rotl) "fshl" else "fshr";
+            const decl_s = try std.fmt.allocPrint(
+                emitter.allocator,
+                "declare i{d} @llvm.{s}.i{d}(i{d}, i{d}, i{d})",
+                .{ info.bits, intr_n, info.bits, info.bits, info.bits, info.bits },
+            );
+            defer emitter.allocator.free(decl_s);
+            try emitter.requireIntrinsicDecl(decl_s);
+            const t_id = state.nextTmp();
+            if (sh_info.bits == info.bits) {
+                try state.print("  %_rot_a_{d} = add i{d} %_v_{d}, 0\n", .{ t_id, info.bits, args[1] });
+            } else if (sh_info.bits < info.bits) {
+                try state.print(
+                    "  %_rot_a_{d} = zext i{d} %_v_{d} to i{d}\n",
+                    .{ t_id, sh_info.bits, args[1], info.bits },
+                );
+            } else {
+                try state.print(
+                    "  %_rot_a_{d} = trunc i{d} %_v_{d} to i{d}\n",
+                    .{ t_id, sh_info.bits, args[1], info.bits },
+                );
+            }
+            try state.print(
+                "  %_v_{d} = call i{d} @llvm.{s}.i{d}(i{d} %_v_{d}, i{d} %_v_{d}, i{d} %_rot_a_{d})\n",
+                .{ dst_raw, info.bits, intr_n, info.bits, info.bits, args[0], info.bits, args[0], info.bits, t_id },
+            );
+        },
+        .ptr_is_null => {
+            if (args.len < 1) {
+                try state.print("  %_v_{d} = or i1 false, true\n", .{dst_raw});
+                return;
+            }
+            try state.print("  %_v_{d} = icmp eq ptr %_v_{d}, null\n", .{ dst_raw, args[0] });
+        },
+        .ptr_offset => {
+            if (args.len < 3) {
+                try state.print("  %_v_{d} = select i1 true, ptr null, ptr null\n", .{dst_raw});
+                return;
+            }
+            const ptr_ty = try unwrapTransparentType(emitter, body.getInst(MirValueId.fromInt(args[0])).type_id);
+            const pointee_ty = try unwrapTransparentType(emitter, TypeId.fromInt(emitter.input.pool.getNode(ptr_ty).lhs));
+            const stride: u64 = if (pointee_ty == .opaque_ty)
+                1
+            else
+                (try emitter.resolver.resolveType(pointee_ty)).size_bytes;
+            const ptr_bits: u16 = @intCast(ptr_bytes * 8);
+            const d_info = resolveIntegerInfo(emitter, body.getInst(MirValueId.fromInt(args[1])).type_id) orelse
+                IntScalarInfo{ .bits = ptr_bits, .is_signed = false };
+            const t_id = state.nextTmp();
+            if (d_info.bits == ptr_bits) {
+                try state.print("  %_po_d_{d} = add {s} %_v_{d}, 0\n", .{ t_id, ptr_int, args[1] });
+            } else if (d_info.bits < ptr_bits) {
+                const ext_op = if (d_info.is_signed) "sext" else "zext";
+                try state.print("  %_po_d_{d} = {s} i{d} %_v_{d} to {s}\n", .{ t_id, ext_op, d_info.bits, args[1], ptr_int });
+            } else {
+                try state.print("  %_po_d_{d} = trunc i{d} %_v_{d} to {s}\n", .{ t_id, d_info.bits, args[1], ptr_int });
+            }
+            const mode_val = extractConstU32Llvm(body, args[2]) orelse 0;
+            try state.print("  %_po_b_{d} = mul {s} %_po_d_{d}, {d}\n", .{ t_id, ptr_int, t_id, stride });
+            if (mode_val == 1) {
+                try state.print("  %_po_s_{d} = sub {s} 0, %_po_b_{d}\n", .{ t_id, ptr_int, t_id });
+                try state.print("  %_v_{d} = getelementptr i8, ptr %_v_{d}, {s} %_po_s_{d}\n", .{ dst_raw, args[0], ptr_int, t_id });
+            } else {
+                try state.print("  %_v_{d} = getelementptr i8, ptr %_v_{d}, {s} %_po_b_{d}\n", .{ dst_raw, args[0], ptr_int, t_id });
+            }
+        },
+        .slice_split_at => {
+            if (args.len < 2) return;
+            const tup_ty = try unwrapTransparentType(emitter, inst.type_id);
+            const tup_lay = try emitter.resolver.resolveType(tup_ty);
+            const tup_elems = emitter.input.pool.getTupleElements(tup_ty);
+            const half_ref_ty = try unwrapTransparentType(emitter, TypeId.fromInt(tup_elems[0]));
+            const sl_ty = try unwrapTransparentType(emitter, TypeId.fromInt(emitter.input.pool.getNode(half_ref_ty).lhs));
+            const elem_ty = try unwrapTransparentType(emitter, TypeId.fromInt(emitter.input.pool.getNode(sl_ty).lhs));
+            const elem_lay = try emitter.resolver.resolveType(elem_ty);
+            const elem_align = @max(elem_lay.alignBytes(), 1);
+            const tup_slot = try state.allocEntryBytes(tup_lay.size_bytes, tup_lay.alignBytes());
+            defer emitter.allocator.free(tup_slot);
+            const src_ty = try unwrapTransparentType(emitter, body.getInst(MirValueId.fromInt(args[0])).type_id);
+            const t_id = state.nextTmp();
+            if (emitter.input.pool.isSliceRefType(src_ty)) {
+                try state.print(
+                    "  %_ssa_f_{d} = select i1 true, {{ ptr, {s} }} %_v_{d}, {{ ptr, {s} }} %_v_{d}\n",
+                    .{ t_id, ptr_int, args[0], ptr_int, args[0] },
+                );
+            } else {
+                try state.print(
+                    "  %_ssa_f_{d} = load {{ ptr, {s} }}, ptr %_v_{d}, align {d}\n",
+                    .{ t_id, ptr_int, args[0], ptr_bytes },
+                );
+            }
+            try state.print(
+                "  %_ssa_p_{d} = extractvalue {{ ptr, {s} }} %_ssa_f_{d}, 0\n" ++
+                    "  %_ssa_l_{d} = extractvalue {{ ptr, {s} }} %_ssa_f_{d}, 1\n" ++
+                    "  %_ssa_oob_{d} = icmp ugt {s} %_v_{d}, %_ssa_l_{d}\n" ++
+                    "  br i1 %_ssa_oob_{d}, label %_ssa_tr_{d}, label %_ssa_ok_{d}\n" ++
+                    "_ssa_tr_{d}:\n" ++
+                    "  call void @_cx_rt_trap(i32 2)\n" ++
+                    "  unreachable\n" ++
+                    "_ssa_ok_{d}:\n" ++
+                    "  %_ssa_rl_{d} = sub {s} %_ssa_l_{d}, %_v_{d}\n" ++
+                    "  %_ssa_mb_{d} = mul {s} %_v_{d}, {d}\n",
+                .{
+                    t_id,    ptr_int, t_id,                  t_id,
+                    ptr_int, t_id,    t_id,                  ptr_int,
+                    args[1], t_id,    t_id,                  t_id,
+                    t_id,    t_id,    t_id,                  t_id,
+                    ptr_int, t_id,    args[1],               t_id,
+                    ptr_int, args[1], elem_lay.stride_bytes,
+                },
+            );
+            try state.print(
+                "  %_ssa_rp0_{d} = getelementptr inbounds i8, ptr %_ssa_p_{d}, {s} %_ssa_mb_{d}\n" ++
+                    "  %_ssa_rz_{d} = icmp eq {s} %_ssa_rl_{d}, 0\n" ++
+                    "  %_ssa_pn_{d} = icmp eq ptr %_ssa_p_{d}, null\n" ++
+                    "  %_ssa_rd_{d} = and i1 %_ssa_rz_{d}, %_ssa_pn_{d}\n" ++
+                    "  %_ssa_rp_{d} = select i1 %_ssa_rd_{d}, ptr inttoptr ({s} {d} to ptr), ptr %_ssa_rp0_{d}\n" ++
+                    "  %_ssa_lp_{d} = select i1 %_ssa_pn_{d}, ptr inttoptr ({s} {d} to ptr), ptr %_ssa_p_{d}\n",
+                .{
+                    t_id,       t_id,    ptr_int, t_id,
+                    t_id,       ptr_int, t_id,    t_id,
+                    t_id,       t_id,    t_id,    t_id,
+                    t_id,       t_id,    ptr_int, elem_align,
+                    t_id,       t_id,    t_id,    ptr_int,
+                    elem_align, t_id,
+                },
+            );
+            try state.print(
+                "  %_ssa_lv0_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr %_ssa_lp_{d}, 0\n" ++
+                    "  %_ssa_lv_{d} = insertvalue {{ ptr, {s} }} %_ssa_lv0_{d}, {s} %_v_{d}, 1\n" ++
+                    "  %_ssa_rv0_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr %_ssa_rp_{d}, 0\n" ++
+                    "  %_ssa_rv_{d} = insertvalue {{ ptr, {s} }} %_ssa_rv0_{d}, {s} %_ssa_rl_{d}, 1\n",
+                .{
+                    t_id,    ptr_int, t_id,    t_id,
+                    ptr_int, t_id,    ptr_int, args[1],
+                    t_id,    ptr_int, t_id,    t_id,
+                    ptr_int, t_id,    ptr_int, t_id,
+                },
+            );
+            if (emitter.input.pool.isSliceRefType(half_ref_ty)) {
+                try state.print(
+                    "  store {{ ptr, {s} }} %_ssa_lv_{d}, ptr {s}, align {d}\n" ++
+                        "  %_ssa_tf1_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                        "  store {{ ptr, {s} }} %_ssa_rv_{d}, ptr %_ssa_tf1_{d}, align {d}\n",
+                    .{
+                        ptr_int, t_id,     tup_slot, ptr_bytes,
+                        t_id,    tup_slot, ptr_int,  2 * ptr_bytes,
+                        ptr_int, t_id,     t_id,     ptr_bytes,
+                    },
+                );
+            } else {
+                const left_slot = try state.allocEntryBytes(2 * ptr_bytes, ptr_bytes);
+                defer emitter.allocator.free(left_slot);
+                const right_slot = try state.allocEntryBytes(2 * ptr_bytes, ptr_bytes);
+                defer emitter.allocator.free(right_slot);
+                try state.print(
+                    "  store {{ ptr, {s} }} %_ssa_lv_{d}, ptr {s}, align {d}\n" ++
+                        "  store {{ ptr, {s} }} %_ssa_rv_{d}, ptr {s}, align {d}\n" ++
+                        "  store ptr {s}, ptr {s}, align {d}\n" ++
+                        "  %_ssa_tf1_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                        "  store ptr {s}, ptr %_ssa_tf1_{d}, align {d}\n",
+                    .{
+                        ptr_int,   t_id,      left_slot,  ptr_bytes,
+                        ptr_int,   t_id,      right_slot, ptr_bytes,
+                        left_slot, tup_slot,  ptr_bytes,  t_id,
+                        tup_slot,  ptr_int,   ptr_bytes,  right_slot,
+                        t_id,      ptr_bytes,
+                    },
+                );
+            }
+            state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_ssa_ok_{d}", .{t_id}));
+            const loaded = try emitLoadValueFromPtr(emitter, state, tup_ty, tup_slot, tup_lay.alignBytes(), null, 0, 0, 0);
+            defer emitter.allocator.free(loaded);
+            const val_ty = try formatLlvmValueType(emitter, tup_ty);
+            defer emitter.allocator.free(val_ty);
+            try state.print("  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n", .{ dst_raw, val_ty, loaded, val_ty, loaded });
+        },
+        .slice_reverse => {
+            if (args.len < 1) {
+                try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+                return;
+            }
+            const ref_ty = try unwrapTransparentType(emitter, body.getInst(MirValueId.fromInt(args[0])).type_id);
+            const sl_ty = try unwrapTransparentType(emitter, TypeId.fromInt(emitter.input.pool.getNode(ref_ty).lhs));
+            const elem_ty = try unwrapTransparentType(emitter, TypeId.fromInt(emitter.input.pool.getNode(sl_ty).lhs));
+            const elem_lay = try emitter.resolver.resolveType(elem_ty);
+            if (elem_lay.size_bytes > 0) {
+                const lo_slot = try state.allocEntryBytes(ptr_bytes, ptr_bytes);
+                defer emitter.allocator.free(lo_slot);
+                const hi_slot = try state.allocEntryBytes(ptr_bytes, ptr_bytes);
+                defer emitter.allocator.free(hi_slot);
+                const sw_slot = try state.allocEntryBytes(elem_lay.size_bytes, elem_lay.alignBytes());
+                defer emitter.allocator.free(sw_slot);
+                const t_id = state.nextTmp();
+                if (emitter.input.pool.isSliceRefType(ref_ty)) {
+                    try state.print(
+                        "  %_srev_f_{d} = select i1 true, {{ ptr, {s} }} %_v_{d}, {{ ptr, {s} }} %_v_{d}\n",
+                        .{ t_id, ptr_int, args[0], ptr_int, args[0] },
+                    );
+                } else {
+                    try state.print(
+                        "  %_srev_f_{d} = load {{ ptr, {s} }}, ptr %_v_{d}, align {d}\n",
+                        .{ t_id, ptr_int, args[0], ptr_bytes },
+                    );
+                }
+                try state.print(
+                    "  %_srev_p_{d} = extractvalue {{ ptr, {s} }} %_srev_f_{d}, 0\n" ++
+                        "  %_srev_l_{d} = extractvalue {{ ptr, {s} }} %_srev_f_{d}, 1\n" ++
+                        "  %_srev_ge2_{d} = icmp uge {s} %_srev_l_{d}, 2\n" ++
+                        "  br i1 %_srev_ge2_{d}, label %_srev_in_{d}, label %_srev_dn_{d}\n" ++
+                        "_srev_in_{d}:\n" ++
+                        "  store {s} 0, ptr {s}, align {d}\n" ++
+                        "  %_srev_h0_{d} = sub {s} %_srev_l_{d}, 1\n" ++
+                        "  store {s} %_srev_h0_{d}, ptr {s}, align {d}\n" ++
+                        "  br label %_srev_lp_{d}\n" ++
+                        "_srev_lp_{d}:\n",
+                    .{
+                        t_id,    ptr_int, t_id,      t_id,
+                        ptr_int, t_id,    t_id,      ptr_int,
+                        t_id,    t_id,    t_id,      t_id,
+                        t_id,    ptr_int, lo_slot,   ptr_bytes,
+                        t_id,    ptr_int, t_id,      ptr_int,
+                        t_id,    hi_slot, ptr_bytes, t_id,
+                        t_id,
+                    },
+                );
+                try state.print(
+                    "  %_srev_lo_{d} = load {s}, ptr {s}, align {d}\n" ++
+                        "  %_srev_hi_{d} = load {s}, ptr {s}, align {d}\n" ++
+                        "  %_srev_lt_{d} = icmp ult {s} %_srev_lo_{d}, %_srev_hi_{d}\n" ++
+                        "  br i1 %_srev_lt_{d}, label %_srev_bd_{d}, label %_srev_dn_{d}\n" ++
+                        "_srev_bd_{d}:\n" ++
+                        "  %_srev_lob_{d} = mul {s} %_srev_lo_{d}, {d}\n" ++
+                        "  %_srev_hib_{d} = mul {s} %_srev_hi_{d}, {d}\n",
+                    .{
+                        t_id, ptr_int, lo_slot, ptr_bytes,
+                        t_id, ptr_int, hi_slot, ptr_bytes,
+                        t_id, ptr_int, t_id,    t_id,
+                        t_id, t_id,    t_id,    t_id,
+                        t_id, ptr_int, t_id,    elem_lay.stride_bytes,
+                        t_id, ptr_int, t_id,    elem_lay.stride_bytes,
+                    },
+                );
+                try state.print(
+                    "  %_srev_lop_{d} = getelementptr inbounds i8, ptr %_srev_p_{d}, {s} %_srev_lob_{d}\n" ++
+                        "  %_srev_hip_{d} = getelementptr inbounds i8, ptr %_srev_p_{d}, {s} %_srev_hib_{d}\n",
+                    .{
+                        t_id, t_id, ptr_int, t_id,
+                        t_id, t_id, ptr_int, t_id,
+                    },
+                );
+                const lop_s = try std.fmt.allocPrint(emitter.allocator, "%_srev_lop_{d}", .{t_id});
+                defer emitter.allocator.free(lop_s);
+                const hip_s = try std.fmt.allocPrint(emitter.allocator, "%_srev_hip_{d}", .{t_id});
+                defer emitter.allocator.free(hip_s);
+                try emitMemcpyBytes(emitter, state, sw_slot, 1, lop_s, 1, elem_lay.size_bytes);
+                try emitMemcpyBytes(emitter, state, lop_s, 1, hip_s, 1, elem_lay.size_bytes);
+                try emitMemcpyBytes(emitter, state, hip_s, 1, sw_slot, 1, elem_lay.size_bytes);
+                try state.print(
+                    "  %_srev_nlo_{d} = add {s} %_srev_lo_{d}, 1\n" ++
+                        "  %_srev_nhi_{d} = sub {s} %_srev_hi_{d}, 1\n" ++
+                        "  store {s} %_srev_nlo_{d}, ptr {s}, align {d}\n" ++
+                        "  store {s} %_srev_nhi_{d}, ptr {s}, align {d}\n" ++
+                        "  br label %_srev_lp_{d}\n" ++
+                        "_srev_dn_{d}:\n",
+                    .{
+                        t_id,    ptr_int,   t_id,    t_id,      ptr_int, t_id,
+                        ptr_int, t_id,      lo_slot, ptr_bytes, ptr_int, t_id,
+                        hi_slot, ptr_bytes, t_id,    t_id,
+                    },
+                );
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_srev_dn_{d}", .{t_id}));
+            }
+            try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+        },
+        .soa_vec_new => {
+            const vec_ty = try unwrapTransparentType(emitter, inst.type_id);
+            const alloc_s = if (args.len >= 1)
+                try emitExtractAllocRawLlvm(emitter, state, body, args[0])
+            else
+                try emitter.allocator.dupe(u8, "0");
+            defer emitter.allocator.free(alloc_s);
+            const t_id = state.nextTmp();
+            try state.print(
+                "  %_svn0_{d} = insertvalue %_cx_ty_{d} zeroinitializer, {s} {s}, 3\n" ++
+                    "  %_v_{d} = select i1 true, %_cx_ty_{d} %_svn0_{d}, %_cx_ty_{d} %_svn0_{d}\n",
+                .{ t_id, vec_ty.toU32(), ptr_int, alloc_s, dst_raw, vec_ty.toU32(), t_id, vec_ty.toU32(), t_id },
+            );
+        },
+        .soa_vec_with_cap => {
+            if (args.len < 3) return;
+            const is_try = (extractConstU32Llvm(body, args[2]) orelse 0) != 0;
+            const out_ty = try unwrapTransparentType(emitter, inst.type_id);
+            const vec_ty = if (is_try)
+                try unwrapTransparentType(emitter, TypeId.fromInt(emitter.input.pool.getNode(out_ty).lhs))
+            else
+                out_ty;
+            const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(vec_ty).lhs));
+            const vec_lay = try emitter.resolver.resolveType(vec_ty);
+            const vec_slot = try state.allocEntryBytes(vec_lay.size_bytes, vec_lay.alignBytes());
+            defer emitter.allocator.free(vec_slot);
+            try emitMemsetZero(emitter, state, vec_slot, vec_lay.size_bytes, vec_lay.alignBytes());
+            const alloc_s = try emitExtractAllocRawLlvm(emitter, state, body, args[0]);
+            defer emitter.allocator.free(alloc_s);
+            const t_id = state.nextTmp();
+            try state.print(
+                "  %_svwc_ap_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                    "  store {s} {s}, ptr %_svwc_ap_{d}, align {d}\n",
+                .{ t_id, vec_slot, ptr_int, ptr_bytes + 8, ptr_int, alloc_s, t_id, ptr_bytes },
+            );
+            const cap_u64 = if (ptr_bytes == 4) blk_c64: {
+                try state.print("  %_svwc_c64_{d} = zext i32 %_v_{d} to i64\n", .{ t_id, args[1] });
+                break :blk_c64 try std.fmt.allocPrint(emitter.allocator, "%_svwc_c64_{d}", .{t_id});
+            } else try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[1]});
+            defer emitter.allocator.free(cap_u64);
+            const ok_ssa = try emitSoaVecEnsureCapLlvm(emitter, state, vec_slot, elem_struct, cap_u64, is_try);
+            defer emitter.allocator.free(ok_ssa);
+            if (!is_try) {
+                const loaded = try emitLoadValueFromPtr(emitter, state, vec_ty, vec_slot, vec_lay.alignBytes(), null, 0, 0, 0);
+                defer emitter.allocator.free(loaded);
+                try state.print(
+                    "  %_v_{d} = select i1 true, %_cx_ty_{d} {s}, %_cx_ty_{d} {s}\n",
+                    .{ dst_raw, vec_ty.toU32(), loaded, vec_ty.toU32(), loaded },
+                );
+            } else {
+                const out_lay = try emitter.resolver.resolveType(out_ty);
+                const sum_detail = (try emitter.resolver.getSumDetail(out_ty)).?;
+                const res_slot = try state.allocEntryBytes(out_lay.size_bytes, out_lay.alignBytes());
+                defer emitter.allocator.free(res_slot);
+                try emitMemsetZero(emitter, state, res_slot, out_lay.size_bytes, out_lay.alignBytes());
+                try state.print(
+                    "  br i1 {s}, label %_svwc_ok_{d}, label %_svwc_er_{d}\n_svwc_ok_{d}:\n",
+                    .{ ok_ssa, t_id, t_id, t_id },
+                );
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svwc_ok_{d}", .{t_id}));
+                const pay_p = if (sum_detail.payload_offset == 0)
+                    try emitter.allocator.dupe(u8, res_slot)
+                else blk_pp: {
+                    try state.print(
+                        "  %_svwc_pp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n",
+                        .{ t_id, res_slot, ptr_int, sum_detail.payload_offset },
+                    );
+                    break :blk_pp try std.fmt.allocPrint(emitter.allocator, "%_svwc_pp_{d}", .{t_id});
+                };
+                defer emitter.allocator.free(pay_p);
+                try emitMemcpyBytes(emitter, state, pay_p, 1, vec_slot, vec_lay.alignBytes(), vec_lay.size_bytes);
+                try emitWriteSumDiscriminantToPtr(emitter, state, out_ty, res_slot, out_lay.alignBytes(), 0);
+                try state.print("  br label %_svwc_jn_{d}\n_svwc_er_{d}:\n", .{ t_id, t_id });
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svwc_er_{d}", .{t_id}));
+                try emitWriteSumDiscriminantToPtr(emitter, state, out_ty, res_slot, out_lay.alignBytes(), 1);
+                try state.print("  br label %_svwc_jn_{d}\n_svwc_jn_{d}:\n", .{ t_id, t_id });
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svwc_jn_{d}", .{t_id}));
+                const loaded = try emitLoadValueFromPtr(emitter, state, out_ty, res_slot, out_lay.alignBytes(), null, 0, 0, 0);
+                defer emitter.allocator.free(loaded);
+                const val_ty = try formatLlvmValueType(emitter, out_ty);
+                defer emitter.allocator.free(val_ty);
+                try state.print("  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n", .{ dst_raw, val_ty, loaded, val_ty, loaded });
+            }
+        },
+        .soa_vec_len, .soa_vec_cap => {
+            if (args.len < 1) return;
+            const off_b: u32 = if (kind == .soa_vec_len) ptr_bytes else ptr_bytes + 4;
+            const t_id = state.nextTmp();
+            try state.print(
+                "  %_svlc_p_{d} = getelementptr inbounds i8, ptr %_v_{d}, {s} {d}\n" ++
+                    "  %_svlc_32_{d} = load i32, ptr %_svlc_p_{d}, align 4\n",
+                .{ t_id, args[0], ptr_int, off_b, t_id, t_id },
+            );
+            if (ptr_bytes == 4) {
+                try state.print("  %_v_{d} = add i32 %_svlc_32_{d}, 0\n", .{ dst_raw, t_id });
+            } else {
+                try state.print("  %_v_{d} = zext i32 %_svlc_32_{d} to i64\n", .{ dst_raw, t_id });
+            }
+        },
+        .soa_vec_push => {
+            if (args.len < 3) return;
+            const is_try = (extractConstU32Llvm(body, args[2]) orelse 0) != 0;
+            const ref_ty = try unwrapTransparentType(emitter, body.getInst(MirValueId.fromInt(args[0])).type_id);
+            const vec_ty = try unwrapTransparentType(emitter, TypeId.fromInt(emitter.input.pool.getNode(ref_ty).lhs));
+            const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(vec_ty).lhs));
+            const st_lay = try emitter.resolver.resolveType(elem_struct);
+            const elem_slot = try state.allocEntryBytes(@max(st_lay.size_bytes, 1), st_lay.alignBytes());
+            defer emitter.allocator.free(elem_slot);
+            try emitMemsetZero(emitter, state, elem_slot, st_lay.size_bytes, st_lay.alignBytes());
+            const elem_ssa = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[1]});
+            defer emitter.allocator.free(elem_ssa);
+            try emitStoreValueToPtr(emitter, state, elem_struct, elem_ssa, elem_slot, st_lay.alignBytes(), 0, 0, 0);
+
+            const t_id = state.nextTmp();
+            try state.print(
+                "  %_svp_lp_{d} = getelementptr inbounds i8, ptr %_v_{d}, {s} {d}\n" ++
+                    "  %_svp_l32_{d} = load i32, ptr %_svp_lp_{d}, align 4\n" ++
+                    "  %_svp_l64_{d} = zext i32 %_svp_l32_{d} to i64\n" ++
+                    "  %_svp_min_{d} = add i64 %_svp_l64_{d}, 1\n",
+                .{ t_id, args[0], ptr_int, ptr_bytes, t_id, t_id, t_id, t_id, t_id, t_id },
+            );
+            const vp_s = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
+            defer emitter.allocator.free(vp_s);
+            const min_s = try std.fmt.allocPrint(emitter.allocator, "%_svp_min_{d}", .{t_id});
+            defer emitter.allocator.free(min_s);
+            const ok_ssa = try emitSoaVecEnsureCapLlvm(emitter, state, vp_s, elem_struct, min_s, is_try);
+            defer emitter.allocator.free(ok_ssa);
+
+            try state.print(
+                "  br i1 {s}, label %_svp_wr_{d}, label %_svp_oom_{d}\n_svp_wr_{d}:\n" ++
+                    "  %_svp_dp_{d} = load ptr, ptr %_v_{d}, align {d}\n" ++
+                    "  %_svp_cp_{d} = getelementptr inbounds i8, ptr %_v_{d}, {s} {d}\n" ++
+                    "  %_svp_c32_{d} = load i32, ptr %_svp_cp_{d}, align 4\n",
+                .{
+                    ok_ssa,  t_id,    t_id,          t_id,
+                    t_id,    args[0], ptr_bytes,     t_id,
+                    args[0], ptr_int, ptr_bytes + 4, t_id,
+                    t_id,
+                },
+            );
+            state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svp_wr_{d}", .{t_id}));
+            const cap_pt = if (ptr_bytes == 4)
+                try std.fmt.allocPrint(emitter.allocator, "%_svp_c32_{d}", .{t_id})
+            else blk_cp: {
+                try state.print("  %_svp_cz_{d} = zext i32 %_svp_c32_{d} to i64\n", .{ t_id, t_id });
+                break :blk_cp try std.fmt.allocPrint(emitter.allocator, "%_svp_cz_{d}", .{t_id});
+            };
+            defer emitter.allocator.free(cap_pt);
+            const len_pt = if (ptr_bytes == 4)
+                try std.fmt.allocPrint(emitter.allocator, "%_svp_l32_{d}", .{t_id})
+            else
+                try std.fmt.allocPrint(emitter.allocator, "%_svp_l64_{d}", .{t_id});
+            defer emitter.allocator.free(len_pt);
+
+            var col_i: u32 = 0;
+            while (col_i < st_lay.aux_len) : (col_i += 1) {
+                const fld = emitter.resolver.fields_by_decl.items[st_lay.aux_start + col_i];
+                if (fld.size_bytes == 0) continue;
+                const d_col = try emitDynamicSoaColByteOffset(emitter, state, elem_struct, col_i, cap_pt);
+                defer emitter.allocator.free(d_col.off_ssa);
+                const sub_t = state.nextTmp();
+                try state.print(
+                    "  %_svp_sf_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                        "  %_svp_eo_{d} = mul {s} {s}, {d}\n" ++
+                        "  %_svp_do_{d} = add {s} {s}, %_svp_eo_{d}\n" ++
+                        "  %_svp_df_{d} = getelementptr inbounds i8, ptr %_svp_dp_{d}, {s} %_svp_do_{d}\n",
+                    .{
+                        sub_t, elem_slot, ptr_int,       fld.byte_offset,
+                        sub_t, ptr_int,   len_pt,        fld.size_bytes,
+                        sub_t, ptr_int,   d_col.off_ssa, sub_t,
+                        sub_t, t_id,      ptr_int,       sub_t,
+                    },
+                );
+                const sf_s = try std.fmt.allocPrint(emitter.allocator, "%_svp_sf_{d}", .{sub_t});
+                defer emitter.allocator.free(sf_s);
+                const df_s = try std.fmt.allocPrint(emitter.allocator, "%_svp_df_{d}", .{sub_t});
+                defer emitter.allocator.free(df_s);
+                try emitMemcpyBytes(emitter, state, df_s, 1, sf_s, 1, fld.size_bytes);
+            }
+            try state.print(
+                "  %_svp_nl_{d} = add i32 %_svp_l32_{d}, 1\n" ++
+                    "  store i32 %_svp_nl_{d}, ptr %_svp_lp_{d}, align 4\n" ++
+                    "  br label %_svp_sk_{d}\n_svp_oom_{d}:\n",
+                .{ t_id, t_id, t_id, t_id, t_id, t_id },
+            );
+            state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svp_oom_{d}", .{t_id}));
+            if (emitter.drop_type_set.contains(elem_struct.toU32())) {
+                try state.print("  call void @_cx_drop_ty_{d}(ptr {s})\n", .{ elem_struct.toU32(), elem_slot });
+            }
+            try state.print("  br label %_svp_sk_{d}\n_svp_sk_{d}:\n", .{ t_id, t_id });
+            state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svp_sk_{d}", .{t_id}));
+
+            if (!is_try) {
+                try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+            } else {
+                const out_ty = try unwrapTransparentType(emitter, inst.type_id);
+                const out_lay = try emitter.resolver.resolveType(out_ty);
+                const res_slot = try state.allocEntryBytes(@max(out_lay.size_bytes, 1), out_lay.alignBytes());
+                defer emitter.allocator.free(res_slot);
+                try emitMemsetZero(emitter, state, res_slot, out_lay.size_bytes, out_lay.alignBytes());
+                try state.print(
+                    "  br i1 {s}, label %_svp_ro_{d}, label %_svp_re_{d}\n_svp_ro_{d}:\n",
+                    .{ ok_ssa, t_id, t_id, t_id },
+                );
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svp_ro_{d}", .{t_id}));
+                try emitWriteSumDiscriminantToPtr(emitter, state, out_ty, res_slot, out_lay.alignBytes(), 0);
+                try state.print("  br label %_svp_rj_{d}\n_svp_re_{d}:\n", .{ t_id, t_id });
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svp_re_{d}", .{t_id}));
+                try emitWriteSumDiscriminantToPtr(emitter, state, out_ty, res_slot, out_lay.alignBytes(), 1);
+                try state.print("  br label %_svp_rj_{d}\n_svp_rj_{d}:\n", .{ t_id, t_id });
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svp_rj_{d}", .{t_id}));
+                const loaded = try emitLoadValueFromPtr(emitter, state, out_ty, res_slot, out_lay.alignBytes(), null, 0, 0, 0);
+                defer emitter.allocator.free(loaded);
+                const val_ty = try formatLlvmValueType(emitter, out_ty);
+                defer emitter.allocator.free(val_ty);
+                try state.print("  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n", .{ dst_raw, val_ty, loaded, val_ty, loaded });
+            }
+        },
+        .soa_vec_pop => {
+            if (args.len < 1) return;
+            const opt_ty = try unwrapTransparentType(emitter, inst.type_id);
+            const opt_lay = try emitter.resolver.resolveType(opt_ty);
+            const sum_detail = (try emitter.resolver.getSumDetail(opt_ty)).?;
+            const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(opt_ty).lhs));
+            const st_lay = try emitter.resolver.resolveType(elem_struct);
+            const opt_slot = try state.allocEntryBytes(@max(opt_lay.size_bytes, 1), opt_lay.alignBytes());
+            defer emitter.allocator.free(opt_slot);
+            try emitMemsetZero(emitter, state, opt_slot, opt_lay.size_bytes, opt_lay.alignBytes());
+            const elem_slot = try state.allocEntryBytes(@max(st_lay.size_bytes, 1), st_lay.alignBytes());
+            defer emitter.allocator.free(elem_slot);
+            try emitMemsetZero(emitter, state, elem_slot, st_lay.size_bytes, st_lay.alignBytes());
+            const t_id = state.nextTmp();
+            try state.print(
+                "  %_svpp_lp_{d} = getelementptr inbounds i8, ptr %_v_{d}, {s} {d}\n" ++
+                    "  %_svpp_l32_{d} = load i32, ptr %_svpp_lp_{d}, align 4\n" ++
+                    "  %_svpp_ez_{d} = icmp eq i32 %_svpp_l32_{d}, 0\n" ++
+                    "  br i1 %_svpp_ez_{d}, label %_svpp_nn_{d}, label %_svpp_sm_{d}\n" ++
+                    "_svpp_nn_{d}:\n",
+                .{ t_id, args[0], ptr_int, ptr_bytes, t_id, t_id, t_id, t_id, t_id, t_id, t_id, t_id },
+            );
+            state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svpp_nn_{d}", .{t_id}));
+            try emitWriteSumDiscriminantToPtr(emitter, state, opt_ty, opt_slot, opt_lay.alignBytes(), 0);
+            try state.print(
+                "  br label %_svpp_dn_{d}\n" ++
+                    "_svpp_sm_{d}:\n" ++
+                    "  %_svpp_nl_{d} = sub i32 %_svpp_l32_{d}, 1\n" ++
+                    "  store i32 %_svpp_nl_{d}, ptr %_svpp_lp_{d}, align 4\n" ++
+                    "  %_svpp_dp_{d} = load ptr, ptr %_v_{d}, align {d}\n" ++
+                    "  %_svpp_cp_{d} = getelementptr inbounds i8, ptr %_v_{d}, {s} {d}\n" ++
+                    "  %_svpp_c32_{d} = load i32, ptr %_svpp_cp_{d}, align 4\n",
+                .{
+                    t_id,          t_id,    t_id,      t_id, t_id,    t_id,
+                    t_id,          args[0], ptr_bytes, t_id, args[0], ptr_int,
+                    ptr_bytes + 4, t_id,    t_id,
+                },
+            );
+            state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svpp_sm_{d}", .{t_id}));
+            const cap_pt = if (ptr_bytes == 4)
+                try std.fmt.allocPrint(emitter.allocator, "%_svpp_c32_{d}", .{t_id})
+            else blk_cp: {
+                try state.print("  %_svpp_cz_{d} = zext i32 %_svpp_c32_{d} to i64\n", .{ t_id, t_id });
+                break :blk_cp try std.fmt.allocPrint(emitter.allocator, "%_svpp_cz_{d}", .{t_id});
+            };
+            defer emitter.allocator.free(cap_pt);
+            const idx_pt = if (ptr_bytes == 4)
+                try std.fmt.allocPrint(emitter.allocator, "%_svpp_nl_{d}", .{t_id})
+            else blk_ip: {
+                try state.print("  %_svpp_iz_{d} = zext i32 %_svpp_nl_{d} to i64\n", .{ t_id, t_id });
+                break :blk_ip try std.fmt.allocPrint(emitter.allocator, "%_svpp_iz_{d}", .{t_id});
+            };
+            defer emitter.allocator.free(idx_pt);
+
+            var col_i: u32 = 0;
+            while (col_i < st_lay.aux_len) : (col_i += 1) {
+                const fld = emitter.resolver.fields_by_decl.items[st_lay.aux_start + col_i];
+                if (fld.size_bytes == 0) continue;
+                const d_col = try emitDynamicSoaColByteOffset(emitter, state, elem_struct, col_i, cap_pt);
+                defer emitter.allocator.free(d_col.off_ssa);
+                const sub_t = state.nextTmp();
+                try state.print(
+                    "  %_svpp_eo_{d} = mul {s} {s}, {d}\n" ++
+                        "  %_svpp_so_{d} = add {s} {s}, %_svpp_eo_{d}\n" ++
+                        "  %_svpp_sf_{d} = getelementptr inbounds i8, ptr %_svpp_dp_{d}, {s} %_svpp_so_{d}\n" ++
+                        "  %_svpp_df_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n",
+                    .{
+                        sub_t, ptr_int,   idx_pt,        fld.size_bytes,
+                        sub_t, ptr_int,   d_col.off_ssa, sub_t,
+                        sub_t, t_id,      ptr_int,       sub_t,
+                        sub_t, elem_slot, ptr_int,       fld.byte_offset,
+                    },
+                );
+                const sf_s = try std.fmt.allocPrint(emitter.allocator, "%_svpp_sf_{d}", .{sub_t});
+                defer emitter.allocator.free(sf_s);
+                const df_s = try std.fmt.allocPrint(emitter.allocator, "%_svpp_df_{d}", .{sub_t});
+                defer emitter.allocator.free(df_s);
+                try emitMemcpyBytes(emitter, state, df_s, 1, sf_s, 1, fld.size_bytes);
+            }
+            const pay_p = if (sum_detail.payload_offset == 0)
+                try emitter.allocator.dupe(u8, opt_slot)
+            else blk_pp: {
+                try state.print(
+                    "  %_svpp_op_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n",
+                    .{ t_id, opt_slot, ptr_int, sum_detail.payload_offset },
+                );
+                break :blk_pp try std.fmt.allocPrint(emitter.allocator, "%_svpp_op_{d}", .{t_id});
+            };
+            defer emitter.allocator.free(pay_p);
+            try emitMemcpyBytes(emitter, state, pay_p, 1, elem_slot, st_lay.alignBytes(), st_lay.size_bytes);
+            try emitWriteSumDiscriminantToPtr(emitter, state, opt_ty, opt_slot, opt_lay.alignBytes(), 1);
+            try state.print("  br label %_svpp_dn_{d}\n_svpp_dn_{d}:\n", .{ t_id, t_id });
+            state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svpp_dn_{d}", .{t_id}));
+            const loaded = try emitLoadValueFromPtr(emitter, state, opt_ty, opt_slot, opt_lay.alignBytes(), null, 0, 0, 0);
+            defer emitter.allocator.free(loaded);
+            const val_ty = try formatLlvmValueType(emitter, opt_ty);
+            defer emitter.allocator.free(val_ty);
+            try state.print("  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n", .{ dst_raw, val_ty, loaded, val_ty, loaded });
+        },
+        .soa_vec_clear => {
+            if (args.len < 1) return;
+            const ref_ty = try unwrapTransparentType(emitter, body.getInst(MirValueId.fromInt(args[0])).type_id);
+            const vec_ty = try unwrapTransparentType(emitter, TypeId.fromInt(emitter.input.pool.getNode(ref_ty).lhs));
+            const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(vec_ty).lhs));
+            const st_lay = try emitter.resolver.resolveType(elem_struct);
+            const t_id = state.nextTmp();
+            try state.print(
+                "  %_svc_lp_{d} = getelementptr inbounds i8, ptr %_v_{d}, {s} {d}\n",
+                .{ t_id, args[0], ptr_int, ptr_bytes },
+            );
+            if (!type_system.isTrivialDropType(emitter.input.pool, emitter.input.sym_table, elem_struct)) {
+                const idx_slot = try state.allocEntryBytes(4, 4);
+                defer emitter.allocator.free(idx_slot);
+                try state.print(
+                    "  %_svc_dp_{d} = load ptr, ptr %_v_{d}, align {d}\n" ++
+                        "  %_svc_l32_{d} = load i32, ptr %_svc_lp_{d}, align 4\n" ++
+                        "  %_svc_cp_{d} = getelementptr inbounds i8, ptr %_v_{d}, {s} {d}\n" ++
+                        "  %_svc_c32_{d} = load i32, ptr %_svc_cp_{d}, align 4\n" ++
+                        "  %_svc_hn_{d} = icmp ne ptr %_svc_dp_{d}, null\n" ++
+                        "  %_svc_hl_{d} = icmp ugt i32 %_svc_l32_{d}, 0\n" ++
+                        "  %_svc_go_{d} = and i1 %_svc_hn_{d}, %_svc_hl_{d}\n" ++
+                        "  store i32 %_svc_l32_{d}, ptr {s}, align 4\n" ++
+                        "  br i1 %_svc_go_{d}, label %_svc_lp2_{d}, label %_svc_dn_{d}\n",
+                    .{
+                        t_id,    args[0],  ptr_bytes,
+                        t_id,    t_id,     t_id,
+                        args[0], ptr_int,  ptr_bytes + 4,
+                        t_id,    t_id,     t_id,
+                        t_id,    t_id,     t_id,
+                        t_id,    t_id,     t_id,
+                        t_id,    idx_slot, t_id,
+                        t_id,    t_id,
+                    },
+                );
+                try state.print(
+                    "_svc_lp2_{d}:\n" ++
+                        "  %_svc_cur_{d} = load i32, ptr {s}, align 4\n" ++
+                        "  %_svc_mr_{d} = icmp ugt i32 %_svc_cur_{d}, 0\n" ++
+                        "  br i1 %_svc_mr_{d}, label %_svc_bd_{d}, label %_svc_dn_{d}\n" ++
+                        "_svc_bd_{d}:\n" ++
+                        "  %_svc_nx_{d} = sub i32 %_svc_cur_{d}, 1\n" ++
+                        "  store i32 %_svc_nx_{d}, ptr {s}, align 4\n",
+                    .{
+                        t_id,
+                        t_id,
+                        idx_slot,
+                        t_id,
+                        t_id,
+                        t_id,
+                        t_id,
+                        t_id,
+                        t_id,
+                        t_id,
+                        t_id,
+                        t_id,
+                        idx_slot,
+                    },
+                );
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svc_bd_{d}", .{t_id}));
+                const cap_pt = if (ptr_bytes == 4)
+                    try std.fmt.allocPrint(emitter.allocator, "%_svc_c32_{d}", .{t_id})
+                else blk_cp: {
+                    try state.print("  %_svc_cz_{d} = zext i32 %_svc_c32_{d} to i64\n", .{ t_id, t_id });
+                    break :blk_cp try std.fmt.allocPrint(emitter.allocator, "%_svc_cz_{d}", .{t_id});
+                };
+                defer emitter.allocator.free(cap_pt);
+                const idx_pt = if (ptr_bytes == 4)
+                    try std.fmt.allocPrint(emitter.allocator, "%_svc_nx_{d}", .{t_id})
+                else blk_ip: {
+                    try state.print("  %_svc_iz_{d} = zext i32 %_svc_nx_{d} to i64\n", .{ t_id, t_id });
+                    break :blk_ip try std.fmt.allocPrint(emitter.allocator, "%_svc_iz_{d}", .{t_id});
+                };
+                defer emitter.allocator.free(idx_pt);
+                var rev_col: u32 = st_lay.aux_len;
+                while (rev_col > 0) {
+                    rev_col -= 1;
+                    const fld = emitter.resolver.fields_by_decl.items[st_lay.aux_start + rev_col];
+                    const fld_ty = try unwrapTransparentType(emitter, fld.field_ty);
+                    if (fld.size_bytes == 0 or !emitter.drop_type_set.contains(fld_ty.toU32())) continue;
+                    const d_col = try emitDynamicSoaColByteOffset(emitter, state, elem_struct, rev_col, cap_pt);
+                    defer emitter.allocator.free(d_col.off_ssa);
+                    const sub_t = state.nextTmp();
+                    try state.print(
+                        "  %_svc_eo_{d} = mul {s} {s}, {d}\n" ++
+                            "  %_svc_bo_{d} = add {s} {s}, %_svc_eo_{d}\n" ++
+                            "  %_svc_fp_{d} = getelementptr inbounds i8, ptr %_svc_dp_{d}, {s} %_svc_bo_{d}\n" ++
+                            "  call void @_cx_drop_ty_{d}(ptr %_svc_fp_{d})\n",
+                        .{
+                            sub_t,          ptr_int, idx_pt,        fld.size_bytes,
+                            sub_t,          ptr_int, d_col.off_ssa, sub_t,
+                            sub_t,          t_id,    ptr_int,       sub_t,
+                            fld_ty.toU32(), sub_t,
+                        },
+                    );
+                }
+                try state.print("  br label %_svc_lp2_{d}\n_svc_dn_{d}:\n", .{ t_id, t_id });
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svc_dn_{d}", .{t_id}));
+            }
+            try state.print(
+                "  store i32 0, ptr %_svc_lp_{d}, align 4\n  %_v_{d} = add i8 0, 0\n",
+                .{ t_id, dst_raw },
+            );
+        },
+        .soa_vec_reserve => {
+            if (args.len < 3) return;
+            const is_try = (extractConstU32Llvm(body, args[2]) orelse 0) != 0;
+            const ref_ty = try unwrapTransparentType(emitter, body.getInst(MirValueId.fromInt(args[0])).type_id);
+            const vec_ty = try unwrapTransparentType(emitter, TypeId.fromInt(emitter.input.pool.getNode(ref_ty).lhs));
+            const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(vec_ty).lhs));
+            const t_id = state.nextTmp();
+            const add_64 = if (ptr_bytes == 4) blk_a64: {
+                try state.print("  %_svr_a64_{d} = zext i32 %_v_{d} to i64\n", .{ t_id, args[1] });
+                break :blk_a64 try std.fmt.allocPrint(emitter.allocator, "%_svr_a64_{d}", .{t_id});
+            } else try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[1]});
+            defer emitter.allocator.free(add_64);
+            try state.print(
+                "  %_svr_lp_{d} = getelementptr inbounds i8, ptr %_v_{d}, {s} {d}\n" ++
+                    "  %_svr_l32_{d} = load i32, ptr %_svr_lp_{d}, align 4\n" ++
+                    "  %_svr_l64_{d} = zext i32 %_svr_l32_{d} to i64\n" ++
+                    "  %_svr_rem_{d} = sub i64 4294967295, %_svr_l64_{d}\n" ++
+                    "  %_svr_ov_{d} = icmp ugt i64 {s}, %_svr_rem_{d}\n" ++
+                    "  %_svr_sum_{d} = add i64 %_svr_l64_{d}, {s}\n" ++
+                    "  %_svr_nd_{d} = select i1 %_svr_ov_{d}, i64 4294967296, i64 %_svr_sum_{d}\n",
+                .{
+                    t_id, args[0], ptr_int, ptr_bytes, t_id, t_id,
+                    t_id, t_id,    t_id,    t_id,      t_id, add_64,
+                    t_id, t_id,    t_id,    add_64,    t_id, t_id,
+                    t_id,
+                },
+            );
+            const vp_s = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
+            defer emitter.allocator.free(vp_s);
+            const nd_s = try std.fmt.allocPrint(emitter.allocator, "%_svr_nd_{d}", .{t_id});
+            defer emitter.allocator.free(nd_s);
+            const ok_ssa = try emitSoaVecEnsureCapLlvm(emitter, state, vp_s, elem_struct, nd_s, is_try);
+            defer emitter.allocator.free(ok_ssa);
+            if (!is_try) {
+                try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+            } else {
+                const out_ty = try unwrapTransparentType(emitter, inst.type_id);
+                const out_lay = try emitter.resolver.resolveType(out_ty);
+                const res_slot = try state.allocEntryBytes(@max(out_lay.size_bytes, 1), out_lay.alignBytes());
+                defer emitter.allocator.free(res_slot);
+                try emitMemsetZero(emitter, state, res_slot, out_lay.size_bytes, out_lay.alignBytes());
+                try state.print(
+                    "  br i1 {s}, label %_svr_ro_{d}, label %_svr_re_{d}\n_svr_ro_{d}:\n",
+                    .{ ok_ssa, t_id, t_id, t_id },
+                );
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svr_ro_{d}", .{t_id}));
+                try emitWriteSumDiscriminantToPtr(emitter, state, out_ty, res_slot, out_lay.alignBytes(), 0);
+                try state.print("  br label %_svr_rj_{d}\n_svr_re_{d}:\n", .{ t_id, t_id });
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svr_re_{d}", .{t_id}));
+                try emitWriteSumDiscriminantToPtr(emitter, state, out_ty, res_slot, out_lay.alignBytes(), 1);
+                try state.print("  br label %_svr_rj_{d}\n_svr_rj_{d}:\n", .{ t_id, t_id });
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_svr_rj_{d}", .{t_id}));
+                const loaded = try emitLoadValueFromPtr(emitter, state, out_ty, res_slot, out_lay.alignBytes(), null, 0, 0, 0);
+                defer emitter.allocator.free(loaded);
+                const val_ty = try formatLlvmValueType(emitter, out_ty);
+                defer emitter.allocator.free(val_ty);
+                try state.print("  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n", .{ dst_raw, val_ty, loaded, val_ty, loaded });
+            }
+        },
+        .soa_vec_as_slice => {
+            if (args.len < 1) return;
+            const t_id = state.nextTmp();
+            const soa_sl_ty = try std.fmt.allocPrint(
+                emitter.allocator,
+                "{{ ptr, {s}, {s}, {s} }}",
+                .{ ptr_int, ptr_int, ptr_int },
+            );
+            defer emitter.allocator.free(soa_sl_ty);
+            try state.print(
+                "  %_svas_dp_{d} = load ptr, ptr %_v_{d}, align {d}\n" ++
+                    "  %_svas_lp_{d} = getelementptr inbounds i8, ptr %_v_{d}, {s} {d}\n" ++
+                    "  %_svas_l32_{d} = load i32, ptr %_svas_lp_{d}, align 4\n" ++
+                    "  %_svas_cp_{d} = getelementptr inbounds i8, ptr %_v_{d}, {s} {d}\n" ++
+                    "  %_svas_c32_{d} = load i32, ptr %_svas_cp_{d}, align 4\n",
+                .{
+                    t_id,          args[0], ptr_bytes,
+                    t_id,          args[0], ptr_int,
+                    ptr_bytes,     t_id,    t_id,
+                    t_id,          args[0], ptr_int,
+                    ptr_bytes + 4, t_id,    t_id,
+                },
+            );
+            const out_len = if (ptr_bytes == 4)
+                try std.fmt.allocPrint(emitter.allocator, "%_svas_l32_{d}", .{t_id})
+            else blk_ol: {
+                try state.print("  %_svas_ol_{d} = zext i32 %_svas_l32_{d} to i64\n", .{ t_id, t_id });
+                break :blk_ol try std.fmt.allocPrint(emitter.allocator, "%_svas_ol_{d}", .{t_id});
+            };
+            defer emitter.allocator.free(out_len);
+            const out_stride = if (ptr_bytes == 4)
+                try std.fmt.allocPrint(emitter.allocator, "%_svas_c32_{d}", .{t_id})
+            else blk_oc: {
+                try state.print("  %_svas_oc_{d} = zext i32 %_svas_c32_{d} to i64\n", .{ t_id, t_id });
+                break :blk_oc try std.fmt.allocPrint(emitter.allocator, "%_svas_oc_{d}", .{t_id});
+            };
+            defer emitter.allocator.free(out_stride);
+            try state.print(
+                "  %_svas_ez_{d} = icmp eq {s} {s}, 0\n" ++
+                    "  %_svas_en_{d} = icmp eq ptr %_svas_dp_{d}, null\n" ++
+                    "  %_svas_em_{d} = or i1 %_svas_ez_{d}, %_svas_en_{d}\n" ++
+                    "  %_svas_fp_{d} = select i1 %_svas_em_{d}, ptr inttoptr ({s} 16 to ptr), ptr %_svas_dp_{d}\n" ++
+                    "  %_svas_f0_{d} = insertvalue {s} zeroinitializer, ptr %_svas_fp_{d}, 0\n" ++
+                    "  %_svas_f1_{d} = insertvalue {s} %_svas_f0_{d}, {s} {s}, 1\n" ++
+                    "  %_svas_f2_{d} = insertvalue {s} %_svas_f1_{d}, {s} {s}, 2\n" ++
+                    "  %_svas_fv_{d} = insertvalue {s} %_svas_f2_{d}, {s} 0, 3\n",
+                .{
+                    t_id,       ptr_int,   out_len,   t_id,      t_id,      t_id,
+                    t_id,       t_id,      t_id,      t_id,      ptr_int,   t_id,
+                    t_id,       soa_sl_ty, t_id,      t_id,      soa_sl_ty, t_id,
+                    ptr_int,    out_len,   t_id,      soa_sl_ty, t_id,      ptr_int,
+                    out_stride, t_id,      soa_sl_ty, t_id,      ptr_int,
+                },
+            );
+            const dst_unwrapped = try unwrapTransparentType(emitter, inst.type_id);
+            const dst_tag = emitter.input.pool.getNode(dst_unwrapped).tag;
+            if ((dst_tag == .ref_ty or dst_tag == .mut_ref_ty) and
+                !emitter.input.pool.isSliceRefType(dst_unwrapped))
+            {
+                const fslot = try state.allocEntryBytes(4 * ptr_bytes, ptr_bytes);
+                defer emitter.allocator.free(fslot);
+                try state.print(
+                    "  store {s} %_svas_fv_{d}, ptr {s}, align {d}\n" ++
+                        "  %_v_{d} = select i1 true, ptr {s}, ptr {s}\n",
+                    .{ soa_sl_ty, t_id, fslot, ptr_bytes, dst_raw, fslot, fslot },
+                );
+            } else {
+                try state.print(
+                    "  %_v_{d} = select i1 true, {s} %_svas_fv_{d}, {s} %_svas_fv_{d}\n",
+                    .{ dst_raw, soa_sl_ty, t_id, soa_sl_ty, t_id },
+                );
+            }
+        },
+        .soa_vec_col_slice => {
+            if (args.len < 2) return;
+            const field_ord = extractConstU32Llvm(body, args[1]) orelse 0;
+            const ref_ty = try unwrapTransparentType(emitter, body.getInst(MirValueId.fromInt(args[0])).type_id);
+            const vec_ty = try unwrapTransparentType(emitter, TypeId.fromInt(emitter.input.pool.getNode(ref_ty).lhs));
+            const elem_struct = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(emitter.input.pool.getNode(vec_ty).lhs));
+            const fld = (try emitter.resolver.getFieldByDeclOrdinal(elem_struct, field_ord)) orelse return;
+            const fld_align: u32 = @as(u32, 1) << @intCast(fld.align_log2);
+            const t_id = state.nextTmp();
+            try state.print(
+                "  %_svcs_dp_{d} = load ptr, ptr %_v_{d}, align {d}\n" ++
+                    "  %_svcs_lp_{d} = getelementptr inbounds i8, ptr %_v_{d}, {s} {d}\n" ++
+                    "  %_svcs_l32_{d} = load i32, ptr %_svcs_lp_{d}, align 4\n" ++
+                    "  %_svcs_cp_{d} = getelementptr inbounds i8, ptr %_v_{d}, {s} {d}\n" ++
+                    "  %_svcs_c32_{d} = load i32, ptr %_svcs_cp_{d}, align 4\n",
+                .{
+                    t_id, args[0], ptr_bytes, t_id,    args[0], ptr_int,       ptr_bytes,
+                    t_id, t_id,    t_id,      args[0], ptr_int, ptr_bytes + 4, t_id,
+                    t_id,
+                },
+            );
+            if (ptr_bytes == 4) {
+                try state.print(
+                    "  %_svcs_ln_{d} = add i32 %_svcs_l32_{d}, 0\n  %_svcs_cpv_{d} = add i32 %_svcs_c32_{d}, 0\n",
+                    .{ t_id, t_id, t_id, t_id },
+                );
+            } else {
+                try state.print(
+                    "  %_svcs_ln_{d} = zext i32 %_svcs_l32_{d} to i64\n  %_svcs_cpv_{d} = zext i32 %_svcs_c32_{d} to i64\n",
+                    .{ t_id, t_id, t_id, t_id },
+                );
+            }
+            const cap_s = try std.fmt.allocPrint(emitter.allocator, "%_svcs_cpv_{d}", .{t_id});
+            defer emitter.allocator.free(cap_s);
+            const dyn_col = try emitDynamicSoaColByteOffset(emitter, state, elem_struct, field_ord, cap_s);
+            defer emitter.allocator.free(dyn_col.off_ssa);
+            try state.print(
+                "  %_svcs_p0_{d} = getelementptr inbounds i8, ptr %_svcs_dp_{d}, {s} {s}\n" ++
+                    "  %_svcs_ez_{d} = icmp eq {s} %_svcs_ln_{d}, 0\n" ++
+                    "  %_svcs_en_{d} = icmp eq ptr %_svcs_dp_{d}, null\n" ++
+                    "  %_svcs_em_{d} = or i1 %_svcs_ez_{d}, %_svcs_en_{d}\n" ++
+                    "  %_svcs_fp_{d} = select i1 %_svcs_em_{d}, ptr inttoptr ({s} {d} to ptr), ptr %_svcs_p0_{d}\n" ++
+                    "  %_svcs_f0_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr %_svcs_fp_{d}, 0\n" ++
+                    "  %_svcs_fv_{d} = insertvalue {{ ptr, {s} }} %_svcs_f0_{d}, {s} %_svcs_ln_{d}, 1\n",
+                .{
+                    t_id,    t_id, ptr_int, dyn_col.off_ssa,    t_id, ptr_int,
+                    t_id,    t_id, t_id,    t_id,               t_id, t_id,
+                    t_id,    t_id, ptr_int, @max(fld_align, 1), t_id, t_id,
+                    ptr_int, t_id, t_id,    ptr_int,            t_id, ptr_int,
+                    t_id,
+                },
+            );
+            const dst_unwrapped = try unwrapTransparentType(emitter, inst.type_id);
+            const dst_tag = emitter.input.pool.getNode(dst_unwrapped).tag;
+            if ((dst_tag == .ref_ty or dst_tag == .mut_ref_ty) and
+                !emitter.input.pool.isSliceRefType(dst_unwrapped))
+            {
+                const fslot = try state.allocEntryBytes(2 * ptr_bytes, ptr_bytes);
+                defer emitter.allocator.free(fslot);
+                try state.print(
+                    "  store {{ ptr, {s} }} %_svcs_fv_{d}, ptr {s}, align {d}\n" ++
+                        "  %_v_{d} = select i1 true, ptr {s}, ptr {s}\n",
+                    .{ ptr_int, t_id, fslot, ptr_bytes, dst_raw, fslot, fslot },
+                );
+            } else {
+                try state.print(
+                    "  %_v_{d} = select i1 true, {{ ptr, {s} }} %_svcs_fv_{d}, {{ ptr, {s} }} %_svcs_fv_{d}\n",
+                    .{ dst_raw, ptr_int, t_id, ptr_int, t_id },
+                );
+            }
+        },
+        .ctx_next_rng_seed => {
+            const t_id = state.nextTmp();
+            const slot_ptr = if (ptr_bytes >= 8) blk_sp: {
+                try state.print(
+                    "  %_rng_sp_{d} = getelementptr inbounds i8, ptr @_cx_default_ctx, {s} {d}\n",
+                    .{ t_id, ptr_int, 2 * ptr_bytes },
+                );
+                break :blk_sp try std.fmt.allocPrint(emitter.allocator, "%_rng_sp_{d}", .{t_id});
+            } else try emitter.allocator.dupe(u8, "@_cx_ctx_wide_2");
+            defer emitter.allocator.free(slot_ptr);
+            const seed_zero_fallback: i64 = @bitCast(@as(u64, 0x9E37_79B9_7F4A_7C15));
+            const seed_increment: i64 = @bitCast(@as(u64, 0x2D35_8DCC_AA6C_78A5));
+            const mix_mul_1: i64 = @bitCast(@as(u64, 0xBF58_476D_1CE4_E5B9));
+            const mix_mul_2: i64 = @bitCast(@as(u64, 0x94D0_49BB_1331_11EB));
+            try state.print(
+                "  %_rng_s0_{d} = load i64, ptr {s}, align 8\n" ++
+                    "  %_rng_z_{d} = icmp eq i64 %_rng_s0_{d}, 0\n" ++
+                    "  %_rng_b_{d} = select i1 %_rng_z_{d}, i64 {d}, i64 %_rng_s0_{d}\n" ++
+                    "  %_rng_nx_{d} = add i64 %_rng_b_{d}, {d}\n" ++
+                    "  store i64 %_rng_nx_{d}, ptr {s}, align 8\n",
+                .{
+                    t_id,               slot_ptr, t_id, t_id, t_id,           t_id,
+                    seed_zero_fallback, t_id,     t_id, t_id, seed_increment, t_id,
+                    slot_ptr,
+                },
+            );
+            try state.print(
+                "  %_rng_sr1_{d} = lshr i64 %_rng_nx_{d}, 30\n" ++
+                    "  %_rng_x1_{d} = xor i64 %_rng_nx_{d}, %_rng_sr1_{d}\n" ++
+                    "  %_rng_m1_{d} = mul i64 %_rng_x1_{d}, {d}\n" ++
+                    "  %_rng_sr2_{d} = lshr i64 %_rng_m1_{d}, 27\n" ++
+                    "  %_rng_x2_{d} = xor i64 %_rng_m1_{d}, %_rng_sr2_{d}\n" ++
+                    "  %_rng_m2_{d} = mul i64 %_rng_x2_{d}, {d}\n" ++
+                    "  %_rng_sr3_{d} = lshr i64 %_rng_m2_{d}, 31\n" ++
+                    "  %_v_{d} = xor i64 %_rng_m2_{d}, %_rng_sr3_{d}\n",
+                .{
+                    t_id,    t_id,      t_id, t_id,      t_id, t_id,
+                    t_id,    mix_mul_1, t_id, t_id,      t_id, t_id,
+                    t_id,    t_id,      t_id, mix_mul_2, t_id, t_id,
+                    dst_raw, t_id,      t_id,
+                },
+            );
+        },
+        .tls_scratch_ptr => {
+            try state.print("  %_v_{d} = select i1 true, ptr @_cx_tls_scratch_buf, ptr @_cx_tls_scratch_buf\n", .{dst_raw});
+        },
+        .tls_alloc_state => {
+            try state.print("  %_v_{d} = select i1 true, ptr @_cx_tls_alloc_buf, ptr @_cx_tls_alloc_buf\n", .{dst_raw});
+        },
+        .fmt_write => try emitFmtWriteOpLlvm(emitter, state, body, dst_raw, inst, args),
+        .memcpy, .memmove => {
+            if (args.len >= 3) {
+                const intr_n = if (kind == .memcpy) "memcpy" else "memmove";
+                if (kind == .memcpy) {
+                    try emitter.requireIntrinsicDecl(
+                        "declare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, " ++
+                            "ptr noalias nocapture readonly, i64, i1 immarg)",
+                    );
+                } else {
+                    try emitter.requireIntrinsicDecl(
+                        "declare void @llvm.memmove.p0.p0.i64(ptr nocapture writeonly, ptr nocapture readonly, i64, i1 immarg)",
+                    );
+                }
+                const t_id = state.nextTmp();
+                const len_64 = if (ptr_bytes == 4) blk_l64: {
+                    try state.print("  %_mm_l64_{d} = zext i32 %_v_{d} to i64\n", .{ t_id, args[2] });
+                    break :blk_l64 try std.fmt.allocPrint(emitter.allocator, "%_mm_l64_{d}", .{t_id});
+                } else try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[2]});
+                defer emitter.allocator.free(len_64);
+                try state.print(
+                    "  %_mm_nz_{d} = icmp ne i64 {s}, 0\n" ++
+                        "  br i1 %_mm_nz_{d}, label %_mm_do_{d}, label %_mm_dn_{d}\n" ++
+                        "_mm_do_{d}:\n" ++
+                        "  call void @llvm.{s}.p0.p0.i64(ptr align 1 %_v_{d}, ptr align 1 %_v_{d}, i64 {s}, i1 false)\n" ++
+                        "  br label %_mm_dn_{d}\n" ++
+                        "_mm_dn_{d}:\n",
+                    .{ t_id, len_64, t_id, t_id, t_id, t_id, intr_n, args[0], args[1], len_64, t_id, t_id },
+                );
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_mm_dn_{d}", .{t_id}));
+            }
+            try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+        },
+        .memset => {
+            if (args.len >= 3) {
+                try emitter.requireIntrinsicDecl(
+                    "declare void @llvm.memset.p0.i64(ptr nocapture writeonly, i8, i64, i1 immarg)",
+                );
+                const t_id = state.nextTmp();
+                const len_64 = if (ptr_bytes == 4) blk_l64: {
+                    try state.print("  %_ms_l64_{d} = zext i32 %_v_{d} to i64\n", .{ t_id, args[2] });
+                    break :blk_l64 try std.fmt.allocPrint(emitter.allocator, "%_ms_l64_{d}", .{t_id});
+                } else try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[2]});
+                defer emitter.allocator.free(len_64);
+                try state.print(
+                    "  %_ms_nz_{d} = icmp ne i64 {s}, 0\n" ++
+                        "  br i1 %_ms_nz_{d}, label %_ms_do_{d}, label %_ms_dn_{d}\n" ++
+                        "_ms_do_{d}:\n" ++
+                        "  call void @llvm.memset.p0.i64(ptr align 1 %_v_{d}, i8 %_v_{d}, i64 {s}, i1 false)\n" ++
+                        "  br label %_ms_dn_{d}\n" ++
+                        "_ms_dn_{d}:\n",
+                    .{ t_id, len_64, t_id, t_id, t_id, t_id, args[0], args[1], len_64, t_id, t_id },
+                );
+                state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_ms_dn_{d}", .{t_id}));
+            }
+            try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+        },
+        .ptr_copy, .ptr_copy_nonoverlapping => {
+            if (args.len >= 3) {
+                const ptr_ty = try unwrapTransparentType(emitter, body.getInst(MirValueId.fromInt(args[0])).type_id);
+                const elem_ty = try unwrapTransparentType(emitter, TypeId.fromInt(emitter.input.pool.getNode(ptr_ty).lhs));
+                const elem_lay = try emitter.resolver.resolveType(elem_ty);
+                if (elem_lay.size_bytes > 0) {
+                    const intr_n = if (kind == .ptr_copy_nonoverlapping) "memcpy" else "memmove";
+                    if (kind == .ptr_copy_nonoverlapping) {
+                        try emitter.requireIntrinsicDecl(
+                            "declare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, " ++
+                                "ptr noalias nocapture readonly, i64, i1 immarg)",
+                        );
+                    } else {
+                        try emitter.requireIntrinsicDecl(
+                            "declare void @llvm.memmove.p0.p0.i64(ptr nocapture writeonly, ptr nocapture readonly, i64, i1 immarg)",
+                        );
+                    }
+                    const t_id = state.nextTmp();
+                    const cnt_64 = if (ptr_bytes == 4) blk_c64: {
+                        try state.print("  %_pc_c64_{d} = zext i32 %_v_{d} to i64\n", .{ t_id, args[2] });
+                        break :blk_c64 try std.fmt.allocPrint(emitter.allocator, "%_pc_c64_{d}", .{t_id});
+                    } else try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[2]});
+                    defer emitter.allocator.free(cnt_64);
+                    try state.print(
+                        "  %_pc_b_{d} = mul i64 {s}, {d}\n" ++
+                            "  %_pc_nz_{d} = icmp ne i64 %_pc_b_{d}, 0\n" ++
+                            "  br i1 %_pc_nz_{d}, label %_pc_do_{d}, label %_pc_dn_{d}\n" ++
+                            "_pc_do_{d}:\n" ++
+                            "  call void @llvm.{s}.p0.p0.i64(ptr align 1 %_v_{d}, ptr align 1 %_v_{d}, i64 %_pc_b_{d}, i1 false)\n" ++
+                            "  br label %_pc_dn_{d}\n" ++
+                            "_pc_dn_{d}:\n",
+                        .{ t_id, cnt_64, elem_lay.size_bytes, t_id, t_id, t_id, t_id, t_id, t_id, intr_n, args[1], args[0], t_id, t_id, t_id },
+                    );
+                    state.setLabelOwned(try std.fmt.allocPrint(emitter.allocator, "_pc_dn_{d}", .{t_id}));
+                }
+            }
+            try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+        },
+        .ptr_read => {
+            if (args.len < 1 or (try isZeroSizedType(emitter, inst.type_id))) {
+                try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+                return;
+            }
+            const src_s = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
+            defer emitter.allocator.free(src_s);
+            const loaded = try emitLoadValueFromPtr(emitter, state, inst.type_id, src_s, 1, null, 0, 0, 0);
+            defer emitter.allocator.free(loaded);
+            const val_ty = try formatLlvmValueType(emitter, inst.type_id);
+            defer emitter.allocator.free(val_ty);
+            try state.print("  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n", .{ dst_raw, val_ty, loaded, val_ty, loaded });
+        },
+        .ptr_write => {
+            if (args.len >= 2) {
+                const val_ty = body.getInst(MirValueId.fromInt(args[1])).type_id;
+                if (!(try isZeroSizedType(emitter, val_ty))) {
+                    const dst_s = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
+                    defer emitter.allocator.free(dst_s);
+                    const val_s = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[1]});
+                    defer emitter.allocator.free(val_s);
+                    try emitStoreValueToPtr(emitter, state, val_ty, val_s, dst_s, 1, 0, 0, 0);
+                }
+            }
+            try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+        },
+        .ptr_drop_in_place => {
+            if (args.len >= 1) {
+                const ptr_ty = try unwrapTransparentType(emitter, body.getInst(MirValueId.fromInt(args[0])).type_id);
+                const elem_ty = try unwrapTransparentType(emitter, TypeId.fromInt(emitter.input.pool.getNode(ptr_ty).lhs));
+                if (emitter.drop_type_set.contains(elem_ty.toU32()) and !(try isZeroSizedType(emitter, elem_ty))) {
+                    try state.print("  call void @_cx_drop_ty_{d}(ptr %_v_{d})\n", .{ elem_ty.toU32(), args[0] });
+                }
+            }
+            try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+        },
+        .forget => {
+            try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+        },
+        .slice_from_raw_parts => {
+            if (args.len < 2) return;
+            const dst_ty = try unwrapTransparentType(emitter, inst.type_id);
+            const dst_tag = emitter.input.pool.getNode(dst_ty).tag;
+            const sl_ty = if (emitter.input.pool.getSliceRefInner(dst_ty)) |slice_inner|
+                try unwrapTransparentType(emitter, slice_inner)
+            else if (dst_tag == .ref_ty or dst_tag == .mut_ref_ty)
+                try unwrapTransparentType(emitter, TypeId.fromInt(emitter.input.pool.getNode(dst_ty).lhs))
+            else
+                dst_ty;
+            const elem_align: u32 = if (!sl_ty.isPrimitiveOrSentinel() and
+                emitter.input.pool.getNode(sl_ty).tag == .slice_ty)
+            blk_ea: {
+                const elem_ty = try unwrapTransparentType(emitter, TypeId.fromInt(emitter.input.pool.getNode(sl_ty).lhs));
+                break :blk_ea @max((try emitter.resolver.resolveType(elem_ty)).alignBytes(), 1);
+            } else 1;
+            const t_id = state.nextTmp();
+            try state.print(
+                "  %_sfrp_n_{d} = icmp eq ptr %_v_{d}, null\n" ++
+                    "  %_sfrp_p_{d} = select i1 %_sfrp_n_{d}, ptr inttoptr ({s} {d} to ptr), ptr %_v_{d}\n" ++
+                    "  %_sfrp_0_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr %_sfrp_p_{d}, 0\n" ++
+                    "  %_sfrp_v_{d} = insertvalue {{ ptr, {s} }} %_sfrp_0_{d}, {s} %_v_{d}, 1\n",
+                .{
+                    t_id,       args[0], t_id, t_id,    ptr_int,
+                    elem_align, args[0], t_id, ptr_int, t_id,
+                    t_id,       ptr_int, t_id, ptr_int, args[1],
+                },
+            );
+            if ((dst_tag == .ref_ty or dst_tag == .mut_ref_ty) and
+                !emitter.input.pool.isSliceRefType(dst_ty))
+            {
+                const fslot = try state.allocEntryBytes(2 * ptr_bytes, ptr_bytes);
+                defer emitter.allocator.free(fslot);
+                try state.print(
+                    "  store {{ ptr, {s} }} %_sfrp_v_{d}, ptr {s}, align {d}\n" ++
+                        "  %_v_{d} = select i1 true, ptr {s}, ptr {s}\n",
+                    .{ ptr_int, t_id, fslot, ptr_bytes, dst_raw, fslot, fslot },
+                );
+            } else {
+                try state.print(
+                    "  %_v_{d} = select i1 true, {{ ptr, {s} }} %_sfrp_v_{d}, {{ ptr, {s} }} %_sfrp_v_{d}\n",
+                    .{ dst_raw, ptr_int, t_id, ptr_int, t_id },
+                );
+            }
+        },
+        .str_from_utf8_unchecked => {
+            if (args.len < 1) return;
+            const src_ty = try unwrapTransparentType(emitter, body.getInst(MirValueId.fromInt(args[0])).type_id);
+            if (src_ty == .str_ty or
+                emitter.input.pool.getNode(src_ty).tag == .slice_ty or
+                emitter.input.pool.isSliceRefType(src_ty))
+            {
+                try state.print(
+                    "  %_v_{d} = select i1 true, {{ ptr, {s} }} %_v_{d}, {{ ptr, {s} }} %_v_{d}\n",
+                    .{ dst_raw, ptr_int, args[0], ptr_int, args[0] },
+                );
+            } else {
+                try state.print(
+                    "  %_v_{d} = load {{ ptr, {s} }}, ptr %_v_{d}, align {d}\n",
+                    .{ dst_raw, ptr_int, args[0], ptr_bytes },
+                );
+            }
+        },
+        .from_le_bytes, .from_be_bytes => {
+            if (args.len < 1) return;
+            const dst_ty = try unwrapTransparentType(emitter, inst.type_id);
+            const lay = try emitter.resolver.resolveType(dst_ty);
+            const n: usize = @intCast(@min(lay.size_bytes, 16));
+            const arr_ty = body.getInst(MirValueId.fromInt(args[0])).type_id;
+            const slot = try state.allocEntryBytes(16, @max(lay.alignBytes(), 8));
+            defer emitter.allocator.free(slot);
+            try emitMemsetZero(emitter, state, slot, 16, @max(lay.alignBytes(), 8));
+            if (kind == .from_le_bytes) {
+                const arr_s = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
+                defer emitter.allocator.free(arr_s);
+                try emitStoreValueToPtr(emitter, state, arr_ty, arr_s, slot, @max(lay.alignBytes(), 8), 0, 0, 0);
+            } else {
+                const src_slot = try state.allocEntryBytes(16, 8);
+                defer emitter.allocator.free(src_slot);
+                try emitMemsetZero(emitter, state, src_slot, 16, 8);
+                const arr_s = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
+                defer emitter.allocator.free(arr_s);
+                try emitStoreValueToPtr(emitter, state, arr_ty, arr_s, src_slot, 8, 0, 0, 0);
+                for (0..n) |bi| {
+                    const t_id = state.nextTmp();
+                    try state.print(
+                        "  %_fbe_sp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                            "  %_fbe_b_{d} = load i8, ptr %_fbe_sp_{d}, align 1\n" ++
+                            "  %_fbe_dp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                            "  store i8 %_fbe_b_{d}, ptr %_fbe_dp_{d}, align 1\n",
+                        .{ t_id, src_slot, ptr_int, n - 1 - bi, t_id, t_id, t_id, slot, ptr_int, bi, t_id, t_id },
+                    );
+                }
+            }
+            const loaded = try emitLoadValueFromPtr(emitter, state, dst_ty, slot, @max(lay.alignBytes(), 8), null, 0, 0, 0);
+            defer emitter.allocator.free(loaded);
+            const val_ty = try formatLlvmValueType(emitter, dst_ty);
+            defer emitter.allocator.free(val_ty);
+            try state.print("  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n", .{ dst_raw, val_ty, loaded, val_ty, loaded });
+        },
+        .to_le_bytes, .to_be_bytes => {
+            if (args.len < 1) return;
+            const src_ty = body.getInst(MirValueId.fromInt(args[0])).type_id;
+            const dst_ty = try unwrapTransparentType(emitter, inst.type_id);
+            const lay = try emitter.resolver.resolveType(src_ty);
+            const n: usize = @intCast(@min(lay.size_bytes, 16));
+            const src_slot = try state.allocEntryBytes(16, @max(lay.alignBytes(), 8));
+            defer emitter.allocator.free(src_slot);
+            try emitMemsetZero(emitter, state, src_slot, 16, @max(lay.alignBytes(), 8));
+            const src_s = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
+            defer emitter.allocator.free(src_s);
+            try emitStoreValueToPtr(emitter, state, src_ty, src_s, src_slot, @max(lay.alignBytes(), 8), 0, 0, 0);
+            const out_ptr = if (kind == .to_le_bytes)
+                try emitter.allocator.dupe(u8, src_slot)
+            else blk_rev: {
+                const dst_slot = try state.allocEntryBytes(16, 8);
+                try emitMemsetZero(emitter, state, dst_slot, 16, 8);
+                for (0..n) |bi| {
+                    const t_id = state.nextTmp();
+                    try state.print(
+                        "  %_tbe_sp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                            "  %_tbe_b_{d} = load i8, ptr %_tbe_sp_{d}, align 1\n" ++
+                            "  %_tbe_dp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                            "  store i8 %_tbe_b_{d}, ptr %_tbe_dp_{d}, align 1\n",
+                        .{ t_id, src_slot, ptr_int, n - 1 - bi, t_id, t_id, t_id, dst_slot, ptr_int, bi, t_id, t_id },
+                    );
+                }
+                break :blk_rev dst_slot;
+            };
+            defer emitter.allocator.free(out_ptr);
+            const loaded = try emitLoadValueFromPtr(emitter, state, dst_ty, out_ptr, 1, null, 0, 0, 0);
+            defer emitter.allocator.free(loaded);
+            const val_ty = try formatLlvmValueType(emitter, dst_ty);
+            defer emitter.allocator.free(val_ty);
+            try state.print("  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n", .{ dst_raw, val_ty, loaded, val_ty, loaded });
+        },
+        .sqrt => {
+            if (args.len < 1) return;
+            const dst_ty = try unwrapTransparentType(emitter, inst.type_id);
+            const t_id = state.nextTmp();
+            if (dst_ty == .f32_ty) {
+                try emitter.requireIntrinsicDecl("declare float @llvm.sqrt.f32(float)");
+                try state.print(
+                    "  %_sq_neg_{d} = fcmp olt float %_v_{d}, 0.0\n" ++
+                        "  %_sq_raw_{d} = call float @llvm.sqrt.f32(float %_v_{d})\n" ++
+                        "  %_sq_nan_{d} = bitcast i32 2143289344 to float\n" ++
+                        "  %_v_{d} = select i1 %_sq_neg_{d}, float %_sq_nan_{d}, float %_sq_raw_{d}\n",
+                    .{ t_id, args[0], t_id, args[0], t_id, dst_raw, t_id, t_id, t_id },
+                );
+            } else {
+                try emitter.requireIntrinsicDecl("declare double @llvm.sqrt.f64(double)");
+                try state.print(
+                    "  %_sq_neg_{d} = fcmp olt double %_v_{d}, 0.0\n" ++
+                        "  %_sq_raw_{d} = call double @llvm.sqrt.f64(double %_v_{d})\n" ++
+                        "  %_sq_nan_{d} = bitcast i64 9221120237041090560 to double\n" ++
+                        "  %_v_{d} = select i1 %_sq_neg_{d}, double %_sq_nan_{d}, double %_sq_raw_{d}\n",
+                    .{ t_id, args[0], t_id, args[0], t_id, dst_raw, t_id, t_id, t_id },
+                );
+            }
+        },
+        .sys_mmap => {
+            if (args.len < 1) {
+                try state.print("  %_v_{d} = select i1 true, ptr null, ptr null\n", .{dst_raw});
+                return;
+            }
+            try state.print("  %_v_{d} = call ptr @_cx_sys_mmap({s} %_v_{d})\n", .{ dst_raw, ptr_int, args[0] });
+        },
+        .sys_munmap => {
+            if (args.len >= 2) {
+                try state.print("  call void @_cx_sys_munmap(ptr %_v_{d}, {s} %_v_{d})\n", .{ args[0], ptr_int, args[1] });
+            }
+            try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+        },
+        .wasm_memory_grow => {
+            if (args.len >= 2 and emitter.cfg.target.isWasm()) {
+                try emitter.requireIntrinsicDecl("declare i32 @llvm.wasm.memory.grow.i32(i32, i32) nounwind");
+                try state.print(
+                    "  %_v_{d} = call i32 @llvm.wasm.memory.grow.i32(i32 0, i32 %_v_{d})\n",
+                    .{ dst_raw, args[1] },
+                );
+            } else {
+                try state.print("  %_v_{d} = add {s} 0, -1\n", .{ dst_raw, ptr_int });
+            }
+        },
+        .simd_load_unaligned => {
+            if (args.len < 1) return;
+            const dst_ty = try unwrapTransparentType(emitter, inst.type_id);
+            const src_s = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
+            defer emitter.allocator.free(src_s);
+            const loaded = try emitLoadValueFromPtr(emitter, state, dst_ty, src_s, 1, null, 0, 0, 0);
+            defer emitter.allocator.free(loaded);
+            const val_ty = try formatLlvmValueType(emitter, dst_ty);
+            defer emitter.allocator.free(val_ty);
+            try state.print("  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n", .{ dst_raw, val_ty, loaded, val_ty, loaded });
+        },
+        .simd_and, .simd_or, .simd_xor, .simd_eq, .simd_gt_s8, .simd_lt_s8, .simd_swizzle, .simd_shl_u8, .simd_shr_u8 => {
+            if (args.len < 2) return;
+            const dst_ty = try unwrapTransparentType(emitter, inst.type_id);
+            const lay = try emitter.resolver.resolveType(dst_ty);
+            const n: usize = @intCast(@min(lay.size_bytes, 64));
+            const s_a = try state.allocEntryBytes(64, 16);
+            defer emitter.allocator.free(s_a);
+            const s_b = try state.allocEntryBytes(64, 16);
+            defer emitter.allocator.free(s_b);
+            const s_o = try state.allocEntryBytes(64, 16);
+            defer emitter.allocator.free(s_o);
+            try emitMemsetZero(emitter, state, s_a, 64, 16);
+            try emitMemsetZero(emitter, state, s_b, 64, 16);
+            try emitMemsetZero(emitter, state, s_o, 64, 16);
+            const a0_s = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
+            defer emitter.allocator.free(a0_s);
+            try emitStoreValueToPtr(emitter, state, body.getInst(MirValueId.fromInt(args[0])).type_id, a0_s, s_a, 16, 0, 0, 0);
+
+            if (kind == .simd_shl_u8 or kind == .simd_shr_u8) {
+                const sh_info = resolveIntegerInfo(emitter, body.getInst(MirValueId.fromInt(args[1])).type_id).?;
+                const t_sh = state.nextTmp();
+                if (sh_info.bits == 32) {
+                    try state.print("  %_ssh_32_{d} = add i32 %_v_{d}, 0\n", .{ t_sh, args[1] });
+                } else if (sh_info.bits < 32) {
+                    try state.print("  %_ssh_32_{d} = zext i{d} %_v_{d} to i32\n", .{ t_sh, sh_info.bits, args[1] });
+                } else {
+                    try state.print("  %_ssh_32_{d} = trunc i{d} %_v_{d} to i32\n", .{ t_sh, sh_info.bits, args[1] });
+                }
+                try state.print(
+                    "  %_ssh_ge8_{d} = icmp uge i32 %_ssh_32_{d}, 8\n" ++
+                        "  %_ssh_cl_{d} = select i1 %_ssh_ge8_{d}, i32 0, i32 %_ssh_32_{d}\n" ++
+                        "  %_ssh_8_{d} = trunc i32 %_ssh_cl_{d} to i8\n",
+                    .{ t_sh, t_sh, t_sh, t_sh, t_sh, t_sh, t_sh },
+                );
+                const sh_op = if (kind == .simd_shl_u8) "shl" else "lshr";
+                for (0..n) |bi| {
+                    const t_i = state.nextTmp();
+                    try state.print(
+                        "  %_sl_ap_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                            "  %_sl_av_{d} = load i8, ptr %_sl_ap_{d}, align 1\n" ++
+                            "  %_sl_sh_{d} = {s} i8 %_sl_av_{d}, %_ssh_8_{d}\n" ++
+                            "  %_sl_ov_{d} = select i1 %_ssh_ge8_{d}, i8 0, i8 %_sl_sh_{d}\n" ++
+                            "  %_sl_op_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                            "  store i8 %_sl_ov_{d}, ptr %_sl_op_{d}, align 1\n",
+                        .{ t_i, s_a, ptr_int, bi, t_i, t_i, t_i, sh_op, t_i, t_sh, t_i, t_sh, t_i, t_i, s_o, ptr_int, bi, t_i, t_i },
+                    );
+                }
+            } else {
+                const a1_s = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[1]});
+                defer emitter.allocator.free(a1_s);
+                try emitStoreValueToPtr(emitter, state, body.getInst(MirValueId.fromInt(args[1])).type_id, a1_s, s_b, 16, 0, 0, 0);
+                if (kind == .simd_swizzle) {
+                    for (0..16) |bi| {
+                        const t_i = state.nextTmp();
+                        try state.print(
+                            "  %_sw_xp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                                "  %_sw_xv_{d} = load i8, ptr %_sw_xp_{d}, align 1\n" ++
+                                "  %_sw_ok_{d} = icmp ult i8 %_sw_xv_{d}, 16\n" ++
+                                "  %_sw_cl_{d} = and i8 %_sw_xv_{d}, 15\n" ++
+                                "  %_sw_ix_{d} = zext i8 %_sw_cl_{d} to {s}\n" ++
+                                "  %_sw_tp_{d} = getelementptr inbounds i8, ptr {s}, {s} %_sw_ix_{d}\n" ++
+                                "  %_sw_tv_{d} = load i8, ptr %_sw_tp_{d}, align 1\n" ++
+                                "  %_sw_ov_{d} = select i1 %_sw_ok_{d}, i8 %_sw_tv_{d}, i8 0\n" ++
+                                "  %_sw_op_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                                "  store i8 %_sw_ov_{d}, ptr %_sw_op_{d}, align 1\n",
+                            .{
+                                t_i,     s_b, ptr_int, bi,  t_i,     t_i, t_i, t_i,
+                                t_i,     t_i, t_i,     t_i, ptr_int, t_i, s_a, ptr_int,
+                                t_i,     t_i, t_i,     t_i, t_i,     t_i, t_i, s_o,
+                                ptr_int, bi,  t_i,     t_i,
+                            },
+                        );
+                    }
+                } else {
+                    for (0..n) |bi| {
+                        const t_i = state.nextTmp();
+                        try state.print(
+                            "  %_sb_ap_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                                "  %_sb_av_{d} = load i8, ptr %_sb_ap_{d}, align 1\n" ++
+                                "  %_sb_bp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                                "  %_sb_bv_{d} = load i8, ptr %_sb_bp_{d}, align 1\n",
+                            .{ t_i, s_a, ptr_int, bi, t_i, t_i, t_i, s_b, ptr_int, bi, t_i, t_i },
+                        );
+                        if (kind == .simd_and or kind == .simd_or or kind == .simd_xor) {
+                            const bop = switch (kind) {
+                                .simd_and => "and",
+                                .simd_or => "or",
+                                else => "xor",
+                            };
+                            try state.print("  %_sb_ov_{d} = {s} i8 %_sb_av_{d}, %_sb_bv_{d}\n", .{ t_i, bop, t_i, t_i });
+                        } else {
+                            const cop = switch (kind) {
+                                .simd_eq => "eq",
+                                .simd_gt_s8 => "sgt",
+                                else => "slt",
+                            };
+                            try state.print(
+                                "  %_sb_cm_{d} = icmp {s} i8 %_sb_av_{d}, %_sb_bv_{d}\n" ++
+                                    "  %_sb_ov_{d} = sext i1 %_sb_cm_{d} to i8\n",
+                                .{ t_i, cop, t_i, t_i, t_i, t_i },
+                            );
+                        }
+                        try state.print(
+                            "  %_sb_op_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                                "  store i8 %_sb_ov_{d}, ptr %_sb_op_{d}, align 1\n",
+                            .{ t_i, s_o, ptr_int, bi, t_i, t_i },
+                        );
+                    }
+                }
+            }
+            const loaded = try emitLoadValueFromPtr(emitter, state, dst_ty, s_o, 16, null, 0, 0, 0);
+            defer emitter.allocator.free(loaded);
+            const val_ty = try formatLlvmValueType(emitter, dst_ty);
+            defer emitter.allocator.free(val_ty);
+            try state.print("  %_v_{d} = select i1 true, {s} {s}, {s} {s}\n", .{ dst_raw, val_ty, loaded, val_ty, loaded });
+        },
+        .simd_bitmask => {
+            if (args.len < 1) {
+                try state.print("  %_v_{d} = add i32 0, 0\n", .{dst_raw});
+                return;
+            }
+            const vec_ty = body.getInst(MirValueId.fromInt(args[0])).type_id;
+            const lay = try emitter.resolver.resolveType(vec_ty);
+            const n: usize = @intCast(@min(lay.size_bytes, 32));
+            const s_v = try state.allocEntryBytes(32, 16);
+            defer emitter.allocator.free(s_v);
+            try emitMemsetZero(emitter, state, s_v, 32, 16);
+            const v_s = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
+            defer emitter.allocator.free(v_s);
+            try emitStoreValueToPtr(emitter, state, vec_ty, v_s, s_v, 16, 0, 0, 0);
+            var acc_ssa = try emitter.allocator.dupe(u8, "0");
+            defer emitter.allocator.free(acc_ssa);
+            for (0..n) |bi| {
+                const t_i = state.nextTmp();
+                try state.print(
+                    "  %_bm_p_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                        "  %_bm_b_{d} = load i8, ptr %_bm_p_{d}, align 1\n" ++
+                        "  %_bm_neg_{d} = icmp slt i8 %_bm_b_{d}, 0\n" ++
+                        "  %_bm_bit_{d} = select i1 %_bm_neg_{d}, i32 {d}, i32 0\n" ++
+                        "  %_bm_nx_{d} = or i32 {s}, %_bm_bit_{d}\n",
+                    .{ t_i, s_v, ptr_int, bi, t_i, t_i, t_i, t_i, t_i, t_i, @as(u32, 1) << @intCast(bi), t_i, acc_ssa, t_i },
+                );
+                emitter.allocator.free(acc_ssa);
+                acc_ssa = try std.fmt.allocPrint(emitter.allocator, "%_bm_nx_{d}", .{t_i});
+            }
+            const dst_info = resolveIntegerInfo(emitter, inst.type_id) orelse IntScalarInfo{ .bits = 32, .is_signed = false };
+            if (dst_info.bits == 32) {
+                try state.print("  %_v_{d} = add i32 {s}, 0\n", .{ dst_raw, acc_ssa });
+            } else if (dst_info.bits < 32) {
+                try state.print("  %_v_{d} = trunc i32 {s} to i{d}\n", .{ dst_raw, acc_ssa, dst_info.bits });
+            } else {
+                try state.print("  %_v_{d} = zext i32 {s} to i{d}\n", .{ dst_raw, acc_ssa, dst_info.bits });
+            }
+        },
+        else => {
+            try state.print("  %_v_{d} = add i8 0, 0\n", .{dst_raw});
+        },
+    }
 }
 
 /// Extracts a compile-time `u32` constant from SSA `val_raw` in `body` (`null` if non-constant).
@@ -16579,6 +20715,12 @@ fn emitMirBody(emitter: *LlvmModuleEmitter, body_idx: u32, body: *const MirBody)
         try emitter.writeAll("ptr swifterror %_cx_err_slot");
     }
     try emitter.print(") {s}", .{fnUnwindAttrs(emitter)});
+    if (!body.symbol_index.isNone() and
+        body.symbol_index.asInt() < emitter.input.sym_table.symbols.items.len and
+        emitter.input.sym_table.getSymbol(body.symbol_index).extra_flags.is_noinline)
+    {
+        try emitter.writeAll(" noinline");
+    }
     const body_ffi = extractSymFfiMetaLlvm(emitter, body.symbol_index);
     if (emitter.cfg.target.isWasm()) {
         const exp_name = if (body_ffi.wasm_export_name.len > 0)
@@ -16755,7 +20897,9 @@ fn emitMirBody(emitter: *LlvmModuleEmitter, body_idx: u32, body: *const MirBody)
             const bp_ty = try unwrapTransparentType(emitter, body.getInst(bp_val).type_id);
             if (!bp_ty.isPrimitiveOrSentinel()) {
                 const bp_tag = emitter.input.pool.getNode(bp_ty).tag;
-                if (bp_tag == .ref_ty or bp_tag == .mut_ref_ty or bp_tag == .raw_ptr_ty) {
+                if ((bp_tag == .ref_ty or bp_tag == .mut_ref_ty or bp_tag == .raw_ptr_ty) and
+                    !emitter.input.pool.isSliceRefType(bp_ty))
+                {
                     if (lookupProvenRange(emitter, body_idx, bp_val.asInt())) |prov_r| {
                         const bp_ssa = try std.fmt.allocPrint(
                             emitter.allocator,
@@ -17670,6 +21814,20 @@ fn emitMainEntrypointWrapperLlvm(emitter: *LlvmModuleEmitter) !void {
     defer state.deinit();
 
     try state.writeAll("  call void @_cx_rt_init()\n");
+    if (emitter.input.sim_seed != 0) {
+        const sim_seed_i64: i64 = @bitCast(emitter.input.sim_seed);
+        const ptr_bytes = emitter.cfg.target.ptrBytes();
+        if (ptr_bytes >= 8) {
+            const sim_tmp = state.nextTmp();
+            try state.print(
+                "  %_sim_sp_{d} = getelementptr inbounds i8, ptr @_cx_default_ctx, {s} {d}\n" ++
+                    "  store i64 {d}, ptr %_sim_sp_{d}, align 8\n",
+                .{ sim_tmp, ptr_int, 2 * ptr_bytes, sim_seed_i64, sim_tmp },
+            );
+        } else {
+            try state.print("  store i64 {d}, ptr @_cx_ctx_wide_2, align 8\n", .{sim_seed_i64});
+        }
+    }
 
     const callee_op: []u8 = if (emitter.input.is_dev_got_enabled) blk: {
         const got_t = state.nextTmp();
@@ -18305,6 +22463,47 @@ pub fn emitModule(
     if (emitter.synth_globals.items.len > 0) {
         emitter.writeAll(emitter.synth_globals.items) catch return error.OutOfMemory;
         emitter.writeAll("\n") catch return error.OutOfMemory;
+    }
+
+    // Emit GC-eligible `weak_odr hidden @__multi3` for 128-bit multiplies on `-nostdlib` freestanding `wasm32`:
+    if (cfg.target.arch == .wasm32 and cfg.target.isFreestanding()) {
+        emitter.writeAll(
+            "define weak_odr hidden void @__multi3(" ++
+                "ptr noalias nocapture writeonly sret({ i64, i64 }) align 16 %_res, " ++
+                "i64 %_al, i64 %_ah, i64 %_bl, i64 %_bh) unnamed_addr nounwind {\n" ++
+                "entry:\n" ++
+                "  %_al0 = and i64 %_al, 4294967295\n" ++
+                "  %_al1 = lshr i64 %_al, 32\n" ++
+                "  %_bl0 = and i64 %_bl, 4294967295\n" ++
+                "  %_bl1 = lshr i64 %_bl, 32\n" ++
+                "  %_p00 = mul nuw i64 %_al0, %_bl0\n" ++
+                "  %_p01 = mul nuw i64 %_al0, %_bl1\n" ++
+                "  %_p10 = mul nuw i64 %_al1, %_bl0\n" ++
+                "  %_p11 = mul nuw i64 %_al1, %_bl1\n" ++
+                "  %_p00_hi = lshr i64 %_p00, 32\n" ++
+                "  %_p01_lo = and i64 %_p01, 4294967295\n" ++
+                "  %_p10_lo = and i64 %_p10, 4294967295\n" ++
+                "  %_mid0 = add nuw i64 %_p00_hi, %_p01_lo\n" ++
+                "  %_mid = add nuw i64 %_mid0, %_p10_lo\n" ++
+                "  %_p00_lo = and i64 %_p00, 4294967295\n" ++
+                "  %_mid_shl = shl i64 %_mid, 32\n" ++
+                "  %_lo = or i64 %_p00_lo, %_mid_shl\n" ++
+                "  %_p01_hi = lshr i64 %_p01, 32\n" ++
+                "  %_p10_hi = lshr i64 %_p10, 32\n" ++
+                "  %_mid_hi = lshr i64 %_mid, 32\n" ++
+                "  %_hi0 = add i64 %_p11, %_p01_hi\n" ++
+                "  %_hi1 = add i64 %_hi0, %_p10_hi\n" ++
+                "  %_hi2 = add i64 %_hi1, %_mid_hi\n" ++
+                "  %_x0 = mul i64 %_al, %_bh\n" ++
+                "  %_x1 = mul i64 %_ah, %_bl\n" ++
+                "  %_hi3 = add i64 %_hi2, %_x0\n" ++
+                "  %_hi = add i64 %_hi3, %_x1\n" ++
+                "  store i64 %_lo, ptr %_res, align 8\n" ++
+                "  %_res_hi = getelementptr inbounds i64, ptr %_res, i32 1\n" ++
+                "  store i64 %_hi, ptr %_res_hi, align 8\n" ++
+                "  ret void\n" ++
+                "}\n\n",
+        ) catch return error.OutOfMemory;
     }
 
     // Emit sorted `@llvm.*` intrinsic declarations collected across the module:

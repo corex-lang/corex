@@ -85,8 +85,10 @@ pub fn copy_nonoverlapping[T: Copy](dest_slice: &mut [T], src_slice: &[T], /) ->
         return .Err(1);
     }
     var i: usize = 0;
-    while i < copy_len {
-        dest_slice[i] = src_slice[i];
+    while i < src_slice.len() {
+        if i < dest_slice.len() {
+            dest_slice[i] = src_slice[i];
+        }
         i = i +% 1;
     }
     return .Ok(copy_len);

@@ -341,6 +341,8 @@ pub const TypeId = enum(u32) {
     task_group_base_ty = 49,
     /// Built-in linear `TaskHandle` base slot (`50`).
     task_handle_base_ty = 50,
+    /// Constrained type group `TrivialDrop` (`51`).
+    group_trivial_drop = 51,
     /// First dynamically interned user/composite type index (`64`).
     first_dynamic = 64,
     /// Sentinel value representing no type.
@@ -387,12 +389,13 @@ pub const TypeId = enum(u32) {
         return @backingInt(self) <= @backingInt(TypeId.opaque_ty);
     }
 
-    /// Returns true if `self` is one of the 12 active built-in Constrained Type Groups (`32..44`, excluding `37`).
+    /// Returns true if `self` is an active built-in Constrained Type Group (`32..44` excluding `37`, or `51`).
     pub inline fn isBuiltinGroup(self: TypeId) bool {
         const raw = @backingInt(self);
-        return raw >= @backingInt(TypeId.group_signed) and
+        return (raw >= @backingInt(TypeId.group_signed) and
             raw <= @backingInt(TypeId.group_into_bytes) and
-            raw != @backingInt(TypeId._retired_group_numeric);
+            raw != @backingInt(TypeId._retired_group_numeric)) or
+            self == .group_trivial_drop;
     }
 
     /// Returns true if `self` is a signed integer primitive (`i8`..`isize`).

@@ -511,6 +511,12 @@ pub const ParsedCstArtifact = struct {
     has_parse_errors: bool = false,
     /// 128-bit `Wyhash` content fingerprint of the source buffer from which this artifact was parsed.
     source_fingerprint: Fingerprint128 = Fingerprint128.ZERO,
+    /// Cached whole-file `CstNodeIndex -> NodeIndex` reverse map computed once per parse.
+    cst_to_ast: []NodeIndex = &.{},
+    /// Cached whole-file `ast_arena.extra_data` end-offset map computed once per parse.
+    node_extra_end: []u32 = &.{},
+    /// Cached whole-file `@allow(…)` suppression span list computed once per parse.
+    allowed_spans: []symbol_resolver.AllowedSpanEntry = &.{},
 
     /// Initializes an empty `ParsedCstArtifact` bound to `allocator`.
     pub fn init(allocator: std.mem.Allocator) ParsedCstArtifact {
@@ -522,6 +528,17 @@ pub const ParsedCstArtifact = struct {
         };
     }
 
+    /// Releases cached auxiliary syntax maps (`cst_to_ast`, `node_extra_end`, `allowed_spans`).
+    pub fn freeCachedSyntaxMaps(self: *ParsedCstArtifact) void {
+        const alloc = self.token_buffer.allocator;
+        if (self.cst_to_ast.len > 0) alloc.free(self.cst_to_ast);
+        if (self.node_extra_end.len > 0) alloc.free(self.node_extra_end);
+        if (self.allowed_spans.len > 0) alloc.free(self.allowed_spans);
+        self.cst_to_ast = &.{};
+        self.node_extra_end = &.{};
+        self.allowed_spans = &.{};
+    }
+
     /// Clears `diagnostics` while retaining token, CST, and AST buffers for `reparseIncremental`.
     pub fn clearDiagnosticsOnly(self: *ParsedCstArtifact) void {
         self.diagnostics.resetRetainingCapacity();
@@ -529,6 +546,7 @@ pub const ParsedCstArtifact = struct {
 
     /// Clears syntax tables while retaining allocated capacity for fast incremental re-parsing.
     pub fn resetForReparse(self: *ParsedCstArtifact) void {
+        self.freeCachedSyntaxMaps();
         self.token_buffer.tokens.shrinkRetainingCapacity(0);
         self.token_buffer.trivia.clearRetainingCapacity();
         self.cst_arena.nodes.shrinkRetainingCapacity(0);
@@ -544,6 +562,7 @@ pub const ParsedCstArtifact = struct {
 
     /// Releases all owned syntax arenas and diagnostic buffers.
     pub fn deinit(self: *ParsedCstArtifact) void {
+        self.freeCachedSyntaxMaps();
         self.token_buffer.deinit();
         self.cst_arena.deinit();
         self.ast_arena.deinit();
@@ -1027,6 +1046,8 @@ pub const ModuleCompileOptions = struct {
     io: ?std.Io = null,
     /// Optional host environment map forwarded to `zig cc`.
     environ_map: ?*const std.process.Environ.Map = null,
+    /// Optional deterministic `--sim --seed=<u64>` override stored into `context.rng_seed` before `main`.
+    sim_seed: u64 = 0,
     /// Optional diagnostic sink receiving backend/linker errors (`E0007` / `E0008`).
     diagnostic_sink: ?*DiagnosticSink = null,
 };
@@ -2575,7 +2596,7 @@ fn extractItemNameSlice(
             if (!is_leaf or node.flags.is_missing_or_injected or node.token.isNone()) continue;
             if (node.token.asInt() >= token_buffer.countTokens()) continue;
             const use_tok_kind = token_buffer.getToken(node.token).kind;
-            if (isIdentifierTokenKind(use_tok_kind) or use_tok_kind == .kw_async) {
+            if (isIdentifierTokenKind(use_tok_kind) or use_tok_kind == .kw_async or use_tok_kind == .prim_type) {
                 last_ident = getTokenLexeme(source, token_buffer, node.token);
             }
         }
@@ -2656,7 +2677,9 @@ fn extractItemNameSlice(
             }
             break;
         }
-        if (isIdentifierTokenKind(tok_kind) or (item_kind == .mod_decl and tok_kind == .kw_async)) {
+        if (isIdentifierTokenKind(tok_kind) or
+            (item_kind == .mod_decl and (tok_kind == .kw_async or tok_kind == .prim_type)))
+        {
             return getTokenLexeme(source, token_buffer, node.token);
         }
     }
@@ -3253,7 +3276,11 @@ fn findHeaderIdentSpanInCst(
                 {
                     break;
                 }
-                if (isIdentifierTokenKind(tok_rec.kind) or tok_rec.kind == .kw_self_val or tok_rec.kind == .kw_async) {
+                if (isIdentifierTokenKind(tok_rec.kind) or
+                    tok_rec.kind == .kw_self_val or
+                    tok_rec.kind == .kw_async or
+                    tok_rec.kind == .prim_type)
+                {
                     if (std.mem.eql(
                         u8,
                         symbol_resolver.extractTokenSlice(source, token_buffer, sub.token),
@@ -3347,9 +3374,64 @@ fn findMemberIdentSpanInOwnerCst(
     return best_span;
 }
 
+/// Optional lazy $O(1)$ cache of canonical 128-bit `TypeId` fingerprints.
+const TypeCanonHashCache = struct {
+    /// Backing allocator for `hashes`.
+    allocator: std.mem.Allocator,
+    /// Dense `TypeId.toU32() -> Fingerprint128` table (`Fingerprint128.ZERO` = uncomputed).
+    hashes: *std.ArrayListUnmanaged(Fingerprint128),
+};
+
+/// Resolves or computes the pool-order-independent 128-bit canonical fingerprint of dynamic `ty` (`>= 64`).
+fn resolveTypeCanonicalFingerprint(
+    cache_opt: ?TypeCanonHashCache,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    ty: TypeId,
+) Fingerprint128 {
+    const raw_idx: usize = ty.toU32();
+    if (cache_opt) |cache| {
+        if (raw_idx < cache.hashes.items.len) {
+            const cached = cache.hashes.items[raw_idx];
+            if (!Fingerprint128.eql(cached, Fingerprint128.ZERO)) return cached;
+        }
+    }
+    var ty_buf: [512]u8 = undefined;
+    const formatted_ty = pool.formatType(ty, sym_table, &ty_buf);
+    var computed = Fingerprint128.hashBytes(formatted_ty);
+    if (Fingerprint128.eql(computed, Fingerprint128.ZERO)) {
+        computed.low = 1;
+    }
+    if (cache_opt) |cache| {
+        if (raw_idx >= cache.hashes.items.len) {
+            const target_len = @max(pool.nodes.len, raw_idx + 1);
+            if (cache.hashes.ensureTotalCapacity(cache.allocator, target_len)) |_| {
+                const old_len = cache.hashes.items.len;
+                cache.hashes.items.len = target_len;
+                @memset(cache.hashes.items[old_len..target_len], Fingerprint128.ZERO);
+            } else |_| {}
+        }
+        if (raw_idx < cache.hashes.items.len) {
+            cache.hashes.items[raw_idx] = computed;
+        }
+    }
+    return computed;
+}
+
 /// Appends a pool-order-independent canonical representation of `ty` to `hasher`.
 fn hashTypeCanonical(
     hasher: *StructuralHasher,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    ty: TypeId,
+) void {
+    hashTypeCanonicalCached(hasher, null, pool, sym_table, ty);
+}
+
+/// Appends a pool-order-independent canonical representation of `ty` to `hasher`, consulting `cache_opt` in $O(1)$.
+fn hashTypeCanonicalCached(
+    hasher: *StructuralHasher,
+    cache_opt: ?TypeCanonHashCache,
     pool: *const InternPool,
     sym_table: *const SymbolTable,
     ty: TypeId,
@@ -3359,30 +3441,24 @@ fn hashTypeCanonical(
         hasher.updateU32(ty.toU32());
         return;
     }
-    var ty_buf: [512]u8 = undefined;
-    const formatted_ty = pool.formatType(ty, sym_table, &ty_buf);
     hasher.updateU8(1);
-    hasher.updateBytes(formatted_ty);
-}
-
-/// Returns `true` if `extra_idx` falls inside the `TypeId` argument slice of any `.hir_intrinsic_call`.
-fn isIntrinsicTypeArgExtraSlot(store: *const hir.HirStore, extra_idx: usize) bool {
-    for (0..store.nodes.len) |node_idx| {
-        const node = store.nodes.get(node_idx);
-        if (node.tag == .hir_intrinsic_call and node.data.rhs + 2 <= store.extra_data.items.len) {
-            const ty_arg_len: usize = store.extra_data.items[node.data.rhs];
-            const ty_start: usize = node.data.rhs + 2;
-            if (extra_idx >= ty_start and extra_idx < ty_start + ty_arg_len) {
-                return true;
-            }
-        }
-    }
-    return false;
+    hasher.updateFingerprint(resolveTypeCanonicalFingerprint(cache_opt, pool, sym_table, ty));
 }
 
 /// Computes a position- and pool-order-independent 128-bit structural fingerprint of a lowered `HirStore`.
 fn computeHirStoreFingerprint(
     store: *const hir.HirStore,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    interner: *const StringInterner,
+) Fingerprint128 {
+    return computeHirStoreFingerprintCached(store, null, pool, sym_table, interner);
+}
+
+/// Computes a 128-bit structural fingerprint of `store` in $O(E + N)$ time using `cache_opt`.
+fn computeHirStoreFingerprintCached(
+    store: *const hir.HirStore,
+    cache_opt: ?TypeCanonHashCache,
     pool: *const InternPool,
     sym_table: *const SymbolTable,
     interner: *const StringInterner,
@@ -3397,7 +3473,7 @@ fn computeHirStoreFingerprint(
         const node = store.nodes.get(node_idx);
         hasher.updateU8(@backingInt(node.tag));
         hasher.updateU8(@bitCast(node.flags));
-        hashTypeCanonical(&hasher, pool, sym_table, node.type_id);
+        hashTypeCanonicalCached(&hasher, cache_opt, pool, sym_table, node.type_id);
         hasher.updateU32(node.data.lhs);
         switch (node.tag) {
             .hir_struct_decl, .hir_enum_decl, .hir_global_ref => {
@@ -3412,7 +3488,7 @@ fn computeHirStoreFingerprint(
                         const ty_start: usize = node.data.rhs + 2;
                         const safe_end = @min(ty_start + ty_arg_len, store.extra_data.items.len);
                         for (store.extra_data.items[ty_start..safe_end]) |raw_ty_arg| {
-                            hashTypeCanonical(&hasher, pool, sym_table, TypeId.fromInt(raw_ty_arg));
+                            hashTypeCanonicalCached(&hasher, cache_opt, pool, sym_table, TypeId.fromInt(raw_ty_arg));
                         }
                     }
                 }
@@ -3420,18 +3496,48 @@ fn computeHirStoreFingerprint(
             else => hasher.updateU32(node.data.rhs),
         }
     }
-    hasher.updateU32(@intCast(store.extra_data.items.len));
-    for (store.extra_data.items, 0..) |extra_word, extra_idx| {
-        if (has_intrinsic_type_args and isIntrinsicTypeArgExtraSlot(store, extra_idx)) {
-            hasher.updateU32(0);
-        } else {
+    const extra_len = store.extra_data.items.len;
+    hasher.updateU32(@intCast(extra_len));
+    if (!has_intrinsic_type_args or extra_len == 0) {
+        for (store.extra_data.items) |extra_word| {
             hasher.updateU32(extra_word);
+        }
+    } else {
+        var stack_mask: [512]bool = undefined;
+        var heap_mask: ?[]bool = null;
+        defer if (heap_mask) |hm| store.allocator.free(hm);
+        const mask_slice: []bool = if (extra_len <= stack_mask.len)
+            stack_mask[0..extra_len]
+        else blk_hm: {
+            heap_mask = store.allocator.alloc(bool, extra_len) catch null;
+            break :blk_hm heap_mask orelse &.{};
+        };
+        if (mask_slice.len == extra_len) {
+            @memset(mask_slice, false);
+            for (0..store.nodes.len) |node_idx| {
+                const node = store.nodes.get(node_idx);
+                if (node.tag == .hir_intrinsic_call and node.data.rhs + 2 <= extra_len) {
+                    const ty_arg_len: usize = store.extra_data.items[node.data.rhs];
+                    if (ty_arg_len > 0) {
+                        const ty_start: usize = node.data.rhs + 2;
+                        const safe_end = @min(ty_start + ty_arg_len, extra_len);
+                        @memset(mask_slice[ty_start..safe_end], true);
+                    }
+                }
+            }
+            for (store.extra_data.items, mask_slice) |extra_word, is_ty_slot| {
+                hasher.updateU32(if (is_ty_slot) 0 else extra_word);
+            }
+        } else {
+            for (store.extra_data.items) |extra_word| {
+                hasher.updateU32(extra_word);
+            }
         }
     }
     hasher.updateU32(@intCast(store.locals.items.len));
     for (store.locals.items) |loc_decl| {
         hashSymbolTextCanonical(&hasher, interner, loc_decl.name);
-        hashTypeCanonical(&hasher, pool, sym_table, loc_decl.type_id);
+        hashTypeCanonicalCached(&hasher, cache_opt, pool, sym_table, loc_decl.type_id);
         hasher.updateU8(@backingInt(loc_decl.mode));
         hasher.updateU8(@intFromBool(loc_decl.is_mut));
         hasher.updateU8(@intFromBool(loc_decl.is_comptime));
@@ -3440,8 +3546,8 @@ fn computeHirStoreFingerprint(
     for (store.functions.items) |fn_meta| {
         hasher.updateU32(fn_meta.def_id.asInt());
         hashSymbolTextCanonical(&hasher, interner, fn_meta.name);
-        hashTypeCanonical(&hasher, pool, sym_table, fn_meta.fn_ty);
-        hashTypeCanonical(&hasher, pool, sym_table, fn_meta.ret_ty);
+        hashTypeCanonicalCached(&hasher, cache_opt, pool, sym_table, fn_meta.fn_ty);
+        hashTypeCanonicalCached(&hasher, cache_opt, pool, sym_table, fn_meta.ret_ty);
         hasher.updateU32(fn_meta.body_hir.asInt());
         hasher.updateU8(@intFromBool(fn_meta.is_comptime));
         hasher.updateU8(@intFromBool(fn_meta.is_contextless));
@@ -3813,7 +3919,7 @@ fn computeNominalFieldHash64Bounded(
             hasher.update(std.mem.asBytes(&sub_h));
             hasher.update(std.mem.asBytes(&node.rhs));
         },
-        .array_ty, .soa_array_ty, .optional_ty => {
+        .array_ty, .soa_array_ty, .soa_vec_ty, .optional_ty => {
             const elem_h = computeNominalFieldHash64Bounded(
                 pool,
                 sym_table,
@@ -4015,6 +4121,7 @@ fn discoverDevRecordTypeBounded(
         .union_ty,
         .array_ty,
         .soa_array_ty,
+        .soa_vec_ty,
         .slice_ty,
         .soa_slice_ty,
         .optional_ty,
@@ -4033,6 +4140,7 @@ fn discoverDevRecordTypeBounded(
         .soa_slice_ty,
         .array_ty,
         .soa_array_ty,
+        .soa_vec_ty,
         .optional_ty,
         .bit_field_ty,
         => {
@@ -4311,6 +4419,8 @@ pub const CompilerDb = struct {
     pending_file_edits: std.AutoHashMapUnmanaged(u32, PendingFileEdit) = .empty,
     /// Root package/stdlib module bindings (`"core" -> core/root.cx`) keyed by `SymbolId.asInt()`.
     root_module_files: std.AutoHashMapUnmanaged(u32, FileId) = .empty,
+    /// Optional `stdlib/cx/mod.cx` root `FileId` whose exports populate `SymbolTable.cx_prelude_scope`.
+    cx_stdlib_root_fid: FileId = .none,
     /// Active `--sast-strict` policy flag (`W0314` on unproven bounds checks outside `@no_panic`).
     is_sast_strict: bool = false,
     /// Active `--internal-core` privilege flag allowing direct `core.*` kernel root access (`E0218`).
@@ -4401,6 +4511,16 @@ pub const CompilerDb = struct {
     custom_stage_hook: ?CustomStageHook = null,
     /// Execution, Green Path, Durability fast-path, and Early Cutoff counters.
     telemetry: QueryTelemetry = .{},
+    /// Reusable `TypeChecker.node_types` scratch buffer avoiding per-`DefId` large heap churn.
+    tc_scratch_types: std.ArrayListUnmanaged(TypeId) = .empty,
+    /// Reusable `TypeChecker.node_symbols` scratch buffer avoiding per-`DefId` large heap churn.
+    tc_scratch_symbols: std.ArrayListUnmanaged(SymbolIndex) = .empty,
+    /// Reentrancy guard (`true` while an outer `TypeChecker` borrows `tc_scratch_*`).
+    is_tc_scratch_in_use: bool = false,
+    /// Lazy $O(1)$ cache of canonical `TypeId` fingerprints indexed by `TypeId.toU32()`.
+    type_canon_hashes: std.ArrayListUnmanaged(Fingerprint128) = .empty,
+    /// Cross-`DefId` cache of store-independent scalar `const` evaluations keyed by `SymbolIndex.asInt()`.
+    cached_scalar_consts: std.AutoHashMapUnmanaged(u32, hir.ComptimeValue) = .empty,
 
     /// Initializes a new `CompilerDb` instance bound to `allocator`.
     pub fn init(allocator: std.mem.Allocator) !CompilerDb {
@@ -4580,8 +4700,24 @@ pub const CompilerDb = struct {
         self.scratch_dep_edges.deinit(self.allocator);
         self.active_stack.deinit(self.allocator);
         self.in_flight_keys.deinit(self.allocator);
+        self.tc_scratch_types.deinit(self.allocator);
+        self.tc_scratch_symbols.deinit(self.allocator);
+        self.type_canon_hashes.deinit(self.allocator);
+        self.cached_scalar_consts.deinit(self.allocator);
         self.interner.deinit();
         self.* = undefined;
+    }
+
+    /// Returns the `TypeCanonHashCache` view bound to `self.type_canon_hashes`.
+    inline fn typeHashCache(self: *CompilerDb) TypeCanonHashCache {
+        return .{ .allocator = self.allocator, .hashes = &self.type_canon_hashes };
+    }
+
+    /// Clears revision-transient `MirVm`, scalar-`const`, and canonical-type-hash memo caches.
+    inline fn invalidateTransientCaches(self: *CompilerDb) void {
+        self.pure_call_memo_cache.clear();
+        self.cached_scalar_consts.clearRetainingCapacity();
+        self.type_canon_hashes.clearRetainingCapacity();
     }
 
     // ------------ Cancellation & Hook Control Methods -------------
@@ -4675,7 +4811,7 @@ pub const CompilerDb = struct {
             memo_ptr.changed_at = self.current_revision;
             memo_ptr.verified_at = self.current_revision;
         }
-        self.pure_call_memo_cache.clear();
+        self.invalidateTransientCaches();
     }
 
     /// Reads `target_layout` while recording a tracked dependency on `CONFIG_KEY_TARGET_LAYOUT`.
@@ -5243,6 +5379,8 @@ pub const CompilerDb = struct {
 
         var scratch_def_keys: std.ArrayListUnmanaged(u32) = .empty;
         defer scratch_def_keys.deinit(self.allocator);
+        self.cached_scalar_consts.clearRetainingCapacity();
+        self.type_canon_hashes.clearRetainingCapacity();
 
         if (collectMatchingDefMapKeys(self.allocator, BodyAstWindow, &self.body_windows, target_fid, &scratch_def_keys)) |_| {
             for (scratch_def_keys.items) |def_raw| _ = self.body_windows.remove(def_raw);
@@ -5491,8 +5629,48 @@ pub const CompilerDb = struct {
         if (parent_pkg != .root) {
             try self.propagateSubtreePackageId(child_file_id, parent_pkg);
         }
+        if (self.symbol_table.isCoreKernelFile(parent_file_id)) {
+            try self.markCoreKernelSubtree(child_file_id);
+        }
         if (existing_opt == child_file_id) return;
         self.bumpConfigInput(CONFIG_KEY_TARGET_LAYOUT);
+    }
+
+    /// Marks `root_file_id` and all of its bound `mod` children as `core/*` kernel files (`core_kernel_files`).
+    pub fn markCoreKernelSubtree(self: *CompilerDb, root_file_id: FileId) !void {
+        if (root_file_id.isNone()) return;
+        var queue: std.ArrayListUnmanaged(FileId) = .empty;
+        defer queue.deinit(self.allocator);
+        var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer visited.deinit(self.allocator);
+
+        try queue.append(self.allocator, root_file_id);
+        try visited.put(self.allocator, root_file_id.asInt(), {});
+
+        var head: usize = 0;
+        while (head < queue.items.len) : (head += 1) {
+            const cur_fid = queue.items[head];
+            try self.symbol_table.markCoreKernelFile(cur_fid);
+            if (self.parent_to_child_mods.getPtr(cur_fid.asInt())) |child_links| {
+                for (child_links.items) |link| {
+                    if (!(try visited.getOrPut(self.allocator, link.child_fid.asInt())).found_existing) {
+                        try queue.append(self.allocator, link.child_fid);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Registers `stdlib/cx/mod.cx` as the `"cx"` root module and auto-imported `cx` prelude source.
+    pub fn registerCxStdlibPreludeRoot(self: *CompilerDb, root_file_id: FileId) !void {
+        if (self.cx_stdlib_root_fid != root_file_id) {
+            self.cx_stdlib_root_fid = root_file_id;
+            self.bumpConfigInput(CONFIG_KEY_TARGET_LAYOUT);
+        }
+        if (self.symbol_table.getFilePackageId(root_file_id) == .root) {
+            try self.propagateSubtreePackageId(root_file_id, .std_core);
+        }
+        try self.registerRootModule("cx", root_file_id);
     }
 
     /// Registers a root module prefix (such as `"core" -> core/root.cx`) visible across workspace files.
@@ -5511,6 +5689,7 @@ pub const CompilerDb = struct {
             if (self.symbol_table.getFilePackageId(root_file_id) == .root) {
                 try self.propagateSubtreePackageId(root_file_id, .std_core);
             }
+            try self.markCoreKernelSubtree(root_file_id);
             const cx_sym = try self.interner.intern("cx");
             if (!self.root_module_files.contains(cx_sym.asInt())) {
                 try self.root_module_files.put(self.allocator, cx_sym.asInt(), root_file_id);
@@ -6823,6 +7002,7 @@ pub const CompilerDb = struct {
             }
 
             const old_durability = existing_input.durability;
+            const was_stdlib = self.isStdlibFile(file_id);
             const is_content_same = Fingerprint128.eql(existing_input.content_fingerprint, new_fp);
             const is_mid_query = self.active_stack.items.len > 0;
             if (!is_content_same) {
@@ -6830,7 +7010,7 @@ pub const CompilerDb = struct {
                 self.allocator.free(existing_input.owned_text);
                 existing_input.owned_text = cloned_text;
                 existing_input.content_fingerprint = new_fp;
-                self.pure_call_memo_cache.clear();
+                self.invalidateTransientCaches();
                 if (is_mid_query) {
                     self.purgeVirtualFileArtifacts(file_id, false);
                 }
@@ -6849,7 +7029,7 @@ pub const CompilerDb = struct {
             if (!is_content_same) {
                 existing_input.changed_at = self.current_revision;
             }
-            if ((old_durability == .high) != (durability == .high)) {
+            if (was_stdlib != self.isStdlibFile(file_id)) {
                 self.stdlib_privilege_epoch +%= 1;
                 const core_slot = CONFIG_KEY_INTERNAL_CORE - CONFIG_KEY_TARGET_LAYOUT;
                 self.config_changed_at[core_slot] = self.current_revision;
@@ -6858,7 +7038,7 @@ pub const CompilerDb = struct {
                     cfg_memo.changed_at = self.current_revision;
                     cfg_memo.verified_at = self.current_revision;
                 }
-                self.pure_call_memo_cache.clear();
+                self.invalidateTransientCaches();
             }
 
             try self.memos.put(self.allocator, key.asU64(), .{
@@ -7418,8 +7598,9 @@ pub const CompilerDb = struct {
         const seen_gop = try seen_files.getOrPut(self.allocator, file_id.asInt());
         if (seen_gop.found_existing) return;
 
+        const init_entries = (try self.extractItemTree(file_id)).entries;
         var entry_idx: usize = 0;
-        while (entry_idx < (try self.extractItemTree(file_id)).entries.len) : (entry_idx += 1) {
+        while (entry_idx < init_entries.len) : (entry_idx += 1) {
             const entry = (try self.extractItemTree(file_id)).entries[entry_idx];
             if (entry.kind == .mod_decl) {
                 const ext_key: u64 = (@as(u64, file_id.asInt()) << 32) | @as(u64, entry.name_symbol.asInt());
@@ -7429,6 +7610,19 @@ pub const CompilerDb = struct {
             }
         }
         try out_files.append(self.allocator, file_id);
+    }
+
+    /// Collects `root_files` and their explicit `mod` children in post-order (excluding unrequested ambient roots).
+    pub fn collectExplicitModSubtreeFiles(
+        self: *CompilerDb,
+        root_files: []const FileId,
+        out_files: *std.ArrayListUnmanaged(FileId),
+    ) QueryError!void {
+        var seen_files: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer seen_files.deinit(self.allocator);
+        for (root_files) |rfid| {
+            try self.appendModuleSubtreePostOrder(rfid, &seen_files, out_files, 0);
+        }
     }
 
     /// Collects all reachable `FileId`s for `root_file_id` (including `root_module_files` and `extra_file_ids`).
@@ -7482,6 +7676,337 @@ pub const CompilerDb = struct {
         try self.appendModuleSubtreePostOrder(root_file_id, &seen_files, out_files, 0);
     }
 
+    /// Collects all `DefId`s across `reachable_files` to type-check and lower for `root_files`.
+    /// When any root file belongs to `.std_core`, verifies 100% of `DefId`s; otherwise runs a
+    /// demand-driven transitive `DefId` worklist seeded from non-`.std_core` files so user programs
+    /// only body-compile referenced `.std_core` functions, `const`s, `subscript`s, and trait `impl`s.
+    pub fn collectActiveModuleDefIds(
+        self: *CompilerDb,
+        allocator: std.mem.Allocator,
+        root_files: []const FileId,
+        reachable_files: []const FileId,
+        out_defs: *std.ArrayListUnmanaged(DefId),
+    ) QueryError!void {
+        for (reachable_files) |mod_fid| {
+            _ = try self.resolveSignatures(mod_fid);
+        }
+
+        var has_std_core_root = false;
+        for (root_files) |rfid| {
+            if (self.symbol_table.getFilePackageId(rfid) == .std_core) {
+                has_std_core_root = true;
+                break;
+            }
+        }
+
+        var file_rank_map: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        defer file_rank_map.deinit(allocator);
+        for (reachable_files, 0..) |mod_fid, rank_i| {
+            try file_rank_map.put(allocator, mod_fid.asInt(), @intCast(rank_i));
+        }
+
+        // Pre-index `.std_core` trait method names and per-scope `.std_core` `impl` `owner_def_id`s:
+        var trait_method_names: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer trait_method_names.deinit(allocator);
+        for (self.symbol_table.symbols.items) |sym_rec| {
+            if (sym_rec.kind == .trait_sym and !sym_rec.target_scope.isNone()) {
+                for (self.symbol_table.getScopeMembers(sym_rec.target_scope)) |m_idx| {
+                    const m_sym = self.symbol_table.getSymbol(m_idx).*;
+                    if (m_sym.kind == .fn_sym and !m_sym.name.isNone()) {
+                        try trait_method_names.put(allocator, m_sym.name.asInt(), {});
+                    }
+                }
+            }
+        }
+
+        var seen_defs: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer seen_defs.deinit(allocator);
+        var seen_nom_syms: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer seen_nom_syms.deinit(allocator);
+        var seen_trait_methods: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer seen_trait_methods.deinit(allocator);
+
+        var worklist: std.ArrayListUnmanaged(DefId) = .empty;
+        defer worklist.deinit(allocator);
+
+        const EnqueueCtx = struct {
+            /// Backing compiler query database.
+            db: *CompilerDb,
+            /// Scratch allocator for worklist and visited hash maps.
+            alloc: std.mem.Allocator,
+            /// Reachable file rank table (`file_id -> rank`).
+            file_ranks: *const std.AutoHashMapUnmanaged(u32, u32),
+            /// Set of `.std_core` trait method `StringId`s.
+            trait_names: *const std.AutoHashMapUnmanaged(u32, void),
+            /// Visited `DefId` set preventing duplicate queueing.
+            seen: *std.AutoHashMapUnmanaged(u32, void),
+            /// Visited nominal `SymbolIndex` set preventing duplicate `impl` scans.
+            seen_noms: *std.AutoHashMapUnmanaged(u32, void),
+            /// Visited primitive trait method `StringId` set.
+            seen_tmethods: *std.AutoHashMapUnmanaged(u32, void),
+            /// Demand-driven `DefId` BFS worklist.
+            queue: *std.ArrayListUnmanaged(DefId),
+
+            /// Enqueues `cand_def` if it belongs to a reachable file and has not yet been queued.
+            fn enqueueDef(ctx: @This(), cand_def: DefId) std.mem.Allocator.Error!void {
+                if (cand_def.isNone()) return;
+                if (!ctx.file_ranks.contains(cand_def.fileId().asInt())) return;
+                const gop = try ctx.seen.getOrPut(ctx.alloc, cand_def.asInt());
+                if (!gop.found_existing) {
+                    try ctx.queue.append(ctx.alloc, cand_def);
+                }
+            }
+
+            /// Enqueues `sym_idx`'s defining and owning `DefId`s (after unwrapping `use` aliases).
+            fn enqueueSymbol(ctx: @This(), raw_sym_idx: SymbolIndex) std.mem.Allocator.Error!void {
+                var cur_idx = raw_sym_idx;
+                var hops: u8 = 0;
+                while (!cur_idx.isNone() and cur_idx.asInt() < ctx.db.symbol_table.countSymbols() and hops < 16) : (hops += 1) {
+                    const sym = ctx.db.symbol_table.getSymbol(cur_idx).*;
+                    if (sym.kind == .use_alias_sym and !sym.target_symbol.isNone()) {
+                        cur_idx = sym.target_symbol;
+                        continue;
+                    }
+                    break;
+                }
+                if (cur_idx.isNone() or cur_idx.asInt() >= ctx.db.symbol_table.countSymbols()) return;
+                const sym = ctx.db.symbol_table.getSymbol(cur_idx).*;
+                try ctx.enqueueDef(sym.def_id);
+                try ctx.enqueueDef(sym.owner_def_id);
+
+                if (sym.kind == .struct_sym or sym.kind == .enum_sym or sym.kind == .union_sym) {
+                    try ctx.enqueueNominalTraitImpls(cur_idx);
+                } else if (sym.kind == .fn_sym and !sym.scope_id.isNone()) {
+                    const scope_kind = ctx.db.symbol_table.scope_arena.getScope(sym.scope_id).kind;
+                    if (scope_kind == .trait_scope) {
+                        for (ctx.db.symbol_table.symbols.items) |cand_t| {
+                            if (cand_t.kind == .trait_sym and cand_t.target_scope == sym.scope_id) {
+                                try ctx.enqueueDef(cand_t.def_id);
+                                break;
+                            }
+                        }
+                        if (!sym.name.isNone()) {
+                            const tm_gop = try ctx.seen_tmethods.getOrPut(ctx.alloc, sym.name.asInt());
+                            if (!tm_gop.found_existing) {
+                                for (ctx.db.symbol_table.prim_inherent_scopes) |prim_sc| {
+                                    if (prim_sc.isNone()) continue;
+                                    for (ctx.db.symbol_table.getScopeMembers(prim_sc)) |pm_idx| {
+                                        const pm_sym = ctx.db.symbol_table.getSymbol(pm_idx).*;
+                                        if (pm_sym.kind == .fn_sym and pm_sym.name == sym.name) {
+                                            try ctx.enqueueDef(pm_sym.def_id);
+                                            try ctx.enqueueDef(pm_sym.owner_def_id);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            /// Enqueues `.std_core` trait/drop `impl` `owner_def_id`s attached to `nom_sym_idx`.
+            fn enqueueNominalTraitImpls(ctx: @This(), nom_sym_idx: SymbolIndex) std.mem.Allocator.Error!void {
+                if (nom_sym_idx.isNone() or nom_sym_idx.asInt() >= ctx.db.symbol_table.countSymbols()) return;
+                const nom_gop = try ctx.seen_noms.getOrPut(ctx.alloc, nom_sym_idx.asInt());
+                if (nom_gop.found_existing) return;
+                const nom_sym = ctx.db.symbol_table.getSymbol(nom_sym_idx).*;
+                try ctx.enqueueDef(nom_sym.def_id);
+                if (nom_sym.target_scope.isNone()) return;
+                for (ctx.db.symbol_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
+                    const mem_sym = ctx.db.symbol_table.getSymbol(mem_idx).*;
+                    if (mem_sym.kind == .fn_sym and !mem_sym.name.isNone() and
+                        (ctx.trait_names.contains(mem_sym.name.asInt()) or
+                            std.mem.eql(u8, mem_sym.name_text, "drop")))
+                    {
+                        try ctx.enqueueDef(mem_sym.def_id);
+                        try ctx.enqueueDef(mem_sym.owner_def_id);
+                    }
+                }
+            }
+
+            /// Walks `ty` up to `depth <= 12` to enqueue referenced nominal types and their trait/drop `impl`s.
+            fn enqueueTypeNominals(ctx: @This(), ty: TypeId, depth: u8) std.mem.Allocator.Error!void {
+                if (depth > 12 or ty.isError() or ty.isPrimitiveOrSentinel()) return;
+                const node = ctx.db.type_pool.getNode(ty);
+                switch (node.tag) {
+                    .soa_vec_ty,
+                    => {
+                        try ctx.enqueueTypeNominals(TypeId.fromInt(node.lhs), depth + 1);
+                        for (ctx.db.symbol_table.symbols.items) |cand_sym| {
+                            if (cand_sym.kind == .struct_sym and
+                                std.mem.eql(u8, cand_sym.name_text, "AllocatorHandle") and
+                                !cand_sym.target_scope.isNone())
+                            {
+                                for (ctx.db.symbol_table.getScopeMembers(cand_sym.target_scope)) |mem_idx| {
+                                    const mem_sym = ctx.db.symbol_table.getSymbol(mem_idx).*;
+                                    if (mem_sym.kind == .fn_sym and
+                                        (std.mem.eql(u8, mem_sym.name_text, "alloc") or
+                                            std.mem.eql(u8, mem_sym.name_text, "dealloc")))
+                                    {
+                                        try ctx.enqueueDef(mem_sym.def_id);
+                                        try ctx.enqueueDef(mem_sym.owner_def_id);
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    },
+                    .ref_ty,
+                    .mut_ref_ty,
+                    .raw_ptr_ty,
+                    .slice_ty,
+                    .soa_slice_ty,
+                    .array_ty,
+                    .soa_array_ty,
+                    .optional_ty,
+                    .future_ty,
+                    .distinct_ty,
+                    => {
+                        try ctx.enqueueTypeNominals(TypeId.fromInt(node.lhs), depth + 1);
+                    },
+                    .refined_ty => {
+                        try ctx.enqueueTypeNominals(TypeId.fromInt(node.rhs), depth + 1);
+                    },
+                    .result_ty => {
+                        try ctx.enqueueTypeNominals(TypeId.fromInt(node.lhs), depth + 1);
+                        try ctx.enqueueTypeNominals(TypeId.fromInt(node.rhs), depth + 1);
+                    },
+                    .tuple_ty => {
+                        for (ctx.db.type_pool.getTupleElements(ty)) |raw_el| {
+                            try ctx.enqueueTypeNominals(TypeId.fromInt(raw_el), depth + 1);
+                        }
+                    },
+                    .struct_ty, .enum_ty, .union_ty => {
+                        try ctx.enqueueNominalTraitImpls(SymbolIndex.fromInt(node.rhs));
+                        for (ctx.db.type_pool.getGenericTypeArgs(ty)) |raw_ga| {
+                            try ctx.enqueueTypeNominals(TypeId.fromInt(raw_ga), depth + 1);
+                        }
+                    },
+                    .trait_ty, .dyn_trait_ty => {
+                        const t_sym_idx = SymbolIndex.fromInt(node.rhs);
+                        if (!t_sym_idx.isNone() and t_sym_idx.asInt() < ctx.db.symbol_table.countSymbols()) {
+                            try ctx.enqueueDef(ctx.db.symbol_table.getSymbol(t_sym_idx).def_id);
+                        }
+                    },
+                    .fn_ty, .closure_ty => {
+                        if (ctx.db.type_pool.getFnSignatureView(ty)) |sig| {
+                            const arity = sig.paramCount();
+                            const r_ty = sig.ret_ty;
+                            for (0..arity) |pi| {
+                                const cur_s = ctx.db.type_pool.getFnSignatureView(ty).?;
+                                try ctx.enqueueTypeNominals(cur_s.getParamType(pi), depth + 1);
+                            }
+                            try ctx.enqueueTypeNominals(r_ty, depth + 1);
+                        }
+                    },
+                    else => {},
+                }
+            }
+        };
+
+        const eq_ctx = EnqueueCtx{
+            .db = self,
+            .alloc = allocator,
+            .file_ranks = &file_rank_map,
+            .trait_names = &trait_method_names,
+            .seen = &seen_defs,
+            .seen_noms = &seen_nom_syms,
+            .seen_tmethods = &seen_trait_methods,
+            .queue = &worklist,
+        };
+
+        // Seed worklist with explicit `mod` subtree when any root is `.std_core`, otherwise all non-`.std_core` files:
+        if (has_std_core_root) {
+            var explicit_seed_files: std.ArrayListUnmanaged(FileId) = .empty;
+            defer explicit_seed_files.deinit(allocator);
+            try self.collectExplicitModSubtreeFiles(root_files, &explicit_seed_files);
+            for (explicit_seed_files.items) |seed_fid| {
+                const tree = try self.extractItemTree(seed_fid);
+                for (tree.entries) |entry| {
+                    try eq_ctx.enqueueDef(entry.def_id);
+                }
+            }
+        } else {
+            for (reachable_files) |mod_fid| {
+                if (self.symbol_table.getFilePackageId(mod_fid) == .std_core) continue;
+                const tree = try self.extractItemTree(mod_fid);
+                for (tree.entries) |entry| {
+                    try eq_ctx.enqueueDef(entry.def_id);
+                }
+            }
+        }
+
+        var cursor: usize = 0;
+        while (cursor < worklist.items.len) : (cursor += 1) {
+            const cur_def = worklist.items[cursor];
+            const cur_fid = cur_def.fileId();
+            const item_tree = try self.extractItemTree(cur_fid);
+            const entry = item_tree.getEntry(cur_def) orelse continue;
+            const def_sig = try self.getDefSignature(cur_def);
+            try eq_ctx.enqueueTypeNominals(def_sig.type_id, 0);
+
+            const tc_res = try self.typecheckBody(cur_def);
+            if (self.def_side_tables.getPtr(cur_def.asInt())) |st_ptr| {
+                for (st_ptr.node_symbols) |sym_idx| {
+                    if (!sym_idx.isNone()) try eq_ctx.enqueueSymbol(sym_idx);
+                }
+                var conv_iter = st_ptr.try_conversions.valueIterator();
+                while (conv_iter.next()) |conv_def_ptr| {
+                    try eq_ctx.enqueueDef(conv_def_ptr.*);
+                }
+                var map_iter = st_ptr.call_arg_mappings.valueIterator();
+                while (map_iter.next()) |map_ptr| {
+                    if (!map_ptr.callee_sym.isNone()) try eq_ctx.enqueueSymbol(map_ptr.callee_sym);
+                }
+                for (st_ptr.node_types) |nty| {
+                    if (!nty.isError()) try eq_ctx.enqueueTypeNominals(nty, 0);
+                }
+                var inst_iter = st_ptr.call_instantiations.valueIterator();
+                while (inst_iter.next()) |slice_ptr| {
+                    for (slice_ptr.*) |ity| {
+                        if (!ity.isError()) try eq_ctx.enqueueTypeNominals(ity, 0);
+                    }
+                }
+                var interp_iter = st_ptr.string_interps.valueIterator();
+                while (interp_iter.next()) |interp_ptr| {
+                    for (interp_ptr.holes) |hole| {
+                        if (!hole.expr_type_id.isError()) try eq_ctx.enqueueTypeNominals(hole.expr_type_id, 0);
+                    }
+                }
+            }
+
+            if (tc_res.error_count == 0 and entry.kind != .extern_static and entry.kind != .ffi_extern_block) {
+                const hir_store = try self.lowerDefHir(cur_def);
+                for (0..hir_store.nodes.len) |ni| {
+                    const hnode = hir_store.nodes.get(ni);
+                    if (!hnode.type_id.isError()) try eq_ctx.enqueueTypeNominals(hnode.type_id, 0);
+                    if (hnode.tag == .hir_global_ref) {
+                        try eq_ctx.enqueueDef(DefId.fromInt(hnode.data.lhs));
+                        try eq_ctx.enqueueSymbol(SymbolIndex.fromInt(hnode.data.rhs));
+                    }
+                }
+                for (hir_store.locals.items) |hloc| {
+                    if (!hloc.type_id.isError()) try eq_ctx.enqueueTypeNominals(hloc.type_id, 0);
+                }
+            }
+        }
+
+        try out_defs.ensureUnusedCapacity(allocator, worklist.items.len);
+        out_defs.appendSliceAssumeCapacity(worklist.items);
+        const SortCtx = struct {
+            /// Reachable file rank table (`file_id -> rank`).
+            ranks: *const std.AutoHashMapUnmanaged(u32, u32),
+            /// Orders `DefId`s deterministically by `(reachable_file_rank, itemIndex)`.
+            fn lessThan(sctx: @This(), lhs: DefId, rhs: DefId) bool {
+                const l_rank = sctx.ranks.get(lhs.fileId().asInt()) orelse std.math.maxInt(u32);
+                const r_rank = sctx.ranks.get(rhs.fileId().asInt()) orelse std.math.maxInt(u32);
+                if (l_rank != r_rank) return l_rank < r_rank;
+                return lhs.itemIndex() < rhs.itemIndex();
+            }
+        };
+        std.mem.sort(DefId, out_defs.items, SortCtx{ .ranks = &file_rank_map }, SortCtx.lessThan);
+    }
+
     /// Clones and optimizes (`--dev` or `--release`) all `MirBody` items across `reachable_files` into `out_bodies`.
     pub fn collectOptimizedModuleBodies(
         self: *CompilerDb,
@@ -7519,24 +8044,40 @@ pub const CompilerDb = struct {
 
         for (reachable_files) |mod_fid| {
             _ = try self.resolveSignatures(mod_fid);
-            var entry_idx: usize = 0;
-            while (entry_idx < (try self.extractItemTree(mod_fid)).entries.len) : (entry_idx += 1) {
-                const entry = (try self.extractItemTree(mod_fid)).entries[entry_idx];
-                if (entry.kind == .extern_static or entry.kind == .ffi_extern_block) continue;
-                const def_mir = try self.buildDefMirArtifact(entry.def_id);
-                if (self.lowered_def_hirs.getPtr(entry.def_id.asInt())) |hir_ptr| {
-                    for (hir_ptr.functions.items) |fn_meta| {
-                        if (fn_meta.is_comptime and !fn_meta.def_id.isNone()) {
-                            try comptime_fn_defs.put(out_allocator, fn_meta.def_id.asInt(), {});
-                        }
+        }
+
+        var active_roots: std.ArrayListUnmanaged(FileId) = .empty;
+        defer active_roots.deinit(out_allocator);
+        for (reachable_files) |mod_fid| {
+            if (mod_fid == root_file_id or self.symbol_table.getFilePackageId(mod_fid) != .std_core) {
+                try active_roots.append(out_allocator, mod_fid);
+            }
+        }
+        if (active_roots.items.len == 0) {
+            try active_roots.append(out_allocator, root_file_id);
+        }
+
+        var active_defs: std.ArrayListUnmanaged(DefId) = .empty;
+        defer active_defs.deinit(out_allocator);
+        try self.collectActiveModuleDefIds(out_allocator, active_roots.items, reachable_files, &active_defs);
+
+        for (active_defs.items) |active_def_id| {
+            const item_tree = try self.extractItemTree(active_def_id.fileId());
+            const entry = item_tree.getEntry(active_def_id) orelse continue;
+            if (entry.kind == .extern_static or entry.kind == .ffi_extern_block) continue;
+            const def_mir = try self.buildDefMirArtifact(entry.def_id);
+            if (self.lowered_def_hirs.getPtr(entry.def_id.asInt())) |hir_ptr| {
+                for (hir_ptr.functions.items) |fn_meta| {
+                    if (fn_meta.is_comptime and !fn_meta.def_id.isNone()) {
+                        try comptime_fn_defs.put(out_allocator, fn_meta.def_id.asInt(), {});
                     }
                 }
-                if (def_mir.is_comptime_initializer_only) continue;
-                for (def_mir.bundle.bodies.items) |*src_body| {
-                    var cloned_body = src_body.clone(out_allocator) catch return error.OutOfMemory;
-                    errdefer cloned_body.deinit();
-                    try raw_bodies.append(out_allocator, cloned_body);
-                }
+            }
+            if (def_mir.is_comptime_initializer_only) continue;
+            for (def_mir.bundle.bodies.items) |*src_body| {
+                var cloned_body = src_body.clone(out_allocator) catch return error.OutOfMemory;
+                errdefer cloned_body.deinit();
+                try raw_bodies.append(out_allocator, cloned_body);
             }
         }
 
@@ -7609,24 +8150,35 @@ pub const CompilerDb = struct {
         for (reachable_files.items) |mod_fid| {
             if ((try self.parseCst(mod_fid)).diagnostics.hasErrors()) has_front_errors = true;
             if ((try self.resolveSignatures(mod_fid)).error_count > 0) has_front_errors = true;
+        }
 
-            var entry_idx: usize = 0;
-            while (entry_idx < (try self.extractItemTree(mod_fid)).entries.len) : (entry_idx += 1) {
-                const entry = (try self.extractItemTree(mod_fid)).entries[entry_idx];
-                if ((try self.typecheckBody(entry.def_id)).error_count > 0) has_front_errors = true;
-                if (!(try self.verifySastMir(entry.def_id)).is_verified_sound) has_front_errors = true;
+        var root_list: std.ArrayListUnmanaged(FileId) = .empty;
+        defer root_list.deinit(self.allocator);
+        try root_list.append(self.allocator, root_file_id);
+        for (options.extra_file_ids) |efid| {
+            try root_list.append(self.allocator, efid);
+        }
 
-                if (!has_front_errors and (entry.kind == .const_decl or entry.kind == .extern_block)) {
-                    const ct_art = self.evalComptimeDef(entry.def_id) catch |ct_err| switch (ct_err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        error.Canceled => return error.Canceled,
-                        else => {
-                            has_front_errors = true;
-                            continue;
-                        },
-                    };
-                    if (ct_art.has_errors) has_front_errors = true;
-                }
+        var active_defs: std.ArrayListUnmanaged(DefId) = .empty;
+        defer active_defs.deinit(self.allocator);
+        try self.collectActiveModuleDefIds(self.allocator, root_list.items, reachable_files.items, &active_defs);
+
+        for (active_defs.items) |active_def_id| {
+            const item_tree = try self.extractItemTree(active_def_id.fileId());
+            const entry = item_tree.getEntry(active_def_id) orelse continue;
+            if ((try self.typecheckBody(entry.def_id)).error_count > 0) has_front_errors = true;
+            if (!(try self.verifySastMir(entry.def_id)).is_verified_sound) has_front_errors = true;
+
+            if (!has_front_errors and (entry.kind == .const_decl or entry.kind == .extern_block)) {
+                const ct_art = self.evalComptimeDef(entry.def_id) catch |ct_err| switch (ct_err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Canceled => return error.Canceled,
+                    else => {
+                        has_front_errors = true;
+                        continue;
+                    },
+                };
+                if (ct_art.has_errors) has_front_errors = true;
             }
         }
         if (has_front_errors) return error.FrontendErrors;
@@ -7707,6 +8259,38 @@ pub const CompilerDb = struct {
         defer file_tokens.deinit(self.allocator);
         try self.populateFileTokensMap(&file_tokens);
 
+        for (working_bodies.items) |*body_ptr| {
+            const inst_ops_list = body_ptr.insts.items(.op);
+            const inst_operands = body_ptr.insts.items(.operands);
+            for (inst_ops_list, inst_operands) |inst_op, ops| {
+                if (inst_op != .fn_addr) continue;
+                const target_sym = SymbolIndex.fromInt(ops.rhs);
+                if (target_sym.isNone() or target_sym.asInt() >= self.symbol_table.symbols.items.len) continue;
+                const sym_rec = self.symbol_table.getSymbol(target_sym).*;
+                if (sym_rec.kind != .const_sym) continue;
+                const raw_def = DefId.fromInt(ops.lhs);
+                const target_def = if (!raw_def.isNone()) raw_def else sym_rec.def_id;
+                if (target_def.isNone()) continue;
+                if (!self.evaluated_comptime_defs.contains(target_def.asInt())) {
+                    _ = self.evalComptimeDef(target_def) catch {};
+                }
+            }
+        }
+        // Re-populate `file_tokens` in case `evalComptimeDef` parsed an additional module file:
+        try self.populateFileTokensMap(&file_tokens);
+
+        var const_rodata_map: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        defer const_rodata_map.deinit(self.allocator);
+        var ct_eval_iter = self.evaluated_comptime_defs.iterator();
+        while (ct_eval_iter.next()) |ct_kv| {
+            const ct_art = ct_kv.value_ptr.*;
+            if (!ct_art.has_errors and !ct_art.rodata_id.isNone() and
+                ct_art.rodata_id.domain() == .rodata_blob)
+            {
+                try const_rodata_map.put(self.allocator, ct_kv.key_ptr.*, ct_art.rodata_id.payloadIndex());
+            }
+        }
+
         const prev_entry_fid = self.symbol_table.active_entry_file_id;
         self.symbol_table.active_entry_file_id = root_file_id;
         defer self.symbol_table.active_entry_file_id = prev_entry_fid;
@@ -7721,6 +8305,7 @@ pub const CompilerDb = struct {
             .vfs_source_map = options.vfs_source_map orelse self.vfs_source_map,
             .file_tokens = &file_tokens,
             .rodata_pool = &self.rodata_pool,
+            .const_rodata_map = &const_rodata_map,
             .blob_store = &blob_store,
             .proven_ranges = proven_views,
             .is_dev_got_enabled = options.is_dev_got_enabled,
@@ -7732,6 +8317,7 @@ pub const CompilerDb = struct {
             .output_path = options.output_path,
             .io = active_io,
             .environ_map = options.environ_map,
+            .sim_seed = options.sim_seed,
             .diagnostic_sink = options.diagnostic_sink,
         });
     }
@@ -7815,6 +8401,16 @@ pub const CompilerDb = struct {
             return error.UnresolvedCallee;
         }
         const load_ty = if (!expected_ty.isError()) expected_ty else artifact.type_id;
+        const unwrapped_load = self.type_pool.unwrapUnderlyingType(load_ty);
+        const unwrapped_art = self.type_pool.unwrapUnderlyingType(artifact.type_id);
+        if (unwrapped_load != unwrapped_art and !unwrapped_load.isPrimitiveOrSentinel()) {
+            const load_node = self.type_pool.getNode(unwrapped_load);
+            if ((load_node.tag == .ref_ty or load_node.tag == .raw_ptr_ty) and
+                self.type_pool.unwrapUnderlyingType(TypeId.fromInt(load_node.lhs)) == unwrapped_art)
+            {
+                return .{ .sym_ptr = .{ .alloc_id = artifact.rodata_id, .byte_offset = 0 } };
+            }
+        }
         return vm.loadTypedSlotFromMemory(.{ .alloc_id = artifact.rodata_id, .byte_offset = 0 }, load_ty);
     }
 
@@ -7886,7 +8482,7 @@ pub const CompilerDb = struct {
                     var effective_changed_at = memo_snapshot.changed_at;
                     if (!Fingerprint128.eql(live_fp, memo_snapshot.output_fingerprint)) {
                         effective_changed_at = self.current_revision;
-                        self.pure_call_memo_cache.clear();
+                        self.invalidateTransientCaches();
                     }
                     if (self.memos.getPtr(key.asU64())) |memo_ptr| {
                         memo_ptr.output_fingerprint = live_fp;
@@ -8119,8 +8715,12 @@ pub const CompilerDb = struct {
         const frame = &self.active_stack.items[self.active_stack.items.len - 1];
         const cur_slice = self.scratch_dep_edges.items[frame.start_dep_index..];
         if (cur_slice.len > MAX_DEPS_PER_MEMO) return;
-        for (cur_slice) |existing_dep| {
-            if (existing_dep.asU64() == dep_key.asU64()) return;
+        const raw_dep = dep_key.asU64();
+        if (cur_slice.len > 0 and cur_slice[cur_slice.len - 1].asU64() == raw_dep) return;
+        var rev_idx = cur_slice.len;
+        while (rev_idx > 0) {
+            rev_idx -= 1;
+            if (cur_slice[rev_idx].asU64() == raw_dep) return;
         }
         try self.scratch_dep_edges.append(self.allocator, dep_key);
     }
@@ -8252,6 +8852,24 @@ pub const CompilerDb = struct {
             &parsed_ptr.cst_arena,
             &parsed_ptr.ast_arena,
         );
+        parsed_ptr.freeCachedSyntaxMaps();
+        parsed_ptr.cst_to_ast = syntax_arenas.computeCstToAstMap(
+            self.allocator,
+            parsed_ptr.cst_arena.countNodes(),
+            &parsed_ptr.ast_arena,
+        ) catch return error.OutOfMemory;
+        errdefer parsed_ptr.freeCachedSyntaxMaps();
+        parsed_ptr.node_extra_end = syntax_arenas.computeAstNodeExtraEnds(
+            self.allocator,
+            &parsed_ptr.ast_arena,
+        ) catch return error.OutOfMemory;
+        parsed_ptr.allowed_spans = symbol_resolver.collectAllowedSpansFromCst(
+            self.allocator,
+            file_id,
+            source,
+            &parsed_ptr.token_buffer,
+            &parsed_ptr.cst_arena,
+        ) catch return error.OutOfMemory;
         return parsed_ptr.cst_fingerprint;
     }
 
@@ -9261,15 +9879,16 @@ pub const CompilerDb = struct {
         return state;
     }
 
-    /// Pre-collects Pass-1 module scopes across `pkg_id`'s entire `mod` subtree before any Pass-2 `use pkg.…` resolves.
-    fn ensurePackageSubtreePass1(
+    /// Pre-collects Pass-1 module scopes across `root_fid`'s entire `mod` subtree before Pass-2 `use` imports resolve.
+    fn ensureModuleRootSubtreePass1(
         self: *CompilerDb,
+        root_fid: FileId,
         pkg_id: PackageId,
         hasher: *StructuralHasher,
         caller_fid: FileId,
         is_skipping_caller_pass1: bool,
     ) QueryError!void {
-        const pkg_root_fid = self.package_root_files.get(pkg_id) orelse return;
+        if (root_fid.isNone()) return;
         var subtree_files: std.ArrayListUnmanaged(FileId) = .empty;
         defer subtree_files.deinit(self.allocator);
         var mod_links: std.ArrayListUnmanaged(ModLink) = .empty;
@@ -9277,8 +9896,8 @@ pub const CompilerDb = struct {
         var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
         defer visited.deinit(self.allocator);
 
-        try subtree_files.append(self.allocator, pkg_root_fid);
-        try visited.put(self.allocator, pkg_root_fid.asInt(), {});
+        try subtree_files.append(self.allocator, root_fid);
+        try visited.put(self.allocator, root_fid.asInt(), {});
 
         var head: usize = 0;
         while (head < subtree_files.items.len) : (head += 1) {
@@ -9332,6 +9951,24 @@ pub const CompilerDb = struct {
                 }
             }
         }
+    }
+
+    /// Pre-collects Pass-1 module scopes across `pkg_id`'s entire `mod` subtree before any Pass-2 `use pkg.…` resolves.
+    fn ensurePackageSubtreePass1(
+        self: *CompilerDb,
+        pkg_id: PackageId,
+        hasher: *StructuralHasher,
+        caller_fid: FileId,
+        is_skipping_caller_pass1: bool,
+    ) QueryError!void {
+        const pkg_root_fid = self.package_root_files.get(pkg_id) orelse return;
+        try self.ensureModuleRootSubtreePass1(
+            pkg_root_fid,
+            pkg_id,
+            hasher,
+            caller_fid,
+            is_skipping_caller_pass1,
+        );
     }
 
     /// Returns `true` if `key`'s previous memo edges included an `@embed_bytes` or `@c_import` dependency.
@@ -9426,6 +10063,9 @@ pub const CompilerDb = struct {
                         root_sym_raw,
                         cached_scope,
                     );
+                    if (!self.cx_stdlib_root_fid.isNone() and root_fid == self.cx_stdlib_root_fid) {
+                        self.symbol_table.cx_prelude_scope = cached_scope;
+                    }
                 }
                 continue;
             }
@@ -9442,7 +10082,12 @@ pub const CompilerDb = struct {
                         root_sym_raw,
                         root_sigs.module_scope,
                     );
-                    if (self.symbol_table.getFilePackageId(root_fid) == .std_core) {
+                    if (!self.cx_stdlib_root_fid.isNone() and root_fid == self.cx_stdlib_root_fid) {
+                        self.symbol_table.cx_prelude_scope = root_sigs.module_scope;
+                    }
+                    if (self.symbol_table.getFilePackageId(root_fid) == .std_core and
+                        (self.cx_stdlib_root_fid.isNone() or root_fid != self.cx_stdlib_root_fid))
+                    {
                         try self.symbol_table.setPackageRootScope(.std_core, root_sigs.module_scope);
                     }
                 }
@@ -9507,6 +10152,29 @@ pub const CompilerDb = struct {
         }
 
         // Pre-collect intra-package Pass-1 scopes across `caller_pkg` so `use pkg.…` works from any submodule:
+        if (caller_pkg == .std_core) {
+            for (root_mod_syms.items) |std_sym_raw| {
+                const std_root_fid = self.root_module_files.get(std_sym_raw) orelse continue;
+                if (self.symbol_table.getFilePackageId(std_root_fid) != .std_core) continue;
+                try self.ensureModuleRootSubtreePass1(
+                    std_root_fid,
+                    .std_core,
+                    &hasher,
+                    file_id,
+                    is_eligible_for_sig_reuse,
+                );
+                if (self.symbol_table.file_module_scopes.get(std_root_fid.asInt())) |std_scope| {
+                    if (!std_scope.isNone()) {
+                        try self.symbol_table.named_module_scopes.put(self.allocator, std_sym_raw, std_scope);
+                        if (!self.cx_stdlib_root_fid.isNone() and std_root_fid == self.cx_stdlib_root_fid) {
+                            self.symbol_table.cx_prelude_scope = std_scope;
+                        } else {
+                            try self.symbol_table.setPackageRootScope(.std_core, std_scope);
+                        }
+                    }
+                }
+            }
+        }
         if (self.package_root_files.contains(caller_pkg)) {
             try self.ensurePackageSubtreePass1(caller_pkg, &hasher, file_id, is_eligible_for_sig_reuse);
             if (self.package_dep_files.count() > 0) {
@@ -9539,7 +10207,11 @@ pub const CompilerDb = struct {
                 p1_mut.has_consumed_pass2 = true;
             }
             if (!pass1_state.mod_scope.isNone()) {
-                if (caller_pkg == .std_core and self.symbol_table.lookupPackageRootScope(.std_core) == null) {
+                if (!self.cx_stdlib_root_fid.isNone() and file_id == self.cx_stdlib_root_fid) {
+                    self.symbol_table.cx_prelude_scope = pass1_state.mod_scope;
+                    const cx_sym = try self.interner.intern("cx");
+                    try self.symbol_table.named_module_scopes.put(self.allocator, cx_sym.asInt(), pass1_state.mod_scope);
+                } else if (caller_pkg == .std_core and self.symbol_table.lookupPackageRootScope(.std_core) == null) {
                     var has_parent_mod = false;
                     var p_it = self.external_mod_files.valueIterator();
                     while (p_it.next()) |val_fid| {
@@ -9584,6 +10256,7 @@ pub const CompilerDb = struct {
                                 child_sigs.module_scope,
                             );
                             if (!self.is_package_graph_mounted and
+                                caller_pkg != .std_core and
                                 !self.symbol_table.configured_pkg_deps.contains(caller_pkg))
                             {
                                 try self.symbol_table.named_module_scopes.put(
@@ -9700,7 +10373,20 @@ pub const CompilerDb = struct {
                     sig_sink,
                 ) catch return error.OutOfMemory;
 
-                var checker = TypeChecker.init(
+                const can_borrow_sig_scratch = !self.is_tc_scratch_in_use;
+                if (can_borrow_sig_scratch) {
+                    const ast_len = parsed_ptr.ast_arena.countNodes();
+                    self.tc_scratch_types.ensureTotalCapacity(self.allocator, ast_len) catch return error.OutOfMemory;
+                    self.tc_scratch_types.items.len = ast_len;
+                    self.tc_scratch_symbols.ensureTotalCapacity(self.allocator, ast_len) catch return error.OutOfMemory;
+                    self.tc_scratch_symbols.items.len = ast_len;
+                    self.is_tc_scratch_in_use = true;
+                }
+                defer if (can_borrow_sig_scratch) {
+                    self.is_tc_scratch_in_use = false;
+                };
+
+                var checker = TypeChecker.initWithCachedMaps(
                     self.allocator,
                     &self.interner,
                     &self.type_pool,
@@ -9711,6 +10397,11 @@ pub const CompilerDb = struct {
                     &parsed_ptr.cst_arena,
                     &parsed_ptr.ast_arena,
                     sig_sink,
+                    parsed_ptr.cst_to_ast,
+                    parsed_ptr.node_extra_end,
+                    parsed_ptr.allowed_spans,
+                    if (can_borrow_sig_scratch) self.tc_scratch_types.items else null,
+                    if (can_borrow_sig_scratch) self.tc_scratch_symbols.items else null,
                 ) catch return error.OutOfMemory;
                 defer checker.deinit();
                 checker.db = self;
@@ -9831,11 +10522,13 @@ pub const CompilerDb = struct {
                 var file_st = checker.extractFileSemanticSideTables(self.allocator) catch
                     return error.OutOfMemory;
                 errdefer file_st.deinit();
+                file_st.ast_fingerprint = post_parsed_ptr.ast_fingerprint;
                 if (try self.file_side_tables.fetchPut(self.allocator, file_id.asInt(), file_st)) |prev_kv| {
                     var old_st = prev_kv.value;
                     old_st.deinit();
                 }
                 _ = sym_end;
+                self.type_canon_hashes.clearRetainingCapacity();
                 try self.file_sig_sync_states.put(self.allocator, file_id.asInt(), .{
                     .sym_start = sym_start,
                     .sym_end = post_sig_sym_end,
@@ -10008,6 +10701,17 @@ pub const CompilerDb = struct {
             if (has_unflattened_syms and !sym_mut.owner_def_id.isNone()) {
                 if (unflattened_owner_remap.get(sym_mut.owner_def_id.asInt())) |mapped_owner| {
                     sym_mut.owner_def_id = mapped_owner;
+                }
+            }
+        }
+        if (has_unflattened_syms and unflattened_owner_remap.count() > 0) {
+            self.symbol_table.clearFileOwnerDefMembers(file_id);
+            var rebuild_sym: u32 = sym_start;
+            while (rebuild_sym < sym_end) : (rebuild_sym += 1) {
+                const s_idx = SymbolIndex.fromInt(rebuild_sym);
+                const s_owner = self.symbol_table.getSymbol(s_idx).owner_def_id;
+                if (!s_owner.isNone()) {
+                    try self.symbol_table.registerOwnerDefMember(s_owner, s_idx);
                 }
             }
         }
@@ -10238,7 +10942,20 @@ pub const CompilerDb = struct {
                     def_id.asInt(),
                 );
 
-                var checker = TypeChecker.init(
+                const can_borrow_body_scratch = !self.is_tc_scratch_in_use;
+                if (can_borrow_body_scratch) {
+                    const ast_len = parsed_ptr.ast_arena.countNodes();
+                    self.tc_scratch_types.ensureTotalCapacity(self.allocator, ast_len) catch return error.OutOfMemory;
+                    self.tc_scratch_types.items.len = ast_len;
+                    self.tc_scratch_symbols.ensureTotalCapacity(self.allocator, ast_len) catch return error.OutOfMemory;
+                    self.tc_scratch_symbols.items.len = ast_len;
+                    self.is_tc_scratch_in_use = true;
+                }
+                defer if (can_borrow_body_scratch) {
+                    self.is_tc_scratch_in_use = false;
+                };
+
+                var checker = TypeChecker.initWithCachedMaps(
                     self.allocator,
                     &self.interner,
                     &self.type_pool,
@@ -10249,6 +10966,11 @@ pub const CompilerDb = struct {
                     &parsed_ptr.cst_arena,
                     &parsed_ptr.ast_arena,
                     body_sink,
+                    parsed_ptr.cst_to_ast,
+                    parsed_ptr.node_extra_end,
+                    parsed_ptr.allowed_spans,
+                    if (can_borrow_body_scratch) self.tc_scratch_types.items else null,
+                    if (can_borrow_body_scratch) self.tc_scratch_symbols.items else null,
                 ) catch return error.OutOfMemory;
                 defer checker.deinit();
                 checker.db = self;
@@ -10333,18 +11055,31 @@ pub const CompilerDb = struct {
                             ) catch {};
                         };
                         var remapped_syms: std.ArrayListUnmanaged(SymbolIndex) = .empty;
+                        const had_prev_target_list = self.symbol_table.owner_def_members.contains(
+                            target_check_def.asInt(),
+                        );
                         defer {
                             for (remapped_syms.items) |rem_idx| {
                                 self.symbol_table.getSymbolMut(rem_idx).owner_def_id = def_id;
                             }
+                            if (!had_prev_target_list) {
+                                if (self.symbol_table.owner_def_members.fetchRemove(target_check_def.asInt())) |rem_kv| {
+                                    var rem_list = rem_kv.value;
+                                    rem_list.deinit(self.allocator);
+                                }
+                            }
                             remapped_syms.deinit(self.allocator);
                         }
-                        var scan_i: u32 = 0;
-                        while (scan_i < self.symbol_table.countSymbols()) : (scan_i += 1) {
-                            const cand_sym_idx = SymbolIndex.fromInt(scan_i);
+                        try remapped_syms.appendSlice(
+                            self.allocator,
+                            self.symbol_table.getOwnerDefMembers(def_id),
+                        );
+                        for (remapped_syms.items) |cand_sym_idx| {
                             if (self.symbol_table.getSymbol(cand_sym_idx).owner_def_id == def_id) {
                                 self.symbol_table.getSymbolMut(cand_sym_idx).owner_def_id = target_check_def;
-                                try remapped_syms.append(self.allocator, cand_sym_idx);
+                                if (!had_prev_target_list) {
+                                    try self.symbol_table.registerOwnerDefMember(target_check_def, cand_sym_idx);
+                                }
                             }
                         }
                         checker.checkDefBody(target_check_def) catch return error.OutOfMemory;
@@ -10365,6 +11100,7 @@ pub const CompilerDb = struct {
                 var body_st = checker.extractBodySemanticSideTables(self.allocator, def_id) catch
                     return error.OutOfMemory;
                 errdefer body_st.deinit();
+                body_st.ast_fingerprint = parsed_ptr.ast_fingerprint;
 
                 // Propagate module-level `@attribute_schema` instances so `@field_attr_lookup` sees nominal attrs:
                 if (self.file_side_tables.getPtr(file_id.asInt())) |file_st| {
@@ -10441,9 +11177,10 @@ pub const CompilerDb = struct {
             var sorted_keys: std.ArrayListUnmanaged(u32) = .empty;
             defer sorted_keys.deinit(self.allocator);
 
+            const tc_hash_cache = self.typeHashCache();
             hasher.updateU32(@intCast(st_ptr.node_types.len));
             for (st_ptr.node_types) |node_ty| {
-                hashTypeCanonical(&hasher, &self.type_pool, &self.symbol_table, node_ty);
+                hashTypeCanonicalCached(&hasher, tc_hash_cache, &self.type_pool, &self.symbol_table, node_ty);
             }
 
             hasher.updateU32(@intCast(st_ptr.node_symbols.len));
@@ -10458,7 +11195,7 @@ pub const CompilerDb = struct {
                     hasher.updateU32(sym.owner_def_id.asInt());
                     hasher.updateU16(sym.member_ordinal);
                     hasher.updateBytes(sym.name_text);
-                    hashTypeCanonical(&hasher, &self.type_pool, &self.symbol_table, sym.type_id);
+                    hashTypeCanonicalCached(&hasher, tc_hash_cache, &self.type_pool, &self.symbol_table, sym.type_id);
                     hashSymbolDeprecationMeta(&hasher, &self.symbol_table, &self.interner, sym_idx);
                     var resolved_idx = sym_idx;
                     var resolved_sym = sym;
@@ -10802,68 +11539,101 @@ pub const CompilerDb = struct {
             }
         }
 
-        if (self.body_windows.get(target_def.asInt())) |body_window| {
-            try self.syncDefWindowAndSideTables(target_def, parsed_ptr, body_window.item_ast_node);
-        } else if (self.item_trees.getPtr(target_file.asInt())) |tree_ptr| {
-            if (tree_ptr.getEntry(target_def)) |entry| {
-                try self.syncDefWindowAndSideTables(target_def, parsed_ptr, entry.ast_node);
-            }
-        }
-
+        var fallback_store: ?hir.HirStore = null;
+        defer if (fallback_store) |*fs| fs.deinit();
         var hir_scratch_sink = DiagnosticSink.init(self.allocator);
         defer hir_scratch_sink.deinit();
-        const eval_hook = mir_vm.makeComptimeEvalHook(self, target_def.asInt());
-        const is_target_including_tests = try self.isIncludingTestsForFile(target_file);
-        const target_eff_cfg = self.resolveCfgEnvForFile(target_file, is_target_including_tests);
-        const prev_sast_cfg = self.symbol_table.cfg_env;
-        const prev_sast_inc = self.symbol_table.is_including_tests;
-        self.symbol_table.cfg_env = target_eff_cfg;
-        self.symbol_table.is_including_tests = is_target_including_tests;
-        defer {
-            self.symbol_table.cfg_env = prev_sast_cfg;
-            self.symbol_table.is_including_tests = prev_sast_inc;
-        }
 
-        var store = hir.lowerDefToHir(
-            self.allocator,
-            target_def,
-            input_ptr.owned_text,
-            &parsed_ptr.token_buffer,
-            &parsed_ptr.cst_arena,
-            &parsed_ptr.ast_arena,
-            &self.interner,
-            &self.type_pool,
-            &self.symbol_table,
-            self.def_side_tables.getPtr(target_def.asInt()),
-            &hir_scratch_sink,
-            active_layout,
-            eval_hook,
-        ) catch |err| switch (err) {
-            error.Canceled => return error.Canceled,
-            error.DependencyCycle => return error.DependencyCycle,
-            error.MissingSourceInput => return error.MissingSourceInput,
-            error.InvalidDefId => return error.InvalidDefId,
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.OutOfMemory,
-        };
-        defer store.deinit();
-        if (hir_scratch_sink.error_count != 0) {
-            if (sast_sink) |dst_sink| {
-                for (hir_scratch_sink.diagnostics.items) |diag_item| {
-                    if (diag_item.code == .e0325_comptime_sandbox_violation) {
-                        dst_sink.emit(diag_item) catch return error.OutOfMemory;
+        const hir_key = QueryKey.forDef(.lower_def_hir, target_def).asU64();
+        const has_fresh_cached_hir = !self.in_flight_keys.contains(hir_key) and
+            self.lowered_def_hirs.contains(target_def.asInt()) and
+            (if (self.memos.get(hir_key)) |memo_hdr| memo_hdr.verified_at == self.current_revision else false);
+        const initial_store_ptr: *const hir.HirStore = if (has_fresh_cached_hir) blk_cached: {
+            if (self.hir_diagnostics.getPtr(target_def.asInt())) |hir_sink| {
+                if (hir_sink.error_count != 0) {
+                    if (sast_sink) |dst_sink| {
+                        for (hir_sink.diagnostics.items) |diag_item| {
+                            if (diag_item.code == .e0325_comptime_sandbox_violation) {
+                                dst_sink.emit(diag_item) catch return error.OutOfMemory;
+                            }
+                        }
                     }
+                    return;
                 }
             }
-            return;
-        }
+            break :blk_cached self.lowered_def_hirs.getPtr(target_def.asInt()).?;
+        } else blk_fallback: {
+            if (self.body_windows.get(target_def.asInt())) |body_window| {
+                try self.syncDefWindowAndSideTables(target_def, parsed_ptr, body_window.item_ast_node);
+            } else if (self.item_trees.getPtr(target_file.asInt())) |tree_ptr| {
+                if (tree_ptr.getEntry(target_def)) |entry| {
+                    try self.syncDefWindowAndSideTables(target_def, parsed_ptr, entry.ast_node);
+                }
+            }
+            const eval_hook = mir_vm.makeComptimeEvalHook(self, target_def.asInt());
+            const is_target_including_tests = try self.isIncludingTestsForFile(target_file);
+            const target_eff_cfg = self.resolveCfgEnvForFile(target_file, is_target_including_tests);
+            const prev_sast_cfg = self.symbol_table.cfg_env;
+            const prev_sast_inc = self.symbol_table.is_including_tests;
+            self.symbol_table.cfg_env = target_eff_cfg;
+            self.symbol_table.is_including_tests = is_target_including_tests;
+            defer {
+                self.symbol_table.cfg_env = prev_sast_cfg;
+                self.symbol_table.is_including_tests = prev_sast_inc;
+            }
+            fallback_store = hir.lowerDefToHirWithCachedMaps(
+                self.allocator,
+                target_def,
+                input_ptr.owned_text,
+                &parsed_ptr.token_buffer,
+                &parsed_ptr.cst_arena,
+                &parsed_ptr.ast_arena,
+                &self.interner,
+                &self.type_pool,
+                &self.symbol_table,
+                self.def_side_tables.getPtr(target_def.asInt()),
+                &hir_scratch_sink,
+                active_layout,
+                eval_hook,
+                parsed_ptr.node_extra_end,
+                parsed_ptr.cst_to_ast,
+            ) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.DependencyCycle => return error.DependencyCycle,
+                error.MissingSourceInput => return error.MissingSourceInput,
+                error.InvalidDefId => return error.InvalidDefId,
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.OutOfMemory,
+            };
+            if (hir_scratch_sink.error_count != 0) {
+                if (sast_sink) |dst_sink| {
+                    for (hir_scratch_sink.diagnostics.items) |diag_item| {
+                        if (diag_item.code == .e0325_comptime_sandbox_violation) {
+                            dst_sink.emit(diag_item) catch return error.OutOfMemory;
+                        }
+                    }
+                }
+                return;
+            }
+            break :blk_fallback &fallback_store.?;
+        };
 
         var mir_scratch_sink = DiagnosticSink.init(self.allocator);
         defer mir_scratch_sink.deinit();
 
-        var bundle = mir.lowerHirToMirForSast(
+        var ext_sub_stores: std.ArrayListUnmanaged(*const hir.HirStore) = .empty;
+        defer ext_sub_stores.deinit(self.allocator);
+        try self.collectCrossFileSubscriptHirStores(initial_store_ptr, &ext_sub_stores);
+
+        const store_ptr: *const hir.HirStore = if (fallback_store) |*fb_store|
+            fb_store
+        else
+            (self.lowered_def_hirs.getPtr(target_def.asInt()) orelse return);
+
+        var bundle = mir.lowerHirToMirForSastWithSubscripts(
             self.allocator,
-            &store,
+            store_ptr,
+            ext_sub_stores.items,
             &self.type_pool,
             &self.symbol_table,
             &self.interner,
@@ -10872,15 +11642,15 @@ pub const CompilerDb = struct {
         defer bundle.deinit();
 
         const def_sig_opt = self.def_signatures.get(target_def.asInt());
-        if (!store.root_hir.isNone() and store.root_hir.asInt() < store.nodes.len) {
-            const root_node = store.getNode(store.root_hir);
+        if (!store_ptr.root_hir.isNone() and store_ptr.root_hir.asInt() < store_ptr.nodes.len) {
+            const root_node = store_ptr.getNode(store_ptr.root_hir);
             if (root_node.tag == .hir_const_decl) {
                 const init_hir = HirIndex.fromInt(root_node.data.rhs);
                 if (!init_hir.isNone()) {
                     var init_body = lowerInitializerHirToMirBody(
                         self.allocator,
                         target_def,
-                        &store,
+                        store_ptr,
                         init_hir,
                         root_node.type_id,
                         &self.type_pool,
@@ -10899,8 +11669,8 @@ pub const CompilerDb = struct {
                 var blk_body = lowerInitializerHirToMirBody(
                     self.allocator,
                     target_def,
-                    &store,
-                    store.root_hir,
+                    store_ptr,
+                    store_ptr.root_hir,
                     .unit_ty,
                     &self.type_pool,
                     &self.symbol_table,
@@ -10939,30 +11709,32 @@ pub const CompilerDb = struct {
             }
         }
         if (self.def_side_tables.getPtr(def_id.asInt())) |st_ptr| {
+            if (!Fingerprint128.eql(st_ptr.ast_fingerprint, Fingerprint128.ZERO) and
+                Fingerprint128.eql(st_ptr.ast_fingerprint, parsed_ptr.ast_fingerprint))
+            {
+                return;
+            }
             if (!item_cst.isNone() and item_cst.asInt() < parsed_ptr.cst_arena.countNodes()) {
-                const cst_map = syntax_arenas.computeCstToAstMap(
-                    self.allocator,
-                    parsed_ptr.cst_arena.countNodes(),
-                    &parsed_ptr.ast_arena,
-                ) catch return error.OutOfMemory;
-                defer if (cst_map.len > 0) self.allocator.free(cst_map);
-
+                const cst_map = parsed_ptr.cst_to_ast;
                 const cst_start: usize = item_cst.asInt();
                 const cst_rec = parsed_ptr.cst_arena.getNode(item_cst);
                 const cst_end: usize = @min(
                     cst_start + @max(@as(usize, cst_rec.subtree_size), 1),
                     cst_map.len,
                 );
-                var min_ast: u32 = std.math.maxInt(u32);
-                for (cst_map[cst_start..cst_end]) |mapped_ast| {
-                    if (!mapped_ast.isNone() and mapped_ast.asInt() < min_ast) {
-                        min_ast = mapped_ast.asInt();
+                if (cst_start < cst_end) {
+                    var min_ast: u32 = std.math.maxInt(u32);
+                    for (cst_map[cst_start..cst_end]) |mapped_ast| {
+                        if (!mapped_ast.isNone() and mapped_ast.asInt() < min_ast) {
+                            min_ast = mapped_ast.asInt();
+                        }
+                    }
+                    if (min_ast != std.math.maxInt(u32) and min_ast != st_ptr.ast_start) {
+                        st_ptr.rebaseWindow(min_ast);
                     }
                 }
-                if (min_ast != std.math.maxInt(u32) and min_ast != st_ptr.ast_start) {
-                    st_ptr.rebaseWindow(min_ast);
-                }
             }
+            st_ptr.ast_fingerprint = parsed_ptr.ast_fingerprint;
         }
     }
 
@@ -11304,7 +12076,7 @@ pub const CompilerDb = struct {
         }
 
         const eval_hook = mir_vm.makeComptimeEvalHook(self, def_id.asInt());
-        var store = hir.lowerDefToHir(
+        var store = hir.lowerDefToHirWithCachedMaps(
             self.allocator,
             def_id,
             input_ptr.owned_text,
@@ -11318,6 +12090,8 @@ pub const CompilerDb = struct {
             hir_sink,
             active_layout,
             eval_hook,
+            parsed_ptr.node_extra_end,
+            parsed_ptr.cst_to_ast,
         ) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.DependencyCycle => return error.DependencyCycle,
@@ -11328,8 +12102,9 @@ pub const CompilerDb = struct {
         };
         errdefer store.deinit();
 
-        var hir_fp = computeHirStoreFingerprint(
+        var hir_fp = computeHirStoreFingerprintCached(
             &store,
+            self.typeHashCache(),
             &self.type_pool,
             &self.symbol_table,
             &self.interner,
@@ -11347,17 +12122,70 @@ pub const CompilerDb = struct {
         return hir_fp;
     }
 
+    /// Collects lowered `HirStore`s for any cross-file `subscript` templates referenced by `store`.
+    fn collectCrossFileSubscriptHirStores(
+        self: *CompilerDb,
+        store: *const hir.HirStore,
+        out_stores: *std.ArrayListUnmanaged(*const hir.HirStore),
+    ) QueryError!void {
+        var ext_defs: std.ArrayListUnmanaged(DefId) = .empty;
+        defer ext_defs.deinit(self.allocator);
+
+        for (0..store.nodes.len) |ni| {
+            const cur_node = store.nodes.get(ni);
+            if (cur_node.tag != .hir_subscript_call) continue;
+            const callee_hir = HirIndex.fromInt(cur_node.data.lhs);
+            if (callee_hir.isNone() or callee_hir.asInt() >= store.nodes.len) continue;
+            const callee_node = store.getNode(callee_hir);
+            if (callee_node.tag != .hir_global_ref) continue;
+            const sub_sym_idx = SymbolIndex.fromInt(callee_node.data.rhs);
+            if (sub_sym_idx.isNone() or sub_sym_idx.asInt() >= self.symbol_table.countSymbols()) continue;
+            const sub_sym = self.symbol_table.getSymbol(sub_sym_idx).*;
+            const owner_def = if (!sub_sym.owner_def_id.isNone()) sub_sym.owner_def_id else sub_sym.def_id;
+            if (owner_def.isNone() or owner_def.fileId() == store.file_id) continue;
+            var is_seen = false;
+            for (ext_defs.items) |seen_def| {
+                if (seen_def == owner_def) {
+                    is_seen = true;
+                    break;
+                }
+            }
+            if (!is_seen) {
+                try ext_defs.append(self.allocator, owner_def);
+            }
+        }
+        if (ext_defs.items.len == 0) return;
+
+        for (ext_defs.items) |ext_def| {
+            _ = try self.lowerDefHir(ext_def);
+        }
+        try out_stores.ensureUnusedCapacity(self.allocator, ext_defs.items.len);
+        for (ext_defs.items) |ext_def| {
+            if (self.lowered_def_hirs.getPtr(ext_def.asInt())) |ext_ptr| {
+                out_stores.appendAssumeCapacity(ext_ptr);
+            }
+        }
+    }
+
     /// Stage 11 implementation: builds and `V1`–`V6` verifies `DefMirArtifact` for `def_id`.
     fn computeBuildDefMir(self: *CompilerDb, def_id: DefId) QueryError!Fingerprint128 {
         if (def_id.isNone()) return error.InvalidDefId;
         const def_sig = try self.getDefSignature(def_id);
-        const hir_store = try self.lowerDefHir(def_id);
+        _ = try self.lowerDefHir(def_id);
         try self.unwindIfCanceled();
 
+        var ext_sub_stores: std.ArrayListUnmanaged(*const hir.HirStore) = .empty;
+        defer ext_sub_stores.deinit(self.allocator);
+        if (self.lowered_def_hirs.getPtr(def_id.asInt())) |initial_ptr| {
+            try self.collectCrossFileSubscriptHirStores(initial_ptr, &ext_sub_stores);
+        }
+        const hir_store = self.lowered_def_hirs.getPtr(def_id.asInt()) orelse return error.MissingSourceInput;
+
         const mir_sink = try resetOrCreateDefDiagSink(&self.mir_diagnostics, self.allocator, def_id.asInt());
-        var bundle = mir.lowerHirToMir(
+        var bundle = mir.lowerHirToMirWithSubscripts(
             self.allocator,
             hir_store,
+            ext_sub_stores.items,
             &self.type_pool,
             &self.symbol_table,
             &self.interner,
@@ -11366,9 +12194,10 @@ pub const CompilerDb = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => blk: {
                 _ = try resetOrCreateDefDiagSink(&self.mir_diagnostics, self.allocator, def_id.asInt());
-                break :blk mir.lowerHirToMirForSast(
+                break :blk mir.lowerHirToMirForSastWithSubscripts(
                     self.allocator,
                     hir_store,
+                    ext_sub_stores.items,
                     &self.type_pool,
                     &self.symbol_table,
                     &self.interner,

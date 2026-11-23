@@ -917,6 +917,8 @@ pub const CodegenModuleInput = struct {
     file_tokens: ?*const std.AutoHashMapUnmanaged(u32, *const syntax_arenas.TokenBuffer) = null,
     /// Optional promoted `.rodata` constant pool (`MirVm`).
     rodata_pool: ?*const mir_vm.RodataPool = null,
+    /// Optional map `DefId.asInt() -> rodata_blob_idx` for global `.rodata`-backed `const` items.
+    const_rodata_map: ?*const std.AutoHashMapUnmanaged(u32, u32) = null,
     /// Optional pre-materialized `@embed_bytes` blob store.
     blob_store: ?*const mir.MirBlobStore = null,
     /// Optional per-body Pentagon `ProvenValueRange` slices.
@@ -941,6 +943,8 @@ pub const CodegenModuleInput = struct {
     io: ?std.Io = null,
     /// Optional host environment map forwarded to `zig` driver lookup and `zig cc`.
     environ_map: ?*const std.process.Environ.Map = null,
+    /// Optional deterministic `--sim --seed=<u64>` override stored into `context.rng_seed` before `main`.
+    sim_seed: u64 = 0,
     /// Optional `DiagnosticSink` receiving `E0007` / `E0008` diagnostics on backend or linker failure.
     diagnostic_sink: ?*DiagnosticSink = null,
 };
@@ -1174,6 +1178,7 @@ fn isSingleNonNullPointerType(pool: *const InternPool, raw_ty: TypeId) bool {
     const unwrapped = pool.unwrapUnderlyingType(raw_ty);
     if (unwrapped == .source_loc_ty) return true;
     if (unwrapped.isPrimitiveOrSentinel() or isBuiltInRuntimeType(pool, unwrapped)) return false;
+    if (pool.isSliceRefType(unwrapped)) return false;
     const tag = pool.getNode(unwrapped).tag;
     return tag == .ref_ty or tag == .mut_ref_ty or tag == .fn_ty;
 }
@@ -1430,7 +1435,8 @@ fn unwrapWasmCSingleScalar(resolver: *TypeLayoutResolver, raw_ty: TypeId, depth:
     }
     if (unwrapped.isPrimitive()) return unwrapped;
     switch (resolver.pool.getNode(unwrapped).tag) {
-        .ref_ty, .mut_ref_ty, .raw_ptr_ty, .fn_ty => return unwrapped,
+        .ref_ty, .mut_ref_ty => return if (resolver.pool.isSliceRefType(unwrapped)) null else unwrapped,
+        .raw_ptr_ty, .fn_ty => return unwrapped,
         .enum_ty => {
             if (resolver.pool.getEnumBackingIntType(unwrapped)) |backing_int_ty| {
                 return unwrapWasmCSingleScalar(resolver, backing_int_ty, depth + 1);
@@ -1585,7 +1591,7 @@ pub const TypeLayoutResolver = struct {
         if (!unwrapped.isPrimitiveOrSentinel() and !isBuiltInRuntimeType(self.pool, unwrapped)) {
             const node = self.pool.getNode(unwrapped);
             switch (node.tag) {
-                .soa_array_ty => {
+                .soa_array_ty, .soa_vec_ty => {
                     repr_flags.is_soa = true;
                 },
                 .tuple_ty => {
@@ -2140,17 +2146,23 @@ pub const AbiClassifier = struct {
                 const ok_layout = try resolver.resolveType(ok_ty);
                 const err_layout = try resolver.resolveType(err_ty);
                 if (ok_layout.size_bytes <= 32) {
+                    const ptr_bytes: u16 = resolver.target_spec.ptrBytes();
                     var swifterr_kind: SwifterrorKind = .none;
                     if (err_layout.size_bytes == 0) {
                         swifterr_kind = .zst_err;
-                    } else if (err_layout.size_bytes >= 1 and err_layout.size_bytes <= 7) {
+                    } else if (err_layout.size_bytes >= 1 and err_layout.size_bytes < ptr_bytes) {
                         swifterr_kind = .tagged_int56;
-                    } else if (err_layout.size_bytes == 8) {
+                    } else if (err_layout.size_bytes == ptr_bytes) {
                         const err_niche = resolver.getNicheSpec(err_layout);
-                        if (err_niche.encoding == .zero_niche and
+                        const is_zero_ptr_niche = err_niche.encoding == .zero_niche and
                             err_niche.byte_offset == 0 and
-                            err_niche.scalar_bytes == 8)
-                        {
+                            err_niche.scalar_bytes == ptr_bytes;
+                        const is_nonnull_int_niche = err_niche.encoding == .high_range and
+                            err_niche.byte_offset == 0 and
+                            err_niche.scalar_bytes == ptr_bytes and
+                            err_niche.invalid_first == 0 and
+                            err_niche.invalid_count >= 1;
+                        if (is_zero_ptr_niche or is_nonnull_int_niche) {
                             swifterr_kind = .nonnull_ptr;
                         }
                     }
@@ -2160,8 +2172,8 @@ pub const AbiClassifier = struct {
                         recipe.ok_ty = ok_ty;
                         recipe.err_ty = err_ty;
                         recipe.swifterror_recipe = .{
-                            .lowered_size_bytes = 8,
-                            .pointee_align_bytes = 8,
+                            .lowered_size_bytes = ptr_bytes,
+                            .pointee_align_bytes = @intCast(ptr_bytes),
                             .pass_mode = .swifterror_ptr,
                             .bank_0 = .gpr,
                             .attr_bits = 0,

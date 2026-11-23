@@ -95,7 +95,7 @@ fn generateRandomValidCxProgram(allocator: std.mem.Allocator, prng_seed: u64) ![
                 "    }}\n" ++
                 "    return .None;\n" ++
                 "}}\n\n" ++
-                "@derive(Copy, Eq)\n" ++
+                "@derive(Copy, Equatable)\n" ++
                 "pub enum FsmStep: u8 {{\n" ++
                 "    Start = 0,\n" ++
                 "    Advance = 1,\n" ++

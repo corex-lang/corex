@@ -51,7 +51,7 @@ const PHASE4_SEED_ITEMS = [_][]const u8{
     "@derive(From)\npub enum AppError { Io(IoError), InvalidPort, }\n",
     "@derive(Copy)\npub struct Vec2 { pub x: f32 = 0.0_f32, pub y: f32 = 1.0_f32 }\n",
     "pub bit_field HeaderBits: u8 { pub ver: u8 | 3, pub flags: u8 | 5 }\n",
-    "@derive(Copy, Eq)\npub enum WireOrder: u8 { Relaxed = 0, Acquire = 2, SeqCst = 5 }\n",
+    "@derive(Copy, Equatable)\npub enum WireOrder: u8 { Relaxed = 0, Acquire = 2, SeqCst = 5 }\n",
     "pub struct OwnedBox { pub payload: i32 }\n" ++
         "pub(pkg) fn take_owned_box(item: own OwnedBox, out_slot: &out i32, /) {\n" ++
         "    out_slot.* = item.payload;\n" ++

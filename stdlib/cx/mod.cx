@@ -1,0 +1,709 @@
+//! Universal Standard Library Prelude and Root Namespace (`cx`)
+//!
+//! Defines CoreX's implicitly imported comparison, hashing, lifecycle, and zero-allocation
+//! formatting traits alongside `FmtWriter`, `FmtArg`, `Context`, `assert`, `panic`, and `dbg`,
+//! while mounting `cx.{col, math, mem, str}` and re-exporting Stage-1 `core` bridge modules.
+//!
+//! Every prelude descriptor (`Ordering`, `FmtSpec`, `FmtWriter`, `FmtArg`, `SourceLoc`) is an
+//! unboxed `Copy` value with zero pre-`main` static constructors across native and `wasm32` targets.
+
+/// Contiguous, ring, generational, and SIMD/SWAR SwissTable collections (`cx.col`).
+pub mod col;
+
+/// Zero-`libc` scalar, overflow-checked, IEEE-754 bit, and elementary math (`cx.math`).
+pub mod math;
+
+/// Arena, pool, fixed-buffer, OS/Wasm page allocators, and safe wire views (`cx.mem`).
+pub mod mem;
+
+/// 24-byte SSO `String`, UTF-8/Unicode tries, and zero-allocation formatters (`cx.str`).
+pub mod str;
+
+pub use col.{Map, Set, Vec};
+pub use core.{async, atomic, ffi, runtime, simd, sys};
+pub use str.String;
+
+// ---------------------------------------- TYPES ----------------------------------------
+// -------------------- Comparison & Hashing --------------------
+/// Canonical three-way total comparison result (`Less = -1`, `Equal = 0`, `Greater = 1`).
+@derive(Copy, Equatable, Comparable, Hash, Clone, Debug)
+pub enum Ordering: i8 {
+    /// Left operand strictly precedes right operand (`-1`).
+    Less = -1,
+    /// Left and right operands compare equivalent (`0`).
+    Equal = 0,
+    /// Left operand strictly succeeds right operand (`1`).
+    Greater = 1,
+}
+
+/// Structural or semantic equivalence contract backing `==` and `!=` (`STD-01` §1.1).
+pub trait Equatable {
+    /// Returns `true` iff `self` and `other` represent equal values.
+    @no_alloc @no_panic
+    fn eq(&self, other: &Self, /) -> bool;
+}
+
+/// Total ordering contract refining `Equatable` and backing `<`, `<=`, `>`, and `>=`.
+pub trait Comparable: Equatable {
+    /// Returns the total `Ordering` between `self` and `other`.
+    @no_alloc @no_panic
+    fn cmp(&self, other: &Self, /) -> Ordering;
+}
+
+/// Streaming byte-oriented hash accumulator (`WyHasher` by default in `cx.col.Map`).
+pub trait Hasher {
+    /// Feeds raw `bytes` into the running hash state.
+    @no_alloc @no_panic
+    fn write(&mut self, bytes: &[u8], /);
+
+    /// Feeds a 64-bit unsigned `word` in canonical Little-Endian byte order.
+    @no_alloc @no_panic
+    fn write_u64(&mut self, word: u64, /) {
+        self.write(&@to_le_bytes(word));
+    }
+
+    /// Finalizes and returns the 64-bit hash digest without consuming `self`.
+    @no_alloc @no_panic
+    fn finish(&self) -> u64;
+}
+
+/// Prefix-free structural hashing contract feeding a generic `Hasher`.
+pub trait Hash {
+    /// Writes `self`'s canonical hash representation into `state`.
+    @no_alloc @no_panic
+    fn hash[H: Hasher](&self, state: &mut H, /);
+}
+
+// ----------------- Lifecycle & Marker Traits ------------------
+/// Canonical zero-argument value constructor trait (`Type.default()`).
+pub trait Default {
+    /// Constructs the canonical default value of `Self`.
+    fn default() -> Self;
+}
+
+/// Explicit deep duplication contract for `Copy` and `AutoDrop` types.
+pub trait Clone {
+    /// Returns an independent owned duplicate of `self`.
+    fn clone(&self) -> Self;
+}
+
+/// Deterministic scope destructor lowered automatically by `MIR` Pass 1 (`ElaborateDrops`).
+pub trait AutoDrop {
+    /// Releases resources owned by `self` at lexical scope exit.
+    fn drop(&mut self);
+}
+
+/// Marker trait satisfied when dropping `Self` inside a `BumpArenaNoFree` region is a zero-instruction no-op.
+pub trait TrivialDrop {}
+
+// ---------------- Formatting & Runtime Context ----------------
+/// Field alignment mode decoded from bits `21..22` of `FmtSpec.flags_and_fill` (`SE-12`).
+@derive(Copy, Equatable, Clone, Debug)
+pub enum FmtAlign: u8 {
+    /// Type-default alignment (`<` for strings, `>` for numbers).
+    Default = 0,
+    /// Explicit left alignment (`<`).
+    Left = 1,
+    /// Explicit center alignment (`^`).
+    Center = 2,
+    /// Explicit right alignment (`>`).
+    Right = 3,
+}
+
+/// Numeric sign display mode decoded from bits `23..24` of `FmtSpec.flags_and_fill` (`SE-12`).
+@derive(Copy, Equatable, Clone, Debug)
+pub enum FmtSign: u8 {
+    /// Emit leading `-` on negative values only (`0`).
+    Default = 0,
+    /// Emit leading `+` on non-negative numeric values (`+`, `1`).
+    Plus = 1,
+    /// Explicit minus-only sign mode (`-`, `2`).
+    Minus = 2,
+}
+
+/// Presentation verb decoded from bits `27..30` of `FmtSpec.flags_and_fill` (`SE-12`).
+@derive(Copy, Equatable, Clone, Debug)
+pub enum FmtVerb: u8 {
+    /// Default human-facing `Display` formatting (`0`).
+    Display = 0,
+    /// Developer-facing `Debug` formatting (`?`, `1`).
+    Debug = 1,
+    /// Lowercase hexadecimal integer formatting (`x`, `2`).
+    LowerHex = 2,
+    /// Uppercase hexadecimal integer formatting (`X`, `3`).
+    UpperHex = 3,
+    /// Base-2 binary integer formatting (`b`, `4`).
+    Binary = 4,
+    /// Base-8 octal integer formatting (`o`, `5`).
+    Octal = 5,
+    /// Lowercase scientific notation (`e`, `6`).
+    LowerExp = 6,
+    /// Uppercase scientific notation (`E`, `7`).
+    UpperExp = 7,
+    /// Fixed-point decimal notation (`f`, `8`).
+    Fixed = 8,
+    /// Hexadecimal pointer address formatting (`p`, `9`).
+    Pointer = 9,
+}
+
+/// Streaming formatting failure reason returned by `FmtWriter` sinks (`STD-01` §1.1).
+@derive(Copy, Equatable, Clone, Debug)
+pub enum FmtError: u8 {
+    /// Fixed-capacity byte sink ran out of space (`1`).
+    BufferFull = 1,
+    /// Underlying operating-system or transport stream write failed (`2`).
+    IoFailure = 2,
+}
+
+/// Concrete function-pointer byte sink (`16 B` on 64-bit, `8 B` on `wasm32`; zero heap vtables).
+@repr(C)
+@derive(Copy)
+pub struct FmtWriter {
+    /// Type-erased sink state pointer passed to `write_fn`.
+    pub ctx: *mut opaque,
+    /// Direct callback streaming UTF-8/raw `bytes` into `ctx`.
+    pub write_fn: fn(*mut opaque, &[u8]) -> unit!FmtError,
+}
+
+/// Human-facing text formatting contract invoked by `"{val}"` interpolation holes (`SE-12`).
+pub trait Display {
+    /// Streams the formatted representation of `self` into `out` honoring `spec`.
+    fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError;
+}
+
+/// Developer-facing structural formatting contract invoked by `"{val:?}"`, `"{val=}"`, and `dbg`.
+pub trait Debug {
+    /// Streams the structural debug representation of `self` into `out` honoring `spec`.
+    fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError;
+}
+
+/// Stack-resident type-erased format argument descriptor (`24 B` on 64-bit, `E0306` escape-checked).
+@repr(C)
+@derive(Copy)
+pub struct FmtArg {
+    /// Type-erased read-only pointer to the formatted value on the caller stack.
+    pub data: *opaque,
+    /// Monomorphized formatting shim invoking `Display.fmt` or `Debug.fmt_debug`.
+    pub fmt_fn: fn(*opaque, &mut FmtWriter, FmtSpec) -> unit!FmtError,
+    /// Compile-time validated 8-byte format specification for this hole.
+    pub spec: FmtSpec,
+}
+
+/// Canonical 10-slot implicit thread/task `Context` ABI table (`80 B` on 64-bit, `44 B` on `wasm32`).
+@repr(C)
+pub struct Context {
+    /// Slot `0`: Default general/arena allocator handle (`with context.allocator = …`).
+    pub allocator: mem.AllocatorHandle,
+    /// Slot `1`: Pointer to thread-local 2-slot ping-pong `[Arena; 2]` scratch ring (`D-04`, `E0328`).
+    pub scratch: *mut [mem.Arena; 2],
+    /// Slot `2`: Deterministic PRNG state advanced under `--sim --seed` (`Fix-18A`).
+    pub rng_seed: u64,
+    /// Slot `3`: Nullable `FlightRecorder` trace ring sink pointer (`Phase 13.2` `D-06B`).
+    pub trace_sink: *mut u8,
+    /// Slot `4`: Scoped temporary allocator handle slot.
+    pub temp_allocator: mem.AllocatorHandle,
+    /// Slot `5`: Structured logger vtable/sink handle.
+    pub logger: *opaque,
+    /// Slot `6`: Compiler/runtime `DiagnosticSink` handle.
+    pub diagnostics: *opaque,
+    /// Slot `7`: Cooperative structured cancellation token handle (`DR-08`).
+    pub cancel_token: *opaque,
+    /// Slot `8`: Active I/O and virtual-clock `ReactorVTable` pointer (`DR-08`, `DR-18`).
+    pub reactor: *opaque,
+    /// Slot `9`: Mutable per-worker reactor context state pointer.
+    pub reactor_ctx: *mut opaque,
+}
+
+// --------------------------------------- CONSTS ----------------------------------------
+/// Sentinel `u16` stored in `FmtSpec.width_or_none` and `precision_or_none` when omitted (`0xFFFF`).
+pub const FMT_SPEC_NONE: u16 = 0xFFFF_u16;
+
+// -------------------------------------- INTERNALS --------------------------------------
+/// Encodes Unicode scalar codepoint `raw_cp` into `out_buf` (`1..=4` UTF-8 bytes), defaulting invalid codes to `' '`.
+@inline @no_alloc @no_panic
+fn encode_fill_utf8(raw_cp: u32, out_buf: &mut [u8; 4], /) -> usize {
+    let cp: u32 = if raw_cp == 0_u32 or raw_cp > 0x10_FFFF_u32 or (
+        raw_cp >= 0xD800_u32 and raw_cp <= 0xDFFF_u32
+    ) {
+        0x20_u32
+    } else {
+        raw_cp
+    };
+    if cp < 0x80_u32 {
+        out_buf[0] = cp as u8;
+        return 1_usize;
+    } else if cp < 0x800_u32 {
+        out_buf[0] = (0xC0_u32 | (cp >> 6_u32)) as u8;
+        out_buf[1] = (0x80_u32 | (cp & 0x3F_u32)) as u8;
+        return 2_usize;
+    } else if cp < 0x1_0000_u32 {
+        out_buf[0] = (0xE0_u32 | (cp >> 12_u32)) as u8;
+        out_buf[1] = (0x80_u32 | ((cp >> 6_u32) & 0x3F_u32)) as u8;
+        out_buf[2] = (0x80_u32 | (cp & 0x3F_u32)) as u8;
+        return 3_usize;
+    }
+    out_buf[0] = (0xF0_u32 | (cp >> 18_u32)) as u8;
+    out_buf[1] = (0x80_u32 | ((cp >> 12_u32) & 0x3F_u32)) as u8;
+    out_buf[2] = (0x80_u32 | ((cp >> 6_u32) & 0x3F_u32)) as u8;
+    out_buf[3] = (0x80_u32 | (cp & 0x3F_u32)) as u8;
+    return 4_usize;
+}
+
+/// Emits `repeat_count` copies of `encoded_fill` into `writer` in stack-batched chunks.
+@std_cap_boundary(clears: [alloc, may_panic, blocking_sync])
+fn write_repeated_fill(
+    writer: &mut FmtWriter,
+    encoded_fill: &[u8],
+    repeat_count: usize,
+    /,
+) -> unit!FmtError {
+    if repeat_count == 0_usize or encoded_fill.is_empty() {
+        return .Ok(());
+    }
+    if encoded_fill.len() == 1_usize {
+        let batch: [u8; 32] = [encoded_fill[0]; 32];
+        var rem: usize = repeat_count;
+        while rem >= 32_usize {
+            (writer.write_fn)(writer.ctx, &batch)?;
+            rem -= 32_usize;
+        }
+        if rem > 0_usize {
+            (writer.write_fn)(writer.ctx, batch[0..rem])?;
+        }
+        return .Ok(());
+    }
+    var idx: usize = 0_usize;
+    while idx < repeat_count {
+        (writer.write_fn)(writer.ctx, encoded_fill)?;
+        idx += 1_usize;
+    }
+    return .Ok(());
+}
+
+/// Direct unbuffered standard-error sink callback (`fd = 2`) used by `dbg`.
+@no_alloc @no_panic
+fn stderr_fmt_write_cb(ctx: *mut opaque, chunk: &[u8]) -> unit!FmtError {
+    _ = ctx;
+    if not chunk.is_empty() {
+        _ = @sys_write(2, chunk);
+    }
+    return .Ok(());
+}
+
+// ------------------------------------- PUBLIC API --------------------------------------
+// -------------------- Comparison & Hashing --------------------
+impl Ordering {
+    /// Returns `true` when `self` is `.Equal`.
+    @inline @no_alloc @no_panic
+    pub fn is_eq(self) -> bool = self == .Equal;
+
+    /// Returns `true` when `self` is not `.Equal`.
+    @inline @no_alloc @no_panic
+    pub fn is_ne(self) -> bool = self != .Equal;
+
+    /// Returns `true` when `self` is `.Less`.
+    @inline @no_alloc @no_panic
+    pub fn is_lt(self) -> bool = self == .Less;
+
+    /// Returns `true` when `self` is `.Less` or `.Equal`.
+    @inline @no_alloc @no_panic
+    pub fn is_le(self) -> bool = self != .Greater;
+
+    /// Returns `true` when `self` is `.Greater`.
+    @inline @no_alloc @no_panic
+    pub fn is_gt(self) -> bool = self == .Greater;
+
+    /// Returns `true` when `self` is `.Greater` or `.Equal`.
+    @inline @no_alloc @no_panic
+    pub fn is_ge(self) -> bool = self != .Less;
+
+    /// Inverts `.Less` <-> `.Greater`, leaving `.Equal` unchanged.
+    @inline @no_alloc @no_panic
+    pub fn reverse(self) -> Ordering {
+        return match self {
+            .Less => .Greater,
+            .Equal => .Equal,
+            .Greater => .Less,
+        };
+    }
+
+    /// Lexicographically chains `self` with `tie_breaker` when `self` is `.Equal`.
+    @inline @no_alloc @no_panic
+    pub fn then(self, tie_breaker: Ordering, /) -> Ordering {
+        return match self {
+            .Equal => tie_breaker,
+            _ => self,
+        };
+    }
+}
+
+// -------------- Primitive Trait Implementations ---------------
+impl Hash for bool {
+    /// Writes `0_u8` (`false`) or `1_u8` (`true`) into `state`.
+    @inline @no_alloc @no_panic
+    pub fn hash[H: Hasher](&self, state: &mut H, /) {
+        state.write(&[self.* as u8]);
+    }
+}
+
+impl Hash for u8 {
+    /// Writes `self` as a 1-byte slice into `state`.
+    @inline @no_alloc @no_panic
+    pub fn hash[H: Hasher](&self, state: &mut H, /) {
+        state.write(&[self.*]);
+    }
+}
+
+impl Hash for u16 {
+    /// Writes `self` in Little-Endian byte order into `state`.
+    @inline @no_alloc @no_panic
+    pub fn hash[H: Hasher](&self, state: &mut H, /) {
+        state.write(&@to_le_bytes(self.*));
+    }
+}
+
+impl Hash for u32 {
+    /// Writes `self` in Little-Endian byte order into `state`.
+    @inline @no_alloc @no_panic
+    pub fn hash[H: Hasher](&self, state: &mut H, /) {
+        state.write(&@to_le_bytes(self.*));
+    }
+}
+
+impl Hash for u64 {
+    /// Writes `self` via `state.write_u64` into `state`.
+    @inline @no_alloc @no_panic
+    pub fn hash[H: Hasher](&self, state: &mut H, /) {
+        state.write_u64(self.*);
+    }
+}
+
+impl Hash for u128 {
+    /// Writes `self` in Little-Endian byte order into `state`.
+    @inline @no_alloc @no_panic
+    pub fn hash[H: Hasher](&self, state: &mut H, /) {
+        state.write(&@to_le_bytes(self.*));
+    }
+}
+
+impl Hash for usize {
+    /// Writes `self` widened to `u64` into `state`.
+    @inline @no_alloc @no_panic
+    pub fn hash[H: Hasher](&self, state: &mut H, /) {
+        state.write_u64(self.* as u64);
+    }
+}
+
+impl Hash for i8 {
+    /// Writes `self` in two's-complement byte form into `state`.
+    @inline @no_alloc @no_panic
+    pub fn hash[H: Hasher](&self, state: &mut H, /) {
+        state.write(&@to_le_bytes(self.*));
+    }
+}
+
+impl Hash for i16 {
+    /// Writes `self` in Little-Endian byte order into `state`.
+    @inline @no_alloc @no_panic
+    pub fn hash[H: Hasher](&self, state: &mut H, /) {
+        state.write(&@to_le_bytes(self.*));
+    }
+}
+
+impl Hash for i32 {
+    /// Writes `self` in Little-Endian byte order into `state`.
+    @inline @no_alloc @no_panic
+    pub fn hash[H: Hasher](&self, state: &mut H, /) {
+        state.write(&@to_le_bytes(self.*));
+    }
+}
+
+impl Hash for i64 {
+    /// Writes `self` via `state.write_u64` into `state`.
+    @inline @no_alloc @no_panic
+    pub fn hash[H: Hasher](&self, state: &mut H, /) {
+        state.write_u64(@bit_cast[u64](self.*));
+    }
+}
+
+impl Hash for i128 {
+    /// Writes `self` in Little-Endian byte order into `state`.
+    @inline @no_alloc @no_panic
+    pub fn hash[H: Hasher](&self, state: &mut H, /) {
+        state.write(&@to_le_bytes(self.*));
+    }
+}
+
+impl Hash for isize {
+    /// Writes `self` sign-extended to `u64` into `state`.
+    @inline @no_alloc @no_panic
+    pub fn hash[H: Hasher](&self, state: &mut H, /) {
+        state.write_u64((self.* as i64) as u64);
+    }
+}
+
+impl Hash for char {
+    /// Writes Unicode scalar `self` (`u32` Little-Endian) into `state`.
+    @inline @no_alloc @no_panic
+    pub fn hash[H: Hasher](&self, state: &mut H, /) {
+        state.write(&@to_le_bytes(self.* as u32));
+    }
+}
+
+impl Hash for str {
+    /// Writes UTF-8 bytes of `self` followed by sentinel `0xFF_u8` for prefix-collision resistance.
+    @inline @no_alloc @no_panic
+    pub fn hash[H: Hasher](&self, state: &mut H, /) {
+        state.write(self.*.as_bytes());
+        state.write(&[0xFF_u8]);
+    }
+}
+
+// ---------------- Formatting & Runtime Context ----------------
+impl FmtSpec {
+    /// Canonical default `Display` format specification (`fill = ' '`, no width or precision).
+    pub const DEFAULT: FmtSpec = FmtSpec {
+        flags_and_fill: 0x20_u32,
+        width_or_none: FMT_SPEC_NONE,
+        precision_or_none: FMT_SPEC_NONE,
+    };
+
+    /// Returns the canonical default `FmtSpec` (`FmtSpec.DEFAULT`).
+    @inline @no_alloc @no_panic
+    pub fn default_spec() -> FmtSpec = FmtSpec.DEFAULT;
+
+    /// Extracts the Unicode scalar fill character (`bits 0..20`, defaulting to `' '`).
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub fn fill_char(self) -> char {
+        let raw_cp: u32 = self.flags_and_fill & 0x1F_FFFF_u32;
+        if raw_cp == 0_u32 or raw_cp > 0x10_FFFF_u32 or (
+            raw_cp >= 0xD800_u32 and raw_cp <= 0xDFFF_u32
+        ) {
+            return ' ';
+        }
+        if raw_cp < 0x80_u32 {
+            return (raw_cp as u8) as char;
+        }
+        return unsafe {
+            ((&raw_cp) as *char).read()
+        };
+    }
+
+    /// Extracts the decoded `FmtAlign` mode (`bits 21..22`).
+    @inline @no_alloc @no_panic
+    pub fn align_mode(self) -> FmtAlign {
+        return match (self.flags_and_fill >> 21_u32) & 0x3_u32 {
+            1_u32 => .Left,
+            2_u32 => .Center,
+            3_u32 => .Right,
+            _ => .Default,
+        };
+    }
+
+    /// Extracts the decoded `FmtSign` mode (`bits 23..24`).
+    @inline @no_alloc @no_panic
+    pub fn sign_mode(self) -> FmtSign {
+        return match (self.flags_and_fill >> 23_u32) & 0x3_u32 {
+            1_u32 => .Plus,
+            2_u32 => .Minus,
+            _ => .Default,
+        };
+    }
+
+    /// Returns `true` when the alternate `#` flag (`bit 25`) is set.
+    @inline @no_alloc @no_panic
+    pub fn has_alt_prefix(self) -> bool = ((self.flags_and_fill >> 25_u32) & 0x1_u32) != 0_u32;
+
+    /// Returns `true` when the zero-padding `0` flag (`bit 26`) is set.
+    @inline @no_alloc @no_panic
+    pub fn is_zero_padded(self) -> bool = ((self.flags_and_fill >> 26_u32) & 0x1_u32) != 0_u32;
+
+    /// Extracts the presentation `FmtVerb` (`bits 27..30`).
+    @inline @no_alloc @no_panic
+    pub fn verb(self) -> FmtVerb {
+        return match (self.flags_and_fill >> 27_u32) & 0xF_u32 {
+            1_u32 => .Debug,
+            2_u32 => .LowerHex,
+            3_u32 => .UpperHex,
+            4_u32 => .Binary,
+            5_u32 => .Octal,
+            6_u32 => .LowerExp,
+            7_u32 => .UpperExp,
+            8_u32 => .Fixed,
+            9_u32 => .Pointer,
+            _ => .Display,
+        };
+    }
+
+    /// Returns `true` when `{expr=}` self-debugging output (`bit 31`) was requested.
+    @inline @no_alloc @no_panic
+    pub fn is_debug_eq(self) -> bool = ((self.flags_and_fill >> 31_u32) & 0x1_u32) != 0_u32;
+
+    /// Returns the explicit minimum field width, or `.None` when omitted (`0xFFFF`).
+    @inline @no_alloc @no_panic
+    pub fn width(self) -> u16? {
+        return if self.width_or_none == FMT_SPEC_NONE {
+            .None
+        } else {
+            .Some(self.width_or_none)
+        };
+    }
+
+    /// Returns the explicit precision, or `.None` when omitted (`0xFFFF`).
+    @inline @no_alloc @no_panic
+    pub fn precision(self) -> u16? {
+        return if self.precision_or_none == FMT_SPEC_NONE {
+            .None
+        } else {
+            .Some(self.precision_or_none)
+        };
+    }
+}
+
+impl FmtWriter {
+    /// Streams raw `bytes` into the underlying sink callback.
+    @std_cap_boundary(clears: [alloc, may_panic, blocking_sync])
+    @inline
+    pub fn write_bytes(&mut self, bytes: &[u8], /) -> unit!FmtError {
+        return (self.write_fn)(self.ctx, bytes);
+    }
+
+    /// Streams UTF-8 `text` into the underlying sink callback.
+    @std_cap_boundary(clears: [alloc, may_panic, blocking_sync])
+    @inline
+    pub fn write_str(&mut self, text: str, /) -> unit!FmtError {
+        return (self.write_fn)(self.ctx, text.as_bytes());
+    }
+
+    /// Streams `raw` padded to `spec.width()` UTF-8 codepoints according to `spec.align_mode()`.
+    @std_cap_boundary(clears: [alloc, may_panic, blocking_sync])
+    pub fn write_padded(&mut self, raw: &[u8], spec: FmtSpec, /) -> unit!FmtError {
+        let min_width: usize = match spec.width() {
+            .Some(width_u16) => width_u16 as usize,
+            .None => return (self.write_fn)(self.ctx, raw),
+        };
+        var cp_count: usize = 0_usize;
+        for byte_val in raw {
+            if (byte_val & 0xC0_u8) != 0x80_u8 {
+                cp_count += 1_usize;
+            }
+        }
+        if cp_count >= min_width {
+            return (self.write_fn)(self.ctx, raw);
+        }
+        let pad_total: usize = min_width - cp_count;
+        var fill_buf: [u8; 4] = [0_u8; 4];
+        let fill_len: usize = encode_fill_utf8(spec.flags_and_fill & 0x1F_FFFF_u32, &mut fill_buf);
+        if fill_len > fill_buf.len() {
+            return .Ok(());
+        }
+        let fill_slice: &[u8] = fill_buf[0..fill_len];
+        return match spec.align_mode() {
+            .Left => {
+                (self.write_fn)(self.ctx, raw)?;
+                write_repeated_fill(self, fill_slice, pad_total)
+            },
+            .Center => {
+                let left_pad: usize = pad_total / 2_usize;
+                write_repeated_fill(self, fill_slice, left_pad)?;
+                (self.write_fn)(self.ctx, raw)?;
+                write_repeated_fill(self, fill_slice, pad_total - left_pad)
+            },
+            _ => {
+                write_repeated_fill(self, fill_slice, pad_total)?;
+                (self.write_fn)(self.ctx, raw)
+            },
+        };
+    }
+}
+
+impl Display for SourceLoc {
+    /// Formats `self` as `<file>:<line>:<col>` into `out`.
+    @no_alloc
+    pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        _ = spec;
+        return @fmt_write(out, "{self.file}:{self.line}:{self.col}");
+    }
+}
+
+impl Debug for SourceLoc {
+    /// Formats `self` in debug mode as `<file>:<line>:<col> (<fn_name>)` into `out`.
+    @no_alloc
+    pub fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        _ = spec;
+        return @fmt_write(out, "{self.file}:{self.line}:{self.col} ({self.fn_name})");
+    }
+}
+
+impl Display for FmtArgs {
+    /// Streams pre-packaged `FmtArgs` directly into `out`.
+    @no_alloc
+    pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        _ = spec;
+        return @fmt_write(out, self.*);
+    }
+}
+
+// -------------- Assertions, Panics & Diagnostics --------------
+/// Verifies `condition` in all build modes, aborting via `panic(message, loc: loc)` when `false`.
+@inline @no_alloc
+pub fn assert(
+    condition: bool,
+    message: FmtArgs = "",
+    /,
+    *,
+    loc: SourceLoc = @caller_location(),
+) {
+    if not condition {
+        panic(message, loc: loc);
+    }
+}
+
+/// Verifies `condition` in debug/dev builds (`@cfg(debug)`), eliding checks in `--release`.
+@cfg(debug)
+@std_cap_boundary(clears: [may_panic])
+@inline @no_alloc
+pub fn debug_assert(
+    condition: bool,
+    message: FmtArgs = "",
+    /,
+    *,
+    loc: SourceLoc = @caller_location(),
+) {
+    if not condition {
+        panic(message, loc: loc);
+    }
+}
+
+/// No-op `debug_assert` stub in non-debug (`--release`) builds (`@cfg(not debug)`).
+@cfg(not debug)
+@inline @no_alloc @no_panic
+pub fn debug_assert(
+    condition: bool,
+    message: FmtArgs = "",
+    /,
+    *,
+    loc: SourceLoc = @caller_location(),
+) {
+    _ = condition;
+    _ = message;
+    _ = loc;
+}
+
+/// Formats `[loc.file:loc.line:loc.col]` and `message` to standard error and terminates execution (`never`).
+@cold @no_alloc @noinline
+pub fn panic(message: FmtArgs = "", /, *, loc: SourceLoc = @caller_location()) -> never {
+    @panic("[{loc.file}:{loc.line}:{loc.col}] {message}");
+}
+
+/// Prints `[{loc.file}:{loc.line}] = {value:?}` to `stderr` and returns `value` by move (`DR-22` §2.6).
+@std_cap_boundary(clears: [fs, io_fs])
+pub fn dbg[T: Debug](value: own T, /, *, loc: SourceLoc = @caller_location()) -> T {
+    var writer = FmtWriter {
+        ctx: 0_usize as *mut opaque,
+        write_fn: stderr_fmt_write_cb,
+    };
+    @fmt_write(&mut writer, "[{loc.file}:{loc.line}] = {value:?}\n") catch {};
+    return own value;
+}

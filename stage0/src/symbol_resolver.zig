@@ -377,13 +377,13 @@ pub const SymbolKind = enum(u8) {
     extern_static_sym = 21,
 };
 
-/// 1-byte bit-packed mask of compiler-synthesized `@derive(…)` traits (`DR-05` §2.3 & `DR-22` `SE-10B`).
+/// 1-byte bit-packed mask of compiler-synthesized `@derive(…)` traits (`DR-05` §2.3 & `STD-01` §1).
 pub const DeriveMask = packed struct(u8) {
-    /// `@derive(Eq)` (`fn eq(&self, other: &Self) -> bool`).
-    has_eq: bool = false,
-    /// `@derive(Hash)` (`fn hash(&self) -> u64`).
+    /// `@derive(Equatable)` (`fn eq(&self, other: &Self) -> bool`).
+    has_equatable: bool = false,
+    /// `@derive(Hash)` (`fn hash[H: Hasher](&self, state: &mut H, /)` or `fn hash(&self) -> u64`).
     has_hash: bool = false,
-    /// `@derive(Debug)` (`fn debug(&self) -> str`).
+    /// `@derive(Debug)` (`fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec) -> unit!FmtError` or `debug`).
     has_debug: bool = false,
     /// `@derive(Clone)` (`fn clone(&self) -> Self`).
     has_clone: bool = false,
@@ -391,8 +391,10 @@ pub const DeriveMask = packed struct(u8) {
     has_from: bool = false,
     /// `@derive(Copy)` bitwise copy marker synthesis.
     has_copy: bool = false,
-    /// Reserved padding bits (`0`).
-    reserved: u2 = 0,
+    /// `@derive(Comparable)` (`fn cmp(&self, other: &Self) -> Ordering`).
+    has_comparable: bool = false,
+    /// `@derive(Default)` (`fn default() -> Self`).
+    has_default: bool = false,
 
     comptime {
         std.debug.assert(@sizeOf(DeriveMask) == 1);
@@ -400,7 +402,8 @@ pub const DeriveMask = packed struct(u8) {
 
     /// Returns `true` if at least one built-in `@derive` trait is requested.
     pub inline fn hasAny(self: DeriveMask) bool {
-        return self.has_eq or self.has_hash or self.has_debug or self.has_clone or self.has_from or self.has_copy;
+        return self.has_equatable or self.has_hash or self.has_debug or self.has_clone or
+            self.has_from or self.has_copy or self.has_comparable or self.has_default;
     }
 };
 
@@ -432,8 +435,12 @@ pub const DeclExtraFlags = packed struct(u16) {
     is_trusted_ffi: bool = false,
     /// `true` if annotated with `@deprecated` (`DR-14` §2.2 API deprecation marker).
     is_deprecated: bool = false,
-    /// Reserved zero padding bits (`0`).
-    reserved: u3 = 0,
+    /// `true` if annotated with `@noinline` or `@cold` (`STD-01` cold slow-path outline directive).
+    is_noinline: bool = false,
+    /// `true` if struct field is annotated with `@non_null` (`STD-01` pointer niche guarantee).
+    is_non_null: bool = false,
+    /// Reserved zero padding bit (`0`).
+    reserved: u1 = 0,
 
     comptime {
         std.debug.assert(@sizeOf(DeclExtraFlags) == 2);
@@ -637,7 +644,7 @@ pub const SymbolRecord = struct {
     bit_width: u16 = 0,
     /// Bitmask of `comptime`-qualified value parameters (`bit i == 1` when parameter `i` is `comptime`).
     is_comptime_param_mask: u64 = 0,
-    /// Parsed `@derive(Eq, Hash, Debug, Clone, From, Copy)` bitmask on nominal `struct` / `enum` / `union` items.
+    /// Parsed `@derive(Equatable, Comparable, Hash, Debug, Clone, Default, From, Copy)` bitmask on nominal items.
     derive_mask: DeriveMask = .{},
     /// Allowed declaration target bitmask when `flags.is_attribute_schema` is `true`.
     attr_target_mask: AttrTargetMask = .{},
@@ -1000,11 +1007,13 @@ const HeaderAttrKind = enum(u8) {
     builder_item,
     /// `@cache_aligned` target L1/L2 cache-line alignment attribute (`DR-20` `D-10A`).
     cache_aligned,
+    /// `@cold` cold slow-path outline attribute (`STD-01`).
+    cold,
     /// `@constructor` primary/secondary constructor attribute (`SE-22`).
     constructor,
     /// `@deprecated` API deprecation and migration template attribute (`DR-14` §2.2).
     deprecated,
-    /// `@derive(Eq, Hash, Debug, Clone, From, Copy)` trait synthesis attribute.
+    /// `@derive(Equatable, Comparable, Hash, Debug, Clone, Default, From, Copy)` trait synthesis attribute.
     derive,
     /// `@export` symbol export attribute.
     export_attr,
@@ -1038,6 +1047,8 @@ const HeaderAttrKind = enum(u8) {
     no_panic,
     /// Retired `@noalloc` spelling emitting `E0225` with `@no_alloc` fix (`ADR-22D`).
     noalloc,
+    /// `@noinline` explicit inlining prohibition attribute (`STD-01`).
+    noinline_attr,
     /// `@not_send` negative concurrency marker (`DR-08` `!Send`).
     not_send,
     /// `@not_sync` negative concurrency marker (`DR-08` `!Sync`).
@@ -1170,7 +1181,7 @@ pub const MAX_SCOPE_DEPTH: usize = 512;
 /// Maximum identifier byte length evaluated by the stack-allocated Levenshtein matrix (`64`).
 pub const MAX_EDIT_DISTANCE_LEN: usize = 64;
 
-/// Built-in trait names pre-populated in `.global_prelude` (`DR-02`, `DR-04`, `DR-06` & `DR-22` `SE-10B`).
+/// Built-in trait names pre-populated in `.global_prelude` (`DR-02`, `DR-04`, `DR-06` & `STD-01`).
 pub const BUILTIN_TRAIT_NAMES = [_][]const u8{
     "AutoDrop",
     "Clone",
@@ -1179,12 +1190,12 @@ pub const BUILTIN_TRAIT_NAMES = [_][]const u8{
     "Default",
     "Display",
     "Drop",
-    "Eq",
     "From",
     "FromError",
+    "Future",
     "Hash",
+    "Hasher",
     "Iterator",
-    "Ord",
     "Send",
     "Sync",
 };
@@ -1207,11 +1218,11 @@ pub const BuiltinTypeEntry = struct {
     name: []const u8,
     /// Pre-assigned static `TypeId` (`0..50`).
     type_id: TypeId,
-    /// `true` if this entry is one of the 12 Constrained Type Groups (`32..36`, `38..44`).
+    /// `true` if this entry is one of the 13 Constrained Type Groups (`32..36`, `38..44`, `group_trivial_drop`).
     is_group: bool,
 };
 
-/// Canonical table of 20 primitive types, 6 built-in runtime types, and 12 Constrained Type Groups (`DR-22`).
+/// Canonical table of 20 primitive types, 6 built-in runtime types, and 13 Constrained Type Groups (`DR-22`, `STD-01`).
 pub const BUILTIN_TYPES_AND_GROUPS = [_]BuiltinTypeEntry{
     .{ .name = "i8", .type_id = .i8_ty, .is_group = false },
     .{ .name = "i16", .type_id = .i16_ty, .is_group = false },
@@ -1245,6 +1256,7 @@ pub const BUILTIN_TYPES_AND_GROUPS = [_]BuiltinTypeEntry{
     .{ .name = "Copy", .type_id = .group_copy, .is_group = true },
     .{ .name = "FromBytes", .type_id = .group_from_bytes, .is_group = true },
     .{ .name = "IntoBytes", .type_id = .group_into_bytes, .is_group = true },
+    .{ .name = "TrivialDrop", .type_id = .group_trivial_drop, .is_group = true },
     .{ .name = "SourceLoc", .type_id = .source_loc_ty, .is_group = false },
     .{ .name = "FmtSpec", .type_id = .fmt_spec_ty, .is_group = false },
     .{ .name = "FmtArgs", .type_id = .fmt_args_ty, .is_group = false },
@@ -1272,6 +1284,7 @@ pub const BUILTIN_TYPE_AND_GROUP_MAP = std.StaticStringMap(TypeId).initComptime(
     .{ "SourceLoc", .source_loc_ty },
     .{ "TaskGroup", .task_group_base_ty },
     .{ "TaskHandle", .task_handle_base_ty },
+    .{ "TrivialDrop", .group_trivial_drop },
     .{ "Unsigned", .group_unsigned },
     .{ "bool", .bool_ty },
     .{ "char", .char_ty },
@@ -1465,6 +1478,7 @@ const HEADER_ATTR_MAP = std.StaticStringMap(HeaderAttrKind).initComptime(.{
     .{ "builder", .builder },
     .{ "builder_item", .builder_item },
     .{ "cache_aligned", .cache_aligned },
+    .{ "cold", .cold },
     .{ "constructor", .constructor },
     .{ "deprecated", .deprecated },
     .{ "derive", .derive },
@@ -1484,6 +1498,7 @@ const HEADER_ATTR_MAP = std.StaticStringMap(HeaderAttrKind).initComptime(.{
     .{ "no_block", .no_block },
     .{ "no_panic", .no_panic },
     .{ "noalloc", .noalloc },
+    .{ "noinline", .noinline_attr },
     .{ "not_send", .not_send },
     .{ "not_sync", .not_sync },
     .{ "overload", .overload },
@@ -1538,9 +1553,11 @@ pub const ALLOW_LINT_NAME_MAP = std.StaticStringMap(AllowLintMask).initComptime(
 /// $O(1)$ static lookup map from built-in `@derive` trait identifiers to `DeriveMask` bits.
 const DERIVE_TRAIT_MAP = std.StaticStringMap(DeriveMask).initComptime(.{
     .{ "Clone", DeriveMask{ .has_clone = true } },
+    .{ "Comparable", DeriveMask{ .has_comparable = true } },
     .{ "Copy", DeriveMask{ .has_copy = true } },
     .{ "Debug", DeriveMask{ .has_debug = true } },
-    .{ "Eq", DeriveMask{ .has_eq = true } },
+    .{ "Default", DeriveMask{ .has_default = true } },
+    .{ "Equatable", DeriveMask{ .has_equatable = true } },
     .{ "From", DeriveMask{ .has_from = true } },
     .{ "Hash", DeriveMask{ .has_hash = true } },
 });
@@ -2234,6 +2251,7 @@ fn collectItemSliceInScopeWithOrdinal(
                 const name_span = token_buffer.getTokenSpan(file_id, name_tok);
 
                 const is_flat_mod_allowed = !sym_table.is_flat_named_module_scopes_suppressed and
+                    file_pkg_id != .std_core and
                     !sym_table.configured_pkg_deps.contains(file_pkg_id);
                 const bound_ext_scope: ScopeId = if (ast_node.rhs.tag != .extra) blk: {
                     const direct_ext = sym_table.getExternalModuleScope(file_id, name_sym);
@@ -2257,7 +2275,7 @@ fn collectItemSliceInScopeWithOrdinal(
                         file_id,
                         .{},
                     );
-                    if (!sym_table.is_flat_named_module_scopes_suppressed) {
+                    if (is_flat_mod_allowed) {
                         try sym_table.named_module_scopes.put(sym_table.allocator, name_sym.asInt(), fresh_scope);
                     }
                     break :blk fresh_scope;
@@ -2325,13 +2343,29 @@ fn collectItemSliceInScopeWithOrdinal(
                 const name_span = token_buffer.getTokenSpan(file_id, name_tok);
                 const effective_owner_def = if (!def_id.isNone()) def_id else enclosing_owner_def;
 
-                const member_scope = try sym_table.scope_arena.allocScope(
-                    .nominal_type_scope,
-                    enclosing_scope,
-                    effective_owner_def,
-                    file_id,
-                    .{},
-                );
+                const static_builtin_tid: TypeId = if (!enclosing_scope.isNone() and
+                    enclosing_scope.asInt() < sym_table.scope_arena.countScopes() and
+                    sym_table.scope_arena.getScope(enclosing_scope).pkg_id == .std_core)
+                blk_static_tid: {
+                    if (std.mem.eql(u8, name_str, "SourceLoc")) break :blk_static_tid .source_loc_ty;
+                    if (std.mem.eql(u8, name_str, "FmtSpec")) break :blk_static_tid .fmt_spec_ty;
+                    if (std.mem.eql(u8, name_str, "FmtArgs")) break :blk_static_tid .fmt_args_ty;
+                    break :blk_static_tid .err_ty;
+                } else .err_ty;
+                const member_scope = if (!static_builtin_tid.isError() and
+                    !sym_table.prim_inherent_scopes[static_builtin_tid.toU32()].isNone())
+                    sym_table.prim_inherent_scopes[static_builtin_tid.toU32()]
+                else
+                    try sym_table.scope_arena.allocScope(
+                        .nominal_type_scope,
+                        enclosing_scope,
+                        effective_owner_def,
+                        file_id,
+                        .{},
+                    );
+                if (!static_builtin_tid.isError()) {
+                    sym_table.prim_inherent_scopes[static_builtin_tid.toU32()] = member_scope;
+                }
                 const sym_kind: SymbolKind = if (is_bit_field)
                     .bit_field_sym
                 else if (ast_node.tag == .union_decl)
@@ -2353,6 +2387,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     .ast_node = item_node_idx,
                     .cst_node = item_cst,
                     .decl_span = name_span,
+                    .type_id = static_builtin_tid,
                     .target_scope = member_scope,
                     .derive_mask = header_meta.derive_mask,
                     .attr_target_mask = header_meta.attr_target_mask,
@@ -3562,6 +3597,8 @@ pub const SymbolTable = struct {
     external_module_scopes: std.AutoHashMapUnmanaged(u64, ScopeId) = .empty,
     /// Maps `DefId.asInt()` to its primary `SymbolIndex`.
     def_to_symbol: std.AutoHashMapUnmanaged(u32, SymbolIndex) = .empty,
+    /// Maps owning `DefId.asInt()` (`impl` or `@derive` nominal) to its ordered member `SymbolIndex` list.
+    owner_def_members: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(SymbolIndex)) = .empty,
     /// Maps nominal `TypeId.toU32()` to its defining `SymbolIndex` for field/variant/method lookup.
     type_to_symbol: std.AutoHashMapUnmanaged(u32, SymbolIndex) = .empty,
     /// Registered `@from` (`FromError`) `(source_err_ty, target_err_ty)` pairs for `?` upcasting (`DR-07`).
@@ -3594,6 +3631,12 @@ pub const SymbolTable = struct {
     cx_meta_scope: ScopeId = .none,
     /// Lazily resolved or synthesized `cx` unified standard library root `ScopeId` (`DR-21` `ADR-21B`).
     cx_root_scope: ScopeId = .none,
+    /// Root module `ScopeId` of `stdlib/cx/mod.cx` supplying `cx` prelude exports to non-`core` files (`STD-01`).
+    cx_prelude_scope: ScopeId = .none,
+    /// Set of `FileId.asInt()` handles belonging to internal `core/` kernel sources (exempt from `cx_prelude_scope`).
+    core_kernel_files: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Inherent member `ScopeId` table indexed by static `TypeId` (`0..63`, e.g., `str` `16`, `SourceLoc` `45`, `FmtSpec` `46`).
+    prim_inherent_scopes: [mem_foundation.TypeId.first_dynamic.toU32()]ScopeId = @splat(.none),
     /// Lazily resolved or synthesized `cx.sync.atomic` / `cx.atomic` module `ScopeId`.
     cx_atomic_scope: ScopeId = .none,
     /// Active binary entrypoint `FileId` during codegen `main` wrapper emission (`.none` when unset).
@@ -3630,6 +3673,12 @@ pub const SymbolTable = struct {
         }
         self.scope_members.deinit(self.allocator);
 
+        var owner_mem_iter = self.owner_def_members.valueIterator();
+        while (owner_mem_iter.next()) |list_ptr| {
+            list_ptr.deinit(self.allocator);
+        }
+        self.owner_def_members.deinit(self.allocator);
+
         var param_spec_iter = self.fn_param_specs.valueIterator();
         while (param_spec_iter.next()) |spec_slice_ptr| {
             self.allocator.free(spec_slice_ptr.*);
@@ -3657,6 +3706,7 @@ pub const SymbolTable = struct {
         self.scoped_map.deinit(self.allocator);
         self.file_module_scopes.deinit(self.allocator);
         self.file_package_ids.deinit(self.allocator);
+        self.core_kernel_files.deinit(self.allocator);
         self.package_root_scopes.deinit(self.allocator);
         self.package_dep_scopes.deinit(self.allocator);
         self.configured_pkg_deps.deinit(self.allocator);
@@ -3691,6 +3741,11 @@ pub const SymbolTable = struct {
             list_ptr.clearRetainingCapacity();
         }
 
+        var owner_mem_reset_iter = self.owner_def_members.valueIterator();
+        while (owner_mem_reset_iter.next()) |list_ptr| {
+            list_ptr.clearRetainingCapacity();
+        }
+
         var param_spec_iter = self.fn_param_specs.valueIterator();
         while (param_spec_iter.next()) |spec_slice_ptr| {
             self.allocator.free(spec_slice_ptr.*);
@@ -3719,6 +3774,7 @@ pub const SymbolTable = struct {
         self.scoped_map.clearRetainingCapacity();
         self.file_module_scopes.clearRetainingCapacity();
         self.file_package_ids.clearRetainingCapacity();
+        self.core_kernel_files.clearRetainingCapacity();
         self.package_root_scopes.clearRetainingCapacity();
         self.package_dep_scopes.clearRetainingCapacity();
         self.configured_pkg_deps.clearRetainingCapacity();
@@ -3742,6 +3798,8 @@ pub const SymbolTable = struct {
         self.scope_arena.resetRetainingCapacity();
         self.cx_meta_scope = .none;
         self.cx_root_scope = .none;
+        self.cx_prelude_scope = .none;
+        self.prim_inherent_scopes = @splat(.none);
         self.cx_atomic_scope = .none;
         self.active_entry_file_id = .none;
         self.is_internal_core = false;
@@ -3763,6 +3821,18 @@ pub const SymbolTable = struct {
     pub fn getFilePackageId(self: *const SymbolTable, file_id: FileId) PackageId {
         if (file_id.isNone()) return .root;
         return self.file_package_ids.get(file_id.asInt()) orelse .root;
+    }
+
+    /// Marks `file_id` as an internal `core/` kernel source file (exempt from `cx_prelude_scope`).
+    pub fn markCoreKernelFile(self: *SymbolTable, file_id: FileId) !void {
+        if (file_id.isNone()) return;
+        try self.core_kernel_files.put(self.allocator, file_id.asInt(), {});
+    }
+
+    /// Returns `true` if `file_id` belongs to the internal `core/` kernel source tree.
+    pub inline fn isCoreKernelFile(self: *const SymbolTable, file_id: FileId) bool {
+        if (file_id.isNone()) return false;
+        return self.core_kernel_files.contains(file_id.asInt());
     }
 
     /// Returns `true` if `file_id` is permitted to import `core.*` directly (`false` for all `PackageId >= 2`).
@@ -4289,9 +4359,12 @@ pub const SymbolTable = struct {
         const core_sym_id = try interner.intern("core");
         const cx_sym_id = try interner.intern("cx");
 
-        const registered_root = self.named_module_scopes.get(core_sym_id.asInt()) orelse
+        const registered_root = if (!self.cx_prelude_scope.isNone())
+            self.cx_prelude_scope
+        else
             self.named_module_scopes.get(cx_sym_id.asInt()) orelse
-            ScopeId.none;
+                self.named_module_scopes.get(core_sym_id.asInt()) orelse
+                ScopeId.none;
         const root_scope = if (!registered_root.isNone())
             registered_root
         else if (!self.cx_root_scope.isNone())
@@ -4320,6 +4393,10 @@ pub const SymbolTable = struct {
         // [1] Ensure `cx.meta` and its reflection mirror types (`TypeInfo`, `FieldInfo`, etc.) exist under `cx`:
         _ = try self.ensureCxMetaScope(interner);
 
+        // When `stdlib/cx/mod.cx` (`cx_prelude_scope`) is mounted, skip synthesizing `atomic`/`async`/`ffi`/`mem`
+        // stubs that collide with `mod.cx`'s real `pub mod mem;` and `pub use core.{async, atomic, ffi, …};`:
+        const has_real_cx_stdlib = !self.cx_prelude_scope.isNone();
+
         // [2] Bridge `cx.sync.atomic` -> `core/atomic.cx` when loaded, or synthesize standalone `atomic` stubs (`[P0-A]`):
         const atomic_sym_id = try interner.intern("atomic");
         const existing_atomic = self.lookupInScopeDirect(root_scope, atomic_sym_id, NamespaceMask.VALUE_ONLY);
@@ -4327,16 +4404,18 @@ pub const SymbolTable = struct {
             self.getSymbol(existing_atomic).target_scope
         else blk: {
             const fresh_atomic_scope = try self.scope_arena.allocScope(.module_scope, root_scope, .NONE, .none, .{});
-            _ = try self.defineSymbol(.{
-                .name = atomic_sym_id,
-                .name_text = interner.get(atomic_sym_id),
-                .kind = .module_sym,
-                .namespace = .value_ns,
-                .visibility = .public,
-                .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
-                .scope_id = root_scope,
-                .target_scope = fresh_atomic_scope,
-            }, null);
+            if (!has_real_cx_stdlib) {
+                _ = try self.defineSymbol(.{
+                    .name = atomic_sym_id,
+                    .name_text = interner.get(atomic_sym_id),
+                    .kind = .module_sym,
+                    .namespace = .value_ns,
+                    .visibility = .public,
+                    .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+                    .scope_id = root_scope,
+                    .target_scope = fresh_atomic_scope,
+                }, null);
+            }
             break :blk fresh_atomic_scope;
         };
         const atomic_order_variants = [_][]const u8{
@@ -4456,7 +4535,7 @@ pub const SymbolTable = struct {
         }
 
         const mem_sym_id = try interner.intern("mem");
-        if (self.lookupInScopeDirect(root_scope, mem_sym_id, NamespaceMask.VALUE_ONLY).isNone()) {
+        if (!has_real_cx_stdlib and self.lookupInScopeDirect(root_scope, mem_sym_id, NamespaceMask.VALUE_ONLY).isNone()) {
             const mem_scope = try self.scope_arena.allocScope(.module_scope, root_scope, .NONE, .none, .{});
             _ = try self.defineSymbol(.{
                 .name = mem_sym_id,
@@ -4489,46 +4568,48 @@ pub const SymbolTable = struct {
         try self.populateStandaloneTypeSubmoduleStub(interner, root_scope, "testing", &.{
             .{ .name = "Bencher", .type_id = .bencher_ty },
         });
-        try self.populateStandaloneTypeSubmoduleStub(interner, root_scope, "async", &.{
-            .{ .name = "TaskGroup", .type_id = .task_group_base_ty },
-            .{ .name = "TaskHandle", .type_id = .task_handle_base_ty },
-        });
-        const async_mod_id = try interner.intern("async");
-        const async_mod_idx = self.lookupInScopeDirect(root_scope, async_mod_id, NamespaceMask.VALUE_ONLY);
-        if (!async_mod_idx.isNone() and !self.getSymbol(async_mod_idx).target_scope.isNone()) {
-            const async_sub_scope = self.getSymbol(async_mod_idx).target_scope;
-            for ([_][]const u8{ "block_on", "task_group", "yield_now" }) |async_fn_name| {
-                const fn_sym_id = try interner.intern(async_fn_name);
-                if (self.lookupInScopeDirect(async_sub_scope, fn_sym_id, NamespaceMask.VALUE_ONLY).isNone()) {
-                    _ = try self.defineSymbol(.{
-                        .name = fn_sym_id,
-                        .name_text = interner.get(fn_sym_id),
-                        .kind = .fn_sym,
-                        .namespace = .value_ns,
-                        .visibility = .public,
-                        .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
-                        .scope_id = async_sub_scope,
-                        .type_id = .err_ty,
-                    }, null);
+        if (!has_real_cx_stdlib) {
+            try self.populateStandaloneTypeSubmoduleStub(interner, root_scope, "async", &.{
+                .{ .name = "TaskGroup", .type_id = .task_group_base_ty },
+                .{ .name = "TaskHandle", .type_id = .task_handle_base_ty },
+            });
+            const async_mod_id = try interner.intern("async");
+            const async_mod_idx = self.lookupInScopeDirect(root_scope, async_mod_id, NamespaceMask.VALUE_ONLY);
+            if (!async_mod_idx.isNone() and !self.getSymbol(async_mod_idx).target_scope.isNone()) {
+                const async_sub_scope = self.getSymbol(async_mod_idx).target_scope;
+                for ([_][]const u8{ "block_on", "task_group", "yield_now" }) |async_fn_name| {
+                    const fn_sym_id = try interner.intern(async_fn_name);
+                    if (self.lookupInScopeDirect(async_sub_scope, fn_sym_id, NamespaceMask.VALUE_ONLY).isNone()) {
+                        _ = try self.defineSymbol(.{
+                            .name = fn_sym_id,
+                            .name_text = interner.get(fn_sym_id),
+                            .kind = .fn_sym,
+                            .namespace = .value_ns,
+                            .visibility = .public,
+                            .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
+                            .scope_id = async_sub_scope,
+                            .type_id = .err_ty,
+                        }, null);
+                    }
                 }
             }
+            const target_c_tys = computeTargetCFfiTypes(self.cfg_env);
+            try self.populateStandaloneTypeSubmoduleStub(interner, root_scope, "ffi", &.{
+                .{ .name = "c_char", .type_id = target_c_tys.c_char_ty },
+                .{ .name = "c_schar", .type_id = .i8_ty },
+                .{ .name = "c_uchar", .type_id = .u8_ty },
+                .{ .name = "c_short", .type_id = .i16_ty },
+                .{ .name = "c_ushort", .type_id = .u16_ty },
+                .{ .name = "c_int", .type_id = .i32_ty },
+                .{ .name = "c_uint", .type_id = .u32_ty },
+                .{ .name = "c_long", .type_id = target_c_tys.c_long_ty },
+                .{ .name = "c_ulong", .type_id = target_c_tys.c_ulong_ty },
+                .{ .name = "c_longlong", .type_id = .i64_ty },
+                .{ .name = "c_ulonglong", .type_id = .u64_ty },
+                .{ .name = "c_longdouble", .type_id = .f64_ty },
+                .{ .name = "c_void", .type_id = .opaque_ty },
+            });
         }
-        const target_c_tys = computeTargetCFfiTypes(self.cfg_env);
-        try self.populateStandaloneTypeSubmoduleStub(interner, root_scope, "ffi", &.{
-            .{ .name = "c_char", .type_id = target_c_tys.c_char_ty },
-            .{ .name = "c_schar", .type_id = .i8_ty },
-            .{ .name = "c_uchar", .type_id = .u8_ty },
-            .{ .name = "c_short", .type_id = .i16_ty },
-            .{ .name = "c_ushort", .type_id = .u16_ty },
-            .{ .name = "c_int", .type_id = .i32_ty },
-            .{ .name = "c_uint", .type_id = .u32_ty },
-            .{ .name = "c_long", .type_id = target_c_tys.c_long_ty },
-            .{ .name = "c_ulong", .type_id = target_c_tys.c_ulong_ty },
-            .{ .name = "c_longlong", .type_id = .i64_ty },
-            .{ .name = "c_ulonglong", .type_id = .u64_ty },
-            .{ .name = "c_longdouble", .type_id = .f64_ty },
-            .{ .name = "c_void", .type_id = .opaque_ty },
-        });
 
         return root_scope;
     }
@@ -4621,7 +4702,7 @@ pub const SymbolTable = struct {
             .flags = .{ .is_pub = true, .is_used = true, .is_builtin = true },
             .scope_id = parent_scope,
             .target_scope = var_scope,
-            .derive_mask = .{ .has_eq = true, .has_hash = true, .has_debug = true, .has_clone = true, .has_copy = true },
+            .derive_mask = .{ .has_equatable = true, .has_hash = true, .has_debug = true, .has_clone = true, .has_copy = true },
             .repr_tag_bits = repr_tag_bits,
         }, null);
         for (variant_names, 0..) |var_name, ord| {
@@ -4802,6 +4883,9 @@ pub const SymbolTable = struct {
                 sym_idx,
             );
             try self.type_to_symbol.put(self.allocator, entry.type_id.toU32(), sym_idx);
+            if (!member_scope.isNone() and entry.type_id.toU32() < self.prim_inherent_scopes.len) {
+                self.prim_inherent_scopes[entry.type_id.toU32()] = member_scope;
+            }
         }
 
         // [2] Register built-in generic `Result` and `Option` type constructors:
@@ -4829,7 +4913,7 @@ pub const SymbolTable = struct {
             );
         }
 
-        // [3] Register built-in traits (`Clone`, `Debug`, `Display`, `Eq`, `From`, `FromError`, `Ord`, etc.):
+        // [3] Register built-in traits (`Clone`, `Debug`, `Display`, `From`, `FromError`, `Hash`, `Hasher`, etc.):
         for (BUILTIN_TRAIT_NAMES) |trait_name| {
             const sym_name = try interner.intern(trait_name);
             const key = packScopedSymbolKey(self.prelude_scope, sym_name, .type_ns);
@@ -4858,7 +4942,40 @@ pub const SymbolTable = struct {
             gop.value_ptr.* = .empty;
         }
         try gop.value_ptr.append(self.allocator, sym_idx);
+
+        if (!record.owner_def_id.isNone()) {
+            try self.registerOwnerDefMember(record.owner_def_id, sym_idx);
+        }
         return sym_idx;
+    }
+
+    /// Appends `sym_idx` to the member list of `owner_def` in `owner_def_members`.
+    pub fn registerOwnerDefMember(self: *SymbolTable, owner_def: DefId, sym_idx: SymbolIndex) !void {
+        if (owner_def.isNone() or sym_idx.isNone()) return;
+        const owner_gop = try self.owner_def_members.getOrPut(self.allocator, owner_def.asInt());
+        if (!owner_gop.found_existing) {
+            owner_gop.value_ptr.* = .empty;
+        }
+        try owner_gop.value_ptr.append(self.allocator, sym_idx);
+    }
+
+    /// Returns the ordered slice of member `SymbolIndex` handles owned by `owner_def` (`&.{}` if none).
+    pub inline fn getOwnerDefMembers(self: *const SymbolTable, owner_def: DefId) []const SymbolIndex {
+        if (owner_def.isNone()) return &.{};
+        if (self.owner_def_members.getPtr(owner_def.asInt())) |list_ptr| {
+            return list_ptr.items;
+        }
+        return &.{};
+    }
+
+    /// Clears all `owner_def_members` buckets belonging to `file_id` prior to re-collecting module items.
+    pub fn clearFileOwnerDefMembers(self: *SymbolTable, file_id: FileId) void {
+        var iter = self.owner_def_members.iterator();
+        while (iter.next()) |kv| {
+            if (DefId.fromInt(kv.key_ptr.*).fileId() == file_id) {
+                kv.value_ptr.clearRetainingCapacity();
+            }
+        }
     }
 
     /// Retrieves a read-only pointer to the `SymbolRecord` at `sym_idx`.
@@ -5060,6 +5177,16 @@ pub const SymbolTable = struct {
                 return distinct_tb_idx;
             }
 
+            // [2.6] Real module declaration or `pub use` import supersedes a synthetic `is_builtin` stub:
+            if (existing.flags.is_builtin and !record.flags.is_builtin) {
+                const real_idx = try self.appendSymbol(record);
+                try self.scoped_map.put(self.allocator, key, real_idx);
+                if (!record.def_id.isNone()) {
+                    try self.def_to_symbol.put(self.allocator, record.def_id.asInt(), real_idx);
+                }
+                return real_idx;
+            }
+
             // [2.8] Defer duplicate `E0408` until `@cfg` pruning when either declaration carries `@cfg` (`SE-18`):
             if (existing.has_cfg_attr or record.has_cfg_attr) {
                 const cfg_sym_idx = try self.appendSymbol(record);
@@ -5116,6 +5243,45 @@ pub const SymbolTable = struct {
         return .none;
     }
 
+    /// Returns the inherent member `ScopeId` registered for a static `TypeId` (`0..63`), or `.none`.
+    pub inline fn getBuiltinTypeMemberScope(self: *const SymbolTable, type_id: TypeId) ScopeId {
+        if (type_id.toU32() < self.prim_inherent_scopes.len) {
+            const cached = self.prim_inherent_scopes[type_id.toU32()];
+            if (!cached.isNone()) return cached;
+        }
+        if (self.type_to_symbol.get(type_id.toU32())) |sym_idx| {
+            return self.getSymbol(sym_idx).target_scope;
+        }
+        return .none;
+    }
+
+    /// Resolves a nominal struct `TypeId` inside `cx.<submod_name>` in $O(1)$ when `stdlib/cx` is mounted.
+    pub fn lookupCxSubmoduleType(
+        self: *const SymbolTable,
+        interner: *const StringInterner,
+        submod_name: []const u8,
+        type_name: []const u8,
+    ) ?TypeId {
+        const root_scope = if (!self.cx_prelude_scope.isNone())
+            self.cx_prelude_scope
+        else
+            self.cx_root_scope;
+        if (root_scope.isNone()) return null;
+        const submod_id = interner.lookup(submod_name) orelse return null;
+        const type_sym_id = interner.lookup(type_name) orelse return null;
+        const mod_sym_idx = self.lookupInScopeDirect(root_scope, submod_id, NamespaceMask.VALUE_ONLY);
+        if (mod_sym_idx.isNone()) return null;
+        const mod_scope = self.getSymbol(mod_sym_idx).target_scope;
+        if (mod_scope.isNone()) return null;
+        const found_idx = self.lookupInScopeDirect(mod_scope, type_sym_id, NamespaceMask.TYPE_ONLY);
+        if (found_idx.isNone()) return null;
+        const found_sym = self.getSymbol(found_idx).*;
+        if (found_sym.kind == .struct_sym and !found_sym.type_id.isError()) {
+            return found_sym.type_id;
+        }
+        return null;
+    }
+
     /// Walks up the lexical parent chain from `start_scope` to `.global_prelude` looking up `name` in `mask`.
     pub fn lookupLexical(
         self: *const SymbolTable,
@@ -5127,6 +5293,33 @@ pub const SymbolTable = struct {
         var cursor = start_scope;
         var steps: usize = 0;
         while (!cursor.isNone() and cursor.asInt() < self.scope_arena.countScopes() and steps <= MAX_SCOPE_DEPTH) : (steps += 1) {
+            if (cursor == self.prelude_scope and !self.cx_prelude_scope.isNone() and
+                start_scope != self.prelude_scope and start_scope != self.cx_prelude_scope)
+            {
+                const start_rec = if (!start_scope.isNone() and start_scope.asInt() < self.scope_arena.countScopes())
+                    self.scope_arena.getScope(start_scope)
+                else
+                    null;
+                const is_in_cx_mod = start_rec != null and start_rec.?.enclosing_module == self.cx_prelude_scope;
+                const is_in_core_kernel = start_rec != null and !start_rec.?.file_id.isNone() and
+                    self.core_kernel_files.contains(start_rec.?.file_id.asInt());
+                if (!is_in_cx_mod and !is_in_core_kernel) {
+                    const cx_idx = self.lookupInScopeDirect(self.cx_prelude_scope, name, mask);
+                    if (!cx_idx.isNone()) {
+                        const cx_sym = self.getSymbol(cx_idx);
+                        const unwrapped_cx = if (cx_sym.kind == .use_alias_sym and !cx_sym.target_symbol.isNone())
+                            self.getSymbol(cx_sym.target_symbol)
+                        else
+                            cx_sym;
+                        if (cx_sym.visibility == .public and
+                            cx_sym.kind != .module_sym and
+                            unwrapped_cx.kind != .module_sym)
+                        {
+                            return self.checkSymbolVisibility(cx_idx, start_scope);
+                        }
+                    }
+                }
+            }
             const sym_idx = self.lookupInScopeDirect(cursor, name, mask);
             if (!sym_idx.isNone()) {
                 return self.checkSymbolVisibility(sym_idx, start_scope);
@@ -5444,13 +5637,23 @@ pub fn emitUnresolvedSymbolDiagnostic(
 ) !void {
     const arena_alloc = sink.arena.asAllocator();
     const is_retired_numeric = std.mem.eql(u8, name_text, "Numeric");
+    const is_retired_eq = std.mem.eql(u8, name_text, "Eq");
+    const is_retired_ord = std.mem.eql(u8, name_text, "Ord");
     const effective_suggestion: ?[]const u8 = if (is_retired_numeric)
         (suggestion_opt orelse "Number")
+    else if (is_retired_eq)
+        "Equatable"
+    else if (is_retired_ord)
+        "Comparable"
     else
         suggestion_opt;
 
     const main_msg = if (is_retired_numeric)
         "the `Numeric` type group was retired in favor of `Number` (or `Integer` / `Float`)"
+    else if (is_retired_eq)
+        "the `Eq` alias was retired in favor of canonical `Equatable`"
+    else if (is_retired_ord)
+        "the `Ord` alias was retired in favor of canonical `Comparable`"
     else
         try std.fmt.allocPrint(
             arena_alloc,
@@ -5459,6 +5662,10 @@ pub fn emitUnresolvedSymbolDiagnostic(
         );
     const primary_label = if (is_retired_numeric)
         "retired type group `Numeric`; did you mean `Number`?"
+    else if (is_retired_eq)
+        "retired alias `Eq`; write `Equatable` instead"
+    else if (is_retired_ord)
+        "retired alias `Ord`; write `Comparable` instead"
     else if (effective_suggestion) |sug|
         try std.fmt.allocPrint(arena_alloc, "not found in this scope; did you mean `{s}`?", .{sug})
     else
@@ -5480,7 +5687,7 @@ pub fn emitUnresolvedSymbolDiagnostic(
         const is_unambiguous_scalar = if (lookupUnambiguousForeignScalar(name_text)) |prim_name|
             std.mem.eql(u8, sug, prim_name)
         else
-            false;
+            (is_retired_eq or is_retired_ord);
         const is_any_scalar_hint = if (lookupForeignScalarHint(name_text)) |hint_name|
             std.mem.eql(u8, sug, hint_name)
         else
@@ -5770,7 +5977,7 @@ pub const ItemHeaderMetadata = struct {
     flags: SymbolFlags = .{},
     /// Phase 7.6 `@constructor`, `@builder`, `@builder_item`, `has_repr_int`, and item kind flags (`DR-22`).
     extra_flags: DeclExtraFlags = .{},
-    /// Parsed `@derive(Eq, Hash, Debug, Clone, From, Copy)` bitmask.
+    /// Parsed `@derive(Equatable, Comparable, Hash, Debug, Clone, From, Copy)` bitmask.
     derive_mask: DeriveMask = .{},
     /// Parsed `@attribute_schema(targets: …)` target bitmask.
     attr_target_mask: AttrTargetMask = .{},
@@ -6046,17 +6253,22 @@ fn extractAttrUint32Lexeme(lexeme: []const u8) ?u32 {
     return std.fmt.parseInt(u32, clean_buf[0..clean_len], 0) catch null;
 }
 
-/// Extracts `emits` and `clears` capability bitmasks from `@std_cap_boundary(…)` inside `[arg_start .. attr_end)`.
+/// Extracts and validates `emits` / `clears` capability bitmasks from `@std_cap_boundary(…)` (`E0327`).
 fn extractStdCapBoundaryMasks(
     source: []const u8,
+    file_id: FileId,
     token_buffer: *const TokenBuffer,
     cst_arena: *const LosslessCstArena,
+    attr_tok: TokenIndex,
     arg_start: usize,
     attr_end: usize,
     emits_out: *u16,
     clears_out: *u16,
-) void {
+    diagnostic_sink: ?*DiagnosticSink,
+) !void {
     var active_mode: enum { emits_mode, clears_mode } = .clears_mode;
+    var has_any_cap = false;
+    var has_emitted_err = false;
     var arg_cur = arg_start;
     while (arg_cur < attr_end) : (arg_cur += 1) {
         const arg_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cur)));
@@ -6066,7 +6278,29 @@ fn extractStdCapBoundaryMasks(
             continue;
         }
         const arg_kind = token_buffer.getToken(arg_leaf.token).kind;
-        if (!isIdentifierToken(arg_kind) and arg_kind != .string_lit and arg_kind != .byte_string_lit) continue;
+        switch (arg_kind) {
+            .lparen, .rparen, .lbracket, .rbracket, .comma, .eq, .colon, .dot => continue,
+            else => {},
+        }
+        if (!isIdentifierToken(arg_kind) and arg_kind != .string_lit and arg_kind != .byte_string_lit) {
+            if (diagnostic_sink) |sink| {
+                const bad_span = token_buffer.getTokenSpan(file_id, arg_leaf.token);
+                const labels = [1]LabeledSpan{.{
+                    .span = bad_span,
+                    .label = "invalid token inside `@std_cap_boundary(…)`",
+                    .style = .primary,
+                }};
+                _ = try sink.emit(.{
+                    .code = .e0327_forbidden_sandbox_bypass_attribute,
+                    .severity = .err,
+                    .primary_span = bad_span,
+                    .message = "invalid argument in `@std_cap_boundary`; expected `clears: […]` or `emits: […]`",
+                    .labels = &labels,
+                });
+                has_emitted_err = true;
+            }
+            continue;
+        }
         const raw_lex = extractTokenSlice(source, token_buffer, arg_leaf.token);
         var unquote_buf: [256]u8 = undefined;
         const ident_lex = if (arg_kind == .string_lit or arg_kind == .byte_string_lit)
@@ -6080,18 +6314,78 @@ fn extractStdCapBoundaryMasks(
         else
             .eof;
         if (next_kind == .eq or next_kind == .colon) {
-            if (std.mem.eql(u8, ident_lex, "emits")) {
+            if (std.mem.eql(u8, ident_lex, "emits") or std.mem.eql(u8, ident_lex, "adds")) {
                 active_mode = .emits_mode;
             } else if (std.mem.eql(u8, ident_lex, "clears")) {
                 active_mode = .clears_mode;
+            } else if (diagnostic_sink) |sink| {
+                const bad_span = token_buffer.getTokenSpan(file_id, arg_leaf.token);
+                const arena_alloc = sink.arena.asAllocator();
+                const msg = try std.fmt.allocPrint(
+                    arena_alloc,
+                    "unknown `@std_cap_boundary` parameter `{s}`; expected `clears` or `emits`",
+                    .{ident_lex},
+                );
+                const labels = [1]LabeledSpan{.{
+                    .span = bad_span,
+                    .label = "unknown `@std_cap_boundary` parameter key",
+                    .style = .primary,
+                }};
+                _ = try sink.emit(.{
+                    .code = .e0327_forbidden_sandbox_bypass_attribute,
+                    .severity = .err,
+                    .primary_span = bad_span,
+                    .message = msg,
+                    .labels = &labels,
+                });
+                has_emitted_err = true;
             }
             continue;
         }
         if (CAPABILITY_NAME_MAP.get(ident_lex)) |cap_bit| {
+            has_any_cap = true;
             switch (active_mode) {
                 .emits_mode => emits_out.* |= cap_bit,
                 .clears_mode => clears_out.* |= cap_bit,
             }
+        } else if (diagnostic_sink) |sink| {
+            const bad_span = token_buffer.getTokenSpan(file_id, arg_leaf.token);
+            const arena_alloc = sink.arena.asAllocator();
+            const msg = try std.fmt.allocPrint(
+                arena_alloc,
+                "unknown capability tag `{s}` in `@std_cap_boundary`",
+                .{ident_lex},
+            );
+            const labels = [1]LabeledSpan{.{
+                .span = bad_span,
+                .label = "unrecognized capability identifier",
+                .style = .primary,
+            }};
+            _ = try sink.emit(.{
+                .code = .e0327_forbidden_sandbox_bypass_attribute,
+                .severity = .err,
+                .primary_span = bad_span,
+                .message = msg,
+                .labels = &labels,
+            });
+            has_emitted_err = true;
+        }
+    }
+    if (!has_any_cap and !has_emitted_err) {
+        if (diagnostic_sink) |sink| {
+            const attr_span = token_buffer.getTokenSpan(file_id, attr_tok);
+            const labels = [1]LabeledSpan{.{
+                .span = attr_span,
+                .label = "missing capability tags in `@std_cap_boundary`",
+                .style = .primary,
+            }};
+            _ = try sink.emit(.{
+                .code = .e0327_forbidden_sandbox_bypass_attribute,
+                .severity = .err,
+                .primary_span = attr_span,
+                .message = "`@std_cap_boundary` requires at least one capability tag in `clears: […]` or `emits: […]`",
+                .labels = &labels,
+            });
         }
     }
 }
@@ -6739,6 +7033,7 @@ fn extractItemHeaderMetadataWithInterner(
                                 },
                                 .no_panic => meta.contract_flags.is_no_panic = true,
                                 .no_block => meta.contract_flags.is_no_block = true,
+                                .cold, .noinline_attr => meta.extra_flags.is_noinline = true,
                                 .not_send => meta.extra_flags.is_not_send = true,
                                 .not_sync => meta.extra_flags.is_not_sync = true,
                                 .linear => meta.contract_flags.is_linear = true,
@@ -6888,14 +7183,17 @@ fn extractItemHeaderMetadataWithInterner(
                                 ),
                                 .std_cap_boundary => {
                                     meta.contract_flags.is_std_cap_boundary = true;
-                                    extractStdCapBoundaryMasks(
+                                    try extractStdCapBoundaryMasks(
                                         source,
+                                        file_id,
                                         token_buffer,
                                         cst_arena,
+                                        leaf.token,
                                         attr_cur + 1,
                                         attr_end,
                                         &meta.cap_emits_mask,
                                         &meta.cap_clears_mask,
+                                        diagnostic_sink,
                                     );
                                 },
                                 .repr => extractReprAttr(
@@ -7028,7 +7326,7 @@ pub fn findItemNameToken(
             break;
         }
         if (isIdentifierToken(tok_kind) or
-            (tok_kind == .kw_async and !main_token.isNone() and
+            ((tok_kind == .kw_async or tok_kind == .prim_type) and !main_token.isNone() and
                 main_token.asInt() < token_buffer.countTokens() and
                 token_buffer.getToken(main_token).kind == .kw_mod))
         {
@@ -8451,7 +8749,7 @@ pub fn enforceExternalPackageCstHygiene(
                                 }
                                 if (seg_i < total_tokens) {
                                     const seg_kind = token_buffer.getToken(TokenIndex.fromInt(seg_i)).kind;
-                                    if (isIdentifierToken(seg_kind) or seg_kind == .kw_async) {
+                                    if (isIdentifierToken(seg_kind) or seg_kind == .kw_async or seg_kind == .prim_type) {
                                         const core_span = token_buffer.getTokenSpan(file_id, tok_idx);
                                         if (!hasDiagnosticAtSpan(sink, .e0218_direct_core_import_forbidden, core_span)) {
                                             try emitDirectCoreImportDiagnostic(sink, interner, core_span);
@@ -9043,6 +9341,7 @@ pub fn collectFileModuleItems(
     for (stale_def_keys.items) |stale_def_raw| {
         _ = sym_table.def_to_symbol.remove(stale_def_raw);
     }
+    sym_table.clearFileOwnerDefMembers(file_id);
 
     var stale_from_keys: std.ArrayListUnmanaged(u64) = .empty;
     defer stale_from_keys.deinit(sym_table.allocator);
@@ -9387,23 +9686,40 @@ fn resolveImplTargetScope(
                 } else sym_table.lookupLexical(enclosing_scope, target_sym_id, NamespaceMask.TYPE_ONLY);
                 switch (lookup) {
                     .found => |sym_idx| {
-                        const sym = sym_table.getSymbol(sym_idx);
-                        if (!sym.target_scope.isNone()) {
-                            return .{
-                                .target_scope = sym.target_scope,
-                                .trait_sym_idx = trait_sym_idx,
-                            };
+                        const sym = sym_table.getSymbol(sym_idx).*;
+                        const chosen_scope = if (!sym.target_scope.isNone())
+                            sym.target_scope
+                        else blk_mk_scope: {
+                            const created_scope = try sym_table.scope_arena.allocScope(
+                                .nominal_type_scope,
+                                enclosing_scope,
+                                if (!sym.def_id.isNone()) sym.def_id else def_id,
+                                file_id,
+                                .{},
+                            );
+                            sym_table.getSymbolMut(sym_idx).target_scope = created_scope;
+                            break :blk_mk_scope created_scope;
+                        };
+                        if (sym.type_id.toU32() < sym_table.prim_inherent_scopes.len) {
+                            sym_table.prim_inherent_scopes[sym.type_id.toU32()] = chosen_scope;
                         }
-                        const created_scope = try sym_table.scope_arena.allocScope(
-                            .nominal_type_scope,
-                            enclosing_scope,
-                            if (!sym.def_id.isNone()) sym.def_id else def_id,
-                            file_id,
-                            .{},
-                        );
-                        sym_table.getSymbolMut(sym_idx).target_scope = created_scope;
+                        if (!sym.type_id.isError()) {
+                            const self_kw_id = try interner.intern("Self");
+                            if (sym_table.lookupInScopeDirect(chosen_scope, self_kw_id, NamespaceMask.TYPE_ONLY).isNone()) {
+                                _ = try sym_table.defineSymbol(.{
+                                    .name = self_kw_id,
+                                    .name_text = interner.get(self_kw_id),
+                                    .kind = .type_alias_sym,
+                                    .namespace = .type_ns,
+                                    .visibility = .private,
+                                    .flags = .{ .is_used = true, .is_builtin = true },
+                                    .scope_id = chosen_scope,
+                                    .type_id = sym.type_id,
+                                }, null);
+                            }
+                        }
                         return .{
-                            .target_scope = created_scope,
+                            .target_scope = chosen_scope,
                             .trait_sym_idx = trait_sym_idx,
                         };
                     },
@@ -9458,6 +9774,7 @@ fn collectStructOrBitFieldMembers(
             var bit_width: u16 = 0;
             var has_seen_pipe = false;
             var has_field_cfg = false;
+            var has_field_non_null = false;
             var field_allow_mask = AllowLintMask{};
             var field_dep_meta = DeprecatedMeta{};
             var has_field_dep = false;
@@ -9526,6 +9843,8 @@ fn collectStructOrBitFieldMembers(
                                         &field_dep_meta,
                                         &has_field_dep,
                                     );
+                                } else if (std.mem.eql(u8, attr_lex, "non_null")) {
+                                    has_field_non_null = true;
                                 }
                                 break;
                             }
@@ -9587,7 +9906,10 @@ fn collectStructOrBitFieldMembers(
                         .namespace = .value_ns,
                         .visibility = field_vis,
                         .flags = .{ .is_pub = (field_vis == .public) },
-                        .extra_flags = .{ .is_deprecated = is_field_dep },
+                        .extra_flags = .{
+                            .is_deprecated = is_field_dep,
+                            .is_non_null = has_field_non_null,
+                        },
                         .scope_id = member_scope,
                         .owner_def_id = owner_def_id,
                         .cst_node = cst_id,
@@ -10075,7 +10397,7 @@ fn resolveUseTreeCst(
                 alias_tok = sub.token;
             } else if (!has_seen_as and
                 (isIdentifierToken(tok_kind) or tok_kind == .kw_self_val or
-                    tok_kind == .kw_self_type or tok_kind == .kw_async))
+                    tok_kind == .kw_self_type or tok_kind == .kw_async or tok_kind == .prim_type))
             {
                 if (seg_count < segments.len) {
                     segments[seg_count] = sub.token;
@@ -10777,7 +11099,8 @@ fn collectUseTreeCapBindings(
             } else if (has_seen_as and isIdentifierToken(tok_kind)) {
                 alias_slice = extractTokenSlice(source, token_buffer, sub.token);
             } else if (!has_seen_as and
-                (isIdentifierToken(tok_kind) or tok_kind == .kw_self_val or tok_kind == .kw_async))
+                (isIdentifierToken(tok_kind) or tok_kind == .kw_self_val or
+                    tok_kind == .kw_async or tok_kind == .prim_type))
             {
                 if (seg_count < seg_slices.len) {
                     seg_slices[seg_count] = extractTokenSlice(source, token_buffer, sub.token);
@@ -11119,7 +11442,7 @@ pub fn scanFileInactiveCfgCapabilities(
                     is_prev_at = false;
                     continue;
                 } else if (is_prev_cx_root and prev_tok_kind == .dot and
-                    (isIdentifierToken(tok_kind) or tok_kind == .kw_async))
+                    (isIdentifierToken(tok_kind) or tok_kind == .kw_async or tok_kind == .prim_type))
                 {
                     token_caps |= CX_DOMAIN_CAP_MAP.get(lexeme) orelse 0;
                 } else if (prev_tok_kind != .dot and isIdentifierToken(tok_kind)) {

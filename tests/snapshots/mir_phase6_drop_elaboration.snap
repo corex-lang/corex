@@ -63,7 +63,7 @@ mir fn @run_drop_and_bce_showcase(params: 2) {
     %38 = ghost_storage_move _6
     %84 = const_scalar (26, 0)
     %85 = place_store _11 <- %84
-    %39 = fn_addr (3, 59)
+    %39 = fn_addr (3, 60)
     term call [val=%0] -> ^bb4()
   ^bb2() [preds: 1]:
     %43 = const_scalar (16, 0)
@@ -169,7 +169,7 @@ mir fn @run_drop_and_bce_showcase(params: 2) [contextless] [ghost_stripped] {
     %36 = place_load _6
     %84 = const_scalar (26, 0)
     %85 = place_store _11 <- %84
-    %39 = fn_addr (3, 59)
+    %39 = fn_addr (3, 60)
     term call [val=%0] -> ^bb4()
   ^bb2() [preds: 1]:
     %43 = const_scalar (16, 0)

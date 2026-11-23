@@ -3643,9 +3643,7 @@ pub fn lintDefBodyW0202(
     if (top_tag == .impl_decl) {
         const impl_members = checker.getNodeExtraSlice(item_ast_node, true);
         var mem_cursor: usize = 0;
-        var sym_raw: u32 = if (checker.db) |db_ptr| db_ptr.getFilePass1SymStart(checker.file_id) else 0;
-        while (sym_raw < checker.sym_table.countSymbols()) : (sym_raw += 1) {
-            const cand_sym_idx = SymbolIndex.fromInt(sym_raw);
+        for (checker.sym_table.getOwnerDefMembers(def_id)) |cand_sym_idx| {
             if (checker.isSymbolCfgDisabled(cand_sym_idx)) continue;
             const cand_sym = checker.sym_table.getSymbol(cand_sym_idx).*;
             if (cand_sym.owner_def_id != def_id) continue;

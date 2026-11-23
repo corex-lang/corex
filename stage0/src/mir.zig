@@ -629,6 +629,122 @@ pub const MirIntrinsicKind = enum(u16) {
     async_yield = 50,
     /// Synchronous root executor entry (`block_on(fut)`, `extra_args = [fut_val]`, `DR-08`).
     async_block_on = 51,
+    /// Polymorphic `@implements[T, Bound]()` (`operands.lhs = T.asInt()`, `operands.rhs = Bound.asInt()`).
+    implements = 52,
+    /// Polymorphic `T.MIN` scalar bound (`operands.lhs = T.asInt()`, `operands.rhs = 0`).
+    int_min = 53,
+    /// Polymorphic `T.MAX` scalar bound (`operands.lhs = T.asInt()`, `operands.rhs = 0`).
+    int_max = 54,
+    /// Polymorphic `T.BITS` bit width (`operands.lhs = T.asInt()`, `operands.rhs = 0`).
+    int_bits = 55,
+    /// Count leading zero bits (`extra_args = [val]`).
+    scalar_clz = 56,
+    /// Count trailing zero bits (`extra_args = [val]`).
+    scalar_ctz = 57,
+    /// Count set `1` bits (`extra_args = [val]`).
+    scalar_popcnt = 58,
+    /// Byte-order reversal (`extra_args = [val]`).
+    scalar_bswap = 59,
+    /// Bitwise rotate left (`extra_args = [val, count]`).
+    scalar_rotl = 60,
+    /// Bitwise rotate right (`extra_args = [val, count]`).
+    scalar_rotr = 61,
+    /// Raw pointer null check (`extra_args = [ptr]`).
+    ptr_is_null = 62,
+    /// Raw pointer element offset (`extra_args = [ptr, delta, is_sub_flag]`).
+    ptr_offset = 63,
+    /// Checked slice split (`extra_args = [slice_val, mid_val, is_mut_flag]`).
+    slice_split_at = 64,
+    /// In-place slice element reversal (`extra_args = [mut_slice_val]`).
+    slice_reverse = 65,
+    /// `#soa Vec[S].new()` / `.in_arena(&mut arena)` (`extra_args = []` or `[arena_handle]`).
+    soa_vec_new = 66,
+    /// `#soa Vec[S].with_capacity(cap)` / `.try_with_capacity(cap)` (`extra_args = [alloc_val, cap, is_try]`).
+    soa_vec_with_cap = 67,
+    /// `#soa Vec[S].len(&self) -> usize` (`extra_args = [ref_val]`).
+    soa_vec_len = 68,
+    /// `#soa Vec[S].capacity(&self) -> usize` (`extra_args = [ref_val]`).
+    soa_vec_cap = 69,
+    /// `#soa Vec[S].push(&mut self, val)` / `.try_push` (`extra_args = [mut_ref_val, elem_val, is_try]`).
+    soa_vec_push = 70,
+    /// `#soa Vec[S].pop(&mut self) -> S?` (`extra_args = [mut_ref_val]`).
+    soa_vec_pop = 71,
+    /// `#soa Vec[S].clear(&mut self)` (`extra_args = [mut_ref_val]`).
+    soa_vec_clear = 72,
+    /// `#soa Vec[S].reserve(&mut self, add)` / `.try_reserve` (`extra_args = [mut_ref_val, add_val, is_try]`).
+    soa_vec_reserve = 73,
+    /// `#soa Vec[S].as_soa_slice` / `.as_mut_soa_slice` (`extra_args = [ref_val, is_mut]`).
+    soa_vec_as_slice = 74,
+    /// `#soa Vec[S]` column slice projection (`extra_args = [ref_val, field_ord, is_mut]`).
+    soa_vec_col_slice = 75,
+    /// `@ctx_next_rng_seed() -> u64` (`extra_args = []`).
+    ctx_next_rng_seed = 76,
+    /// `@tls_scratch_ptr() -> *mut opaque` (`extra_args = []`, `64 B` zero-init TLS).
+    tls_scratch_ptr = 77,
+    /// `@tls_alloc_state() -> *mut opaque` (`extra_args = []`, `256 B` zero-init TLS).
+    tls_alloc_state = 78,
+    /// `@fmt_write(writer, args) -> unit!FmtError` (`extra_args = [writer_mut_ref, fmt_args]`).
+    fmt_write = 79,
+    /// `@memcpy(dst, src, byte_len) -> unit` (`extra_args = [dst, src, byte_len]`).
+    memcpy = 80,
+    /// `@memmove(dst, src, byte_len) -> unit` (`extra_args = [dst, src, byte_len]`).
+    memmove = 81,
+    /// `@memset(dst, byte, byte_len) -> unit` (`extra_args = [dst, byte, byte_len]`).
+    memset = 82,
+    /// `@ptr_copy[T](src, dst, count) -> unit` (`extra_args = [src, dst, count]`).
+    ptr_copy = 83,
+    /// `@ptr_copy_nonoverlapping[T](src, dst, count) -> unit` (`extra_args = [src, dst, count]`).
+    ptr_copy_nonoverlapping = 84,
+    /// `@ptr_read[T](src) -> T` (`extra_args = [src]`).
+    ptr_read = 85,
+    /// `@ptr_write[T](dst, val) -> unit` (`extra_args = [dst, val]`).
+    ptr_write = 86,
+    /// `@ptr_drop_in_place[T](ptr) -> unit` (`extra_args = [ptr]`).
+    ptr_drop_in_place = 87,
+    /// `@forget[T](val) -> unit` (`extra_args = [val]`).
+    forget = 88,
+    /// `@slice_from_raw_parts[T](ptr, len) -> &[T]` / `&mut [T]` (`extra_args = [ptr, len]`).
+    slice_from_raw_parts = 89,
+    /// `@str_from_utf8_unchecked(bytes) -> str` (`extra_args = [bytes]`).
+    str_from_utf8_unchecked = 90,
+    /// `@from_le_bytes[T](bytes) -> T` (`extra_args = [bytes]`).
+    from_le_bytes = 91,
+    /// `@from_be_bytes[T](bytes) -> T` (`extra_args = [bytes]`).
+    from_be_bytes = 92,
+    /// `@to_le_bytes[T](val) -> [u8; sizeof(T)]` (`extra_args = [val]`).
+    to_le_bytes = 93,
+    /// `@to_be_bytes[T](val) -> [u8; sizeof(T)]` (`extra_args = [val]`).
+    to_be_bytes = 94,
+    /// `@sqrt[T](val) -> T` (`extra_args = [val]`).
+    sqrt = 95,
+    /// `@sys_mmap(len, align) -> *mut u8` (`extra_args = [len, align]`).
+    sys_mmap = 96,
+    /// `@sys_munmap(ptr, len) -> unit` (`extra_args = [ptr, len]`).
+    sys_munmap = 97,
+    /// `@wasm_memory_grow(mem_idx, delta_pages) -> usize` (`extra_args = [mem_idx, delta_pages]`).
+    wasm_memory_grow = 98,
+    /// `@simd_load_unaligned[V](ptr) -> V` (`extra_args = [ptr]`).
+    simd_load_unaligned = 99,
+    /// `@simd_and[V](lhs, rhs) -> V` (`extra_args = [lhs, rhs]`).
+    simd_and = 100,
+    /// `@simd_or[V](lhs, rhs) -> V` (`extra_args = [lhs, rhs]`).
+    simd_or = 101,
+    /// `@simd_xor[V](lhs, rhs) -> V` (`extra_args = [lhs, rhs]`).
+    simd_xor = 102,
+    /// `@simd_eq[V](lhs, rhs) -> Mask` (`extra_args = [lhs, rhs]`).
+    simd_eq = 103,
+    /// `@simd_gt_s8[V](lhs, rhs) -> V` (`extra_args = [lhs, rhs]`).
+    simd_gt_s8 = 104,
+    /// `@simd_lt_s8[V](lhs, rhs) -> V` (`extra_args = [lhs, rhs]`).
+    simd_lt_s8 = 105,
+    /// `@simd_swizzle[V](table, indices) -> V` (`extra_args = [table, indices]`).
+    simd_swizzle = 106,
+    /// `@simd_shl_u8[V](vec, shift) -> V` (`extra_args = [vec, shift]`).
+    simd_shl_u8 = 107,
+    /// `@simd_shr_u8[V](vec, shift) -> V` (`extra_args = [vec, shift]`).
+    simd_shr_u8 = 108,
+    /// `@simd_bitmask[V](vec) -> u32` (`extra_args = [vec]`).
+    simd_bitmask = 109,
 
     /// Returns `true` when `operands.lhs` encodes a `PlaceId` rather than `extra_args` or `TypeId`.
     pub inline fn hasPlaceInLhs(self: MirIntrinsicKind) bool {
@@ -643,10 +759,10 @@ pub const MirIntrinsicKind = enum(u16) {
         return self == .drop_if_live;
     }
 
-    /// Returns `true` when `operands.lhs` encodes a reflected `TypeId` (`size_of`, `align_of`, `type_name`).
+    /// Returns `true` when `operands.lhs` encodes a reflected `TypeId` (`size_of`, `align_of`, `type_name`, `implements`, `int_*`).
     pub inline fn hasTypeIdInLhs(self: MirIntrinsicKind) bool {
         return switch (self) {
-            .size_of, .align_of, .type_name => true,
+            .size_of, .align_of, .type_name, .implements, .int_min, .int_max, .int_bits => true,
             else => false,
         };
     }
@@ -691,6 +807,27 @@ pub const MirIntrinsicKind = enum(u16) {
             .async_cancel,
             .async_task_group_exit,
             .async_block_on,
+            .slice_split_at,
+            .slice_reverse,
+            .soa_vec_with_cap,
+            .soa_vec_push,
+            .soa_vec_pop,
+            .soa_vec_clear,
+            .soa_vec_reserve,
+            .ctx_next_rng_seed,
+            .fmt_write,
+            .memcpy,
+            .memmove,
+            .memset,
+            .ptr_copy,
+            .ptr_copy_nonoverlapping,
+            .ptr_read,
+            .ptr_write,
+            .ptr_drop_in_place,
+            .forget,
+            .sys_mmap,
+            .sys_munmap,
+            .wasm_memory_grow,
             => true,
             else => false,
         };
@@ -718,6 +855,10 @@ pub const MirIntrinsicKind = enum(u16) {
             .async_task_group_exit,
             .async_yield,
             .async_block_on,
+            .ctx_next_rng_seed,
+            .soa_vec_new,
+            .soa_vec_with_cap,
+            .fmt_write,
             => true,
             else => false,
         };
@@ -2735,6 +2876,7 @@ const MirLowerer = struct {
             .untyped_int_ty,
             .untyped_float_ty,
             .source_loc_ty,
+            .fmt_spec_ty,
             => return false,
             .str_ty, .fmt_args_ty => return true,
             else => {},
@@ -2757,7 +2899,7 @@ const MirLowerer = struct {
             .optional_ty => self.hasTypeRegionsDepth(TypeId.fromInt(node.lhs), depth + 1),
             .result_ty => self.hasTypeRegionsDepth(TypeId.fromInt(node.lhs), depth + 1) or
                 self.hasTypeRegionsDepth(TypeId.fromInt(node.rhs), depth + 1),
-            .array_ty, .soa_array_ty => self.hasTypeRegionsDepth(TypeId.fromInt(node.lhs), depth + 1),
+            .array_ty, .soa_array_ty, .soa_vec_ty => self.hasTypeRegionsDepth(TypeId.fromInt(node.lhs), depth + 1),
             .tuple_ty => blk: {
                 for (self.pool.getTupleElements(unwrapped)) |raw_elem| {
                     if (self.hasTypeRegionsDepth(TypeId.fromInt(raw_elem), depth + 1)) break :blk true;
@@ -3722,6 +3864,23 @@ const MirLowerer = struct {
                 .type_id = .usize_ty,
                 .operands = .{ .lhs = len_const_idx, .rhs = 0 },
             }, tok);
+        } else if (base_node.tag == .soa_vec_ty) blk: {
+            const ref_ty = try self.pool.internRef(unwrapped_base, false);
+            const vec_addr = try self.ssa.emitInst(self.cur_bb, .{
+                .op = .place_addr,
+                .flags = .{ .is_synthetic = true },
+                .type_id = ref_ty,
+                .operands = .{ .lhs = peeled_place.asInt(), .rhs = 0 },
+            }, tok);
+            const a_start: u32 = @intCast(self.body.extra_args.items.len);
+            try self.body.extra_args.append(self.body.allocator, vec_addr.asInt());
+            break :blk try self.ssa.emitInst(self.cur_bb, .{
+                .op = .intrinsic_op,
+                .flags = .{ .is_synthetic = true },
+                .aux_u16 = @backingInt(MirIntrinsicKind.soa_vec_len),
+                .type_id = .usize_ty,
+                .operands = .{ .lhs = a_start, .rhs = 1 },
+            }, tok);
         } else blk: {
             const len_proj = [1]MirProjection{.{ .kind = .slice_len, .payload = 0 }};
             if (!self.isValidPlaceExtension(peeled_place, &len_proj)) return;
@@ -4022,6 +4181,14 @@ const MirLowerer = struct {
         return if (sym_rec.kind == .extern_static_sym) sym_rec else null;
     }
 
+    /// Returns `true` when `node` is an immutable `.rodata`-backed `.hir_global_ref` targeting a `.const_sym`.
+    fn isConstSymGlobalRef(self: *const MirLowerer, node: HirNode) bool {
+        if (node.tag != .hir_global_ref or node.flags.category != .place_imm) return false;
+        const sym_idx = SymbolIndex.fromInt(node.data.rhs);
+        if (sym_idx.isNone() or sym_idx.asInt() >= self.sym_table.symbols.items.len) return false;
+        return self.sym_table.getSymbol(sym_idx).kind == .const_sym;
+    }
+
     /// Lowers an addressable `HIR` expression into a `PlaceId` (`DR-13` §3.2).
     fn lowerPlace(self: *MirLowerer, expr_hir: HirIndex) anyerror!PlaceId {
         if (expr_hir.isNone() or expr_hir.asInt() >= self.hir_store.nodes.len) {
@@ -4041,6 +4208,28 @@ const MirLowerer = struct {
                         .operands = .{ .lhs = node.data.lhs, .rhs = node.data.rhs },
                     }, tok);
                     const ptr_slot = try self.allocTempLocal(raw_ptr_ty, tok, true, false);
+                    const ptr_place = try self.makePlace(ptr_slot, &.{});
+                    try self.markStorageInit(ptr_slot, tok);
+                    _ = try self.ssa.emitInst(self.cur_bb, .{
+                        .op = .place_store,
+                        .flags = .{ .has_side_effects = true, .is_synthetic = true },
+                        .type_id = .unit_ty,
+                        .operands = .{ .lhs = ptr_place.asInt(), .rhs = addr_val.asInt() },
+                    }, tok);
+                    const deref_proj = [1]MirProjection{.{ .kind = .deref, .payload = 0 }};
+                    if (!self.isValidPlaceExtension(ptr_place, &deref_proj)) {
+                        return self.allocErrorFallbackPlace(node.type_id, tok);
+                    }
+                    return self.extendPlace(ptr_place, &deref_proj);
+                } else if (self.isConstSymGlobalRef(node)) {
+                    const ref_ty = try self.pool.internRef(node.type_id, false);
+                    const addr_val = try self.ssa.emitInst(self.cur_bb, .{
+                        .op = .fn_addr,
+                        .flags = .{ .is_synthetic = true },
+                        .type_id = ref_ty,
+                        .operands = .{ .lhs = node.data.lhs, .rhs = node.data.rhs },
+                    }, tok);
+                    const ptr_slot = try self.allocTempLocal(ref_ty, tok, true, false);
                     const ptr_place = try self.makePlace(ptr_slot, &.{});
                     try self.markStorageInit(ptr_slot, tok);
                     _ = try self.ssa.emitInst(self.cur_bb, .{
@@ -4164,14 +4353,16 @@ const MirLowerer = struct {
                 if ((!unwrapped_base.isError() and unwrapped_base != .str_ty and
                     base_tag != .array_ty and base_tag != .slice_ty and
                     base_tag != .soa_array_ty and base_tag != .soa_slice_ty and
-                    base_tag != .raw_ptr_ty and
+                    base_tag != .soa_vec_ty and base_tag != .raw_ptr_ty and
                     unionSliceElemType(self.pool, unwrapped_base) == null) or
                     !self.isValidPlaceExtension(peeled.place_id, &idx_proj))
                 {
                     return self.allocErrorFallbackPlace(node.type_id, tok);
                 }
                 if (base_tag != .raw_ptr_ty) {
-                    const is_soa_base = base_tag == .soa_array_ty or base_tag == .soa_slice_ty;
+                    const is_soa_base = base_tag == .soa_array_ty or
+                        base_tag == .soa_slice_ty or
+                        base_tag == .soa_vec_ty;
                     try self.emitIndexBoundsCheck(peeled.place_id, unwrapped_base, idx_val, is_soa_base, tok);
                 }
                 return self.extendPlace(peeled.place_id, &idx_proj);
@@ -4196,7 +4387,10 @@ const MirLowerer = struct {
                     .{ .kind = .index, .payload = idx_val.asInt() },
                 };
                 if (!unwrapped_base.isError()) {
-                    if (base_node.tag != .soa_array_ty and base_node.tag != .soa_slice_ty) {
+                    if (base_node.tag != .soa_array_ty and
+                        base_node.tag != .soa_slice_ty and
+                        base_node.tag != .soa_vec_ty)
+                    {
                         return self.allocErrorFallbackPlace(node.type_id, tok);
                     }
                     const elem_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(base_node.lhs));
@@ -4374,6 +4568,210 @@ const MirLowerer = struct {
         return fallback;
     }
 
+    /// Unifies a `subscript` template type `pattern_ty` against caller `concrete_ty` into `subst`.
+    fn unifySubscriptSpliceTypes(
+        allocator: std.mem.Allocator,
+        pool: *InternPool,
+        pattern_ty: TypeId,
+        concrete_ty: TypeId,
+        subst: *std.AutoHashMapUnmanaged(u32, TypeId),
+        depth: u32,
+    ) anyerror!void {
+        if (depth > 20 or pattern_ty.isError() or concrete_ty.isError() or pattern_ty == concrete_ty) return;
+        const p_node = pool.getNode(pattern_ty);
+        switch (p_node.tag) {
+            .type_param,
+            .bind_once_group_var,
+            .bind_many_any_var,
+            .builtin_group,
+            .user_group,
+            .trait_ty,
+            => {
+                if (!subst.contains(pattern_ty.toU32())) {
+                    try subst.put(allocator, pattern_ty.toU32(), concrete_ty);
+                }
+                return;
+            },
+            else => {},
+        }
+        const c_unwrapped = pool.unwrapUnderlyingType(concrete_ty);
+        if (p_node.tag == .refined_ty) {
+            return unifySubscriptSpliceTypes(
+                allocator,
+                pool,
+                TypeId.fromInt(p_node.rhs),
+                c_unwrapped,
+                subst,
+                depth + 1,
+            );
+        }
+        const c_node = pool.getNode(c_unwrapped);
+        if (p_node.tag != c_node.tag) return;
+        switch (p_node.tag) {
+            .ref_ty, .mut_ref_ty, .raw_ptr_ty, .slice_ty, .soa_slice_ty, .soa_vec_ty, .optional_ty => {
+                try unifySubscriptSpliceTypes(
+                    allocator,
+                    pool,
+                    TypeId.fromInt(p_node.lhs),
+                    TypeId.fromInt(c_node.lhs),
+                    subst,
+                    depth + 1,
+                );
+            },
+            .array_ty, .soa_array_ty => {
+                if ((p_node.rhs & type_system.SYMBOLIC_ARRAY_LEN_FLAG) != 0 and
+                    (c_node.rhs & type_system.SYMBOLIC_ARRAY_LEN_FLAG) == 0)
+                {
+                    const const_sym = SymbolId.fromInt(p_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG);
+                    const len_key = try pool.internSymbolicArray(.unit_ty, const_sym, false);
+                    if (!subst.contains(len_key.toU32())) {
+                        const concrete_len_ty = try pool.internArray(.unit_ty, c_node.rhs, false);
+                        try subst.put(allocator, len_key.toU32(), concrete_len_ty);
+                    }
+                }
+                try unifySubscriptSpliceTypes(
+                    allocator,
+                    pool,
+                    TypeId.fromInt(p_node.lhs),
+                    TypeId.fromInt(c_node.lhs),
+                    subst,
+                    depth + 1,
+                );
+            },
+            .result_ty => {
+                try unifySubscriptSpliceTypes(
+                    allocator,
+                    pool,
+                    TypeId.fromInt(p_node.lhs),
+                    TypeId.fromInt(c_node.lhs),
+                    subst,
+                    depth + 1,
+                );
+                try unifySubscriptSpliceTypes(
+                    allocator,
+                    pool,
+                    TypeId.fromInt(p_node.rhs),
+                    TypeId.fromInt(c_node.rhs),
+                    subst,
+                    depth + 1,
+                );
+            },
+            .tuple_ty => {
+                const p_elems = pool.getTupleElements(pattern_ty);
+                const c_elems = pool.getTupleElements(c_unwrapped);
+                const n = @min(p_elems.len, c_elems.len);
+                for (0..n) |i| {
+                    try unifySubscriptSpliceTypes(
+                        allocator,
+                        pool,
+                        TypeId.fromInt(p_elems[i]),
+                        TypeId.fromInt(c_elems[i]),
+                        subst,
+                        depth + 1,
+                    );
+                }
+            },
+            .struct_ty, .enum_ty, .union_ty => {
+                if (p_node.rhs == c_node.rhs) {
+                    const p_args = pool.getGenericTypeArgs(pattern_ty);
+                    const c_args = pool.getGenericTypeArgs(c_unwrapped);
+                    const n = @min(p_args.len, c_args.len);
+                    for (0..n) |i| {
+                        try unifySubscriptSpliceTypes(
+                            allocator,
+                            pool,
+                            TypeId.fromInt(p_args[i]),
+                            TypeId.fromInt(c_args[i]),
+                            subst,
+                            depth + 1,
+                        );
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// Substitutes generic type/const parameters inside `ty` using `subst` during `subscript` splicing.
+    fn substSubscriptSpliceType(
+        allocator: std.mem.Allocator,
+        pool: *InternPool,
+        ty: TypeId,
+        subst: *const std.AutoHashMapUnmanaged(u32, TypeId),
+        depth: u32,
+    ) anyerror!TypeId {
+        if (depth > 20 or ty.isError() or subst.count() == 0) return ty;
+        if (subst.get(ty.toU32())) |mapped| return mapped;
+        const node = pool.getNode(ty);
+        if (!node.flags.has_type_vars and node.tag != .trait_ty) return ty;
+        return switch (node.tag) {
+            .ref_ty => try pool.internRef(
+                try substSubscriptSpliceType(allocator, pool, TypeId.fromInt(node.lhs), subst, depth + 1),
+                false,
+            ),
+            .mut_ref_ty => blk: {
+                const inner = try substSubscriptSpliceType(allocator, pool, TypeId.fromInt(node.lhs), subst, depth + 1);
+                if (pool.isOutRef(ty)) break :blk try pool.internOutRef(inner);
+                break :blk try pool.internRef(inner, true);
+            },
+            .raw_ptr_ty => try pool.internRawPtr(
+                try substSubscriptSpliceType(allocator, pool, TypeId.fromInt(node.lhs), subst, depth + 1),
+                node.rhs != 0,
+            ),
+            .slice_ty => try pool.internSlice(
+                try substSubscriptSpliceType(allocator, pool, TypeId.fromInt(node.lhs), subst, depth + 1),
+                false,
+            ),
+            .soa_slice_ty => try pool.internSlice(
+                try substSubscriptSpliceType(allocator, pool, TypeId.fromInt(node.lhs), subst, depth + 1),
+                true,
+            ),
+            .array_ty, .soa_array_ty => blk: {
+                const inner = try substSubscriptSpliceType(allocator, pool, TypeId.fromInt(node.lhs), subst, depth + 1);
+                const is_soa = (node.tag == .soa_array_ty);
+                if ((node.rhs & type_system.SYMBOLIC_ARRAY_LEN_FLAG) != 0) {
+                    const const_sym = SymbolId.fromInt(node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG);
+                    const len_key = try pool.internSymbolicArray(.unit_ty, const_sym, false);
+                    if (subst.get(len_key.toU32())) |bound_len_ty| {
+                        const bound_node = pool.getNode(bound_len_ty);
+                        if (bound_node.tag == .array_ty and (bound_node.rhs & type_system.SYMBOLIC_ARRAY_LEN_FLAG) == 0) {
+                            break :blk try pool.internArray(inner, bound_node.rhs, is_soa);
+                        }
+                    }
+                    break :blk try pool.internSymbolicArray(inner, const_sym, is_soa);
+                }
+                break :blk try pool.internArray(inner, node.rhs, is_soa);
+            },
+            .optional_ty => try pool.internOptional(
+                try substSubscriptSpliceType(allocator, pool, TypeId.fromInt(node.lhs), subst, depth + 1),
+            ),
+            .result_ty => try pool.internResult(
+                try substSubscriptSpliceType(allocator, pool, TypeId.fromInt(node.lhs), subst, depth + 1),
+                try substSubscriptSpliceType(allocator, pool, TypeId.fromInt(node.rhs), subst, depth + 1),
+            ),
+            .tuple_ty => blk: {
+                const old_elems = pool.getTupleElements(ty);
+                const new_elems = try allocator.alloc(TypeId, old_elems.len);
+                defer allocator.free(new_elems);
+                for (old_elems, 0..) |raw_el, i| {
+                    new_elems[i] = try substSubscriptSpliceType(allocator, pool, TypeId.fromInt(raw_el), subst, depth + 1);
+                }
+                break :blk try pool.internTuple(new_elems);
+            },
+            .struct_ty, .enum_ty, .union_ty => blk: {
+                const raw_args = pool.getGenericTypeArgs(ty);
+                if (raw_args.len == 0) break :blk ty;
+                const new_args = try allocator.alloc(TypeId, raw_args.len);
+                defer allocator.free(new_args);
+                for (raw_args, 0..) |raw_a, i| {
+                    new_args[i] = try substSubscriptSpliceType(allocator, pool, TypeId.fromInt(raw_a), subst, depth + 1);
+                }
+                break :blk try pool.internNominalInstantiation(ty, new_args, node.flags.is_copy, node.flags.has_drop);
+            },
+            else => ty,
+        };
+    }
+
     /// Splices a non-recursive `subscript … yield` call inline.
     fn spliceSubscriptCall(
         self: *MirLowerer,
@@ -4422,6 +4820,13 @@ const MirLowerer = struct {
         var result = SplicedSubscriptAccess{ .place_id = .return_place, .sub_store = sub_store };
         errdefer result.deinit(self.allocator);
 
+        const pre_local_len = self.body.locals.items.len;
+        const pre_inst_len = self.body.insts.len;
+        const pre_calls_len = self.body.calls.items.len;
+
+        var sub_subst: std.AutoHashMapUnmanaged(u32, TypeId) = .empty;
+        defer sub_subst.deinit(self.allocator);
+
         // [1] Bind formal parameters of the `subscript` in left-to-right Hylo order:
         var bound_hir_slots: std.ArrayListUnmanaged(u32) = .empty;
         defer bound_hir_slots.deinit(self.allocator);
@@ -4453,6 +4858,40 @@ const MirLowerer = struct {
             const param_hir_slot = fn_meta.param_local_start + @as(u32, @intCast(arg_i));
             const param_decl = sub_store.locals.items[param_hir_slot];
             var arg_hir = HirIndex.fromInt(raw_args[arg_i]);
+            if (!arg_hir.isNone() and self.hir_store.getNode(arg_hir).tag == .hir_project_arg) {
+                arg_hir = HirIndex.fromInt(self.hir_store.getNode(arg_hir).data.rhs);
+            }
+            if (!arg_hir.isNone()) {
+                try unifySubscriptSpliceTypes(
+                    self.allocator,
+                    self.pool,
+                    param_decl.type_id,
+                    self.hir_store.getNode(arg_hir).type_id,
+                    &sub_subst,
+                    0,
+                );
+            }
+        }
+        try unifySubscriptSpliceTypes(
+            self.allocator,
+            self.pool,
+            fn_meta.ret_ty,
+            call_node.type_id,
+            &sub_subst,
+            0,
+        );
+
+        for (0..bind_count) |arg_i| {
+            const param_hir_slot = fn_meta.param_local_start + @as(u32, @intCast(arg_i));
+            const param_decl = sub_store.locals.items[param_hir_slot];
+            const spec_param_ty = try substSubscriptSpliceType(
+                self.allocator,
+                self.pool,
+                param_decl.type_id,
+                &sub_subst,
+                0,
+            );
+            var arg_hir = HirIndex.fromInt(raw_args[arg_i]);
             var arg_mode = param_decl.mode;
             if (!arg_hir.isNone() and self.hir_store.getNode(arg_hir).tag == .hir_project_arg) {
                 const proj_node = self.hir_store.getNode(arg_hir);
@@ -4462,7 +4901,7 @@ const MirLowerer = struct {
 
             const arg_cat = self.hir_store.getNode(arg_hir).flags.category;
             if (arg_mode == .inout_mode or arg_mode == .set_mode or
-                (!self.isSsaScalarEligibleType(param_decl.type_id) and
+                (!self.isSsaScalarEligibleType(spec_param_ty) and
                     (arg_cat == .place_imm or arg_cat == .place_mut)))
             {
                 const arg_place = if (arg_mode == .inout_mode or arg_mode == .set_mode)
@@ -4477,7 +4916,7 @@ const MirLowerer = struct {
                 });
                 _ = self.hir_local_remap.remove(param_hir_slot);
                 try self.hir_place_remap.put(self.allocator, param_hir_slot, arg_place);
-                const unwrapped_param_ty = self.pool.unwrapUnderlyingType(param_decl.type_id);
+                const unwrapped_param_ty = self.pool.unwrapUnderlyingType(spec_param_ty);
                 if (arg_mode == .let_mode and
                     (unwrapped_param_ty.isError() or self.pool.getNode(unwrapped_param_ty).tag != .mut_ref_ty))
                 {
@@ -4485,8 +4924,8 @@ const MirLowerer = struct {
                 }
             } else {
                 const arg_val = try self.lowerRValue(arg_hir);
-                const is_place_needed = !self.isSsaScalarEligibleType(param_decl.type_id) or param_decl.is_mut;
-                const param_lid = try self.allocTempLocal(param_decl.type_id, tok, is_place_needed, false);
+                const is_place_needed = !self.isSsaScalarEligibleType(spec_param_ty) or param_decl.is_mut;
+                const param_lid = try self.allocTempLocal(spec_param_ty, tok, is_place_needed, false);
                 try bound_hir_slots.append(self.allocator, param_hir_slot);
                 try remap_shadows.append(self.allocator, .{
                     .hir_slot = param_hir_slot,
@@ -4498,7 +4937,7 @@ const MirLowerer = struct {
                 if (is_place_needed) {
                     const param_place = try self.makePlace(param_lid, &.{});
                     try self.markStorageInit(param_lid, tok);
-                    try self.emitZeroPadIfRequired(param_place, param_decl.type_id, tok);
+                    try self.emitZeroPadIfRequired(param_place, spec_param_ty, tok);
                     _ = try self.ssa.emitInst(self.cur_bb, .{
                         .op = .place_store,
                         .flags = .{ .has_side_effects = true, .is_synthetic = true },
@@ -4535,10 +4974,17 @@ const MirLowerer = struct {
         var slot = body_local_start;
         while (slot < body_local_end) : (slot += 1) {
             const local_meta = self.hir_store.locals.items[slot];
-            const fresh_lid = try self.allocTempLocal(
+            const spec_local_ty = try substSubscriptSpliceType(
+                self.allocator,
+                self.pool,
                 local_meta.type_id,
+                &sub_subst,
+                0,
+            );
+            const fresh_lid = try self.allocTempLocal(
+                spec_local_ty,
                 tok,
-                !self.isSsaScalarEligibleType(local_meta.type_id) or local_meta.is_mut,
+                !self.isSsaScalarEligibleType(spec_local_ty) or local_meta.is_mut,
                 false,
             );
             try bound_hir_slots.append(self.allocator, slot);
@@ -4604,6 +5050,100 @@ const MirLowerer = struct {
         while (def_idx > 0) {
             def_idx -= 1;
             try result.post_yield_stmts.append(self.allocator, subscript_defers.items[def_idx]);
+        }
+
+        // Specialize spliced generic `subscript` locals, instructions, and nested calls (`T`, `const N`):
+        if (sub_subst.count() > 0) {
+            for (pre_local_len..self.body.locals.items.len) |loc_i| {
+                const next_lty = try substSubscriptSpliceType(
+                    self.allocator,
+                    self.pool,
+                    self.body.locals.items[loc_i].type_id,
+                    &sub_subst,
+                    0,
+                );
+                self.body.locals.items[loc_i].type_id = next_lty;
+                if (loc_i < self.local_var_types.items.len) {
+                    self.local_var_types.items[loc_i] = next_lty;
+                }
+            }
+            for (pre_inst_len..self.body.insts.len) |inst_i| {
+                var sp_inst = self.body.insts.get(inst_i);
+                sp_inst.type_id = try substSubscriptSpliceType(
+                    self.allocator,
+                    self.pool,
+                    sp_inst.type_id,
+                    &sub_subst,
+                    0,
+                );
+                if (sp_inst.op == .fn_addr and sp_inst.operands.rhs < self.sym_table.symbols.items.len) {
+                    const ref_sym = self.sym_table.getSymbol(SymbolIndex.fromInt(sp_inst.operands.rhs)).*;
+                    if (ref_sym.kind == .const_param_sym) {
+                        const len_key = try self.pool.internSymbolicArray(.unit_ty, ref_sym.name, false);
+                        if (sub_subst.get(len_key.toU32())) |bound_len_ty| {
+                            const bound_node = self.pool.getNode(bound_len_ty);
+                            if (bound_node.tag == .array_ty and
+                                (bound_node.rhs & type_system.SYMBOLIC_ARRAY_LEN_FLAG) == 0)
+                            {
+                                const c_idx = try self.body.appendConst(.{ .int_val = @as(i128, bound_node.rhs) });
+                                sp_inst = .{
+                                    .op = .const_scalar,
+                                    .flags = .{},
+                                    .type_id = sp_inst.type_id,
+                                    .operands = .{ .lhs = c_idx, .rhs = 0 },
+                                };
+                            }
+                        }
+                    }
+                } else if (sp_inst.op == .intrinsic_op) {
+                    const ikind: MirIntrinsicKind = @fromBackingInt(sp_inst.aux_u16);
+                    if (ikind.hasTypeIdInLhs()) {
+                        const subst_lhs = try substSubscriptSpliceType(
+                            self.allocator,
+                            self.pool,
+                            TypeId.fromInt(sp_inst.operands.lhs),
+                            &sub_subst,
+                            0,
+                        );
+                        sp_inst.operands.lhs = subst_lhs.asInt();
+                        if (ikind == .implements) {
+                            const subst_rhs = try substSubscriptSpliceType(
+                                self.allocator,
+                                self.pool,
+                                TypeId.fromInt(sp_inst.operands.rhs),
+                                &sub_subst,
+                                0,
+                            );
+                            sp_inst.operands.rhs = subst_rhs.asInt();
+                        }
+                    }
+                }
+                self.body.insts.set(inst_i, sp_inst);
+            }
+            for (self.body.calls.items[pre_calls_len..]) |*sp_cs| {
+                sp_cs.ret_ty = try substSubscriptSpliceType(
+                    self.allocator,
+                    self.pool,
+                    sp_cs.ret_ty,
+                    &sub_subst,
+                    0,
+                );
+                if (sp_cs.type_args_len > 0 and
+                    sp_cs.type_args_start + sp_cs.type_args_len <= self.body.extra_args.items.len)
+                {
+                    for (0..sp_cs.type_args_len) |ta_i| {
+                        const idx = sp_cs.type_args_start + ta_i;
+                        const subst_ta = try substSubscriptSpliceType(
+                            self.allocator,
+                            self.pool,
+                            TypeId.fromInt(self.body.extra_args.items[idx]),
+                            &sub_subst,
+                            0,
+                        );
+                        self.body.extra_args.items[idx] = subst_ta.asInt();
+                    }
+                }
+            }
         }
 
         result.place_id = yielded_place orelse blk: {
@@ -4885,9 +5425,16 @@ const MirLowerer = struct {
                 else => .unit_ty,
             };
         }
+        if (unwrapped == .fmt_spec_ty) {
+            return switch (ordinal) {
+                0 => .u32_ty,
+                1, 2 => .u16_ty,
+                else => .unit_ty,
+            };
+        }
         const node = self.pool.getNode(unwrapped);
         switch (node.tag) {
-            .array_ty, .slice_ty, .soa_array_ty, .soa_slice_ty => return TypeId.fromInt(node.lhs),
+            .array_ty, .slice_ty, .soa_array_ty, .soa_slice_ty, .soa_vec_ty => return TypeId.fromInt(node.lhs),
             .tuple_ty => {
                 const elems = self.pool.getTupleElements(unwrapped);
                 if (ordinal < elems.len) return TypeId.fromInt(elems[ordinal]);
@@ -5078,12 +5625,19 @@ const MirLowerer = struct {
                     return self.loadPlaceValue(proj_place, node.type_id, node.origin_token, false);
                 }
             },
-            .hir_index_proj, .hir_soa_field_ptr => {
+            .hir_index_proj => {
+                if (try self.tryGatherSoaElementRValue(node, false)) |gathered_val| {
+                    return gathered_val;
+                }
+                const elem_place = try self.lowerPlace(expr_hir);
+                return self.loadPlaceValue(elem_place, node.type_id, node.origin_token, false);
+            },
+            .hir_soa_field_ptr => {
                 const elem_place = try self.lowerPlace(expr_hir);
                 return self.loadPlaceValue(elem_place, node.type_id, node.origin_token, false);
             },
             .hir_global_ref => {
-                if (self.resolveExternStaticGlobalRef(node) != null) {
+                if (self.resolveExternStaticGlobalRef(node) != null or self.isConstSymGlobalRef(node)) {
                     const ext_place = try self.lowerPlace(expr_hir);
                     return self.loadPlaceValue(ext_place, node.type_id, node.origin_token, false);
                 }
@@ -5149,6 +5703,84 @@ const MirLowerer = struct {
             else => {},
         }
         return self.lowerRValue(expr_hir);
+    }
+
+    /// If `lhs_hir` is `.hir_index_proj` (or `.hir_block`s wrapping `.hir_index_proj`) on `#soa`, returns its tail `HirIndex`.
+    fn findTailSoaIndexProj(self: *const MirLowerer, lhs_hir: HirIndex) ?HirIndex {
+        var cur = lhs_hir;
+        var depth: usize = 0;
+        while (!cur.isNone() and cur.asInt() < self.hir_store.nodes.len and depth < 16) : (depth += 1) {
+            const node = self.hir_store.getNode(cur);
+            if (node.tag == .hir_index_proj) {
+                const base_hir = HirIndex.fromInt(node.data.lhs);
+                if (!base_hir.isNone() and base_hir.asInt() < self.hir_store.nodes.len) {
+                    const peeled_ty = self.unwrapAllRefsType(self.hir_store.getNode(base_hir).type_id);
+                    if (!peeled_ty.isError()) {
+                        const btag = self.pool.getNode(peeled_ty).tag;
+                        if (btag == .soa_vec_ty or btag == .soa_array_ty or btag == .soa_slice_ty) {
+                            return cur;
+                        }
+                    }
+                }
+                return null;
+            }
+            if (node.tag == .hir_block) {
+                cur = HirIndex.fromInt(node.data.rhs);
+                continue;
+            }
+            break;
+        }
+        return null;
+    }
+
+    /// Gathers all columnar fields of `soa[idx]` into an AoS struct `MirValueId` when `idx_node` indexes `#soa`.
+    fn tryGatherSoaElementRValue(
+        self: *MirLowerer,
+        idx_node: hir.HirNode,
+        is_moving_out: bool,
+    ) anyerror!?MirValueId {
+        const base_hir = HirIndex.fromInt(idx_node.data.lhs);
+        const idx_hir = HirIndex.fromInt(idx_node.data.rhs);
+        if (base_hir.isNone() or base_hir.asInt() >= self.hir_store.nodes.len) return null;
+        const peeled_base_ty = self.unwrapAllRefsType(self.hir_store.getNode(base_hir).type_id);
+        if (peeled_base_ty.isError()) return null;
+        const base_ty_node = self.pool.getNode(peeled_base_ty);
+        if (base_ty_node.tag != .soa_vec_ty and
+            base_ty_node.tag != .soa_array_ty and
+            base_ty_node.tag != .soa_slice_ty)
+        {
+            return null;
+        }
+        const tok = idx_node.origin_token;
+        const raw_base = try self.lowerPlace(base_hir);
+        const peeled = try self.peelAutoDerefPlace(raw_base, self.hir_store.getNode(base_hir).type_id);
+        const saved_mut = self.is_mut_place_context;
+        self.is_mut_place_context = false;
+        const idx_val = try self.lowerRValue(idx_hir);
+        self.is_mut_place_context = saved_mut;
+        try self.emitIndexBoundsCheck(peeled.place_id, peeled_base_ty, idx_val, true, tok);
+
+        const elem_struct_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(base_ty_node.lhs));
+        var field_vals: std.ArrayListUnmanaged(u32) = .empty;
+        defer field_vals.deinit(self.allocator);
+        var f_ord: u32 = 0;
+        while (resolveVerifierFieldType(self.pool, self.sym_table, elem_struct_ty, f_ord)) |f_ty| : (f_ord += 1) {
+            const soa_projs = [2]MirProjection{
+                .{ .kind = .soa_elem, .payload = f_ord },
+                .{ .kind = .index, .payload = idx_val.asInt() },
+            };
+            const f_place = try self.extendPlace(peeled.place_id, &soa_projs);
+            const f_val = try self.loadPlaceValue(f_place, f_ty, tok, is_moving_out);
+            try field_vals.append(self.allocator, f_val.asInt());
+        }
+        const elems_start: u32 = @intCast(self.body.extra_args.items.len);
+        try self.body.extra_args.appendSlice(self.body.allocator, field_vals.items);
+        return try self.ssa.emitInst(self.cur_bb, .{
+            .op = .aggregate_make,
+            .aux_u16 = @backingInt(AggregateKind.struct_agg),
+            .type_id = idx_node.type_id,
+            .operands = .{ .lhs = elems_start, .rhs = @intCast(field_vals.items.len) },
+        }, tok);
     }
 
     /// If `lhs_hir` is `.hir_subscript_call` (or `.hir_block`s wrapping `.hir_subscript_call`), returns its tail `HirIndex`.
@@ -5227,7 +5859,7 @@ const MirLowerer = struct {
                 return self.ssa.readVariable(lid.asInt(), self.cur_bb);
             },
             .hir_global_ref => {
-                if (self.resolveExternStaticGlobalRef(node) != null) {
+                if (self.resolveExternStaticGlobalRef(node) != null or self.isConstSymGlobalRef(node)) {
                     const ext_place = try self.lowerPlace(expr_hir);
                     return self.loadPlaceValue(ext_place, node.type_id, tok, true);
                 }
@@ -5370,6 +6002,58 @@ const MirLowerer = struct {
                     return self.emitUnitVal(tok);
                 }
 
+                if (self.findTailSoaIndexProj(lhs_hir)) |soa_idx_hir| {
+                    const rhs_val = try self.lowerRValue(rhs_hir);
+                    if (self.cur_bb.isNone() or self.ssa.isBlockTerminated(self.cur_bb)) {
+                        return self.emitUnitVal(tok);
+                    }
+                    const assign_borrow_base = self.active_expr_borrows.items.len;
+                    try self.lowerSubscriptAssignPrefixBlocks(lhs_hir);
+                    if (self.cur_bb.isNone() or self.ssa.isBlockTerminated(self.cur_bb)) {
+                        self.active_expr_borrows.items.len = assign_borrow_base;
+                        return self.emitUnitVal(tok);
+                    }
+                    const soa_idx_node = self.hir_store.getNode(soa_idx_hir);
+                    const base_hir = HirIndex.fromInt(soa_idx_node.data.lhs);
+                    const idx_hir = HirIndex.fromInt(soa_idx_node.data.rhs);
+                    const raw_base = try self.lowerMutPlace(base_hir);
+                    const peeled = try self.peelAutoDerefPlace(raw_base, self.hir_store.getNode(base_hir).type_id);
+                    const saved_mut = self.is_mut_place_context;
+                    self.is_mut_place_context = false;
+                    const idx_val = try self.lowerRValue(idx_hir);
+                    self.is_mut_place_context = saved_mut;
+                    const peeled_base_ty = self.pool.unwrapUnderlyingType(peeled.pointee_ty);
+                    try self.emitIndexBoundsCheck(peeled.place_id, peeled_base_ty, idx_val, true, tok);
+                    const elem_struct_ty = self.pool.unwrapUnderlyingType(
+                        TypeId.fromInt(self.pool.getNode(peeled_base_ty).lhs),
+                    );
+                    var f_ord: u32 = 0;
+                    while (resolveVerifierFieldType(self.pool, self.sym_table, elem_struct_ty, f_ord)) |f_ty| : (f_ord += 1) {
+                        const f_val = try self.ssa.emitInst(self.cur_bb, .{
+                            .op = .aggregate_extract,
+                            .flags = .{ .is_synthetic = true },
+                            .type_id = f_ty,
+                            .operands = .{ .lhs = rhs_val.asInt(), .rhs = f_ord },
+                        }, tok);
+                        const soa_projs = [2]MirProjection{
+                            .{ .kind = .soa_elem, .payload = f_ord },
+                            .{ .kind = .index, .payload = idx_val.asInt() },
+                        };
+                        const f_place = try self.extendPlace(peeled.place_id, &soa_projs);
+                        const write_tok = try self.emitGhostOpen(.ghost_access_set, f_place, .scoped_projection, tok);
+                        try self.emitZeroPadIfRequired(f_place, f_ty, tok);
+                        _ = try self.ssa.emitInst(self.cur_bb, .{
+                            .op = .place_store,
+                            .flags = .{ .has_side_effects = true },
+                            .type_id = .unit_ty,
+                            .operands = .{ .lhs = f_place.asInt(), .rhs = f_val.asInt() },
+                        }, tok);
+                        try self.emitGhostEnd(write_tok, tok);
+                    }
+                    try self.popAndCloseBorrowsTo(assign_borrow_base, tok);
+                    return self.emitUnitVal(tok);
+                }
+
                 const rhs_val = try self.lowerRValue(rhs_hir);
                 if (self.cur_bb.isNone() or self.ssa.isBlockTerminated(self.cur_bb)) {
                     return self.emitUnitVal(tok);
@@ -5454,6 +6138,11 @@ const MirLowerer = struct {
                 return self.loadPlaceValue(proj_place, node.type_id, tok, true);
             },
             .hir_index_proj, .hir_soa_field_ptr => {
+                if (node.tag == .hir_index_proj) {
+                    if (try self.tryGatherSoaElementRValue(node, true)) |gathered_val| {
+                        return gathered_val;
+                    }
+                }
                 const elem_place = try self.lowerPlace(expr_hir);
                 return self.loadPlaceValue(elem_place, node.type_id, tok, true);
             },
@@ -6346,12 +7035,104 @@ const MirLowerer = struct {
                     .type_id = node.type_id,
                     .operands = .{ .lhs = args_start, .rhs = @intCast(lowered_vals.items.len) },
                 }, tok),
+                .int_min, .int_max, .int_bits => blk_int_meta: {
+                    const type_arg_raw = if (type_len >= 1 and extra_base + 2 < self.hir_store.extra_data.items.len)
+                        self.hir_store.extra_data.items[extra_base + 2]
+                    else
+                        node.type_id.asInt();
+                    const mir_kind: MirIntrinsicKind = switch (internal_kind) {
+                        .int_min => .int_min,
+                        .int_max => .int_max,
+                        .int_bits => .int_bits,
+                        else => unreachable,
+                    };
+                    break :blk_int_meta self.ssa.emitInst(self.cur_bb, .{
+                        .op = .intrinsic_op,
+                        .flags = .{ .is_synthetic = true },
+                        .aux_u16 = @backingInt(mir_kind),
+                        .type_id = node.type_id,
+                        .operands = .{ .lhs = type_arg_raw, .rhs = 0 },
+                    }, tok);
+                },
+                .scalar_clz,
+                .scalar_ctz,
+                .scalar_popcnt,
+                .scalar_bswap,
+                .scalar_rotl,
+                .scalar_rotr,
+                .ptr_is_null,
+                .ptr_offset,
+                .slice_split_at,
+                .slice_reverse,
+                .soa_vec_new,
+                .soa_vec_with_cap,
+                .soa_vec_len,
+                .soa_vec_cap,
+                .soa_vec_push,
+                .soa_vec_pop,
+                .soa_vec_clear,
+                .soa_vec_reserve,
+                .soa_vec_as_slice,
+                .soa_vec_col_slice,
+                => blk_std01_int: {
+                    const mir_kind: MirIntrinsicKind = switch (internal_kind) {
+                        .scalar_clz => .scalar_clz,
+                        .scalar_ctz => .scalar_ctz,
+                        .scalar_popcnt => .scalar_popcnt,
+                        .scalar_bswap => .scalar_bswap,
+                        .scalar_rotl => .scalar_rotl,
+                        .scalar_rotr => .scalar_rotr,
+                        .ptr_is_null => .ptr_is_null,
+                        .ptr_offset => .ptr_offset,
+                        .slice_split_at => .slice_split_at,
+                        .slice_reverse => .slice_reverse,
+                        .soa_vec_new => .soa_vec_new,
+                        .soa_vec_with_cap => .soa_vec_with_cap,
+                        .soa_vec_len => .soa_vec_len,
+                        .soa_vec_cap => .soa_vec_cap,
+                        .soa_vec_push => .soa_vec_push,
+                        .soa_vec_pop => .soa_vec_pop,
+                        .soa_vec_clear => .soa_vec_clear,
+                        .soa_vec_reserve => .soa_vec_reserve,
+                        .soa_vec_as_slice => .soa_vec_as_slice,
+                        .soa_vec_col_slice => .soa_vec_col_slice,
+                        else => unreachable,
+                    };
+                    break :blk_std01_int self.ssa.emitInst(self.cur_bb, .{
+                        .op = .intrinsic_op,
+                        .flags = .{
+                            .has_side_effects = mir_kind.isSideEffectingRoot(),
+                            .has_trap_risk = internal_kind == .slice_split_at,
+                            .is_synthetic = true,
+                            .is_unsafe = node.flags.is_unsafe,
+                        },
+                        .aux_u16 = @backingInt(mir_kind),
+                        .type_id = node.type_id,
+                        .operands = .{ .lhs = args_start, .rhs = @intCast(lowered_vals.items.len) },
+                    }, tok);
+                },
             };
         }
 
         const intr_kind: type_system.IntrinsicKind = @fromBackingInt(@intCast(@as(u8, @truncate(node.data.lhs))));
         switch (intr_kind) {
             .c_import => return self.emitUnitVal(tok),
+            .implements => {
+                const t0_raw = if (type_len >= 1 and extra_base + 2 < self.hir_store.extra_data.items.len)
+                    self.hir_store.extra_data.items[extra_base + 2]
+                else
+                    TypeId.unit_ty.asInt();
+                const t1_raw = if (type_len >= 2 and extra_base + 3 < self.hir_store.extra_data.items.len)
+                    self.hir_store.extra_data.items[extra_base + 3]
+                else
+                    TypeId.unit_ty.asInt();
+                return self.ssa.emitInst(self.cur_bb, .{
+                    .op = .intrinsic_op,
+                    .aux_u16 = @backingInt(MirIntrinsicKind.implements),
+                    .type_id = .bool_ty,
+                    .operands = .{ .lhs = t0_raw, .rhs = t1_raw },
+                }, tok);
+            },
             .compile_error => {
                 const args_start: u32 = @intCast(self.body.extra_args.items.len);
                 try self.body.extra_args.appendSlice(self.body.allocator, lowered_vals.items);
@@ -6532,6 +7313,41 @@ const MirLowerer = struct {
             .simd_sub,
             .simd_mul,
             .simd_reduce_add,
+            .simd_load_unaligned,
+            .simd_and,
+            .simd_or,
+            .simd_xor,
+            .simd_eq,
+            .simd_gt_s8,
+            .simd_lt_s8,
+            .simd_swizzle,
+            .simd_shl_u8,
+            .simd_shr_u8,
+            .simd_bitmask,
+            .sqrt,
+            .from_le_bytes,
+            .from_be_bytes,
+            .to_le_bytes,
+            .to_be_bytes,
+            .slice_from_raw_parts,
+            .slice_from_raw_parts_mut,
+            .str_from_utf8_unchecked,
+            .tls_scratch_ptr,
+            .tls_alloc_state,
+            .ctx_next_rng_seed,
+            .fmt_write,
+            .memcpy,
+            .memmove,
+            .memset,
+            .ptr_copy,
+            .ptr_copy_nonoverlapping,
+            .ptr_read,
+            .ptr_write,
+            .drop_in_place,
+            .forget,
+            .sys_mmap,
+            .sys_munmap,
+            .wasm_memory_grow,
             => {
                 const mir_kind: MirIntrinsicKind = switch (intr_kind) {
                     .simd_splat => .simd_splat,
@@ -6539,13 +7355,50 @@ const MirLowerer = struct {
                     .simd_sub => .simd_sub,
                     .simd_mul => .simd_mul,
                     .simd_reduce_add => .simd_reduce_add,
+                    .simd_load_unaligned => .simd_load_unaligned,
+                    .simd_and => .simd_and,
+                    .simd_or => .simd_or,
+                    .simd_xor => .simd_xor,
+                    .simd_eq => .simd_eq,
+                    .simd_gt_s8 => .simd_gt_s8,
+                    .simd_lt_s8 => .simd_lt_s8,
+                    .simd_swizzle => .simd_swizzle,
+                    .simd_shl_u8 => .simd_shl_u8,
+                    .simd_shr_u8 => .simd_shr_u8,
+                    .simd_bitmask => .simd_bitmask,
+                    .sqrt => .sqrt,
+                    .from_le_bytes => .from_le_bytes,
+                    .from_be_bytes => .from_be_bytes,
+                    .to_le_bytes => .to_le_bytes,
+                    .to_be_bytes => .to_be_bytes,
+                    .slice_from_raw_parts, .slice_from_raw_parts_mut => .slice_from_raw_parts,
+                    .str_from_utf8_unchecked => .str_from_utf8_unchecked,
+                    .tls_scratch_ptr => .tls_scratch_ptr,
+                    .tls_alloc_state => .tls_alloc_state,
+                    .ctx_next_rng_seed => .ctx_next_rng_seed,
+                    .fmt_write => .fmt_write,
+                    .memcpy => .memcpy,
+                    .memmove => .memmove,
+                    .memset => .memset,
+                    .ptr_copy => .ptr_copy,
+                    .ptr_copy_nonoverlapping => .ptr_copy_nonoverlapping,
+                    .ptr_read => .ptr_read,
+                    .ptr_write => .ptr_write,
+                    .drop_in_place => .ptr_drop_in_place,
+                    .forget => .forget,
+                    .sys_mmap => .sys_mmap,
+                    .sys_munmap => .sys_munmap,
+                    .wasm_memory_grow => .wasm_memory_grow,
                     else => unreachable,
                 };
                 const args_start: u32 = @intCast(self.body.extra_args.items.len);
                 try self.body.extra_args.appendSlice(self.body.allocator, lowered_vals.items);
                 return self.ssa.emitInst(self.cur_bb, .{
                     .op = .intrinsic_op,
-                    .flags = .{ .is_unsafe = node.flags.is_unsafe },
+                    .flags = .{
+                        .has_side_effects = mir_kind.isSideEffectingRoot(),
+                        .is_unsafe = node.flags.is_unsafe,
+                    },
                     .aux_u16 = @backingInt(mir_kind),
                     .type_id = node.type_id,
                     .operands = .{ .lhs = args_start, .rhs = @intCast(lowered_vals.items.len) },
@@ -7808,6 +8661,24 @@ const MirLowerer = struct {
                     .operands = .{ .lhs = c_idx, .rhs = 0 },
                 }, tok);
             }
+            if (base_node.tag == .soa_vec_ty) {
+                const ref_ty = try self.pool.internRef(unwrapped_base, false);
+                const vec_addr = try self.ssa.emitInst(self.cur_bb, .{
+                    .op = .place_addr,
+                    .flags = .{ .is_synthetic = true },
+                    .type_id = ref_ty,
+                    .operands = .{ .lhs = peeled_place.asInt(), .rhs = 0 },
+                }, tok);
+                const a_start: u32 = @intCast(self.body.extra_args.items.len);
+                try self.body.extra_args.append(self.body.allocator, vec_addr.asInt());
+                return self.ssa.emitInst(self.cur_bb, .{
+                    .op = .intrinsic_op,
+                    .flags = .{ .is_synthetic = true },
+                    .aux_u16 = @backingInt(MirIntrinsicKind.soa_vec_len),
+                    .type_id = .usize_ty,
+                    .operands = .{ .lhs = a_start, .rhs = 1 },
+                }, tok);
+            }
         }
         const len_proj = [1]MirProjection{.{ .kind = .slice_len, .payload = 0 }};
         if (self.isValidPlaceExtension(peeled_place, &len_proj)) {
@@ -8392,7 +9263,7 @@ const MirLowerer = struct {
                 const dst_bits = self.scalarBitWidth(dst_ty);
                 if (dst_bits > src_bits) break :blk .float_promote;
                 if (dst_bits < src_bits) break :blk .float_demote;
-                break :blk null;
+                break :blk if (src_ty == dst_ty) null else .float_promote;
             },
         };
     }
@@ -9319,6 +10190,7 @@ const MirLowerer = struct {
         if (agg_ty.isError()) return 0;
         const unwrapped = self.pool.unwrapUnderlyingType(agg_ty);
         if (unwrapped == .source_loc_ty) return 4;
+        if (unwrapped == .fmt_spec_ty) return 3;
         const node = self.pool.getNode(unwrapped);
         switch (node.tag) {
             .tuple_ty => return self.pool.getTupleElements(unwrapped).len,
@@ -11397,7 +12269,7 @@ fn isValidProjectionChain(
                 }
                 if (node.tag != .array_ty and node.tag != .slice_ty and
                     node.tag != .soa_array_ty and node.tag != .soa_slice_ty and
-                    node.tag != .raw_ptr_ty)
+                    node.tag != .soa_vec_ty and node.tag != .raw_ptr_ty)
                 {
                     return false;
                 }
@@ -11405,7 +12277,7 @@ fn isValidProjectionChain(
             },
             .soa_elem => {
                 if (active_downcast != null) return false;
-                if (node.tag != .soa_array_ty and node.tag != .soa_slice_ty) {
+                if (node.tag != .soa_array_ty and node.tag != .soa_slice_ty and node.tag != .soa_vec_ty) {
                     return false;
                 }
                 const elem_struct_ty = pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
@@ -11415,7 +12287,7 @@ fn isValidProjectionChain(
             .slice_len => {
                 if (active_downcast != null) return false;
                 if (cur_ty != .str_ty and node.tag != .slice_ty and node.tag != .soa_slice_ty and
-                    node.tag != .array_ty and node.tag != .soa_array_ty and
+                    node.tag != .soa_vec_ty and node.tag != .array_ty and node.tag != .soa_array_ty and
                     unionSliceElemType(pool, cur_ty) == null)
                 {
                     return false;
@@ -11457,6 +12329,13 @@ fn resolveVerifierFieldType(
         return switch (ordinal) {
             0, 1 => .str_ty,
             2, 3 => .u32_ty,
+            else => null,
+        };
+    }
+    if (unwrapped == .fmt_spec_ty) {
+        return switch (ordinal) {
+            0 => .u32_ty,
+            1, 2 => .u16_ty,
             else => null,
         };
     }
@@ -14224,7 +15103,7 @@ test "test_mir_derive_bodies_attribute_schema_and_inclusive_u8_range_end_to_end"
         \\pub struct Column {
         \\    pub width: i32 = 8,
         \\}
-        \\@derive(Eq, Hash, Clone, Debug)
+        \\@derive(Equatable, Hash, Clone, Debug)
         \\pub struct Point {
         \\    @Column(width: 32)
         \\    pub x: i32,
@@ -14248,8 +15127,8 @@ test "test_mir_derive_bodies_attribute_schema_and_inclusive_u8_range_end_to_end"
     var bundle = try lowerSourceToMir(alloc, FileId.fromInt(10), source, TargetLayout.NATIVE_64, .{});
     defer bundle.deinit();
     try std.testing.expect(!bundle.hir_bundle.diagnostics.hasErrors());
-    // 4 `@derive` bodies (`eq`, `hash`, `clone`, `debug`) + 2 user functions = 6 verified `MirBody`s:
-    try std.testing.expectEqual(@as(usize, 6), bundle.mir_bundle.bodies.items.len);
+    // 5 `@derive` bodies (`eq`, `hash`, `clone`, `debug`, `fmt_debug`) + 2 user functions = 7 verified `MirBody`s:
+    try std.testing.expectEqual(@as(usize, 7), bundle.mir_bundle.bodies.items.len);
 }
 
 test "test_redteam_3a_mir_mut_ref_linearity_two_phase_borrows_and_match_ref_guards" {

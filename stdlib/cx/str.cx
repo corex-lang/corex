@@ -1,0 +1,5142 @@
+//! UTF-8 Strings, Unicode 16.0 Segmentation, and Numeric Formatting (`cx.str`)
+//!
+//! Implements the 24-byte Little-Endian Small String Optimization (`String` with 23 inline UTF-8
+//! bytes and `0x7F` `String?` niche), ergonomic zero-allocation `str` views and lazy iterators,
+//! Keiser–Lemire SIMD/SWAR UTF-8 validation, tree-shakeable Unicode 16.0 `wcwidth` & UAX #29 tries,
+//! and zero-`libc` `jeaiii` / `Schubfach` / `Eisel–Lemire` numeric conversions (`STD-01` §1.4, §2.4–§2.6).
+//!
+//! Every `.rodata` lookup table lives in an independent top-level `const` symbol, and `str.display_width`
+//! consults only `WCWIDTH_*` plus scalar emoji state so `wasm-ld --gc-sections` strips `GCB_*` and
+//! `GRAPHEME_DFA` completely unless `.graphemes()` or `grapheme_class` is called (`< 8.7 KiB` Profile C).
+
+use cx.col.Vec;
+use cx.math.{carrying_add_u64, widening_mul_u64};
+use cx.mem.{AllocError, AllocatorHandle, Arena, Layout};
+
+// ---------------------------------------- TYPES ----------------------------------------
+// ---------------- 24-Byte SSO String & CowStr -----------------
+/// Owned dynamic byte buffer alias used for `O(1)` `String.into_bytes` ownership transfer.
+type ByteVec = Vec[u8];
+
+/// 24-byte UTF-8 `String` with 23-byte Little-Endian SSO (`sizeof(String) == sizeof(String?) == 24 B`).
+@repr(C)
+@align(8)
+pub struct String {
+    /// Inline `[0..23]` UTF-8 bytes + length in `raw_bytes[23]` (`0..=23`), or overlaid `HeapRepr` (`raw_bytes[23] >= 0x80`).
+    raw_bytes: [u8; 24],
+}
+
+/// Non-inline 24-byte `String` overlay on 64-bit targets (`flagged_cap` places bit 31 at `raw_bytes[23]` on LE).
+@cfg(target.ptr_width == 64)
+@repr(C)
+@align(8)
+@derive(Copy)
+struct HeapRepr64 {
+    /// Non-null UTF-8 byte buffer pointer (`Bytes 0..7`).
+    ptr: *mut u8,
+    /// Full 64-bit LSB-tagged `AllocatorHandle` (`Bytes 8..15`).
+    alloc: AllocatorHandle,
+    /// Initialized UTF-8 byte length (`Bytes 16..19`).
+    len: u32,
+    /// `cap | 0x8000_0000` (`Bytes 20..23`, ensuring `raw_bytes[23] >= 0x80`).
+    flagged_cap: u32,
+}
+
+/// Non-inline 24-byte `String` overlay on 32-bit (`wasm32`) targets preserving identical byte offsets `16..23`.
+@cfg(target.ptr_width == 32)
+@repr(C)
+@align(8)
+@derive(Copy)
+struct HeapRepr32 {
+    /// Non-null UTF-8 byte buffer pointer (`Bytes 0..3`).
+    ptr: *mut u8,
+    /// High-half pointer padding (`Bytes 4..7`).
+    _pad0: u32,
+    /// 32-bit LSB-tagged `AllocatorHandle` (`Bytes 8..11`).
+    alloc: AllocatorHandle,
+    /// High-half handle padding (`Bytes 12..15`).
+    _pad1: u32,
+    /// Initialized UTF-8 byte length (`Bytes 16..19`).
+    len: u32,
+    /// `cap | 0x8000_0000` (`Bytes 20..23`, ensuring `raw_bytes[23] >= 0x80`).
+    flagged_cap: u32,
+}
+
+/// Active 24-byte `String` heap/arena/rodata overlay (`HeapRepr64` on 64-bit targets).
+@cfg(target.ptr_width == 64)
+type HeapRepr = HeapRepr64;
+
+/// Active 24-byte `String` heap/arena/rodata overlay (`HeapRepr32` on `wasm32` targets).
+@cfg(target.ptr_width == 32)
+type HeapRepr = HeapRepr32;
+
+/// Zero-sized 64-bit `HeapRepr` packer (`target.ptr_width == 64`).
+@cfg(target.ptr_width == 64)
+@derive(Copy)
+struct PtrWidthOps64 {}
+
+/// Zero-sized 32-bit `HeapRepr` packer (`target.ptr_width == 32`).
+@cfg(target.ptr_width == 32)
+@derive(Copy)
+struct PtrWidthOps32 {}
+
+/// Active pointer-width `HeapRepr` packer (`PtrWidthOps64` on 64-bit targets).
+@cfg(target.ptr_width == 64)
+type ActivePtrOps = PtrWidthOps64;
+
+/// Active pointer-width `HeapRepr` packer (`PtrWidthOps32` on `wasm32` targets).
+@cfg(target.ptr_width == 32)
+type ActivePtrOps = PtrWidthOps32;
+
+/// Clone-on-write UTF-8 string holding either a borrowed `str` view or an owned 24-byte `String`.
+@repr(C)
+@align(8)
+pub(pkg) enum CowStr {
+    /// Zero-allocation borrowed UTF-8 slice.
+    Borrowed(str),
+    /// Owned 24-byte SSO or heap-allocated `String`.
+    Owned(String),
+}
+
+// --------------- Validation & Conversion Errors ---------------
+/// Detailed UTF-8 validation failure reporting the valid prefix length and offending sequence width.
+@derive(Copy, Equatable, Debug)
+pub struct Utf8Error {
+    /// Byte index up to which the input is valid UTF-8.
+    pub valid_up_to: usize,
+    /// `.None` if truncated at end of input, or `.Some(1..=3)` for the invalid byte sequence length.
+    pub error_len: u8?,
+}
+
+/// Error returned by `cx.str.parse_int` and `str.parse_int` (`sizeof(ParseIntError?) == 1 B`).
+@derive(Copy, Equatable, Debug)
+pub enum ParseIntError: u8 {
+    /// Input string was empty (`""`).
+    Empty = 1,
+    /// Input contained an invalid sign or a character outside `0..radix`.
+    InvalidDigit = 2,
+    /// Parsed integer exceeded `[T.MIN, T.MAX]`.
+    Overflow = 3,
+}
+
+/// Error returned by `cx.str.parse_float` and `str.parse_float` (`sizeof(ParseFloatError?) == 1 B`).
+@derive(Copy, Equatable, Debug)
+pub enum ParseFloatError: u8 {
+    /// Input string was empty (`""`).
+    Empty = 1,
+    /// Input did not match IEEE-754 decimal or `inf`/`nan` syntax.
+    InvalidSyntax = 2,
+}
+
+// --------------- Zero-Allocation str Iterators ----------------
+/// Lazy UTF-8 Unicode scalar (`char`) iterator over a `str` slice.
+@repr(C)
+pub struct CharsIter {
+    /// Remaining valid UTF-8 bytes.
+    rem: &[u8],
+}
+
+/// Lazy `(byte_offset, char)` iterator over a `str` slice.
+@repr(C)
+pub struct CharIndicesIter {
+    /// Remaining valid UTF-8 bytes.
+    rem: &[u8],
+    /// Current byte offset from start of original `str`.
+    offset: usize,
+}
+
+/// Lazy UAX #29 Extended Grapheme Cluster iterator over a `str` slice.
+@repr(C)
+pub struct GraphemeIter {
+    /// Remaining valid UTF-8 bytes.
+    rem: &[u8],
+}
+
+/// Lazy `(byte_offset, cluster_str)` iterator over UAX #29 Extended Grapheme Clusters.
+@repr(C)
+pub(pkg) struct GraphemeIndicesIter {
+    /// Remaining valid UTF-8 bytes.
+    rem: &[u8],
+    /// Current byte offset from start of original `str`.
+    offset: usize,
+}
+
+/// Lazy substring iterator splitting `text` around `sep`.
+@repr(C)
+pub struct SplitIter {
+    /// Unconsumed tail of the input slice.
+    text: str,
+    /// Delimiter pattern (`""` yields single Unicode scalar slices).
+    sep: str,
+    /// When `false`, skips empty `""` segments.
+    keep_empty: bool,
+    /// `true` once the final trailing segment has been yielded.
+    done: bool,
+}
+
+/// Lazy Unicode whitespace-delimited word iterator skipping leading/trailing/repeated whitespace.
+@repr(C)
+pub struct SplitWhitespaceIter {
+    /// Remaining unconsumed `str` tail.
+    rem: str,
+}
+
+/// Lazy line iterator splitting on `\n` or `\r\n` without yielding a spurious trailing empty line.
+@repr(C)
+pub struct LinesIter {
+    /// Remaining unconsumed `str` tail.
+    rem: str,
+}
+
+// ---------------- Stack & String Format Sinks -----------------
+/// Stack-resident byte-slice sink backing `@no_alloc` `cx.str.format_into`.
+@repr(C)
+struct SliceSink {
+    /// Destination mutable byte buffer pointer.
+    ptr: *mut u8,
+    /// Destination buffer capacity in bytes.
+    cap: usize,
+    /// Number of UTF-8 bytes written so far.
+    pos: usize,
+}
+
+/// Streaming `FmtWriter` adapter appending formatted chunks into a `String`.
+@repr(C)
+struct StringSink {
+    /// Destination `String` pointer.
+    target: *mut String,
+}
+
+/// Zero-sized 128-bit SIMD string/UTF-8 dispatch marker (`x86_64` and `aarch64`).
+@cfg(target.arch == "x86_64" or target.arch == "aarch64")
+@derive(Copy)
+struct SimdStrOps {}
+
+/// Zero-sized portable SWAR/scalar string/UTF-8 dispatch marker (`wasm32` and freestanding targets).
+@cfg(not (target.arch == "x86_64" or target.arch == "aarch64"))
+@derive(Copy)
+struct SwarStrOps {}
+
+/// Active target SIMD/SWAR string-kernel selector (`SimdStrOps` on `x86_64` and `aarch64`).
+@cfg(target.arch == "x86_64" or target.arch == "aarch64")
+type ActiveStrOps = SimdStrOps;
+
+/// Active target SIMD/SWAR string-kernel selector (`SwarStrOps` on `wasm32` and portable targets).
+@cfg(not (target.arch == "x86_64" or target.arch == "aarch64"))
+type ActiveStrOps = SwarStrOps;
+
+// --------------------------------------- CONSTS ----------------------------------------
+// -------------------- SSO & SWAR Bit Masks --------------------
+/// Bit 7 marker in `String.raw_bytes[23]` identifying non-inline `HeapRepr`.
+const STRING_HEAP_FLAG_U8: u8 = 0x80_u8;
+
+/// Bit 31 marker in `HeapRepr.flagged_cap` setting `raw_bytes[23] >= 0x80` on Little-Endian targets.
+const STRING_HEAP_FLAG_U32: u32 = 0x8000_0000_u32;
+
+/// 31-bit capacity mask on `HeapRepr.flagged_cap`.
+const STRING_CAP_MASK_U32: u32 = 0x7FFF_FFFF_u32;
+
+/// 8-byte SWAR high-bit mask testing ASCII-only 64-bit words (`(word & mask) == 0`).
+const ASCII_HIGH_MASK_U64: u64 = 0x8080_8080_8080_8080_u64;
+
+/// Maximum inline SSO byte capacity (`23` UTF-8 bytes).
+const STRING_INLINE_CAP: usize = 23;
+
+/// Default base-10 radix (`u8 is 2..=36`) for `parse_int` and `format_int`.
+const DEFAULT_RADIX: u8 is 2..=36 = 10;
+
+// --------------- Keiser-Lemire SIMD UTF-8 LUTs ----------------
+/// Keiser–Lemire table 1A (`16 B`) indexing high nibble of `prev_byte_1`.
+@cfg(target.arch == "x86_64" or target.arch == "aarch64")
+const KL_BYTE_1_HIGH: [u8; 16] = [
+    0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+    0x80, 0x80, 0x80, 0x80, 0x21, 0x01, 0x15, 0x49,
+];
+
+/// Keiser–Lemire table 1B (`16 B`) indexing low nibble of `prev_byte_1`.
+@cfg(target.arch == "x86_64" or target.arch == "aarch64")
+const KL_BYTE_1_LOW: [u8; 16] = [
+    0xE7, 0xA3, 0x83, 0x83, 0x8B, 0xCB, 0xCB, 0xCB,
+    0xCB, 0xCB, 0xCB, 0xCB, 0xCB, 0xDB, 0xCB, 0xCB,
+];
+
+/// Keiser–Lemire table 2A (`16 B`) indexing high nibble of `curr_byte`.
+@cfg(target.arch == "x86_64" or target.arch == "aarch64")
+const KL_BYTE_2_HIGH: [u8; 16] = [
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0xE6, 0xAE, 0xBA, 0xBA, 0x01, 0x01, 0x01, 0x01,
+];
+
+// ----------------- jeaiii Decimal Digit Pairs -----------------
+/// Two-digit ASCII decimal lookup table (`00`..`99`, `200 B` `.rodata`) for `jeaiii` formatting.
+const DEC_DIGITS_LUT: [u8; 200] = [
+    0x30, 0x30, 0x30, 0x31, 0x30, 0x32, 0x30, 0x33,
+    0x30, 0x34, 0x30, 0x35, 0x30, 0x36, 0x30, 0x37,
+    0x30, 0x38, 0x30, 0x39, 0x31, 0x30, 0x31, 0x31,
+    0x31, 0x32, 0x31, 0x33, 0x31, 0x34, 0x31, 0x35,
+    0x31, 0x36, 0x31, 0x37, 0x31, 0x38, 0x31, 0x39,
+    0x32, 0x30, 0x32, 0x31, 0x32, 0x32, 0x32, 0x33,
+    0x32, 0x34, 0x32, 0x35, 0x32, 0x36, 0x32, 0x37,
+    0x32, 0x38, 0x32, 0x39, 0x33, 0x30, 0x33, 0x31,
+    0x33, 0x32, 0x33, 0x33, 0x33, 0x34, 0x33, 0x35,
+    0x33, 0x36, 0x33, 0x37, 0x33, 0x38, 0x33, 0x39,
+    0x34, 0x30, 0x34, 0x31, 0x34, 0x32, 0x34, 0x33,
+    0x34, 0x34, 0x34, 0x35, 0x34, 0x36, 0x34, 0x37,
+    0x34, 0x38, 0x34, 0x39, 0x35, 0x30, 0x35, 0x31,
+    0x35, 0x32, 0x35, 0x33, 0x35, 0x34, 0x35, 0x35,
+    0x35, 0x36, 0x35, 0x37, 0x35, 0x38, 0x35, 0x39,
+    0x36, 0x30, 0x36, 0x31, 0x36, 0x32, 0x36, 0x33,
+    0x36, 0x34, 0x36, 0x35, 0x36, 0x36, 0x36, 0x37,
+    0x36, 0x38, 0x36, 0x39, 0x37, 0x30, 0x37, 0x31,
+    0x37, 0x32, 0x37, 0x33, 0x37, 0x34, 0x37, 0x35,
+    0x37, 0x36, 0x37, 0x37, 0x37, 0x38, 0x37, 0x39,
+    0x38, 0x30, 0x38, 0x31, 0x38, 0x32, 0x38, 0x33,
+    0x38, 0x34, 0x38, 0x35, 0x38, 0x36, 0x38, 0x37,
+    0x38, 0x38, 0x38, 0x39, 0x39, 0x30, 0x39, 0x31,
+    0x39, 0x32, 0x39, 0x33, 0x39, 0x34, 0x39, 0x35,
+    0x39, 0x36, 0x39, 0x37, 0x39, 0x38, 0x39, 0x39,
+];
+
+// --------------- wcwidth 3-Stage Trie (3,202 B) ---------------
+/// Stage-1 index (`512 B`) mapping `256`-scalar BMP/SMP blocks (`(cp >> 2) >> 6`) to `WCWIDTH_S2` blocks.
+const WCWIDTH_S1: [u8; 512] = [
+    0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
+    0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+    0x0E, 0x0F, 0x00, 0x10, 0x00, 0x00, 0x00, 0x11,
+    0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x00, 0x00,
+    0x18, 0x00, 0x00, 0x19, 0x00, 0x1A, 0x1B, 0x1C,
+    0x00, 0x00, 0x00, 0x1D, 0x1E, 0x1F, 0x20, 0x21,
+    0x22, 0x23, 0x24, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x26, 0x00, 0x27, 0x00,
+    0x28, 0x29, 0x2A, 0x2B, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x2C,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x25, 0x25, 0x2D, 0x00, 0x00, 0x2E, 0x2F,
+    0x00, 0x30, 0x31, 0x32, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x33, 0x00, 0x00, 0x34, 0x35, 0x36,
+    0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E,
+    0x3F, 0x40, 0x41, 0x00, 0x42, 0x43, 0x44, 0x45,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x46, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x47, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x48, 0x49, 0x00, 0x00, 0x00, 0x4A,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25,
+    0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x25, 0x4B,
+    0x25, 0x25, 0x25, 0x25, 0x4C, 0x4D, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4E,
+    0x25, 0x4F, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x51, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x52,
+    0x00, 0x53, 0x54, 0x55, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x56, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x57, 0x49, 0x58, 0x00, 0x59, 0x5A, 0x00, 0x00,
+    0x5B, 0x5C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x5D, 0x5E, 0x5F, 0x60, 0x61, 0x62, 0x63, 0x64,
+    0x00, 0x65, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Stage-2 index (`1648 B`, `103` unique 8-way blocks) mapping `(s2_blk << 3) | ((byte_idx >> 3) & 7)` to `WCWIDTH_POOL`.
+const WCWIDTH_S2: [u16; 824] = [
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2,
+    0x001C, 0x001C, 0x001C, 0x0392, 0x00D2, 0x00D2, 0x00D2, 0x00D2,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x0207, 0x00D2, 0x00D2, 0x00D2,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x01DA, 0x001D, 0x0300, 0x00D2,
+    0x016A, 0x00D2, 0x01FE, 0x0185, 0x00D2, 0x00D2, 0x0085, 0x0406,
+    0x0099, 0x003D, 0x00C2, 0x00D2, 0x00D2, 0x01EA, 0x00D2, 0x002E,
+    0x011F, 0x01D6, 0x00E7, 0x00D2, 0x0298, 0x00D2, 0x0019, 0x001C,
+    0x00C4, 0x015F, 0x0178, 0x012D, 0x00A6, 0x0182, 0x0111, 0x015E,
+    0x0248, 0x0182, 0x0154, 0x01F8, 0x0248, 0x0182, 0x039E, 0x0084,
+    0x00A6, 0x03C1, 0x0243, 0x012D, 0x03C0, 0x00D2, 0x0257, 0x00D2,
+    0x031F, 0x012E, 0x03A8, 0x012D, 0x00A6, 0x03C1, 0x02D8, 0x012D,
+    0x0181, 0x0302, 0x0111, 0x012D, 0x00A6, 0x00D2, 0x03B5, 0x00D2,
+    0x00D2, 0x034B, 0x0211, 0x00D2, 0x00D2, 0x0318, 0x0070, 0x00D2,
+    0x0215, 0x024B, 0x00D2, 0x040A, 0x0172, 0x0041, 0x03BF, 0x00D2,
+    0x00D2, 0x02F9, 0x000A, 0x01EE, 0x00B2, 0x00D2, 0x00D2, 0x00D2,
+    0x0280, 0x0280, 0x02C9, 0x001C, 0x001C, 0x001C, 0x001C, 0x001C,
+    0x00D2, 0x00D2, 0x00E6, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2,
+    0x0004, 0x0080, 0x0080, 0x0080, 0x00D2, 0x0109, 0x023B, 0x00D2,
+    0x01F4, 0x00D2, 0x00D2, 0x00D2, 0x0247, 0x00A4, 0x00D2, 0x00D2,
+    0x00D2, 0x03E1, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2,
+    0x0329, 0x00D2, 0x01C9, 0x0400, 0x00D2, 0x003D, 0x00C1, 0x00D2,
+    0x0039, 0x0130, 0x03C0, 0x0366, 0x0181, 0x0000, 0x00D2, 0x0352,
+    0x00D2, 0x0159, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00BC, 0x02D1,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x001C, 0x001C,
+    0x01F4, 0x0070, 0x00D2, 0x0392, 0x00D2, 0x00D2, 0x003D, 0x0044,
+    0x02DC, 0x0326, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x007B,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x0321,
+    0x01B4, 0x02AC, 0x038A, 0x00C5, 0x037F, 0x014C, 0x0330, 0x0145,
+    0x01B1, 0x01C4, 0x0384, 0x00D2, 0x028E, 0x018E, 0x00D2, 0x00D2,
+    0x00C6, 0x00D2, 0x004E, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x0230,
+    0x00D2, 0x00D2, 0x00D2, 0x00A7, 0x00D2, 0x00D2, 0x00D2, 0x001C,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x033B, 0x0280, 0x0280, 0x013E,
+    0x0280, 0x0280, 0x0280, 0x0280, 0x0280, 0x0280, 0x03D5, 0x0370,
+    0x0280, 0x0226, 0x03D2, 0x0280, 0x0197, 0x0280, 0x0280, 0x0280,
+    0x03D1, 0x02A2, 0x0280, 0x01A7, 0x0276, 0x0280, 0x0280, 0x026E,
+    0x0272, 0x0280, 0x02B0, 0x0280, 0x0280, 0x0280, 0x0280, 0x0280,
+    0x0280, 0x0280, 0x0280, 0x0280, 0x0280, 0x0280, 0x0280, 0x0280,
+    0x0280, 0x0280, 0x0280, 0x0280, 0x0220, 0x0280, 0x019E, 0x00D2,
+    0x00D2, 0x00D2, 0x00D2, 0x0357, 0x00FD, 0x00D2, 0x00D2, 0x0217,
+    0x00FA, 0x00D9, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x02DA, 0x0029,
+    0x00D2, 0x00EE, 0x02E3, 0x0281, 0x00C4, 0x00F2, 0x00D2, 0x00A5,
+    0x00D2, 0x0093, 0x0262, 0x0182, 0x00D2, 0x03A2, 0x00A6, 0x009E,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00B8,
+    0x0280, 0x0280, 0x0280, 0x0280, 0x0280, 0x038E, 0x001C, 0x001C,
+    0x01C7, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2,
+    0x0061, 0x029E, 0x0275, 0x028B, 0x00D2, 0x00D2, 0x00D2, 0x00A7,
+    0x03D2, 0x0280, 0x0280, 0x00D1, 0x00D2, 0x0320, 0x00D2, 0x0378,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x0315,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x0320,
+    0x00D2, 0x00D2, 0x00D2, 0x020A, 0x00D2, 0x00D2, 0x00D2, 0x00D2,
+    0x0036, 0x03DB, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x0247,
+    0x00D2, 0x0038, 0x00D2, 0x0294, 0x00D2, 0x00D2, 0x00D2, 0x00D2,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x0306, 0x00D2, 0x003A,
+    0x00D2, 0x00D2, 0x01EA, 0x00D2, 0x0180, 0x00D2, 0x00D2, 0x00D2,
+    0x00A6, 0x003B, 0x00C3, 0x03C4, 0x0181, 0x00DD, 0x00A3, 0x00D2,
+    0x00C4, 0x02EF, 0x00D2, 0x0049, 0x0181, 0x00FF, 0x01BA, 0x00D2,
+    0x00D2, 0x0235, 0x00A6, 0x00D2, 0x00D2, 0x00D2, 0x00A7, 0x0212,
+    0x0181, 0x0302, 0x0320, 0x0252, 0x00D2, 0x00A8, 0x02F4, 0x0248,
+    0x00D2, 0x003B, 0x03B9, 0x00D2, 0x00D2, 0x025B, 0x00E5, 0x00D2,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x0115, 0x0009, 0x00D2,
+    0x00D2, 0x0266, 0x0320, 0x00D2, 0x00D2, 0x03F3, 0x00D2, 0x00D2,
+    0x0249, 0x0124, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2,
+    0x00D2, 0x02E8, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2,
+    0x00D2, 0x03F9, 0x00FC, 0x00D2, 0x00D2, 0x00D2, 0x0127, 0x0320,
+    0x0312, 0x00AA, 0x03CA, 0x00D2, 0x03AE, 0x00D2, 0x00D2, 0x00D2,
+    0x00D2, 0x0396, 0x00D2, 0x00D2, 0x0017, 0x008D, 0x00D2, 0x00D2,
+    0x00D2, 0x01E2, 0x03F7, 0x00D2, 0x01BE, 0x00D2, 0x00D2, 0x00D2,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x0304,
+    0x0181, 0x020A, 0x03BA, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2,
+    0x00D2, 0x003D, 0x0166, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2,
+    0x00FD, 0x035C, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x0360,
+    0x00D2, 0x006E, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2,
+    0x00D2, 0x00D2, 0x004A, 0x00D2, 0x036B, 0x00D2, 0x00D2, 0x0342,
+    0x0280, 0x0280, 0x0280, 0x0280, 0x0280, 0x0280, 0x0280, 0x013D,
+    0x0280, 0x0280, 0x0280, 0x0280, 0x0280, 0x0280, 0x03D5, 0x00C5,
+    0x00CF, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x030A,
+    0x0280, 0x0012, 0x0075, 0x02BD, 0x0280, 0x0280, 0x0280, 0x0280,
+    0x0280, 0x0280, 0x0280, 0x0280, 0x0280, 0x0280, 0x0280, 0x013C,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D3, 0x0039, 0x00D2, 0x00D2,
+    0x001C, 0x0025, 0x00C3, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2,
+    0x00D2, 0x00D2, 0x00D2, 0x03E8, 0x0106, 0x017E, 0x00D2, 0x00D2,
+    0x00D2, 0x00D2, 0x0008, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2,
+    0x0280, 0x0280, 0x0374, 0x0374, 0x00D2, 0x00D2, 0x00D2, 0x00D2,
+    0x001C, 0x0201, 0x001C, 0x03ED, 0x0264, 0x01DE, 0x00D2, 0x00D2,
+    0x01CF, 0x011C, 0x00D2, 0x00D2, 0x004A, 0x00D2, 0x00D2, 0x00D2,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x03BD, 0x00D2, 0x0347,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x0347,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x0081,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x006E, 0x00D2,
+    0x00D2, 0x00D2, 0x0071, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2,
+    0x01C5, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x018A, 0x00D2,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x0054, 0x00D2, 0x00D2, 0x00D2,
+    0x0138, 0x013C, 0x0069, 0x03D9, 0x00D2, 0x00D2, 0x00D2, 0x00D2,
+    0x0280, 0x0335, 0x0280, 0x02C1, 0x013E, 0x0280, 0x022B, 0x0284,
+    0x0280, 0x0272, 0x02C8, 0x0280, 0x0280, 0x0280, 0x0280, 0x01A9,
+    0x0280, 0x03D3, 0x0193, 0x0141, 0x0323, 0x01C5, 0x00D2, 0x01A0,
+    0x0280, 0x0280, 0x013F, 0x00D2, 0x0280, 0x0280, 0x02B7, 0x00CA,
+    0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x00D2, 0x02A7,
+    0x0139, 0x0273, 0x0339, 0x0280, 0x0280, 0x0280, 0x0280, 0x0280,
+    0x00D2, 0x00D2, 0x00D2, 0x021C, 0x027C, 0x0280, 0x0059, 0x0065,
+];
+
+/// Stage-3 shortest-superstring overlapped 2-bit width leaf pool (`1042 B`, 4 scalars per byte).
+const WCWIDTH_POOL: [u8; 1042] = [
+    0x05, 0x50, 0x10, 0x50, 0x55, 0x55, 0x55, 0x55,
+    0x05, 0x54, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+    0x50, 0x05, 0x6A, 0x55, 0x55, 0x55, 0x65, 0x55,
+    0x55, 0x55, 0x55, 0x05, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
+    0x50, 0x00, 0x00, 0x00, 0x00, 0x50, 0x55, 0x55,
+    0x15, 0x00, 0x00, 0x55, 0x55, 0x51, 0x01, 0x41,
+    0x55, 0x00, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+    0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x54, 0x55, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55,
+    0x55, 0x55, 0x56, 0x59, 0x55, 0x55, 0x55, 0x65,
+    0xA9, 0xAA, 0x6A, 0x55, 0xA5, 0xAA, 0xAA, 0xAA,
+    0x96, 0x00, 0x00, 0x00, 0x00, 0xAA, 0xAA, 0x5A,
+    0x55, 0xAA, 0xAA, 0x56, 0x55, 0x5A, 0x55, 0x55,
+    0x55, 0x55, 0x00, 0x40, 0x55, 0x55, 0x55, 0x55,
+    0x55, 0x6A, 0x59, 0x55, 0x55, 0xA9, 0x56, 0x96,
+    0x55, 0x55, 0x55, 0x55, 0x05, 0x55, 0x55, 0x55,
+    0x55, 0x55, 0x05, 0x00, 0x10, 0x00, 0x00, 0x05,
+    0x00, 0x04, 0x41, 0x55, 0x55, 0x01, 0x40, 0x41,
+    0x41, 0x55, 0x55, 0x55, 0x15, 0x51, 0x55, 0x55,
+    0x55, 0x50, 0x55, 0x45, 0x55, 0x55, 0x51, 0x55,
+    0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x15, 0x00,
+    0x14, 0x40, 0x45, 0x41, 0x55, 0x51, 0x55, 0x55,
+    0x55, 0x51, 0x54, 0x51, 0x55, 0x55, 0x55, 0x55,
+    0x40, 0x00, 0x00, 0x00, 0x40, 0x55, 0x55, 0x55,
+    0x55, 0x55, 0x55, 0x55, 0x95, 0x56, 0x55, 0xAA,
+    0xAA, 0x56, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+    0x55, 0x55, 0x41, 0x55, 0x54, 0x55, 0x55, 0x55,
+    0x55, 0x15, 0x40, 0x41, 0x51, 0x04, 0x55, 0x55,
+    0x55, 0x55, 0x55, 0x55, 0x55, 0x01, 0x55, 0x05,
+    0x00, 0x50, 0x55, 0x55, 0x55, 0x55, 0x15, 0x05,
+    0x50, 0x50, 0x45, 0x45, 0x15, 0x55, 0x55, 0x55,
+    0x55, 0x55, 0x55, 0x55, 0x05, 0x00, 0x40, 0x01,
+    0x00, 0x55, 0x55, 0x55, 0x55, 0x55, 0x10, 0x00,
+    0x50, 0x01, 0x54, 0x55, 0x51, 0x55, 0x55, 0x55,
+    0x55, 0x05, 0x50, 0x55, 0x10, 0x04, 0x40, 0x55,
+    0x55, 0x55, 0x55, 0x55, 0x05, 0x10, 0x00, 0x55,
+    0x55, 0x55, 0x55, 0x55, 0x00, 0x05, 0x55, 0x55,
+    0x55, 0x55, 0x55, 0x55, 0x55, 0x04, 0x40, 0x54,
+    0x6A, 0x55, 0x55, 0x55, 0xAA, 0xAA, 0xAA, 0xAA,
+    0xAA, 0xAA, 0xAA, 0x55, 0x55, 0x55, 0x55, 0x65,
+    0x55, 0xA5, 0x59, 0x65, 0x59, 0x55, 0xA5, 0x55,
+    0x55, 0x55, 0x55, 0x69, 0x41, 0x15, 0x14, 0x50,
+    0x51, 0x55, 0x55, 0x55, 0x00, 0x00, 0x05, 0x55,
+    0x55, 0x55, 0x55, 0x55, 0x55, 0x45, 0x54, 0x15,
+    0x00, 0x00, 0x00, 0x50, 0x55, 0x55, 0x00, 0x00,
+    0x40, 0x54, 0x00, 0x04, 0x55, 0x01, 0x00, 0x00,
+    0x01, 0x00, 0x54, 0x51, 0x01, 0x00, 0x55, 0x55,
+    0x05, 0x50, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+    0x55, 0x54, 0x55, 0x55, 0x55, 0x95, 0x55, 0x55,
+    0x55, 0x55, 0x56, 0x55, 0x55, 0x95, 0x6A, 0xAA,
+    0xAA, 0xAA, 0xAA, 0xAA, 0x6A, 0x81, 0xAA, 0x6A,
+    0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x95, 0xAA,
+    0xA8, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+    0x96, 0x55, 0x59, 0xA5, 0x55, 0x55, 0x55, 0x55,
+    0x55, 0x5A, 0x55, 0x55, 0x01, 0x14, 0x55, 0x55,
+    0x55, 0x55, 0x50, 0x11, 0x55, 0x55, 0x56, 0x55,
+    0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x45, 0x00,
+    0x40, 0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x01,
+    0x01, 0x50, 0x55, 0x55, 0x55, 0x55, 0x01, 0x00,
+    0x00, 0x00, 0x55, 0x55, 0x55, 0x55, 0x01, 0x40,
+    0x45, 0x10, 0x55, 0x05, 0x00, 0x00, 0x54, 0x55,
+    0x55, 0x55, 0x01, 0x54, 0x55, 0x55, 0x15, 0x00,
+    0x55, 0x55, 0x55, 0x55, 0x50, 0x51, 0x55, 0x55,
+    0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x15,
+    0x00, 0x50, 0x55, 0x55, 0x55, 0x55, 0x55, 0x05,
+    0x40, 0x55, 0x15, 0x00, 0x40, 0x55, 0x55, 0x55,
+    0x55, 0x55, 0x55, 0x50, 0x55, 0x55, 0x55, 0x55,
+    0xAA, 0xAA, 0xAA, 0x56, 0xAA, 0xAA, 0xAA, 0xAA,
+    0x0A, 0xA0, 0xAA, 0xAA, 0xAA, 0x6A, 0x95, 0xAA,
+    0x55, 0x55, 0x55, 0x15, 0x50, 0x55, 0x55, 0x55,
+    0x15, 0x50, 0x04, 0x55, 0x45, 0x01, 0x00, 0x00,
+    0x55, 0x55, 0x51, 0x01, 0x54, 0x55, 0x51, 0x55,
+    0x41, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+    0x11, 0x51, 0x55, 0x05, 0x00, 0x54, 0x00, 0x54,
+    0x55, 0x55, 0x51, 0x55, 0x55, 0x55, 0x55, 0x15,
+    0x00, 0x44, 0x15, 0x55, 0x55, 0x54, 0x55, 0x55,
+    0x55, 0x55, 0x15, 0x00, 0x40, 0x11, 0xAA, 0x5A,
+    0x55, 0x95, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+    0xAA, 0x6A, 0xAA, 0xAA, 0xAA, 0xAA, 0x5A, 0x95,
+    0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+    0x56, 0x56, 0xAA, 0xAA, 0x6A, 0xAA, 0x55, 0x55,
+    0x55, 0x55, 0x55, 0xA9, 0x55, 0x55, 0x01, 0x50,
+    0x55, 0x55, 0x55, 0x55, 0x50, 0x15, 0x00, 0x00,
+    0x00, 0x00, 0xAA, 0xAA, 0xAA, 0xAA, 0xA9, 0xAA,
+    0xAA, 0xAA, 0x55, 0x56, 0x55, 0x55, 0x55, 0x55,
+    0xAA, 0xAA, 0x55, 0x55, 0xAA, 0xAA, 0xAA, 0xAA,
+    0x5A, 0x55, 0x56, 0x6A, 0xA9, 0x55, 0xAA, 0x55,
+    0x55, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+    0xA6, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+    0x2A, 0x04, 0x00, 0x54, 0x51, 0x55, 0x54, 0x50,
+    0x55, 0x45, 0x55, 0x50, 0x55, 0x55, 0x55, 0x55,
+    0x55, 0x55, 0xA5, 0x55, 0x15, 0x00, 0x00, 0x50,
+    0x55, 0x55, 0x55, 0x15, 0x00, 0x00, 0x41, 0x55,
+    0x15, 0x00, 0x01, 0x00, 0x54, 0x55, 0x55, 0x45,
+    0x44, 0x55, 0x55, 0x55, 0x01, 0x04, 0x00, 0x41,
+    0x41, 0x10, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+    0x15, 0x54, 0x55, 0x55, 0x55, 0x55, 0xAA, 0xA9,
+    0xAA, 0x69, 0x01, 0x00, 0x40, 0x55, 0x55, 0x55,
+    0x55, 0x55, 0x55, 0x55, 0x51, 0x00, 0x00, 0x54,
+    0x54, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+    0x69, 0x55, 0x55, 0x55, 0x55, 0x55, 0x15, 0x14,
+    0x55, 0x5A, 0x55, 0x65, 0x55, 0x56, 0x55, 0x55,
+    0xA9, 0xAA, 0x9A, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+    0xAA, 0x9A, 0xAA, 0x54, 0x55, 0x55, 0x5A, 0x55,
+    0x55, 0x55, 0x00, 0x55, 0x55, 0x55, 0x55, 0x51,
+    0x00, 0x40, 0x55, 0x45, 0x50, 0x11, 0x50, 0x55,
+    0x55, 0x55, 0x15, 0x40, 0x00, 0x00, 0x50, 0x01,
+    0x55, 0x55, 0x55, 0x55, 0x00, 0x54, 0x55, 0x55,
+    0x15, 0x00, 0x00, 0x55, 0x55, 0x55, 0x15, 0x40,
+    0x55, 0x55, 0x55, 0x55, 0xAA, 0xAA, 0xAA, 0xAA,
+    0xAA, 0x6A, 0x55, 0x55, 0x00, 0x00, 0x00, 0x55,
+    0x55, 0xA5, 0xAA, 0x95, 0x55, 0x55, 0x55, 0x66,
+    0x95, 0x9A, 0x55, 0x55, 0xAA, 0xAA, 0xAA, 0x55,
+    0x55, 0x55, 0x00, 0x00, 0x00, 0x00, 0x55, 0x55,
+    0x55, 0x55, 0x00, 0x40, 0x00, 0x10, 0x01, 0x10,
+    0x54, 0x51, 0x55, 0x55, 0x55, 0x55, 0x04, 0x14,
+    0x54, 0x05, 0x04, 0x50, 0x55, 0x41, 0x55, 0x55,
+    0x05, 0x00, 0x00, 0x40, 0x50, 0x55, 0x55, 0x45,
+    0x55, 0x05, 0x44, 0x55, 0x55, 0x55, 0x55, 0x55,
+    0x45, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+    0x14, 0x54, 0x55, 0x15, 0x55, 0x55, 0x01, 0x40,
+    0x01, 0x55, 0xA9, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+    0xAA, 0xAA, 0x5A, 0x55, 0x55, 0x55, 0x55, 0x55,
+    0x55, 0x40, 0x15, 0x54, 0x55, 0x45, 0x55, 0x01,
+    0x55, 0x15, 0x50, 0x55, 0x15, 0x00, 0x00, 0x00,
+    0x54, 0x55, 0x51, 0x55, 0x55, 0x15, 0x51, 0x00,
+    0x10, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x15,
+    0x44, 0x01, 0x00, 0x54, 0x15, 0x00, 0x00, 0x14,
+    0x04, 0x50, 0x55, 0x55, 0x55, 0x55, 0x01, 0x00,
+    0x00, 0x40,
+];
+
+// -------------- UAX #29 Grapheme Trie (4,491 B) ---------------
+/// Stage-1 index (`1,024 B`) mapping `128`-scalar BMP/SMP blocks (`(cp >> 1) >> 6`) to `GCB_S2` blocks.
+const GCB_S1: [u8; 1024] = [
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
+    0x00, 0x03, 0x00, 0x04, 0x05, 0x06, 0x07, 0x08,
+    0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
+    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+    0x19, 0x1A, 0x1B, 0x1C, 0x00, 0x00, 0x1D, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1E, 0x1F,
+    0x20, 0x21, 0x22, 0x00, 0x23, 0x24, 0x25, 0x26,
+    0x27, 0x28, 0x00, 0x29, 0x00, 0x00, 0x00, 0x00,
+    0x2A, 0x2B, 0x2C, 0x2D, 0x00, 0x00, 0x2E, 0x2F,
+    0x00, 0x30, 0x00, 0x31, 0x32, 0x33, 0x34, 0x35,
+    0x00, 0x00, 0x36, 0x00, 0x00, 0x00, 0x37, 0x00,
+    0x00, 0x38, 0x39, 0x3A, 0x00, 0x00, 0x00, 0x00,
+    0x3B, 0x3C, 0x00, 0x00, 0x00, 0x3D, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x3E, 0x3F, 0x00, 0x00,
+    0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x00, 0x46,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x47,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x49, 0x4A, 0x00, 0x4B,
+    0x00, 0x00, 0x00, 0x4C, 0x00, 0x4D, 0x4E, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x4F, 0x50, 0x00, 0x00,
+    0x00, 0x00, 0x51, 0x00, 0x00, 0x52, 0x53, 0x54,
+    0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x5B, 0x5C,
+    0x5D, 0x5E, 0x00, 0x5F, 0x60, 0x61, 0x62, 0x00,
+    0x63, 0x00, 0x64, 0x65, 0x66, 0x67, 0x00, 0x00,
+    0x68, 0x69, 0x6A, 0x6B, 0x00, 0x6C, 0x6D, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x6E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x6F, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x70, 0x71, 0x00,
+    0x00, 0x00, 0x72, 0x00, 0x00, 0x00, 0x73, 0x74,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x75, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x76, 0x00,
+    0x00, 0x00, 0x77, 0x78, 0x79, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x7A, 0x7B, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x7C, 0x7D, 0x71, 0x00, 0x00, 0x7E, 0x00, 0x00,
+    0x00, 0x7F, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x81, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x83, 0x83, 0x84, 0x85, 0x86, 0x83, 0x83, 0x87,
+    0x83, 0x83, 0x88, 0x83, 0x89, 0x83, 0x8A, 0x8B,
+    0x8C, 0x8D, 0x8E, 0x83, 0x83, 0x83, 0x00, 0x00,
+    0x83, 0x83, 0x83, 0x83, 0x83, 0x83, 0x83, 0x8F,
+];
+
+/// Stage-2 index (`2304 B`, `144` unique 8-way blocks) mapping `(s2_blk << 3) | ((byte_idx >> 3) & 7)` to `GCB_POOL`.
+const GCB_S2: [u16; 1152] = [
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x041B, 0x041B, 0x03A9, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x01DC, 0x01DC, 0x01DC, 0x01DC, 0x01DC, 0x01DC, 0x01DC, 0x042A,
+    0x0408, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x00B6, 0x01DC, 0x01DD, 0x023D, 0x042A, 0x042A, 0x042A,
+    0x0015, 0x0208, 0x042A, 0x042A, 0x0018, 0x01DC, 0x042A, 0x0429,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x03E8, 0x0483, 0x042A,
+    0x01FD, 0x0411, 0x042A, 0x01DC, 0x00B9, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x02A9, 0x0429, 0x042A, 0x042A, 0x0018, 0x040B,
+    0x042A, 0x0462, 0x006B, 0x042A, 0x042A, 0x01F3, 0x042A, 0x042A,
+    0x042A, 0x00B3, 0x042A, 0x042A, 0x017B, 0x01DC, 0x0205, 0x01DC,
+    0x0383, 0x0473, 0x0366, 0x01E8, 0x0456, 0x01E4, 0x019A, 0x035D,
+    0x01A8, 0x0473, 0x0361, 0x0120, 0x026F, 0x01A0, 0x019A, 0x0025,
+    0x03EF, 0x042A, 0x042A, 0x042C, 0x0304, 0x0411, 0x042A, 0x0071,
+    0x03EF, 0x0473, 0x0361, 0x03CD, 0x0321, 0x042A, 0x019A, 0x0354,
+    0x01A8, 0x0473, 0x0361, 0x0033, 0x026F, 0x01F5, 0x019A, 0x01FC,
+    0x0428, 0x042A, 0x042A, 0x02C7, 0x0127, 0x040E, 0x042A, 0x042A,
+    0x0370, 0x0473, 0x0361, 0x0476, 0x0143, 0x043E, 0x019A, 0x042A,
+    0x01A8, 0x042A, 0x042A, 0x0026, 0x012F, 0x024D, 0x019A, 0x0161,
+    0x00F6, 0x0473, 0x0366, 0x0369, 0x0118, 0x040E, 0x019A, 0x042A,
+    0x01A8, 0x042A, 0x042A, 0x042A, 0x039F, 0x00D2, 0x042A, 0x0192,
+    0x042A, 0x042A, 0x042A, 0x005A, 0x0339, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x0396, 0x017C, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x0197, 0x042A, 0x0187, 0x042A, 0x042A, 0x042A, 0x037D,
+    0x02EE, 0x01E0, 0x01DC, 0x00B8, 0x0426, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x0042, 0x02FE, 0x042A, 0x03D9, 0x0429, 0x02F4,
+    0x002B, 0x019D, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x01C4, 0x01C4, 0x01C4, 0x01C4, 0x01C4, 0x01C4, 0x0277, 0x0277,
+    0x0277, 0x0277, 0x027B, 0x027F, 0x027F, 0x027F, 0x027F, 0x027F,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x0042, 0x042A, 0x042A,
+    0x042A, 0x034A, 0x042A, 0x003F, 0x042A, 0x019A, 0x042A, 0x019A,
+    0x042A, 0x042A, 0x042A, 0x03DE, 0x0452, 0x040B, 0x042A, 0x042A,
+    0x03F2, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x024D, 0x042A, 0x040D, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x000D, 0x01B2, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x03C5, 0x042A, 0x042A, 0x042A, 0x0060, 0x0008, 0x0433,
+    0x042A, 0x042A, 0x042A, 0x01DC, 0x00B7, 0x042A, 0x042A, 0x042A,
+    0x008A, 0x042A, 0x042A, 0x02AA, 0x045D, 0x042A, 0x0018, 0x0247,
+    0x008B, 0x042A, 0x03FA, 0x042A, 0x042A, 0x042A, 0x029D, 0x0247,
+    0x042A, 0x042A, 0x0315, 0x03E3, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x01DA, 0x0063, 0x03C0,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x01DC, 0x01DC, 0x01DC, 0x01DC,
+    0x0414, 0x042A, 0x01BC, 0x0386, 0x038E, 0x042A, 0x041B, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x01DC, 0x01DC, 0x0429,
+    0x042A, 0x042A, 0x02C5, 0x038E, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x0150, 0x0253, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x0052, 0x0388, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x0388, 0x042A, 0x042A, 0x042A, 0x00A3, 0x042A, 0x0213, 0x00E0,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x02C5, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x0052, 0x02C3, 0x02C6, 0x042A, 0x042A, 0x00A5,
+    0x030C, 0x0223, 0x0225, 0x0225, 0x0225, 0x0225, 0x0225, 0x0225,
+    0x0152, 0x0225, 0x0225, 0x0225, 0x0225, 0x0225, 0x0225, 0x0225,
+    0x021C, 0x00AB, 0x02C2, 0x0256, 0x0444, 0x020F, 0x01CD, 0x042A,
+    0x042A, 0x0350, 0x03B2, 0x0258, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x004E, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x0350, 0x0252, 0x042A, 0x042A, 0x042A, 0x03B0, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x019C, 0x019B,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x019C,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x01DC, 0x01DC,
+    0x042A, 0x042A, 0x017B, 0x038C, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x024B, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x02BE, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x019C, 0x0235,
+    0x042A, 0x0194, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x019B,
+    0x0328, 0x042A, 0x0136, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x00F7, 0x042A, 0x042A, 0x0261, 0x0082, 0x042A, 0x01DC, 0x0248,
+    0x042A, 0x042A, 0x0242, 0x042A, 0x001A, 0x0343, 0x01C4, 0x01C6,
+    0x0383, 0x042A, 0x042A, 0x00F0, 0x0429, 0x042A, 0x040F, 0x042A,
+    0x042A, 0x042A, 0x0044, 0x02A4, 0x032C, 0x042A, 0x042A, 0x0423,
+    0x042A, 0x042A, 0x042A, 0x0039, 0x0411, 0x042A, 0x03B5, 0x01B8,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x0288, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x0277, 0x0000, 0x027F, 0x027F, 0x0281,
+    0x042A, 0x042B, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x01DC, 0x042A, 0x01DC, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x0412,
+    0x042A, 0x0194, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x041D,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x019D,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x0429, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x0375,
+    0x02E1, 0x042A, 0x042A, 0x00EA, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x024D, 0x042A,
+    0x042A, 0x042A, 0x0349, 0x042A, 0x042A, 0x042A, 0x02D9, 0x042A,
+    0x042A, 0x042A, 0x024A, 0x042A, 0x042A, 0x042A, 0x042A, 0x017A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x02A9, 0x0429, 0x042A, 0x042A,
+    0x034A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x02D5, 0x042A, 0x042A, 0x0241, 0x0180, 0x042A, 0x042A, 0x01F0,
+    0x008B, 0x042A, 0x042A, 0x00D8, 0x013B, 0x042A, 0x042A, 0x042A,
+    0x0040, 0x042A, 0x0269, 0x0181, 0x00E6, 0x042A, 0x042A, 0x0410,
+    0x008B, 0x042A, 0x042A, 0x0092, 0x0111, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x0163, 0x03BB, 0x0411, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x019C, 0x02B1, 0x042A,
+    0x00F6, 0x042A, 0x042A, 0x02F7, 0x015A, 0x040E, 0x0401, 0x0181,
+    0x042A, 0x042A, 0x042A, 0x02CA, 0x00CC, 0x0178, 0x024F, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x0091, 0x03D4, 0x042B, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x02CE, 0x0099, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x019C, 0x031A, 0x0429, 0x0195, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x0169, 0x0429, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x01AB, 0x0245, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x01AA, 0x02E6, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x0163, 0x00C4, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x0171, 0x0334, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x007C, 0x039C, 0x042A,
+    0x001D, 0x042A, 0x042A, 0x01D4, 0x040E, 0x0048, 0x042A, 0x042A,
+    0x00BF, 0x0096, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x03B3, 0x033D, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x028F, 0x022E, 0x02B9, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x0467, 0x0359, 0x042A, 0x042A, 0x042A,
+    0x0074, 0x0298, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x03A5,
+    0x00A1, 0x042A, 0x042A, 0x018C, 0x0040, 0x0424, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x041B, 0x037A, 0x0246, 0x042A, 0x042A,
+    0x042A, 0x0194, 0x02AC, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x0181,
+    0x042A, 0x042A, 0x042A, 0x0180, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x014A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x019C, 0x044C, 0x044D, 0x044D,
+    0x0265, 0x0040, 0x042A, 0x042A, 0x042A, 0x042A, 0x0427, 0x019B,
+    0x042A, 0x0249, 0x0421, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x01DC, 0x01DC, 0x0290, 0x01DC, 0x0180, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x02DB, 0x047D,
+    0x0438, 0x042A, 0x0346, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x003F, 0x042A, 0x042A, 0x042A,
+    0x01DC, 0x01DC, 0x01DC, 0x0404, 0x01DC, 0x01DC, 0x00B8, 0x040F,
+    0x0427, 0x0018, 0x00B6, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x0233, 0x0435, 0x046D, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x019C, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042B, 0x042A, 0x042A, 0x042A, 0x017A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x017A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x0194, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x0180, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x017E, 0x042A, 0x042A, 0x042A,
+    0x0225, 0x0225, 0x0225, 0x0225, 0x0225, 0x0225, 0x0225, 0x0225,
+    0x00A4, 0x042A, 0x00A3, 0x042A, 0x042A, 0x042A, 0x00F9, 0x0050,
+    0x0385, 0x030F, 0x00A4, 0x0225, 0x0225, 0x0225, 0x0106, 0x0109,
+    0x0217, 0x0387, 0x00A3, 0x021F, 0x0213, 0x0225, 0x0225, 0x0225,
+    0x0225, 0x0225, 0x0225, 0x0225, 0x0225, 0x0225, 0x0225, 0x0228,
+    0x0225, 0x0225, 0x0225, 0x0218, 0x00FC, 0x0225, 0x0225, 0x0225,
+    0x0225, 0x0225, 0x0225, 0x0225, 0x0225, 0x042A, 0x042A, 0x042A,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x00FD,
+    0x042A, 0x042A, 0x042A, 0x042A, 0x042A, 0x0215, 0x0225, 0x0225,
+    0x00F9, 0x042A, 0x042A, 0x042A, 0x00FB, 0x00FA, 0x042A, 0x042A,
+    0x00FB, 0x042A, 0x00F8, 0x0225, 0x0225, 0x0225, 0x0225, 0x0225,
+    0x00F9, 0x0225, 0x0225, 0x0100, 0x030C, 0x0225, 0x0225, 0x0225,
+    0x0225, 0x0225, 0x0225, 0x0225, 0x0225, 0x0225, 0x0225, 0x0218,
+];
+
+/// Stage-3 shortest-superstring overlapped 4-bit `Grapheme_Cluster_Break` leaf pool (`1163 B`, 2 scalars per byte).
+const GCB_POOL: [u8; 1163] = [
+    0xCC, 0xCC, 0xCC, 0x0C, 0x00, 0xD0, 0xDD, 0xDD,
+    0x05, 0x05, 0x50, 0x55, 0x55, 0x55, 0xA5, 0xAA,
+    0x5A, 0xA5, 0xAA, 0x00, 0x00, 0x99, 0x99, 0x99,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x55, 0x55,
+    0x55, 0x55, 0x05, 0x00, 0x00, 0xEE, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x05, 0x5A, 0x05, 0x00,
+    0x00, 0x50, 0x00, 0x0E, 0xEE, 0xE0, 0xEE, 0xEE,
+    0x00, 0x05, 0x55, 0x05, 0x50, 0x05, 0x00, 0x00,
+    0x55, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x50, 0x55, 0x55, 0xA5, 0x5A, 0x55, 0x00, 0x00,
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
+    0x00, 0x00, 0x50, 0xA0, 0x55, 0x55, 0x55, 0x05,
+    0x00, 0x00, 0xA0, 0xA5, 0x55, 0x55, 0x55, 0x05,
+    0x00, 0x50, 0x00, 0x55, 0x55, 0x50, 0x55, 0x50,
+    0x55, 0x55, 0x00, 0x50, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0xAA, 0xAA, 0x0A, 0xA0, 0xAA, 0x55, 0x55,
+    0x00, 0x55, 0xAA, 0xAA, 0x55, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x55, 0x55, 0x0A, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0xA0, 0xAA, 0x55, 0x55, 0x55,
+    0x55, 0xA5, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x55, 0xA9, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0xF0, 0xFF, 0x0F, 0x0F, 0x0F, 0x00,
+    0x00, 0xF0, 0x00, 0x99, 0x00, 0x00, 0x50, 0x55,
+    0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x05, 0x00,
+    0x00, 0x99, 0x99, 0x99, 0x55, 0x55, 0x55, 0x55,
+    0x5A, 0x05, 0x00, 0x00, 0x05, 0x05, 0x50, 0x50,
+    0x55, 0x0A, 0xAA, 0x55, 0x05, 0x05, 0xAA, 0xAA,
+    0xAA, 0x5A, 0x55, 0xA5, 0x5A, 0x05, 0x90, 0x00,
+    0xFF, 0xFF, 0x00, 0x00, 0xFF, 0x0F, 0x00, 0x00,
+    0xA0, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x55, 0x05,
+    0x00, 0x50, 0xAA, 0x55, 0x55, 0xAA, 0x55, 0xAA,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0xFF, 0xFF,
+    0xFF, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88,
+    0x88, 0x05, 0x99, 0x00, 0x00, 0x50, 0x55, 0x05,
+    0x5A, 0x55, 0x05, 0xAA, 0x0A, 0xAA, 0x6A, 0x09,
+    0x0E, 0x0E, 0x00, 0xEE, 0xEE, 0x00, 0x05, 0xA5,
+    0x0A, 0x00, 0xAA, 0x0A, 0xAA, 0x5A, 0x00, 0xA5,
+    0xA5, 0x0A, 0x55, 0x05, 0x55, 0x55, 0x00, 0xA0,
+    0x5A, 0xA5, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+    0x00, 0x90, 0x00, 0xA5, 0xAA, 0x0A, 0x55, 0x05,
+    0x55, 0x65, 0x00, 0xC0, 0x00, 0xC0, 0xCC, 0x0C,
+    0x00, 0x00, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0xA5, 0xAA, 0x0A, 0xA0, 0x0A, 0xA0,
+    0x5A, 0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0xAA, 0x5A, 0x55, 0x55, 0x55, 0xA5, 0x5A,
+    0x5A, 0xA5, 0xAA, 0xAA, 0xA0, 0x0A, 0x50, 0x55,
+    0x95, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x55, 0x55, 0x55, 0x05, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x50, 0x50, 0x50, 0x00, 0x00, 0xAA, 0x55,
+    0x55, 0x05, 0x00, 0xAA, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x55, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x50, 0x00, 0x00, 0xEE, 0xE0,
+    0x50, 0xAA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x50, 0x5A, 0xAA, 0xA5, 0xAA, 0xAA, 0x5A, 0x55,
+    0x00, 0x00, 0xA0, 0x05, 0x00, 0x00, 0x00, 0x00,
+    0x33, 0x33, 0x33, 0x03, 0xBB, 0xBB, 0xBB, 0xBB,
+    0xBB, 0xBB, 0xBB, 0xBB, 0x0B, 0x00, 0xF0, 0xFF,
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0x50, 0x55, 0x55,
+    0xA5, 0x59, 0x55, 0x05, 0x55, 0x55, 0x55, 0x55,
+    0x55, 0x55, 0x55, 0x55, 0x50, 0x55, 0x55, 0x55,
+    0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xA5, 0x05, 0xAA,
+    0x05, 0x50, 0x05, 0x00, 0x00, 0x00, 0x00, 0x50,
+    0x55, 0x00, 0x00, 0xEE, 0xE0, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x90, 0x55, 0x59, 0x55,
+    0x55, 0x55, 0x55, 0x55, 0x55, 0x05, 0x03, 0x00,
+    0xF0, 0xFF, 0xF0, 0x00, 0x00, 0x00, 0x00, 0xF0,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
+    0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x5F, 0x55, 0x55,
+    0x55, 0x55, 0xA0, 0x55, 0x55, 0x55, 0x05, 0x55,
+    0x55, 0x55, 0x55, 0x55, 0x00, 0x50, 0x05, 0x55,
+    0x50, 0x00, 0x00, 0x00, 0x00, 0x55, 0x55, 0x55,
+    0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50,
+    0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0,
+    0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0,
+    0x0F, 0x00, 0x00, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+    0xAA, 0x00, 0x00, 0x00, 0x50, 0x55, 0x55, 0x5A,
+    0x55, 0x05, 0xA0, 0x0A, 0xA0, 0x6A, 0x00, 0xCC,
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xDD,
+    0xDD, 0xDD, 0xDD, 0xDD, 0xDD, 0xDD, 0xDD, 0x00,
+    0x00, 0xA0, 0x5A, 0xAA, 0xA5, 0x0A, 0x5A, 0x00,
+    0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x00,
+    0x55, 0xA0, 0x5A, 0x5A, 0x00, 0x00, 0x00, 0x00,
+    0xA5, 0x55, 0xAA, 0x5A, 0x5A, 0xA5, 0x5A, 0x05,
+    0x00, 0x00, 0x00, 0x00, 0x55, 0x55, 0x55, 0x55,
+    0x55, 0xAA, 0x5A, 0x55, 0x55, 0x55, 0x05, 0x00,
+    0x00, 0xA5, 0x55, 0x5A, 0x05, 0x00, 0x00, 0x00,
+    0x00, 0xF0, 0xF0, 0x00, 0x00, 0x00, 0x0F, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xA5, 0x5A,
+    0x55, 0x55, 0xA5, 0xA5, 0x5A, 0x5A, 0x0A, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x55, 0x55,
+    0x00, 0x50, 0x55, 0x50, 0x05, 0x00, 0x00, 0x55,
+    0x55, 0x5A, 0x55, 0x55, 0x00, 0x00, 0x55, 0x55,
+    0x05, 0x55, 0x00, 0x00, 0x50, 0x55, 0x05, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x50, 0x05, 0xA5, 0x55,
+    0x55, 0x55, 0x50, 0xA5, 0x5A, 0x05, 0x00, 0x50,
+    0x05, 0x50, 0x55, 0x00, 0xFF, 0xFF, 0xFF, 0xF0,
+    0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, 0x00, 0xAA,
+    0xAA, 0xAA, 0xAA, 0x55, 0x55, 0x00, 0xAA, 0xAA,
+    0x55, 0x5A, 0x55, 0x55, 0x50, 0xA5, 0xA0, 0x6A,
+    0x00, 0x05, 0x00, 0x05, 0x00, 0x50, 0x00, 0x00,
+    0x00, 0x00, 0xA5, 0x00, 0x9A, 0x5A, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x50, 0x55, 0x55, 0x55,
+    0x05, 0x55, 0x55, 0x55, 0x5A, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x55, 0x55, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0xF0, 0xFF, 0x00, 0x00, 0x00, 0x00,
+    0xE0, 0x55, 0x55, 0x55, 0x59, 0x00, 0x00, 0x00,
+    0x00, 0xEE, 0xEE, 0xEE, 0xEE, 0x0E, 0xEE, 0xEE,
+    0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0x5E, 0x05,
+    0xA5, 0xAA, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x55, 0x55, 0x05, 0x00, 0x00, 0x50, 0x55, 0x55,
+    0x55, 0x55, 0x55, 0x55, 0xA5, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x0F, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0xF0, 0x00, 0x00, 0x00, 0x50, 0xA0,
+    0x55, 0x55, 0x55, 0x55, 0x05, 0x00, 0x0A, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x50, 0xA5,
+    0x0A, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x00, 0x30,
+    0x0F, 0x00, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0xA0, 0x55, 0xAA, 0x55, 0x55, 0x00,
+    0x00, 0x00, 0x05, 0xA0, 0x55, 0x00, 0x00, 0x00,
+    0x50, 0xA5, 0x5A, 0x00, 0x00, 0x0E, 0xEE, 0xE0,
+    0xEE, 0xEE, 0x00, 0x05, 0xAA, 0x55, 0xA5, 0x05,
+    0x00, 0x00, 0x00, 0x00, 0xAA, 0x55, 0x00, 0x00,
+    0x55, 0x5A, 0x55, 0x55, 0x55, 0xAA, 0x55, 0x00,
+    0x00, 0x00, 0x00, 0x55, 0x55, 0x55, 0x95, 0x50,
+    0xA5, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50,
+    0x55, 0x53, 0xA0, 0x55, 0x55, 0xAA, 0x55, 0x55,
+    0x55, 0x00, 0xAA, 0x00, 0x55, 0x55, 0x55, 0x05,
+    0x00, 0x50, 0x55, 0x55, 0x55, 0x00, 0x00, 0x00,
+    0x00, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x30, 0x74, 0x33, 0x33, 0x33, 0x33, 0x33,
+    0x33, 0x33, 0x33, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x05, 0xAA, 0x5A, 0x55, 0x55, 0x55,
+    0x55, 0x05, 0x50, 0x55, 0x55, 0x55, 0x00, 0x00,
+    0x50, 0x05, 0xEE, 0x0E, 0x00, 0x00, 0x0F, 0xF0,
+    0x00, 0x00, 0x0F, 0x0F, 0xA0, 0xAA, 0xAA, 0xAA,
+    0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xA5, 0x5A, 0x55,
+    0x55, 0x55, 0xA5, 0xAA, 0x6A, 0xAA, 0x55, 0x05,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x55, 0x55, 0x50,
+    0x55, 0x55, 0x05, 0x00, 0x05, 0x55, 0x50, 0x05,
+    0x55, 0x55, 0x05, 0x00, 0x00, 0xE0, 0xEE, 0xEE,
+    0xEE, 0xEE, 0xEE, 0x00, 0x05, 0x55, 0x35, 0x33,
+    0x33, 0x33, 0x53, 0x55, 0x55, 0x05, 0x50, 0x05,
+    0x55, 0x55, 0x00,
+];
+
+// ---------------- UAX #29 13-State DFA (234 B) ----------------
+/// Transition table (`13 states * 18 classes = 234 B`); bit `0x80` marks a cluster break before `cls`, bits `0..6` encode next state.
+const GRAPHEME_DFA: [u8; 234] = [
+    0x01, 0x02, 0x03, 0x03, 0x01, 0x01, 0x01, 0x01,
+    0x08, 0x04, 0x01, 0x05, 0x06, 0x07, 0x09, 0x0B,
+    0x06, 0x07, 0x81, 0x82, 0x83, 0x83, 0x01, 0x01,
+    0x01, 0x01, 0x88, 0x84, 0x01, 0x85, 0x86, 0x87,
+    0x89, 0x8B, 0x86, 0x87, 0x81, 0x82, 0x03, 0x83,
+    0x81, 0x81, 0x81, 0x81, 0x88, 0x84, 0x81, 0x85,
+    0x86, 0x87, 0x89, 0x8B, 0x86, 0x87, 0x81, 0x82,
+    0x83, 0x83, 0x81, 0x81, 0x81, 0x81, 0x88, 0x84,
+    0x81, 0x85, 0x86, 0x87, 0x89, 0x8B, 0x86, 0x87,
+    0x01, 0x82, 0x83, 0x83, 0x01, 0x01, 0x01, 0x01,
+    0x08, 0x04, 0x01, 0x05, 0x06, 0x07, 0x09, 0x0B,
+    0x06, 0x07, 0x81, 0x82, 0x83, 0x83, 0x01, 0x01,
+    0x01, 0x01, 0x88, 0x84, 0x01, 0x05, 0x06, 0x87,
+    0x89, 0x8B, 0x06, 0x07, 0x81, 0x82, 0x83, 0x83,
+    0x01, 0x01, 0x01, 0x01, 0x88, 0x84, 0x01, 0x85,
+    0x06, 0x07, 0x89, 0x8B, 0x86, 0x87, 0x81, 0x82,
+    0x83, 0x83, 0x01, 0x01, 0x01, 0x01, 0x88, 0x84,
+    0x01, 0x85, 0x86, 0x07, 0x89, 0x8B, 0x86, 0x87,
+    0x81, 0x82, 0x83, 0x83, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x84, 0x01, 0x85, 0x86, 0x87, 0x89, 0x8B,
+    0x86, 0x87, 0x81, 0x82, 0x83, 0x83, 0x01, 0x09,
+    0x0A, 0x09, 0x88, 0x84, 0x01, 0x85, 0x86, 0x87,
+    0x89, 0x8B, 0x86, 0x87, 0x81, 0x82, 0x83, 0x83,
+    0x01, 0x0A, 0x0A, 0x0A, 0x88, 0x84, 0x01, 0x85,
+    0x86, 0x87, 0x09, 0x8B, 0x86, 0x87, 0x81, 0x82,
+    0x83, 0x83, 0x0B, 0x0B, 0x0B, 0x0C, 0x88, 0x84,
+    0x01, 0x85, 0x86, 0x87, 0x89, 0x8B, 0x86, 0x87,
+    0x81, 0x82, 0x83, 0x83, 0x01, 0x01, 0x01, 0x01,
+    0x88, 0x84, 0x01, 0x85, 0x86, 0x87, 0x89, 0x0B,
+    0x86, 0x87,
+];
+
+// --------------- Shared 632 B POW5_SPLIT Table ----------------
+/// Exact normalized 64-bit significands of `5^r` in `[2^63, 2^64)` for `r in 0..=26` (`216 B`).
+const POW5_FINE: [u64; 27] = [
+    0x8000000000000000_u64, 0xA000000000000000_u64, 0xC800000000000000_u64,
+    0xFA00000000000000_u64, 0x9C40000000000000_u64, 0xC350000000000000_u64,
+    0xF424000000000000_u64, 0x9896800000000000_u64, 0xBEBC200000000000_u64,
+    0xEE6B280000000000_u64, 0x9502F90000000000_u64, 0xBA43B74000000000_u64,
+    0xE8D4A51000000000_u64, 0x9184E72A00000000_u64, 0xB5E620F480000000_u64,
+    0xE35FA931A0000000_u64, 0x8E1BC9BF04000000_u64, 0xB1A2BC2EC5000000_u64,
+    0xDE0B6B3A76400000_u64, 0x8AC7230489E80000_u64, 0xAD78EBC5AC620000_u64,
+    0xD8D726B7177A8000_u64, 0x878678326EAC9000_u64, 0xA968163F0A57B400_u64,
+    0xD3C21BCECCEDA100_u64, 0x84595161401484A0_u64, 0xA56FA5B99019A5C8_u64,
+];
+
+/// Rounded-to-nearest 128-bit `(hi, lo)` significands of `5^(27 * c)` for `c in -13..=12` (`416 B`).
+const POW5_COARSE: [(u64, u64); 26] = [
+    (0x8049A4AC0C5811AE_u64, 0x205B896D777D6279_u64), // c = -13 (5^-351).
+    (0xCF42894A5DCE35EA_u64, 0x52064CAC828675B9_u64), // c = -12 (5^-324).
+    (0xA76C582338ED2621_u64, 0xAF2AF2B80AF6F24E_u64), // c = -11 (5^-297).
+    (0x873E4F75E2224E68_u64, 0x5A7744A6E804A292_u64), // c = -10 (5^-270).
+    (0xDA7F5BF590966848_u64, 0xAF39A475506A899F_u64), // c = -9 (5^-243).
+    (0xB080392CC4349DEC_u64, 0xBD8D794D96AACFB4_u64), // c = -8 (5^-216).
+    (0x8E938662882AF53E_u64, 0x547EB47B7282EE9C_u64), // c = -7 (5^-189).
+    (0xE65829B3046B0AFA_u64, 0x0CB4A5A3112A5113_u64), // c = -6 (5^-162).
+    (0xBA121A4650E4DDEB_u64, 0x92F34D62616CE413_u64), // c = -5 (5^-135).
+    (0x964E858C91BA2655_u64, 0x3A6A07F8D510F870_u64), // c = -4 (5^-108).
+    (0xF2D56790AB41C2A2_u64, 0xFAE27299423FB9C3_u64), // c = -3 (5^-81).
+    (0xC428D05AA4751E4C_u64, 0xAA97E14C3C26B887_u64), // c = -2 (5^-54).
+    (0x9E74D1B791E07E48_u64, 0x775EA264CF55347E_u64), // c = -1 (5^-27).
+    (0x8000000000000000_u64, 0x0000000000000000_u64), // c = +0 (5^0).
+    (0xCECB8F27F4200F3A_u64, 0x0000000000000000_u64), // c = +1 (5^27).
+    (0xA70C3C40A64E6C51_u64, 0x999090B65F67D924_u64), // c = +2 (5^54).
+    (0x86F0AC99B4E8DAFD_u64, 0x69A028BB3DED71A4_u64), // c = +3 (5^81).
+    (0xDA01EE641A708DE9_u64, 0xE80E6F4820CC9496_u64), // c = +4 (5^108).
+    (0xB01AE745B101E9E4_u64, 0x5EC05DCFF72E7F90_u64), // c = +5 (5^135).
+    (0x8E41ADE9FBEBC27D_u64, 0x14588F13BE847307_u64), // c = +6 (5^162).
+    (0xE5D3EF282A242E81_u64, 0x8F1668C8A86DA5FB_u64), // c = +7 (5^189).
+    (0xB9A74A0637CE2EE1_u64, 0x6D953E2BD7173693_u64), // c = +8 (5^216).
+    (0x95F83D0A1FB69CD9_u64, 0x4ABDAF101564F98E_u64), // c = +9 (5^243).
+    (0xF24A01A73CF2DCCF_u64, 0xBC633B39673C8CEC_u64), // c = +10 (5^270).
+    (0xC3B8358109E84F07_u64, 0x0A862F80EC4700C8_u64), // c = +11 (5^297).
+    (0x9E19DB92B4E31BA9_u64, 0x6C07A2C26A8346D1_u64), // c = +12 (5^324).
+];
+
+/// Exact powers `10^0 .. 10^22` representable with zero error in IEEE-754 `f64` (`184 B`).
+const EXACT_POW10_F64: [f64; 23] = [
+     1.0e0,  1.0e1,  1.0e2,  1.0e3,  1.0e4,  1.0e5,  1.0e6,  1.0e7,
+     1.0e8,  1.0e9, 1.0e10, 1.0e11, 1.0e12, 1.0e13, 1.0e14, 1.0e15,
+    1.0e16, 1.0e17, 1.0e18, 1.0e19, 1.0e20, 1.0e21, 1.0e22,
+];
+
+/// Maximum new leading decimal digits produced when multiplying by `2^k` for `k in 0..=31` (`32 B`).
+const DEC_LSHIFT_NEW_DIGITS: [u8; 32] = [
+     0,  1,  1,  1,  2,  2,  2,  3,
+     3,  3,  4,  4,  4,  4,  5,  5,
+     5,  6,  6,  6,  7,  7,  7,  7,
+     8,  8,  8,  9,  9,  9, 10, 10,
+];
+
+/// Active BCD digit ceiling inside Nigel Tao's `[u8; 864]` decimal shift-and-round buffer.
+const MAX_DEC_DIGITS: usize = 800;
+
+// -------------------------------------- INTERNALS --------------------------------------
+// --------------- Pointer, UTF-8 & ASCII Helpers ---------------
+/// Returns non-null sentinel byte pointer `1` for zero-capacity `HeapRepr` instances.
+@inline @no_alloc @no_panic
+fn dangling_u8_ptr() -> *mut u8 {
+    return 1_usize as *mut u8;
+}
+
+@cfg(target.ptr_width == 64)
+impl PtrWidthOps64 {
+    /// Packs `(ptr, alloc, len, flagged_cap)` into the 24-byte 64-bit `HeapRepr64` overlay.
+    @inline @no_alloc @no_panic
+    fn pack_heap(self, ptr: *mut u8, alloc: AllocatorHandle, len: u32, flagged_cap: u32, /) -> HeapRepr {
+        _ = self;
+        return HeapRepr64 {
+            ptr: ptr,
+            alloc: alloc,
+            len: len,
+            flagged_cap: flagged_cap,
+        };
+    }
+}
+
+@cfg(target.ptr_width == 32)
+impl PtrWidthOps32 {
+    /// Packs `(ptr, alloc, len, flagged_cap)` into the 24-byte `wasm32` `HeapRepr32` overlay (`_pad0 = 0, _pad1 = 0`).
+    @inline @no_alloc @no_panic
+    fn pack_heap(self, ptr: *mut u8, alloc: AllocatorHandle, len: u32, flagged_cap: u32, /) -> HeapRepr {
+        _ = self;
+        return HeapRepr32 {
+            ptr: ptr,
+            _pad0: 0_u32,
+            alloc: alloc,
+            _pad1: 0_u32,
+            len: len,
+            flagged_cap: flagged_cap,
+        };
+    }
+}
+
+/// Projects non-null `ptr` as `&String` with dominating non-null proof (`0` `E0303`).
+@std_cap_boundary(clears: [unsafe_op])
+@inline @no_alloc @no_panic
+fn string_ptr_ref(ptr: *String, /) -> &String {
+    if not ptr.is_null() {
+        return unsafe {
+            &ptr.*
+        };
+    }
+    return string_ptr_ref(8_usize as *String);
+}
+
+/// Reinterprets a validated Unicode scalar `codepoint` (`<= 0x10FFFF`, non-surrogate) as `char`.
+@std_cap_boundary(clears: [unsafe_op, may_panic])
+@inline @no_alloc @no_panic
+fn u32_to_char_unchecked(codepoint: u32, /) -> char {
+    return unsafe {
+        @ptr_read(&raw codepoint as *char)
+    };
+}
+
+/// Reads an unaligned 64-bit word from `ptr` safely across all targets.
+@std_cap_boundary(clears: [unsafe_op])
+@inline @no_alloc @no_panic
+fn read_u64_unaligned(ptr: *u8, /) -> u64 {
+    var raw: [u8; 8] = [0_u8; 8];
+    unsafe {
+        @memcpy(&raw mut raw[0] as *mut opaque, ptr as *opaque, 8);
+    }
+    return @from_le_bytes[u64](raw);
+}
+
+/// Returns `true` if `byte` is NOT a UTF-8 continuation byte (`0b10xx_xxxx`).
+@inline @no_alloc @no_panic
+fn is_utf8_char_boundary_byte(byte: u8, /) -> bool {
+    return (byte & 0xC0_u8) != 0x80_u8;
+}
+
+/// Decodes the leading Unicode scalar `(char, byte_width)` from valid non-empty UTF-8 `bytes`.
+@std_cap_boundary(clears: [unsafe_op, may_panic])
+@inline @no_alloc @no_panic
+fn decode_utf8_first(bytes: &[u8], /) -> (char, usize) {
+    let b0: u32 = bytes[0] as u32;
+    if b0 < 0x80_u32 {
+        return (u32_to_char_unchecked(b0), 1);
+    }
+    let len: usize = bytes.len();
+    if b0 < 0xE0_u32 and len >= 2 {
+        let b1: u32 = (bytes[1] & 0x3F_u8) as u32;
+        let cp2: u32 = ((b0 & 0x1F_u32) << 6_u32) | b1;
+        return (u32_to_char_unchecked(cp2), 2);
+    }
+    if b0 < 0xF0_u32 and len >= 3 {
+        let b1: u32 = (bytes[1] & 0x3F_u8) as u32;
+        let b2: u32 = (bytes[2] & 0x3F_u8) as u32;
+        let cp3: u32 = ((b0 & 0x0F_u32) << 12_u32) | (b1 << 6_u32) | b2;
+        return (u32_to_char_unchecked(cp3), 3);
+    }
+    if len >= 4 {
+        let b1: u32 = (bytes[1] & 0x3F_u8) as u32;
+        let b2: u32 = (bytes[2] & 0x3F_u8) as u32;
+        let b3: u32 = (bytes[3] & 0x3F_u8) as u32;
+        let cp4: u32 = ((b0 & 0x07_u32) << 18_u32) | (b1 << 12_u32) | (b2 << 6_u32) | b3;
+        return (u32_to_char_unchecked(cp4), 4);
+    }
+    return ('\u{FFFD}', 1);
+}
+
+/// Decodes the final Unicode scalar `(char, byte_width)` from valid non-empty UTF-8 `bytes`.
+@std_cap_boundary(clears: [may_panic])
+@inline @no_alloc @no_panic
+fn decode_utf8_last(bytes: &[u8], /) -> (char, usize) {
+    let total: usize = bytes.len();
+    var start: usize = total -% 1;
+    if bytes[start] < 0x80_u8 {
+        let (ch_ascii, _) = decode_utf8_first(bytes[start..total]);
+        return (ch_ascii, 1);
+    }
+    while start > 0 and not is_utf8_char_boundary_byte(bytes[start]) {
+        start = start -% 1;
+    }
+    let (ch, width) = decode_utf8_first(bytes[start..total]);
+    return (ch, width);
+}
+
+/// Encodes `ch` into `out[0..4]`, returning its UTF-8 byte length (`1..=4`).
+@inline @no_alloc @no_panic
+fn encode_utf8_char(ch: char, out: &mut [u8; 4], /) -> usize {
+    let cp: u32 = ch as u32;
+    if cp < 0x80_u32 {
+        out[0] = cp as u8;
+        return 1;
+    }
+    if cp < 0x800_u32 {
+        out[0] = (0xC0_u32 | (cp >> 6_u32)) as u8;
+        out[1] = (0x80_u32 | (cp & 0x3F_u32)) as u8;
+        return 2;
+    }
+    if cp < 0x10000_u32 {
+        out[0] = (0xE0_u32 | (cp >> 12_u32)) as u8;
+        out[1] = (0x80_u32 | ((cp >> 6_u32) & 0x3F_u32)) as u8;
+        out[2] = (0x80_u32 | (cp & 0x3F_u32)) as u8;
+        return 3;
+    }
+    out[0] = (0xF0_u32 | (cp >> 18_u32)) as u8;
+    out[1] = (0x80_u32 | ((cp >> 12_u32) & 0x3F_u32)) as u8;
+    out[2] = (0x80_u32 | ((cp >> 6_u32) & 0x3F_u32)) as u8;
+    out[3] = (0x80_u32 | (cp & 0x3F_u32)) as u8;
+    return 4;
+}
+
+/// Returns `true` if `ch` has Unicode `White_Space=Yes` (`0` `.rodata` bytes).
+@inline @no_alloc @no_panic
+fn is_unicode_whitespace(ch: char, /) -> bool {
+    let cp: u32 = ch as u32;
+    if cp <= 0x20_u32 {
+        return cp == 0x20_u32 or (cp >= 0x09_u32 and cp <= 0x0D_u32);
+    }
+    if cp < 0x1680_u32 {
+        return cp == 0x85_u32 or cp == 0xA0_u32;
+    }
+    if cp <= 0x200A_u32 {
+        return cp == 0x1680_u32 or cp >= 0x2000_u32;
+    }
+    return cp == 0x2028_u32 or cp == 0x2029_u32 or cp == 0x202F_u32 or cp == 0x205F_u32 or cp == 0x3000_u32;
+}
+
+/// Returns `true` if `set_text` contains `target` (fast-pathing ASCII sets without decoding UTF-8).
+@std_cap_boundary(clears: [may_panic])
+@inline @no_alloc @no_panic
+fn is_char_in_trim_set(set_text: str, target: char, /) -> bool {
+    let set_bytes: &[u8] = set_text.as_bytes();
+    let cp: u32 = target as u32;
+    if cp < 0x80_u32 {
+        let needle_b: u8 = cp as u8;
+        var i: usize = 0;
+        while i < set_bytes.len() {
+            if set_bytes[i] == needle_b {
+                return true;
+            }
+            i = i +% 1;
+        }
+        return false;
+    }
+    var rem: &[u8] = set_bytes;
+    while rem.len() > 0 {
+        let (cand, width) = decode_utf8_first(rem);
+        if cand == target {
+            return true;
+        }
+        rem = rem[width..rem.len()];
+    }
+    return false;
+}
+
+// --------------- SIMD & Scalar Substring Search ---------------
+/// Returns `true` if `haystack[pos .. pos + needle.len()] == needle`.
+@std_cap_boundary(clears: [unsafe_op])
+@inline @no_alloc @no_panic
+fn is_bytes_equal_at(hay_ptr: *u8, pos: usize, needle_ptr: *u8, needle_len: usize, /) -> bool {
+    var i: usize = 0;
+    while i < needle_len {
+        if unsafe {
+            hay_ptr.add(pos +% i).read()
+        } != unsafe {
+            needle_ptr.add(i).read()
+        } {
+            return false;
+        }
+        i = i +% 1;
+    }
+    return true;
+}
+
+@cfg(target.arch == "x86_64" or target.arch == "aarch64")
+impl SimdStrOps {
+    /// 16-byte SIMD first+last byte substring search on `x86_64` and `aarch64`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    fn find_bytes(self, haystack: &[u8], needle: &[u8], /) -> usize? {
+        _ = self;
+        let n_len: usize = needle.len();
+        let h_len: usize = haystack.len();
+        if n_len == 0 {
+            return .Some(0);
+        }
+        if n_len > h_len {
+            return .None;
+        }
+        let hay_ptr: *u8 = haystack.as_ptr();
+        let ndl_ptr: *u8 = needle.as_ptr();
+        let first_b: u8 = needle[0];
+        let last_off: usize = n_len -% 1;
+        let last_b: u8 = needle[last_off];
+        let first_vec: [u8; 16] = @simd_splat[[u8; 16]](first_b);
+        let last_vec: [u8; 16] = @simd_splat[[u8; 16]](last_b);
+
+        var pos: usize = 0;
+        while pos +% last_off +% 16 <= h_len {
+            let blk_first: [u8; 16] = unsafe {
+                @simd_load_unaligned[[u8; 16]](hay_ptr.add(pos))
+            };
+            let blk_last: [u8; 16] = unsafe {
+                @simd_load_unaligned[[u8; 16]](hay_ptr.add(pos +% last_off))
+            };
+            var mask: u16 = @simd_bitmask(
+                @simd_and(@simd_eq(blk_first, first_vec), @simd_eq(blk_last, last_vec)),
+            );
+            while mask != 0_u16 {
+                let lane: usize = mask.trailing_zeros() as usize;
+                let cand: usize = pos +% lane;
+                if n_len <= 2 or is_bytes_equal_at(
+                    hay_ptr,
+                    cand +% 1,
+                    unsafe {
+                        ndl_ptr.add(1_usize)
+                    },
+                    n_len -% 2,
+                ) {
+                    return .Some(cand);
+                }
+                mask = mask & (mask -% 1_u16);
+            }
+            pos = pos +% 16;
+        }
+
+        let limit: usize = h_len -% n_len;
+        while pos <= limit {
+            if unsafe {
+                hay_ptr.add(pos).read()
+            } == first_b and unsafe {
+                hay_ptr.add(pos +% last_off).read()
+            } == last_b and (
+                n_len <= 2 or is_bytes_equal_at(
+                    hay_ptr,
+                    pos +% 1,
+                    unsafe {
+                        ndl_ptr.add(1_usize)
+                    },
+                    n_len -% 2,
+                )
+            ) {
+                return .Some(pos);
+            }
+            pos = pos +% 1;
+        }
+        return .None;
+    }
+}
+
+@cfg(not (target.arch == "x86_64" or target.arch == "aarch64"))
+impl SwarStrOps {
+    /// Portable first+last byte substring search on `wasm32` and non-128-bit targets (`0 B` `.rodata`).
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    fn find_bytes(self, haystack: &[u8], needle: &[u8], /) -> usize? {
+        _ = self;
+        let n_len: usize = needle.len();
+        let h_len: usize = haystack.len();
+        if n_len == 0 {
+            return .Some(0);
+        }
+        if n_len > h_len {
+            return .None;
+        }
+        let hay_ptr: *u8 = haystack.as_ptr();
+        let ndl_ptr: *u8 = needle.as_ptr();
+        let first_b: u8 = needle[0];
+        let last_off: usize = n_len -% 1;
+        let last_b: u8 = needle[last_off];
+        let limit: usize = h_len -% n_len;
+        var pos: usize = 0;
+        while pos <= limit {
+            if unsafe {
+                hay_ptr.add(pos).read()
+            } == first_b and unsafe {
+                hay_ptr.add(pos +% last_off).read()
+            } == last_b and (
+                n_len <= 2 or is_bytes_equal_at(
+                    hay_ptr,
+                    pos +% 1,
+                    unsafe {
+                        ndl_ptr.add(1_usize)
+                    },
+                    n_len -% 2,
+                )
+            ) {
+                return .Some(pos);
+            }
+            pos = pos +% 1;
+        }
+        return .None;
+    }
+}
+
+// -------------- Keiser-Lemire SIMD + SWAR UTF-8 ---------------
+/// Validates UTF-8 from `start_idx` and returns `.None` if valid, or exact maximal-prefix `Utf8Error`.
+@std_cap_boundary(clears: [unsafe_op])
+@no_alloc @no_panic
+fn validate_utf8_detailed_from(bytes: &[u8], var pos: usize, /) -> Utf8Error? {
+    let len: usize = bytes.len();
+    let ptr: *u8 = bytes.as_ptr();
+    while pos +% 8 <= len {
+        if (
+            read_u64_unaligned(
+                unsafe {
+                    ptr.add(pos)
+                },
+            ) & ASCII_HIGH_MASK_U64
+        ) == 0_u64 {
+            pos = pos +% 8;
+        } else {
+            break;
+        }
+    }
+
+    while pos < len {
+        let b0: u8 = unsafe {
+            ptr.add(pos).read()
+        };
+        if b0 < 0x80_u8 {
+            pos = pos +% 1;
+            while pos +% 8 <= len and (
+                read_u64_unaligned(
+                    unsafe {
+                        ptr.add(pos)
+                    },
+                ) & ASCII_HIGH_MASK_U64
+            ) == 0_u64 {
+                pos = pos +% 8;
+            }
+            continue;
+        }
+        if b0 >= 0xC2_u8 and b0 <= 0xDF_u8 {
+            if pos +% 1 >= len {
+                return .Some(Utf8Error { valid_up_to: pos, error_len: .None });
+            }
+            if (
+                unsafe {
+                    ptr.add(pos +% 1).read()
+                } & 0xC0_u8
+            ) != 0x80_u8 {
+                return .Some(Utf8Error { valid_up_to: pos, error_len: .Some(1_u8) });
+            }
+            pos = pos +% 2;
+        } else if b0 >= 0xE0_u8 and b0 <= 0xEF_u8 {
+            if pos +% 1 >= len {
+                return .Some(Utf8Error { valid_up_to: pos, error_len: .None });
+            }
+            let b1: u8 = unsafe {
+                ptr.add(pos +% 1).read()
+            };
+            let b1_ok: bool = if b0 == 0xE0_u8 {
+                b1 >= 0xA0_u8 and b1 <= 0xBF_u8
+            } else if b0 == 0xED_u8 {
+                b1 >= 0x80_u8 and b1 <= 0x9F_u8
+            } else {
+                (b1 & 0xC0_u8) == 0x80_u8
+            };
+            if not b1_ok {
+                return .Some(Utf8Error { valid_up_to: pos, error_len: .Some(1_u8) });
+            }
+            if pos +% 2 >= len {
+                return .Some(Utf8Error { valid_up_to: pos, error_len: .None });
+            }
+            if (
+                unsafe {
+                    ptr.add(pos +% 2).read()
+                } & 0xC0_u8
+            ) != 0x80_u8 {
+                return .Some(Utf8Error { valid_up_to: pos, error_len: .Some(2_u8) });
+            }
+            pos = pos +% 3;
+        } else if b0 >= 0xF0_u8 and b0 <= 0xF4_u8 {
+            if pos +% 1 >= len {
+                return .Some(Utf8Error { valid_up_to: pos, error_len: .None });
+            }
+            let b1: u8 = unsafe {
+                ptr.add(pos +% 1).read()
+            };
+            let b1_ok: bool = if b0 == 0xF0_u8 {
+                b1 >= 0x90_u8 and b1 <= 0xBF_u8
+            } else if b0 == 0xF4_u8 {
+                b1 >= 0x80_u8 and b1 <= 0x8F_u8
+            } else {
+                (b1 & 0xC0_u8) == 0x80_u8
+            };
+            if not b1_ok {
+                return .Some(Utf8Error { valid_up_to: pos, error_len: .Some(1_u8) });
+            }
+            if pos +% 2 >= len {
+                return .Some(Utf8Error { valid_up_to: pos, error_len: .None });
+            }
+            if (
+                unsafe {
+                    ptr.add(pos +% 2).read()
+                } & 0xC0_u8
+            ) != 0x80_u8 {
+                return .Some(Utf8Error { valid_up_to: pos, error_len: .Some(2_u8) });
+            }
+            if pos +% 3 >= len {
+                return .Some(Utf8Error { valid_up_to: pos, error_len: .None });
+            }
+            if (
+                unsafe {
+                    ptr.add(pos +% 3).read()
+                } & 0xC0_u8
+            ) != 0x80_u8 {
+                return .Some(Utf8Error { valid_up_to: pos, error_len: .Some(3_u8) });
+            }
+            pos = pos +% 4;
+        } else {
+            return .Some(Utf8Error { valid_up_to: pos, error_len: .Some(1_u8) });
+        }
+    }
+    return .None;
+}
+
+/// Returns `true` if `curr` ends with an incomplete multi-byte lead at lanes `13..=15`.
+@cfg(target.arch == "x86_64" or target.arch == "aarch64")
+@inline @no_alloc @no_panic
+fn has_incomplete_utf8_tail(curr: &[u8; 16], /) -> bool {
+    return curr[15] >= 0xC0_u8 or curr[14] >= 0xE0_u8 or curr[13] >= 0xF0_u8;
+}
+
+@cfg(target.arch == "x86_64" or target.arch == "aarch64")
+impl SimdStrOps {
+    /// Keiser–Lemire 16-byte SIMD UTF-8 fast validator (`48 B` `.rodata`) on `x86_64` and `aarch64`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    fn validate_utf8_fast(self, bytes: &[u8], /) -> bool {
+        _ = self;
+        let len: usize = bytes.len();
+        if len < 32 {
+            return validate_utf8_detailed_from(bytes, 0) is .None;
+        }
+        let ptr: *u8 = bytes.as_ptr();
+        let low_mask: [u8; 16] = @simd_splat[[u8; 16]](0x0F_u8);
+        let mask_80: [u8; 16] = @simd_splat[[u8; 16]](0x80_u8);
+        let zero_vec: [u8; 16] = @simd_splat[[u8; 16]](0_u8);
+        let seven_vec: [u8; 16] = @simd_splat[[u8; 16]](7_u8);
+        let fifteen_vec: [u8; 16] = @simd_splat[[u8; 16]](15_u8);
+
+        // Advance across initial scalar boundary `>= 3` so `ptr.add(off - 3)` is always in bounds:
+        var off: usize = 0;
+        while off < 4 and off < len {
+            if unsafe {
+                ptr.add(off).read()
+            } < 0x80_u8 {
+                off = off +% 1;
+            } else {
+                break;
+            }
+        }
+        if off < 4 {
+            return validate_utf8_detailed_from(bytes, 0) is .None;
+        }
+
+        var err_acc: [u8; 16] = zero_vec;
+        var prev_incomplete: bool = false;
+        while off +% 16 <= len {
+            let curr: [u8; 16] = unsafe {
+                @simd_load_unaligned[[u8; 16]](ptr.add(off))
+            };
+            if @simd_bitmask(curr) == 0_u16 {
+                if prev_incomplete {
+                    return false;
+                }
+                off = off +% 16;
+                continue;
+            }
+            let pb1: [u8; 16] = unsafe {
+                @simd_load_unaligned[[u8; 16]](ptr.add(off -% 1))
+            };
+            let pb2: [u8; 16] = unsafe {
+                @simd_load_unaligned[[u8; 16]](ptr.add(off -% 2))
+            };
+            let pb3: [u8; 16] = unsafe {
+                @simd_load_unaligned[[u8; 16]](ptr.add(off -% 3))
+            };
+
+            let s1h: [u8; 16] = @simd_swizzle(KL_BYTE_1_HIGH, @simd_shr_u8(pb1, 4_u32));
+            let s1l: [u8; 16] = @simd_swizzle(KL_BYTE_1_LOW, @simd_and(pb1, low_mask));
+            let s2h: [u8; 16] = @simd_swizzle(KL_BYTE_2_HIGH, @simd_shr_u8(curr, 4_u32));
+            let special: [u8; 16] = @simd_and(@simd_and(s1h, s1l), s2h);
+
+            let is3: [u8; 16] = @simd_eq(@simd_shr_u8(pb2, 5_u32), seven_vec);
+            let is4: [u8; 16] = @simd_eq(@simd_shr_u8(pb3, 4_u32), fifteen_vec);
+            let must23: [u8; 16] = @simd_and(@simd_or(is3, is4), mask_80);
+
+            err_acc = @simd_or(err_acc, @simd_xor(special, must23));
+            prev_incomplete = has_incomplete_utf8_tail(&curr);
+            off = off +% 16;
+        }
+
+        if @simd_bitmask(@simd_eq(err_acc, zero_vec)) != 0xFFFF_u16 {
+            return false;
+        }
+        let rewind: usize = if prev_incomplete {
+            if unsafe {
+                ptr.add(off -% 1).read()
+            } >= 0xC0_u8 {
+                1
+            } else if unsafe {
+                ptr.add(off -% 2).read()
+            } >= 0xE0_u8 {
+                2
+            } else {
+                3
+            }
+        } else {
+            0
+        };
+        return validate_utf8_detailed_from(bytes, off -% rewind) is .None;
+    }
+}
+
+@cfg(not (target.arch == "x86_64" or target.arch == "aarch64"))
+impl SwarStrOps {
+    /// Portable 8-byte SWAR + scalar UTF-8 validator on `wasm32` (`0 B` `.rodata`).
+    @inline @no_alloc @no_panic
+    fn validate_utf8_fast(self, bytes: &[u8], /) -> bool {
+        _ = self;
+        return validate_utf8_detailed_from(bytes, 0) is .None;
+    }
+}
+
+// ---------------------- UAX #29 DFA Step ----------------------
+/// Advances UAX #29 DFA `state` across `ch`, returning `(break_before_ch, next_state)`.
+@inline @no_alloc @no_panic
+pub(pkg) fn step_grapheme_dfa(state: u8, ch: char, /) -> (bool, u8) {
+    let cls: usize = grapheme_class(ch) as usize;
+    let raw_idx: usize = (state as usize) *% 18_usize +% cls;
+    if raw_idx >= 234_usize {
+        return (true, 1_u8);
+    }
+    let entry: u8 = GRAPHEME_DFA[raw_idx];
+    return ((entry & 0x80_u8) != 0_u8, entry & 0x7F_u8);
+}
+
+// ------------- Float & Integer Conversion Kernels -------------
+/// Branch-minimal 64-bit leading-zero count (`0..=64`) with zero intrinsic dependencies.
+@inline @no_alloc @no_panic
+fn leading_zeros_u64(value: u64, /) -> u64 {
+    if value == 0_u64 {
+        return 64_u64;
+    }
+    var rem: u64 = value;
+    var count: u64 = 0_u64;
+    if (rem >> 32_u64) == 0_u64 {
+        count = count +% 32_u64;
+        rem = rem << 32_u64;
+    }
+    if (rem >> 48_u64) == 0_u64 {
+        count = count +% 16_u64;
+        rem = rem << 16_u64;
+    }
+    if (rem >> 56_u64) == 0_u64 {
+        count = count +% 8_u64;
+        rem = rem << 8_u64;
+    }
+    if (rem >> 60_u64) == 0_u64 {
+        count = count +% 4_u64;
+        rem = rem << 4_u64;
+    }
+    if (rem >> 62_u64) == 0_u64 {
+        count = count +% 2_u64;
+        rem = rem << 2_u64;
+    }
+    if (rem >> 63_u64) == 0_u64 {
+        count = count +% 1_u64;
+    }
+    return count;
+}
+
+/// Exact `floor(bin_exp * log10(2))` for `|bin_exp| <= 1650`.
+@inline @no_alloc @no_panic
+fn floor_log10_pow2(bin_exp: i32, /) -> i32 = (bin_exp *% 315_653) >> 20;
+
+/// Exact `floor(bin_exp * log10(2) - log10(4 / 3))` for irregular power-of-two lower boundaries.
+@inline @no_alloc @no_panic
+fn floor_log10_pow2_minus_log10_4_over_3(bin_exp: i32, /) -> i32 =
+    (bin_exp *% 631_305 -% 261_663) >> 21;
+
+/// Exact `floor(exp10 * log2(10))` for `exp10 in -351..=350`.
+@inline @no_alloc @no_panic
+fn floor_log2_pow10(exp10: i32, /) -> i32 = (exp10 *% 1_741_647) >> 19;
+
+/// Reconstructs the normalized 128-bit `(hi, lo)` significand of `10^exp10` (`<= 1.52 ULP_128`) for `exp10 in -351..=350`.
+@inline @no_alloc @no_panic
+pub(pkg) fn pow10_sig128(exp10: i32, /) -> (u64, u64) {
+    let shifted: u32 = (exp10 +% 351) as u32;
+    let coarse_idx: usize = ((shifted *% 9710_u32) >> 18_u32) as usize;
+    let fine_idx: usize = (shifted % 27_u32) as usize;
+    if coarse_idx >= 26_usize {
+        return (0_u64, 0_u64);
+    }
+    let (coarse_hi, coarse_lo) = POW5_COARSE[coarse_idx];
+    let fine_val: u64 = POW5_FINE[fine_idx];
+
+    let (mid_lo, mid_carry) = widening_mul_u64(coarse_lo, fine_val);
+    let (prod_lo, prod_hi) = widening_mul_u64(coarse_hi, fine_val);
+    let (sum_lo, carry_out) = carrying_add_u64(prod_lo, mid_carry, false);
+    let sum_hi: u64 = prod_hi +% (carry_out as u64);
+
+    if (sum_hi >> 63_u64) == 0_u64 {
+        return ((sum_hi << 1_u64) | (sum_lo >> 63_u64), (sum_lo << 1_u64) | (mid_lo >> 63_u64));
+    }
+    return (sum_hi, sum_lo);
+}
+
+/// Computes upper 64 bits (with sticky bit `0`) of `((pow_hi : pow_lo) + 2) * (scaled_sig << beta)` for Schubfach.
+@inline @no_alloc @no_panic
+fn umul192_upper64_modified(pow_hi: u64, pow_lo: u64, scaled_sig: u64, beta: u64, /) -> u64 {
+    let y_shifted: u64 = scaled_sig << (beta & 7_u64);
+    let (guard_lo, carry0) = carrying_add_u64(pow_lo, 2_u64, false);
+    let guard_hi: u64 = pow_hi +% (carry0 as u64);
+    let (_, lo_hi) = widening_mul_u64(guard_lo, y_shifted);
+    let (mid_lo, upper64) = widening_mul_u64(guard_hi, y_shifted);
+    let (mid64, carry1) = carrying_add_u64(mid_lo, lo_hi, false);
+    return (upper64 +% (carry1 as u64)) | ((mid64 > 1_u64) as u64);
+}
+
+// ---------- Eisel-Lemire Subnormal & Stack Fallback -----------
+/// Resolves `eisel_lemire_f64` subnormals (`biased_exp in -52..=0`), returning `.None` on ambiguous ties.
+@inline @no_alloc @no_panic
+fn eisel_lemire_subnormal_f64(prod_hi: u64, prod_lo: u64, msb: i32, biased_exp: i32, /) -> u64? {
+    let total_sh: u64 = (((9 +% msb) +% (1 -% biased_exp)) as u32) as u64;
+    if total_sh >= 64_u64 {
+        return .None;
+    }
+    let sh_masked: u64 = total_sh & 63_u64;
+    let x_guard: u64 = prod_hi >> sh_masked;
+    let rem_mask: u64 = (1_u64 << sh_masked) -% 1_u64;
+    let rem_hi: u64 = prod_hi & rem_mask;
+    if ((x_guard & 1_u64) == 1_u64 and rem_hi == 0_u64 and prod_lo <= 16_u64) or (
+        (x_guard & 1_u64) == 0_u64 and rem_hi == rem_mask and prod_lo >= (0xFFFF_FFFF_FFFF_FFF0_u64)
+    ) {
+        return .None;
+    }
+    let sticky: bool = rem_hi != 0_u64 or prod_lo > 16_u64;
+    let round_up: u64 = ((x_guard & 1_u64) == 1_u64 and (sticky or (x_guard & 2_u64) != 0_u64)) as u64;
+    let sig: u64 = (x_guard >> 1_u64) +% round_up;
+    if sig >= (1_u64 << 52_u64) {
+        return .Some(1_u64 << 52_u64);
+    }
+    return .Some(sig);
+}
+
+/// Shifts `val` left by `shift_amt & 63` in loop-free `u64` SSA so VRP proves `rhs < 64` without widening.
+@inline @no_alloc @no_panic
+fn shl_u64_masked(val: u64, shift_amt: u32, /) -> u64 = val << ((shift_amt as u64) & 63_u64);
+
+/// Shifts BCD `digit` left by `shift_k & 31` in loop-free `u64` SSA so VRP proves `rhs < 64` without widening.
+@inline @no_alloc @no_panic
+fn shl_digit_u64(digit: u8, shift_k: u32, /) -> u64 = (digit as u64) << ((shift_k as u64) & 31_u64);
+
+/// Multiplies BCD buffer `digits[0..*num_digits]` in place by `2^shift_k` (`shift_k in 1..=29`), updating `*dec_pt` and `*is_trunc`.
+@no_alloc @no_panic
+fn dec_buf_left_shift(
+    digits: &mut [u8; 864],
+    num_digits: &mut usize,
+    dec_pt: &mut i32,
+    is_trunc: &mut bool,
+    shift_k: u32,
+    /,
+) {
+    let k_masked: u32 = shift_k & 31_u32;
+    let new_lead_u8: u8 = DEC_LSHIFT_NEW_DIGITS[(k_masked as usize) & 31_usize];
+    let new_lead: usize = new_lead_u8 as usize;
+    var read_pos: usize = num_digits.*;
+    var write_pos: usize = num_digits.* +% new_lead;
+    var acc: u64 = 0;
+    while read_pos > 0 {
+        read_pos = read_pos -% 1;
+        write_pos = write_pos -% 1;
+        acc = acc +% shl_digit_u64(digits[read_pos % 864_usize], shift_k);
+        let quo: u64 = acc / 10_u64;
+        let rem: u8 = ((acc -% quo *% 10_u64) & 0xFF_u64) as u8;
+        let slot1: usize = write_pos;
+        if slot1 < MAX_DEC_DIGITS {
+            digits[slot1] = rem;
+        } else if rem != 0 {
+            is_trunc.* = true;
+        }
+        acc = quo;
+    }
+    while acc > 0 {
+        write_pos = write_pos -% 1;
+        let quo: u64 = acc / 10_u64;
+        let rem: u8 = ((acc -% quo *% 10_u64) & 0xFF_u64) as u8;
+        let slot2: usize = write_pos;
+        if slot2 < MAX_DEC_DIGITS {
+            digits[slot2] = rem;
+        }
+        acc = quo;
+    }
+    while write_pos > 0 {
+        write_pos = write_pos -% 1;
+        let slot3: usize = write_pos;
+        if slot3 < MAX_DEC_DIGITS {
+            digits[slot3] = 0;
+        }
+    }
+    var total_len: usize = num_digits.* +% new_lead;
+    if total_len > MAX_DEC_DIGITS {
+        total_len = MAX_DEC_DIGITS;
+    }
+    dec_pt.* = dec_pt.* +% (new_lead_u8 as i32);
+    var lead_zeros: usize = 0;
+    while lead_zeros < total_len and digits[lead_zeros % 864_usize] == 0 {
+        lead_zeros = lead_zeros +% 1;
+    }
+    if lead_zeros > 0 {
+        var idx: usize = lead_zeros;
+        while idx < total_len {
+            let dst_idx: usize = idx -% lead_zeros;
+            if dst_idx < MAX_DEC_DIGITS {
+                digits[dst_idx] = digits[idx % 864_usize];
+            }
+            idx = idx +% 1;
+        }
+        total_len = total_len -% lead_zeros;
+        dec_pt.* = dec_pt.* -% ((lead_zeros & 0x3FF_usize) as i32);
+    }
+    while total_len > 0 and digits[(total_len -% 1) % 864_usize] == 0 {
+        total_len = total_len -% 1;
+    }
+    num_digits.* = total_len;
+}
+
+/// Divides BCD buffer `digits[0..*num_digits]` in place by `2^shift_k` (`shift_k in 1..=29`), updating `*dec_pt` and `*is_trunc`.
+@no_alloc @no_panic
+fn dec_buf_right_shift(
+    digits: &mut [u8; 864],
+    num_digits: &mut usize,
+    dec_pt: &mut i32,
+    is_trunc: &mut bool,
+    shift_k: u32,
+    /,
+) {
+    let k_clamped: u64 = (shift_k & 31_u32) as u64;
+    let rem_mask: u64 = (1_u64 << k_clamped) -% 1_u64;
+    var read_pos: usize = 0;
+    var write_pos: usize = 0;
+    var acc: u64 = 0;
+    let cur_len: usize = num_digits.*;
+    while (acc >> k_clamped) == 0_u64 {
+        if read_pos < cur_len {
+            acc = acc *% 10_u64 +% (digits[read_pos % 864_usize] as u64);
+            read_pos = read_pos +% 1;
+        } else {
+            if acc == 0_u64 {
+                num_digits.* = 0;
+                return;
+            }
+            while (acc >> k_clamped) == 0_u64 {
+                acc = acc *% 10_u64;
+                dec_pt.* = dec_pt.* -% 1;
+            }
+            break;
+        }
+    }
+    dec_pt.* = dec_pt.* -% ((read_pos as i32) -% 1);
+    while read_pos < cur_len {
+        let out_dig: u8 = (acc >> k_clamped) as u8;
+        acc = acc & rem_mask;
+        if write_pos < MAX_DEC_DIGITS {
+            digits[write_pos] = out_dig;
+            write_pos = write_pos +% 1;
+        } else if out_dig != 0 {
+            is_trunc.* = true;
+        }
+        acc = acc *% 10_u64 +% (digits[read_pos % 864_usize] as u64);
+        read_pos = read_pos +% 1;
+    }
+    let first_rem_dig: u8 = (acc >> k_clamped) as u8;
+    acc = acc & rem_mask;
+    if write_pos < MAX_DEC_DIGITS {
+        digits[write_pos] = first_rem_dig;
+        write_pos = write_pos +% 1;
+    } else if first_rem_dig != 0 {
+        is_trunc.* = true;
+    }
+    while acc > 0_u64 {
+        acc = acc *% 10_u64;
+        let tail_dig: u8 = (acc >> k_clamped) as u8;
+        acc = acc & rem_mask;
+        if write_pos < MAX_DEC_DIGITS {
+            digits[write_pos] = tail_dig;
+            write_pos = write_pos +% 1;
+        } else if tail_dig != 0 {
+            is_trunc.* = true;
+            break;
+        }
+    }
+    while write_pos > 0 and digits[(write_pos -% 1) % 864_usize] == 0 {
+        write_pos = write_pos -% 1;
+    }
+    num_digits.* = write_pos;
+}
+
+/// Converts positive finite `val` (`f64`) to its shortest round-trip `(decimal_significand, base10_exp)` pair via `Schubfach`.
+@no_alloc @no_panic
+pub(pkg) fn schubfach_to_decimal_f64(val: f64, /) -> (u64, i32) {
+    let bits: u64 = @bit_cast[u64](val);
+    let bin_exp: i32 = ((bits >> 52_u64) & 0x7FF_u64) as i32;
+    var bin_sig: u64 = bits & 0x000F_FFFF_FFFF_FFFF_u64;
+    let is_regular: bool = bin_sig != 0_u64 or bin_exp <= 1;
+    let q_exp: i32 = if bin_exp != 0 {
+        bin_sig = bin_sig | (1_u64 << 52_u64);
+        bin_exp -% 1075
+    } else {
+        -1074
+    };
+
+    let center_val: u64 = bin_sig << 2_u64;
+    let lo_bound: u64 = center_val -% (
+        if is_regular {
+            2_u64
+        } else {
+            1_u64
+        }
+    );
+    let hi_bound: u64 = center_val +% 2_u64;
+
+    let k: i32 = if is_regular {
+        floor_log10_pow2(q_exp)
+    } else {
+        floor_log10_pow2_minus_log10_4_over_3(q_exp)
+    };
+    let beta: u64 = ((q_exp +% floor_log2_pow10(0 -% k) +% 1) as u32) as u64;
+    let (pow_hi, pow_lo) = pow10_sig128(0 -% k);
+
+    let lo_scaled: u64 = umul192_upper64_modified(pow_hi, pow_lo, lo_bound, beta);
+    let mid_scaled: u64 = umul192_upper64_modified(pow_hi, pow_lo, center_val, beta);
+    let hi_scaled: u64 = umul192_upper64_modified(pow_hi, pow_lo, hi_bound, beta);
+    let lsb: u64 = bin_sig & 1_u64;
+
+    let cand: u64 = hi_scaled / 40_u64;
+    if cand >= 1_u64 and (lo_scaled +% lsb <= cand *% 40_u64) and (
+        cand *% 40_u64 +% lsb <= hi_scaled
+    ) {
+        var dec_sig: u64 = cand;
+        var exp10: i32 = k +% 1;
+        while dec_sig % 10_u64 == 0_u64 {
+            dec_sig = dec_sig / 10_u64;
+            exp10 = exp10 +% 1;
+        }
+        return (dec_sig, exp10);
+    }
+
+    let t_under: u64 = mid_scaled >> 2_u64;
+    let t_over: u64 = t_under +% 1_u64;
+    let under_in: bool = (lo_scaled +% lsb) <= (t_under << 2_u64);
+    let over_in: bool = ((t_over << 2_u64) +% lsb) <= hi_scaled;
+    let rem: u64 = mid_scaled & 3_u64;
+    let under_closer: bool = rem < 2_u64 or (rem == 2_u64 and (t_under & 1_u64) == 0_u64);
+
+    var dec_sig: u64 = if under_in and (not over_in or under_closer) {
+        t_under
+    } else {
+        t_over
+    };
+    var exp10: i32 = k;
+    while dec_sig % 10_u64 == 0_u64 {
+        dec_sig = dec_sig / 10_u64;
+        exp10 = exp10 +% 1;
+    }
+    return (dec_sig, exp10);
+}
+
+/// Converts positive finite `val` (`f32`) to its shortest round-trip `(decimal_significand, base10_exp)` pair via `Schubfach`.
+@no_alloc @no_panic
+pub(pkg) fn schubfach_to_decimal_f32(val: f32, /) -> (u32, i32) {
+    let bits: u32 = @bit_cast[u32](val);
+    let bin_exp: i32 = ((bits >> 23_u32) & 0xFF_u32) as i32;
+    var bin_sig: u64 = (bits & 0x007F_FFFF_u32) as u64;
+    let is_regular: bool = bin_sig != 0_u64 or bin_exp <= 1;
+    let q_exp: i32 = if bin_exp != 0 {
+        bin_sig = bin_sig | (1_u64 << 23_u64);
+        bin_exp -% 150
+    } else {
+        -149
+    };
+
+    let center_val: u64 = bin_sig << 2_u64;
+    let lo_bound: u64 = center_val -% (
+        if is_regular {
+            2_u64
+        } else {
+            1_u64
+        }
+    );
+    let hi_bound: u64 = center_val +% 2_u64;
+
+    let k: i32 = if is_regular {
+        floor_log10_pow2(q_exp)
+    } else {
+        floor_log10_pow2_minus_log10_4_over_3(q_exp)
+    };
+    let beta: u64 = ((q_exp +% floor_log2_pow10(0 -% k) +% 1) as u32) as u64;
+    let (pow_hi, pow_lo) = pow10_sig128(0 -% k);
+
+    let lo_scaled: u64 = umul192_upper64_modified(pow_hi, pow_lo, lo_bound, beta);
+    let mid_scaled: u64 = umul192_upper64_modified(pow_hi, pow_lo, center_val, beta);
+    let hi_scaled: u64 = umul192_upper64_modified(pow_hi, pow_lo, hi_bound, beta);
+    let lsb: u64 = bin_sig & 1_u64;
+
+    let cand: u64 = hi_scaled / 40_u64;
+    if cand >= 1_u64 and (lo_scaled +% lsb <= cand *% 40_u64) and (
+        cand *% 40_u64 +% lsb <= hi_scaled
+    ) {
+        var dec_sig: u64 = cand;
+        var exp10: i32 = k +% 1;
+        while dec_sig % 10_u64 == 0_u64 {
+            dec_sig = dec_sig / 10_u64;
+            exp10 = exp10 +% 1;
+        }
+        return (dec_sig as u32, exp10);
+    }
+
+    let t_under: u64 = mid_scaled >> 2_u64;
+    let t_over: u64 = t_under +% 1_u64;
+    let under_in: bool = (lo_scaled +% lsb) <= (t_under << 2_u64);
+    let over_in: bool = ((t_over << 2_u64) +% lsb) <= hi_scaled;
+    let rem: u64 = mid_scaled & 3_u64;
+    let under_closer: bool = rem < 2_u64 or (rem == 2_u64 and (t_under & 1_u64) == 0_u64);
+
+    var dec_sig: u64 = if under_in and (not over_in or under_closer) {
+        t_under
+    } else {
+        t_over
+    };
+    var exp10: i32 = k;
+    while dec_sig % 10_u64 == 0_u64 {
+        dec_sig = dec_sig / 10_u64;
+        exp10 = exp10 +% 1;
+    }
+    return (dec_sig as u32, exp10);
+}
+
+/// Fast `Eisel–Lemire` `u64 * 10^exp10 -> f64` converter; returns `.None` only on ambiguous halfway ties (`< 0.001%`).
+@no_alloc @no_panic
+pub(pkg) fn eisel_lemire_f64(mantissa: u64, exp10: i32, /) -> f64? {
+    if mantissa == 0_u64 or exp10 < -342 {
+        return .Some(0.0);
+    }
+    if exp10 > 308 {
+        return .Some(@bit_cast[f64](0x7FF0_0000_0000_0000_u64));
+    }
+    if mantissa < (1_u64 << 53_u64) and exp10 >= -22 and exp10 <= 22 {
+        let flt_man: f64 = mantissa as f64;
+        if exp10 >= 0 {
+            return .Some(flt_man * EXACT_POW10_F64[(exp10 as usize) & 0x1F_usize]);
+        }
+        return .Some(flt_man / EXACT_POW10_F64[((0 -% exp10) as usize) & 0x1F_usize]);
+    }
+
+    let clz: u64 = leading_zeros_u64(mantissa) & 63_u64;
+    let norm_man: u64 = mantissa << clz;
+    let e2_pow10: i32 = floor_log2_pow10(exp10);
+    let (pow_hi, pow_lo) = pow10_sig128(exp10);
+
+    var (prod_lo, prod_hi) = widening_mul_u64(norm_man, pow_hi);
+    if (prod_hi & 0x1FF_u64) == 0x1FF_u64 or (prod_hi & 0x1FF_u64) == 0_u64 or prod_lo >= (
+        0xFFFF_FFFF_FFFF_FFFF_u64 -% norm_man
+    ) {
+        let (_, second_hi) = widening_mul_u64(norm_man, pow_lo);
+        let (next_lo, carry_out) = carrying_add_u64(prod_lo, second_hi, false);
+        prod_lo = next_lo;
+        prod_hi = prod_hi +% (carry_out as u64);
+    }
+
+    let msb: i32 = (prod_hi >> 63_u64) as i32;
+    var biased_exp: i32 = (63 -% (clz as i32)) +% e2_pow10 +% msb +% 1023;
+    if biased_exp <= 0 {
+        if biased_exp < -52 {
+            return .Some(0.0);
+        }
+        if eisel_lemire_subnormal_f64(prod_hi, prod_lo, msb, biased_exp) is .Some(sub_bits) {
+            return .Some(@bit_cast[f64](sub_bits));
+        }
+        return .None;
+    }
+    if biased_exp >= 0x7FF {
+        return .Some(@bit_cast[f64](0x7FF0_0000_0000_0000_u64));
+    }
+
+    let sh: u64 = (((9 +% msb) as u32) as u64) & 15_u64;
+    let x54: u64 = prod_hi >> sh;
+    let rem_mask: u64 = (1_u64 << sh) -% 1_u64;
+    let rem_hi: u64 = prod_hi & rem_mask;
+
+    if ((x54 & 1_u64) == 1_u64 and rem_hi == 0_u64 and prod_lo <= 16_u64) or (
+        (x54 & 1_u64) == 0_u64 and rem_hi == rem_mask and prod_lo >= (0xFFFF_FFFF_FFFF_FFF0_u64)
+    ) {
+        return .None;
+    }
+    let sticky: bool = rem_hi != 0_u64 or prod_lo > 16_u64;
+    let round_up: u64 = ((x54 & 1_u64) == 1_u64 and (sticky or (x54 & 2_u64) != 0_u64)) as u64;
+    var x53: u64 = (x54 >> 1_u64) +% round_up;
+    if x53 >= (1_u64 << 53_u64) {
+        x53 = x53 >> 1_u64;
+        biased_exp = biased_exp +% 1;
+        if biased_exp >= 0x7FF {
+            return .Some(@bit_cast[f64](0x7FF0_0000_0000_0000_u64));
+        }
+    }
+    return .Some(
+        @bit_cast[f64](((biased_exp as u64) << 52_u64) | (x53 & 0x000F_FFFF_FFFF_FFFF_u64)),
+    );
+}
+
+/// Fast `Eisel–Lemire` `u64 * 10^exp10 -> f32` converter; returns `.None` only on ambiguous halfway ties.
+@no_alloc @no_panic
+pub(pkg) fn eisel_lemire_f32(mantissa: u64, exp10: i32, /) -> f32? {
+    if mantissa == 0_u64 or exp10 < -65 {
+        return .Some(0.0_f32);
+    }
+    if exp10 > 38 {
+        return .Some(@bit_cast[f32](0x7F80_0000_u32));
+    }
+    let clz: u64 = leading_zeros_u64(mantissa) & 63_u64;
+    let norm_man: u64 = mantissa << clz;
+    let e2_pow10: i32 = floor_log2_pow10(exp10);
+    let (pow_hi, pow_lo) = pow10_sig128(exp10);
+
+    var (prod_lo, prod_hi) = widening_mul_u64(norm_man, pow_hi);
+    if (prod_hi & 0x3FFF_FFFF_u64) == 0x3FFF_FFFF_u64 or (prod_hi & 0x3FFF_FFFF_u64) == 0_u64 or prod_lo >= (
+        0xFFFF_FFFF_FFFF_FFFF_u64 -% norm_man
+    ) {
+        let (_, second_hi) = widening_mul_u64(norm_man, pow_lo);
+        let (next_lo, carry_out) = carrying_add_u64(prod_lo, second_hi, false);
+        prod_lo = next_lo;
+        prod_hi = prod_hi +% (carry_out as u64);
+    }
+
+    let msb: i32 = (prod_hi >> 63_u64) as i32;
+    var biased_exp: i32 = (63 -% (clz as i32)) +% e2_pow10 +% msb +% 127;
+    if biased_exp <= 0 {
+        if biased_exp < -23 {
+            return .Some(0.0_f32);
+        }
+        let sub_sh: u64 = ((((38 +% msb) +% (1 -% biased_exp)) as u32) as u64) & 63_u64;
+        let x_guard: u64 = prod_hi >> sub_sh;
+        let sub_mask: u64 = (1_u64 << sub_sh) -% 1_u64;
+        let sub_rem: u64 = prod_hi & sub_mask;
+        if ((x_guard & 1_u64) == 1_u64 and sub_rem == 0_u64 and prod_lo <= 16_u64) or (
+            (x_guard & 1_u64) == 0_u64 and sub_rem == sub_mask and prod_lo >= (
+                0xFFFF_FFFF_FFFF_FFF0_u64
+            )
+        ) {
+            return .None;
+        }
+        let sub_sticky: bool = sub_rem != 0_u64 or prod_lo > 16_u64;
+        let sub_up: u64 = ((x_guard & 1_u64) == 1_u64 and (sub_sticky or (x_guard & 2_u64) != 0_u64)) as u64;
+        let sig32: u32 = ((x_guard >> 1_u64) +% sub_up) as u32;
+        if sig32 >= (1_u32 << 23_u32) {
+            return .Some(@bit_cast[f32](1_u32 << 23_u32));
+        }
+        return .Some(@bit_cast[f32](sig32));
+    }
+    if biased_exp >= 0xFF {
+        return .Some(@bit_cast[f32](0x7F80_0000_u32));
+    }
+
+    let sh: u64 = (((38 +% msb) as u32) as u64) & 63_u64;
+    let x25: u64 = prod_hi >> sh;
+    let rem_mask: u64 = (1_u64 << sh) -% 1_u64;
+    let rem_hi: u64 = prod_hi & rem_mask;
+    if ((x25 & 1_u64) == 1_u64 and rem_hi == 0_u64 and prod_lo <= 16_u64) or (
+        (x25 & 1_u64) == 0_u64 and rem_hi == rem_mask and prod_lo >= (0xFFFF_FFFF_FFFF_FFF0_u64)
+    ) {
+        return .None;
+    }
+    let sticky: bool = rem_hi != 0_u64 or prod_lo > 16_u64;
+    let round_up: u64 = ((x25 & 1_u64) == 1_u64 and (sticky or (x25 & 2_u64) != 0_u64)) as u64;
+    var x24: u32 = ((x25 >> 1_u64) +% round_up) as u32;
+    if x24 >= (1_u32 << 24_u32) {
+        x24 = x24 >> 1_u32;
+        biased_exp = biased_exp +% 1;
+        if biased_exp >= 0xFF {
+            return .Some(@bit_cast[f32](0x7F80_0000_u32));
+        }
+    }
+    return .Some(
+        @bit_cast[f32](((biased_exp as u32) << 23_u32) | (x24 & ((1_u32 << 23_u32) - 1_u32))),
+    );
+}
+
+/// Exact Nigel Tao `[u8; 864]` BCD shift-and-round IEEE-754 fallback (`mant_bits = 52` for `f64`, `23` for `f32`).
+@no_alloc @no_panic
+fn decimal_shift_and_round_bits(
+    ascii_digits: &[u8],
+    decimal_point: i32,
+    mant_bits: u32,
+    exp_bias: i32,
+    max_biased_exp: i32,
+    /,
+) -> u64 {
+    var buf: [u8; 864] = [0; 864];
+    var num_digits: usize = 0;
+    var dec_pt: i32 = decimal_point;
+    var is_trunc: bool = false;
+
+    var seen_nonzero: bool = false;
+    var scan_idx: usize = 0;
+    let ascii_len: usize = ascii_digits.len();
+    while scan_idx < ascii_len {
+        let byte_val: u8 = ascii_digits[scan_idx];
+        scan_idx = scan_idx +% 1;
+        if not seen_nonzero and byte_val == b'0' {
+            dec_pt = dec_pt -% 1;
+        } else {
+            seen_nonzero = true;
+            let digit_val: u8 = byte_val -% b'0';
+            let cur_slot: usize = num_digits;
+            if cur_slot < MAX_DEC_DIGITS {
+                buf[cur_slot] = digit_val;
+                num_digits = cur_slot +% 1;
+            } else if digit_val != 0 {
+                is_trunc = true;
+            }
+        }
+    }
+    while num_digits > 0 and buf[(num_digits -% 1) % 864_usize] == 0 {
+        num_digits = num_digits -% 1;
+    }
+    if num_digits == 0 {
+        return 0_u64;
+    }
+
+    let max_dp: i32 = if mant_bits == 52_u32 {
+        310
+    } else {
+        40
+    };
+    let min_dp: i32 = if mant_bits == 52_u32 {
+        -326
+    } else {
+        -47
+    };
+    if dec_pt > max_dp {
+        return shl_u64_masked(max_biased_exp as u64, mant_bits);
+    }
+    if dec_pt < min_dp {
+        return 0_u64;
+    }
+
+    var exp2: i32 = 0;
+    while dec_pt > 0 {
+        let rstep: u32 = if dec_pt == 1 {
+            if buf[0] < 2 {
+                1_u32
+            } else if buf[0] < 4 {
+                2_u32
+            } else if buf[0] < 8 {
+                3_u32
+            } else {
+                4_u32
+            }
+        } else {
+            let est: i32 = (dec_pt -% 1) *% 3;
+            if est > 29 {
+                29_u32
+            } else {
+                (est as u32) & 31_u32
+            }
+        };
+        dec_buf_right_shift(&mut buf, &mut num_digits, &mut dec_pt, &mut is_trunc, rstep);
+        exp2 = exp2 +% ((rstep & 31_u32) as i32);
+        if num_digits == 0 {
+            return 0_u64;
+        }
+    }
+    while dec_pt < 0 or (dec_pt == 0 and buf[0] < 5) {
+        let lstep: u32 = if dec_pt == 0 {
+            if buf[0] == 1 {
+                2_u32
+            } else {
+                1_u32
+            }
+        } else {
+            let est: i32 = (0 -% dec_pt) *% 3;
+            if est > 29 {
+                29_u32
+            } else {
+                (est as u32) & 31_u32
+            }
+        };
+        dec_buf_left_shift(&mut buf, &mut num_digits, &mut dec_pt, &mut is_trunc, lstep);
+        exp2 = exp2 -% ((lstep & 31_u32) as i32);
+    }
+
+    var biased_exp: i32 = (exp2 -% 1) +% exp_bias;
+    if biased_exp >= max_biased_exp {
+        return shl_u64_masked(max_biased_exp as u64, mant_bits);
+    }
+
+    var rem_shift: i32 = if biased_exp <= 0 {
+        (mant_bits as i32) +% biased_exp
+    } else {
+        (mant_bits as i32) +% 1
+    };
+    if biased_exp < 0 {
+        biased_exp = 0;
+    }
+    if rem_shift < 0 {
+        return 0_u64;
+    }
+    while rem_shift > 0 {
+        let step_amt: u32 = if rem_shift > 29 {
+            29_u32
+        } else {
+            (rem_shift as u32) & 31_u32
+        };
+        dec_buf_left_shift(&mut buf, &mut num_digits, &mut dec_pt, &mut is_trunc, step_amt);
+        rem_shift = rem_shift -% ((step_amt & 31_u32) as i32);
+    }
+
+    var int_sig: u64 = 0;
+    let int_digits: usize = if dec_pt > 0 {
+        dec_pt as usize
+    } else {
+        0
+    };
+    var i: usize = 0;
+    while i < int_digits {
+        let d_val: u64 = if i < num_digits {
+            buf[i % 864_usize] as u64
+        } else {
+            0_u64
+        };
+        int_sig = int_sig *% 10_u64 +% d_val;
+        i = i +% 1;
+    }
+
+    let cmp_half: i32 = if dec_pt < 0 {
+        -1
+    } else if int_digits >= num_digits {
+        if is_trunc {
+            1
+        } else {
+            -1
+        }
+    } else {
+        let lead_frac: u8 = buf[int_digits % 864_usize];
+        if lead_frac > 5 {
+            1
+        } else if lead_frac < 5 {
+            -1
+        } else {
+            var has_tail: bool = is_trunc;
+            var j: usize = int_digits +% 1;
+            while not has_tail and j < num_digits {
+                if buf[j % 864_usize] != 0 {
+                    has_tail = true;
+                }
+                j = j +% 1;
+            }
+            if has_tail {
+                1
+            } else {
+                0
+            }
+        }
+    };
+
+    if cmp_half > 0 or (cmp_half == 0 and (int_sig & 1_u64) == 1_u64) {
+        int_sig = int_sig +% 1_u64;
+    }
+    let mant_mask: u64 = shl_u64_masked(1_u64, mant_bits) -% 1_u64;
+    if biased_exp == 0 {
+        if int_sig > mant_mask {
+            return shl_u64_masked(1_u64, mant_bits);
+        }
+        return int_sig;
+    }
+    if int_sig >= shl_u64_masked(1_u64, mant_bits +% 1_u32) {
+        int_sig = int_sig >> 1_u64;
+        biased_exp = biased_exp +% 1;
+        if biased_exp >= max_biased_exp {
+            return shl_u64_masked(max_biased_exp as u64, mant_bits);
+        }
+    }
+    return shl_u64_masked(biased_exp as u64, mant_bits) | (int_sig & mant_mask);
+}
+
+/// Writes two decimal digits `00`..`99` at `idx` from `DEC_DIGITS_LUT` into `dst`.
+@std_cap_boundary(clears: [unsafe_op])
+@inline @no_alloc @no_panic
+fn write_2digits(dst: *mut u8, idx: usize, /) {
+    let lut_off: usize = (idx *% 2) % 199_usize;
+    unsafe {
+        @memcpy(dst as *mut opaque, DEC_DIGITS_LUT.as_ptr().add(lut_off) as *opaque, 2);
+    }
+}
+
+/// Formats `val` (`u32`) in base 10 into `dst[0..10]` using James Anhalt's (`jeaiii`) division-free algorithm.
+@std_cap_boundary(clears: [unsafe_op])
+@no_alloc @no_panic
+pub(pkg) fn format_u32_jeaiii(dst: *mut u8, val: u32, /) -> usize {
+    let wide: u64 = val as u64;
+    if val < 100_u32 {
+        if val < 10_u32 {
+            unsafe {
+                dst.write(b'0' +% (val as u8));
+            }
+            return 1;
+        }
+        write_2digits(dst, val as usize);
+        return 2;
+    }
+    if val < 1_000_000_u32 {
+        if val < 10_000_u32 {
+            let prod4: u64 = wide *% 42_949_673_u64;
+            let lead4: usize = if val < 1_000_u32 {
+                unsafe {
+                    dst.write(b'0' +% ((prod4 >> 32_u64) as u8));
+                }
+                1
+            } else {
+                write_2digits(dst, (prod4 >> 32_u64) as usize);
+                2
+            };
+            write_2digits(
+                unsafe {
+                    dst.add(lead4)
+                },
+                (((prod4 & 0xFFFF_FFFF_u64) *% 100_u64) >> 32_u64) as usize,
+            );
+            return lead4 +% 2;
+        }
+        var prod6: u64 = wide *% 429_497_u64;
+        let lead6: usize = if val < 100_000_u32 {
+            unsafe {
+                dst.write(b'0' +% ((prod6 >> 32_u64) as u8));
+            }
+            1
+        } else {
+            write_2digits(dst, (prod6 >> 32_u64) as usize);
+            2
+        };
+        prod6 = (prod6 & 0xFFFF_FFFF_u64) *% 100_u64;
+        write_2digits(
+            unsafe {
+                dst.add(lead6)
+            },
+            (prod6 >> 32_u64) as usize,
+        );
+        prod6 = (prod6 & 0xFFFF_FFFF_u64) *% 100_u64;
+        write_2digits(
+            unsafe {
+                dst.add(lead6 +% 2)
+            },
+            (prod6 >> 32_u64) as usize,
+        );
+        return lead6 +% 4;
+    }
+    if val < 100_000_000_u32 {
+        let mask47: u64 = 0x0000_7FFF_FFFF_FFFF_u64;
+        var prod8: u64 = wide *% 140_737_489_u64;
+        let lead8: usize = if val < 10_000_000_u32 {
+            unsafe {
+                dst.write(b'0' +% ((prod8 >> 47_u64) as u8));
+            }
+            1
+        } else {
+            write_2digits(dst, (prod8 >> 47_u64) as usize);
+            2
+        };
+        prod8 = (prod8 & mask47) *% 100_u64;
+        write_2digits(
+            unsafe {
+                dst.add(lead8)
+            },
+            (prod8 >> 47_u64) as usize,
+        );
+        prod8 = (prod8 & mask47) *% 100_u64;
+        write_2digits(
+            unsafe {
+                dst.add(lead8 +% 2)
+            },
+            (prod8 >> 47_u64) as usize,
+        );
+        prod8 = (prod8 & mask47) *% 100_u64;
+        write_2digits(
+            unsafe {
+                dst.add(lead8 +% 4)
+            },
+            (prod8 >> 47_u64) as usize,
+        );
+        return lead8 +% 6;
+    }
+    var prod10: u64 = if val < 1_000_000_000_u32 {
+        (wide *% 1_441_151_882_u64) >> 25_u64
+    } else {
+        (wide *% 1_441_151_881_u64) >> 25_u64
+    };
+    let lead10: usize = if val < 1_000_000_000_u32 {
+        unsafe {
+            dst.write(b'0' +% ((prod10 >> 32_u64) as u8));
+        }
+        1
+    } else {
+        write_2digits(dst, (prod10 >> 32_u64) as usize);
+        2
+    };
+    prod10 = (prod10 & 0xFFFF_FFFF_u64) *% 100_u64;
+    write_2digits(
+        unsafe {
+            dst.add(lead10)
+        },
+        (prod10 >> 32_u64) as usize,
+    );
+    prod10 = (prod10 & 0xFFFF_FFFF_u64) *% 100_u64;
+    write_2digits(
+        unsafe {
+            dst.add(lead10 +% 2)
+        },
+        (prod10 >> 32_u64) as usize,
+    );
+    prod10 = (prod10 & 0xFFFF_FFFF_u64) *% 100_u64;
+    write_2digits(
+        unsafe {
+            dst.add(lead10 +% 4)
+        },
+        (prod10 >> 32_u64) as usize,
+    );
+    prod10 = (prod10 & 0xFFFF_FFFF_u64) *% 100_u64;
+    write_2digits(
+        unsafe {
+            dst.add(lead10 +% 6)
+        },
+        (prod10 >> 32_u64) as usize,
+    );
+    return lead10 +% 8;
+}
+
+/// Formats `val` (`< 100_000_000`) as an exact zero-padded 8-digit decimal block into `dst`.
+@std_cap_boundary(clears: [unsafe_op])
+@no_alloc @no_panic
+fn fmt_u32_fixed8(dst: *mut u8, val: u32, /) {
+    let mask47: u64 = 0x0000_7FFF_FFFF_FFFF_u64;
+    var prod: u64 = (val as u64) *% 140_737_489_u64;
+    write_2digits(dst, (prod >> 47_u64) as usize);
+    prod = (prod & mask47) *% 100_u64;
+    write_2digits(
+        unsafe {
+            dst.add(2_usize)
+        },
+        (prod >> 47_u64) as usize,
+    );
+    prod = (prod & mask47) *% 100_u64;
+    write_2digits(
+        unsafe {
+            dst.add(4_usize)
+        },
+        (prod >> 47_u64) as usize,
+    );
+    prod = (prod & mask47) *% 100_u64;
+    write_2digits(
+        unsafe {
+            dst.add(6_usize)
+        },
+        (prod >> 47_u64) as usize,
+    );
+}
+
+/// Formats `val` (`u64`) in base 10 into `dst[0..20]` via `jeaiii` 8-digit chunking.
+@std_cap_boundary(clears: [unsafe_op])
+@no_alloc @no_panic
+pub(pkg) fn format_u64_jeaiii(dst: *mut u8, val: u64, /) -> usize {
+    if val <= 0xFFFF_FFFF_u64 {
+        return format_u32_jeaiii(dst, val as u32);
+    }
+    let hi_chunk: u64 = val / 100_000_000_u64;
+    let lo_chunk: u32 = (val % 100_000_000_u64) as u32;
+    if hi_chunk <= 0xFFFF_FFFF_u64 {
+        let lead_len: usize = format_u32_jeaiii(dst, hi_chunk as u32);
+        fmt_u32_fixed8(
+            unsafe {
+                dst.add(lead_len)
+            },
+            lo_chunk,
+        );
+        return lead_len +% 8;
+    }
+    let top_chunk: u32 = (hi_chunk / 100_000_000_u64) as u32;
+    let mid_chunk: u32 = (hi_chunk % 100_000_000_u64) as u32;
+    let lead_len: usize = format_u32_jeaiii(dst, top_chunk);
+    fmt_u32_fixed8(
+        unsafe {
+            dst.add(lead_len)
+        },
+        mid_chunk,
+    );
+    fmt_u32_fixed8(
+        unsafe {
+            dst.add(lead_len +% 8)
+        },
+        lo_chunk,
+    );
+    return lead_len +% 16;
+}
+
+/// Copies `literal` into `buf` or returns `.Err(.BufferFull)`.
+@std_cap_boundary(clears: [unsafe_op])
+@inline @no_alloc @no_panic
+fn copy_ascii_to_buf(buf: &mut [u8], literal: str, /) -> str!FmtError {
+    let n: usize = literal.len();
+    if buf.len() < n {
+        return .Err(.BufferFull);
+    }
+    unsafe {
+        @memcpy(buf.as_mut_ptr() as *mut opaque, literal.as_ptr() as *opaque, n);
+        return .Ok(@str_from_utf8_unchecked(@slice_from_raw_parts(buf.as_ptr(), n)));
+    }
+}
+
+/// Renders `(is_neg, dec_sig, exp10)` shortest Schubfach decimal into `buf` (`max_fixed_int = 16` for `f64`, `9` for `f32`).
+@std_cap_boundary(clears: [unsafe_op, may_panic])
+@no_alloc @no_panic
+fn render_schubfach_decimal(
+    buf: &mut [u8],
+    is_neg: bool,
+    dec_sig: u64,
+    exp10: i32,
+    max_fixed_int: i32,
+    /,
+) -> str!FmtError {
+    var digits_buf: [u8; 24] = [0_u8; 24];
+    let num_digits: usize = format_u64_jeaiii(&raw mut digits_buf[0], dec_sig);
+    let sci_exp: i32 = exp10 +% (num_digits as i32) -% 1;
+
+    var stage: [u8; 40] = [0_u8; 40];
+    var pos: usize = 0;
+    if is_neg {
+        stage[pos] = b'-';
+        pos = pos +% 1;
+    }
+
+    if sci_exp >= 0 and sci_exp < max_fixed_int {
+        let int_len: usize = (sci_exp +% 1) as usize;
+        if int_len >= num_digits {
+            var i: usize = 0;
+            while i < num_digits {
+                stage[pos] = digits_buf[i % 24_usize];
+                pos = pos +% 1;
+                i = i +% 1;
+            }
+            var zeros: usize = int_len -% num_digits;
+            while zeros > 0 {
+                stage[pos] = b'0';
+                pos = pos +% 1;
+                zeros = zeros -% 1;
+            }
+            stage[pos] = b'.';
+            stage[pos +% 1] = b'0';
+            pos = pos +% 2;
+        } else {
+            var i: usize = 0;
+            while i < int_len {
+                stage[pos] = digits_buf[i % 24_usize];
+                pos = pos +% 1;
+                i = i +% 1;
+            }
+            stage[pos] = b'.';
+            pos = pos +% 1;
+            while i < num_digits {
+                stage[pos] = digits_buf[i % 24_usize];
+                pos = pos +% 1;
+                i = i +% 1;
+            }
+        }
+    } else if sci_exp >= -4 and sci_exp < 0 {
+        stage[pos] = b'0';
+        stage[pos +% 1] = b'.';
+        pos = pos +% 2;
+        var lead_z: usize = ((0 -% sci_exp) -% 1) as usize;
+        while lead_z > 0 {
+            stage[pos] = b'0';
+            pos = pos +% 1;
+            lead_z = lead_z -% 1;
+        }
+        var i: usize = 0;
+        while i < num_digits {
+            stage[pos] = digits_buf[i % 24_usize];
+            pos = pos +% 1;
+            i = i +% 1;
+        }
+    } else {
+        stage[pos] = digits_buf[0];
+        pos = pos +% 1;
+        if num_digits > 1 {
+            stage[pos] = b'.';
+            pos = pos +% 1;
+            var i: usize = 1;
+            while i < num_digits {
+                stage[pos] = digits_buf[i % 24_usize];
+                pos = pos +% 1;
+                i = i +% 1;
+            }
+        }
+        stage[pos] = b'e';
+        pos = pos +% 1;
+        let abs_exp: u32 = if sci_exp < 0 {
+            stage[pos] = b'-';
+            pos = pos +% 1;
+            (0 -% sci_exp) as u32
+        } else {
+            sci_exp as u32
+        };
+        let exp_len: usize = format_u32_jeaiii(
+            unsafe {
+                (&raw mut stage[0]).add(pos)
+            },
+            abs_exp,
+        );
+        pos = pos +% exp_len;
+    }
+
+    if buf.len() < pos {
+        return .Err(.BufferFull);
+    }
+    unsafe {
+        @memcpy(buf.as_mut_ptr() as *mut opaque, &raw stage[0] as *opaque, pos);
+        return .Ok(@str_from_utf8_unchecked(@slice_from_raw_parts(buf.as_ptr(), pos)));
+    }
+}
+
+/// Returns `true` if `bytes` matches `pat_lower` ASCII case-insensitively.
+@std_cap_boundary(clears: [may_panic])
+@inline @no_alloc @no_panic
+fn eq_ascii_lower_pat(bytes: &[u8], pat_lower: &[u8], /) -> bool {
+    if bytes.len() != pat_lower.len() {
+        return false;
+    }
+    var i: usize = 0;
+    while i < pat_lower.len() {
+        if (bytes[i] | 0x20_u8) != pat_lower[i] {
+            return false;
+        }
+        i = i +% 1;
+    }
+    return true;
+}
+
+/// Parses IEEE-754 decimal/special string into raw 64-bit (`is_f64 == true`) or 32-bit (`is_f64 == false`) bit pattern.
+@std_cap_boundary(clears: [may_panic])
+@no_alloc @no_panic
+fn parse_float_bits_core(text: str, is_f64: bool, /) -> u64!ParseFloatError {
+    let bytes: &[u8] = text.as_bytes();
+    let total: usize = bytes.len();
+    if total == 0 {
+        return .Err(.Empty);
+    }
+
+    var idx: usize = 0;
+    var sign_bit: u64 = 0_u64;
+    if bytes[0] == b'-' {
+        sign_bit = if is_f64 {
+            1_u64 << 63_u64
+        } else {
+            1_u64 << 31_u64
+        };
+        idx = 1;
+    } else if bytes[0] == b'+' {
+        idx = 1;
+    }
+    if idx >= total {
+        return .Err(.InvalidSyntax);
+    }
+
+    let tail: &[u8] = bytes[idx..total];
+    if eq_ascii_lower_pat(tail, b"inf") or eq_ascii_lower_pat(tail, b"infinity") {
+        let inf_bits: u64 = if is_f64 {
+            0x7FF0_0000_0000_0000_u64
+        } else {
+            0x7F80_0000_u64
+        };
+        return .Ok(sign_bit | inf_bits);
+    }
+    if eq_ascii_lower_pat(tail, b"nan") {
+        let nan_bits: u64 = if is_f64 {
+            0x7FF8_0000_0000_0000_u64
+        } else {
+            0x7FC0_0000_u64
+        };
+        return .Ok(sign_bit | nan_bits);
+    }
+
+    var mantissa_19: u64 = 0_u64;
+    var sig_digits: usize = 0;
+    var extra_int_digits: i64 = 0_i64;
+    var frac_exp_adj: i64 = 0_i64;
+    var saw_any_digit: bool = false;
+    var saw_dot: bool = false;
+    var fallback_digits: [u8; 800] = [0_u8; 800];
+    var fb_len: usize = 0;
+    var fb_dec_pt: i64 = 0_i64;
+    var fb_truncated_nonzero: bool = false;
+
+    while idx < total {
+        let ch_b: u8 = bytes[idx];
+        if ch_b >= b'0' and ch_b <= b'9' {
+            saw_any_digit = true;
+            let dig: u8 = ch_b -% b'0';
+            if sig_digits == 0 and dig == 0_u8 {
+                if saw_dot {
+                    if frac_exp_adj > -1_000_000_000_000_i64 {
+                        frac_exp_adj = frac_exp_adj -% 1_i64;
+                    }
+                    if fb_dec_pt > -1_000_000_000_000_i64 {
+                        fb_dec_pt = fb_dec_pt -% 1_i64;
+                    }
+                }
+            } else {
+                if sig_digits < 19 {
+                    mantissa_19 = mantissa_19 *% 10_u64 +% (dig as u64);
+                    if saw_dot and frac_exp_adj > -1_000_000_000_000_i64 {
+                        frac_exp_adj = frac_exp_adj -% 1_i64;
+                    }
+                } else if not saw_dot and extra_int_digits < 1_000_000_000_000_i64 {
+                    extra_int_digits = extra_int_digits +% 1_i64;
+                }
+                sig_digits = sig_digits +% 1;
+                if not saw_dot and fb_dec_pt < 1_000_000_000_000_i64 {
+                    fb_dec_pt = fb_dec_pt +% 1_i64;
+                }
+                if fb_len < 799 {
+                    fallback_digits[fb_len] = ch_b;
+                    fb_len = fb_len +% 1;
+                } else if dig != 0_u8 {
+                    fb_truncated_nonzero = true;
+                }
+            }
+            idx = idx +% 1;
+        } else if ch_b == b'.' and not saw_dot {
+            saw_dot = true;
+            idx = idx +% 1;
+        } else {
+            break;
+        }
+    }
+
+    if not saw_any_digit {
+        return .Err(.InvalidSyntax);
+    }
+
+    var signed_exp64: i64 = 0_i64;
+    if idx < total and (bytes[idx] == b'e' or bytes[idx] == b'E') {
+        idx = idx +% 1;
+        if idx >= total {
+            return .Err(.InvalidSyntax);
+        }
+        var exp_neg: bool = false;
+        if bytes[idx] == b'-' {
+            exp_neg = true;
+            idx = idx +% 1;
+        } else if bytes[idx] == b'+' {
+            idx = idx +% 1;
+        }
+        if idx >= total or bytes[idx] < b'0' or bytes[idx] > b'9' {
+            return .Err(.InvalidSyntax);
+        }
+        var raw_exp: i64 = 0_i64;
+        while idx < total and bytes[idx] >= b'0' and bytes[idx] <= b'9' {
+            if raw_exp < 1_000_000_000_000_i64 {
+                raw_exp = raw_exp *% 10_i64 +% ((bytes[idx] -% b'0') as i64);
+            }
+            idx = idx +% 1;
+        }
+        signed_exp64 = if exp_neg {
+            0_i64 -% raw_exp
+        } else {
+            raw_exp
+        };
+    }
+
+    if idx != total {
+        return .Err(.InvalidSyntax);
+    }
+    if sig_digits == 0 {
+        return .Ok(sign_bit);
+    }
+
+    let raw_exp10_fast: i64 = signed_exp64 +% frac_exp_adj +% extra_int_digits;
+    let exp10_fast: i32 = if raw_exp10_fast < -10_000_i64 {
+        -10_000
+    } else if raw_exp10_fast > 10_000_i64 {
+        10_000
+    } else {
+        raw_exp10_fast as i32
+    };
+    if sig_digits <= 19 {
+        if is_f64 {
+            if eisel_lemire_f64(mantissa_19, exp10_fast) is .Some(fast_f64) {
+                return .Ok(sign_bit | @bit_cast[u64](fast_f64));
+            }
+        } else {
+            if eisel_lemire_f32(mantissa_19, exp10_fast) is .Some(fast_f32) {
+                return .Ok(sign_bit | (@bit_cast[u32](fast_f32) as u64));
+            }
+        }
+    }
+
+    if fb_truncated_nonzero {
+        fallback_digits[799] = b'1';
+        fb_len = 800;
+    }
+    let raw_total_dec_pt: i64 = fb_dec_pt +% signed_exp64;
+    let total_dec_pt: i32 = if raw_total_dec_pt < -10_000_i64 {
+        -10_000
+    } else if raw_total_dec_pt > 10_000_i64 {
+        10_000
+    } else {
+        raw_total_dec_pt as i32
+    };
+    let exact_bits: u64 = if is_f64 {
+        decimal_shift_and_round_bits(fallback_digits[0..fb_len], total_dec_pt, 52_u32, 1023, 0x7FF)
+    } else {
+        decimal_shift_and_round_bits(fallback_digits[0..fb_len], total_dec_pt, 23_u32, 127, 0xFF)
+    };
+    return .Ok(sign_bit | exact_bits);
+}
+
+// ------------------ FmtWriter Sink Callbacks ------------------
+/// Writes `chunk` into stack `SliceSink`, returning `.Err(.BufferFull)` if capacity is exceeded.
+@std_cap_boundary(clears: [unsafe_op])
+@no_alloc @no_panic
+fn slice_sink_write(ctx: *mut opaque, chunk: &[u8], /) -> unit!FmtError {
+    let sink_ptr: *mut SliceSink = ctx as *mut SliceSink;
+    if sink_ptr.is_null() {
+        return .Ok(());
+    }
+    let sink: &mut SliceSink = unsafe {
+        &mut sink_ptr.*
+    };
+    let n: usize = chunk.len();
+    if n > sink.cap -% sink.pos {
+        return .Err(.BufferFull);
+    }
+    if n > 0 {
+        unsafe {
+            @memcpy(sink.ptr.add(sink.pos) as *mut opaque, chunk.as_ptr() as *opaque, n);
+        }
+        sink.pos = sink.pos +% n;
+    }
+    return .Ok(());
+}
+
+/// Appends raw unvalidated `chunk` bytes into `target` (UTF-8 validated once at `write_fmt` completion).
+@std_cap_boundary(clears: [unsafe_op])
+fn string_try_push_raw_bytes(target: &mut String, chunk: &[u8], /) -> unit!AllocError {
+    let add_len: usize = chunk.len();
+    if add_len == 0 {
+        return .Ok(());
+    }
+    let cur_len: usize = target.len();
+    if add_len > (STRING_CAP_MASK_U32 as usize) -% cur_len {
+        return .Err(.OutOfMemory);
+    }
+    let new_len: usize = cur_len +% add_len;
+
+    if target.is_inline() and new_len <= STRING_INLINE_CAP {
+        if cur_len < target.raw_bytes.len() {
+            unsafe {
+                @memcpy(
+                    &raw mut target.raw_bytes[cur_len] as *mut opaque,
+                    chunk.as_ptr() as *opaque,
+                    add_len,
+                );
+            }
+        }
+        target.raw_bytes[23] = new_len as u8;
+        return .Ok(());
+    }
+
+    target.reserve_non_inline(new_len)?;
+    var heap_cur: HeapRepr = unsafe {
+        @ptr_read(&raw target.raw_bytes as *HeapRepr)
+    };
+    unsafe {
+        @memcpy(heap_cur.ptr.add(cur_len) as *mut opaque, chunk.as_ptr() as *opaque, add_len);
+        heap_cur.len = new_len as u32;
+        @ptr_write(&raw mut target.raw_bytes as *mut HeapRepr, heap_cur);
+    }
+    return .Ok(());
+}
+
+/// Restores `target`'s raw byte length back to `prev_len` (`<= target.len()`) without UTF-8 checks on rollback.
+@std_cap_boundary(clears: [unsafe_op])
+@inline @no_alloc @no_panic
+fn string_rollback_len(target: &mut String, prev_len: usize, /) {
+    if target.is_inline() {
+        target.raw_bytes[23] = prev_len as u8;
+    } else {
+        var heap_cur: HeapRepr = unsafe {
+            @ptr_read(&raw target.raw_bytes as *HeapRepr)
+        };
+        heap_cur.len = prev_len as u32;
+        unsafe {
+            @ptr_write(&raw mut target.raw_bytes as *mut HeapRepr, heap_cur);
+        }
+    }
+}
+
+/// Appends raw `chunk` bytes into `StringSink` during `String.fmt` / `String.write_fmt`.
+@std_cap_boundary(clears: [unsafe_op])
+fn string_sink_write(ctx: *mut opaque, chunk: &[u8], /) -> unit!FmtError {
+    let sink_ptr: *mut StringSink = ctx as *mut StringSink;
+    if sink_ptr.is_null() {
+        return .Ok(());
+    }
+    let sink: &mut StringSink = unsafe {
+        &mut sink_ptr.*
+    };
+    let target_ptr: *mut String = sink.target;
+    if target_ptr.is_null() {
+        return .Ok(());
+    }
+    let target: &mut String = unsafe {
+        &mut target_ptr.*
+    };
+    string_try_push_raw_bytes(target, chunk) catch {
+        return .Err(.BufferFull);
+    };
+    return .Ok(());
+}
+
+/// Computes the exact joined UTF-8 byte length of `parts` separated by `sep`, panicking on `usize` overflow.
+@std_cap_boundary(clears: [alloc])
+@no_alloc
+fn checked_join_byte_len(parts: &[str], sep: str, /) -> usize {
+    let count: usize = parts.len();
+    if count == 0_usize {
+        return 0_usize;
+    }
+    let max_bytes: usize = isize.MAX as usize;
+    let sep_len: usize = sep.len();
+    if sep_len != 0_usize and (count - 1_usize) > max_bytes / sep_len {
+        panic("cx.str.join: byte length overflow");
+    }
+    var total_bytes: usize = sep_len * (count - 1_usize);
+    var i: usize = 0_usize;
+    while i < count {
+        let part_len: usize = parts[i].len();
+        if part_len > max_bytes - total_bytes {
+            panic("cx.str.join: byte length overflow");
+        }
+        total_bytes = total_bytes + part_len;
+        i += 1_usize;
+    }
+    return total_bytes;
+}
+
+/// Streams `args` (`FmtArgs`) into `out` without allocating via the `@fmt_write` compiler intrinsic.
+@inline @no_alloc
+pub(pkg) fn render_fmt_args(out: &mut FmtWriter, args: FmtArgs, /) -> unit!FmtError {
+    return @fmt_write(out, args);
+}
+
+/// Looks up the UAX #29 runtime class (`0..=17`) of `ch` in $O(1)$ without bounds checks.
+@inline @no_alloc @no_panic
+pub(pkg) fn grapheme_class(ch: char, /) -> u8 {
+    let codepoint: u32 = ch as u32;
+    if codepoint < 0x80_u32 {
+        if codepoint == 0x0D_u32 {
+            return 1;
+        } else if codepoint == 0x0A_u32 {
+            return 2;
+        }
+        return if codepoint < 0x20_u32 or codepoint == 0x7F_u32 {
+            3
+        } else {
+            0
+        };
+    }
+    if codepoint >= 0xAC00_u32 and codepoint <= 0xD7A3_u32 {
+        return if (codepoint -% 0xAC00_u32) % 28_u32 == 0_u32 {
+            16
+        } else {
+            17
+        };
+    }
+    if codepoint >= 0x20000_u32 {
+        if codepoint >= 0xE0000_u32 and codepoint <= 0xE0FFF_u32 {
+            if (codepoint >= 0xE0020_u32 and codepoint <= 0xE007F_u32) or (
+                codepoint >= 0xE0100_u32 and codepoint <= 0xE01EF_u32
+            ) {
+                return 5;
+            }
+            return 3;
+        }
+        return 0;
+    }
+    let byte_idx: usize = ((codepoint >> 1_u32) & 0xFFFF_u32) as usize;
+    let s2_blk: usize = GCB_S1[(byte_idx >> 6_usize) & 0x3FF_usize] as usize;
+    let raw_s2_idx: usize = (s2_blk << 3_usize) | ((byte_idx >> 3_usize) & 0x7_usize);
+    if raw_s2_idx >= 1152_usize {
+        return 0;
+    }
+    let pool_off: usize = GCB_S2[raw_s2_idx] as usize;
+    let raw_pool_idx: usize = pool_off +% (byte_idx & 0x7_usize);
+    if raw_pool_idx >= 1163_usize {
+        return 0;
+    }
+    let packed_byte: u8 = GCB_POOL[raw_pool_idx];
+    return if (codepoint & 1_u32) != 0_u32 {
+        (packed_byte >> 4_u8) & 0x0F_u8
+    } else {
+        packed_byte & 0x0F_u8
+    };
+}
+
+// ------------------- Clone-on-Write CowStr --------------------
+impl CowStr {
+    /// Wraps a borrowed `str` slice without allocating.
+    @inline @no_alloc @no_panic
+    pub(pkg) fn from_borrowed(text: str, /) -> Self {
+        return .Borrowed(text);
+    }
+
+    /// Wraps an owned `String` without copying.
+    @inline @no_alloc @no_panic
+    pub(pkg) fn from_owned(owned_str: own String, /) -> Self {
+        return .Owned(own owned_str);
+    }
+
+    /// Borrows the underlying UTF-8 `str` view in place without copying inline `String` bytes onto the stack.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub(pkg) fn as_str(&self) -> str {
+        if self is .Borrowed(view) {
+            return view;
+        }
+        let payload_off: usize = @size_of[CowStr]() -% @size_of[String]();
+        let owned_ptr: *String = unsafe {
+            ((&raw self.* as *u8).add(payload_off)) as *String
+        };
+        return string_ptr_ref(owned_ptr).as_str();
+    }
+
+    /// Borrows the underlying UTF-8 bytes `&[u8]`.
+    @inline @no_alloc @no_panic
+    pub(pkg) fn as_bytes(&self) -> &[u8] {
+        return self.as_str().as_bytes();
+    }
+
+    /// Returns the UTF-8 byte length of `self`.
+    @inline @no_alloc @no_panic
+    pub(pkg) fn len(&self) -> usize {
+        return self.as_str().len();
+    }
+
+    /// Returns `true` if `self` is empty.
+    @inline @no_alloc @no_panic
+    pub(pkg) fn is_empty(&self) -> bool {
+        return self.len() == 0;
+    }
+
+    /// Returns `true` if `self` is `.Borrowed`.
+    @inline @no_alloc @no_panic
+    pub(pkg) fn is_borrowed(&self) -> bool {
+        return self is .Borrowed(_);
+    }
+
+    /// Converts `self` into an owned `String`, allocating only if `.Borrowed` and `> 23` bytes.
+    pub(pkg) fn into_owned(own self) -> String {
+        return match own self {
+            .Borrowed(view) => String.from_str(view),
+            .Owned(buf) => buf,
+        };
+    }
+}
+
+impl GraphemeIndicesIter {
+    /// Segments and returns the next `(byte_offset, grapheme_str)` pair, or `.None` when empty.
+    @std_cap_boundary(clears: [unsafe_op, may_panic])
+    @no_alloc @no_panic
+    pub(pkg) fn next(&mut self) -> (usize, str)? {
+        if self.rem.is_empty() {
+            return .None;
+        }
+        let start_off: usize = self.offset;
+        let (first_ch, first_w) = decode_utf8_first(self.rem);
+        let (_, init_state) = step_grapheme_dfa(0_u8, first_ch);
+        var state: u8 = init_state;
+        var cluster_len: usize = first_w;
+        let total: usize = self.rem.len();
+
+        while cluster_len < total {
+            let (next_ch, next_w) = decode_utf8_first(self.rem[cluster_len..total]);
+            let (should_break, next_state) = step_grapheme_dfa(state, next_ch);
+            if should_break {
+                break;
+            }
+            state = next_state;
+            cluster_len = cluster_len +% next_w;
+        }
+
+        let cluster_str: str = unsafe {
+            @str_from_utf8_unchecked(@slice_from_raw_parts(self.rem.as_ptr(), cluster_len))
+        };
+        self.rem = self.rem[cluster_len..total];
+        self.offset = start_off +% cluster_len;
+        return .Some((start_off, cluster_str));
+    }
+}
+
+// ------------------------------------- PUBLIC API --------------------------------------
+// --------------------- 24-Byte SSO String ---------------------
+impl String {
+    /// Maximum inline UTF-8 byte capacity before spilling to `HeapRepr` (`23` bytes).
+    pub const INLINE_CAP: usize = 23;
+
+    /// Constructs an empty inline `String` (`[0_u8; 24]`; callable at both runtime and `comptime`).
+    @inline @no_alloc @no_panic
+    pub fn new() -> Self {
+        return Self {
+            raw_bytes: [0_u8; 24],
+        };
+    }
+
+    /// Constructs a `String` from static `text` (`<= 23 B` inline SSO, `> 23 B` zero-alloc `STATIC_RODATA` view).
+    @std_cap_boundary(clears: [unsafe_op, may_panic])
+    @inline @no_alloc @no_panic
+    pub fn from_static(comptime text: str, /) -> Self {
+        let byte_len: usize = text.len();
+        if byte_len <= STRING_INLINE_CAP {
+            var inline_out = Self { raw_bytes: [0_u8; 24] };
+            let src_bytes: &[u8] = text.as_bytes();
+            var i: usize = 0;
+            while i < byte_len {
+                inline_out.raw_bytes[i] = src_bytes[i];
+                i = i +% 1;
+            }
+            inline_out.raw_bytes[23] = byte_len as u8;
+            return inline_out;
+        }
+        var static_out = Self { raw_bytes: [0_u8; 24] };
+        unsafe {
+            @ptr_write(
+                &raw mut static_out.raw_bytes as *mut HeapRepr,
+                (ActivePtrOps {}).pack_heap(
+                    text.as_ptr() as *mut u8,
+                    AllocatorHandle { raw_tagged_ptr: 2_usize },
+                    byte_len as u32,
+                    STRING_HEAP_FLAG_U32,
+                ),
+            );
+        }
+        return static_out;
+    }
+
+    /// Constructs an owned `String` copying `text` (inline when `<= 23 B`, else allocated via `context.allocator`).
+    pub fn from_str(text: str, /) -> Self {
+        var out: Self = Self.new();
+        out.push_str(text);
+        return out;
+    }
+
+    /// Constructs a `String` immediately in `HeapRepr` mode backed by `arena` so inline writes never clobber `alloc`.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn in_arena(arena: &mut Arena, /, initial: str = "") -> Self {
+        let init_len: usize = initial.len();
+        if init_len > (STRING_CAP_MASK_U32 as usize) {
+            panic("String.in_arena initial length {init_len=} exceeds 2 GiB String max");
+        }
+        let handle: AllocatorHandle = arena.as_handle();
+        let init_ptr: *mut u8 = if init_len == 0 {
+            dangling_u8_ptr()
+        } else {
+            let raw_buf: *mut u8 = handle.alloc(Layout { size: init_len, alignment: 1 }) catch {
+                panic("String.in_arena({init_len=}) out of memory");
+            };
+            unsafe {
+                @memcpy(raw_buf as *mut opaque, initial.as_ptr() as *opaque, init_len);
+            }
+            raw_buf
+        };
+        var out = Self { raw_bytes: [0_u8; 24] };
+        unsafe {
+            @ptr_write(
+                &raw mut out.raw_bytes as *mut HeapRepr,
+                (ActivePtrOps {}).pack_heap(
+                    init_ptr,
+                    handle,
+                    init_len as u32,
+                    STRING_HEAP_FLAG_U32 | (init_len as u32),
+                ),
+            );
+        }
+        return out;
+    }
+
+    /// Pre-allocates at least `cap` UTF-8 bytes (staying inline when `cap <= 23`), panicking on `AllocError`.
+    pub fn with_capacity(cap: usize, /) -> Self {
+        return Self.try_with_capacity(cap) catch {
+            panic("String.with_capacity({cap=}) out of memory");
+        };
+    }
+
+    /// Fallibly pre-allocates at least `cap` UTF-8 bytes (staying inline when `cap <= 23`).
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn try_with_capacity(cap: usize, /) -> Self!AllocError {
+        if cap <= STRING_INLINE_CAP {
+            return .Ok(Self.new());
+        }
+        if cap > (STRING_CAP_MASK_U32 as usize) {
+            return .Err(.OutOfMemory);
+        }
+        let target_alloc: AllocatorHandle = context.allocator;
+        let ptr: *mut u8 = target_alloc.alloc(Layout { size: cap, alignment: 1 })?;
+        var out = Self { raw_bytes: [0_u8; 24] };
+        unsafe {
+            @ptr_write(
+                &raw mut out.raw_bytes as *mut HeapRepr,
+                (ActivePtrOps {}).pack_heap(
+                    ptr,
+                    target_alloc,
+                    0_u32,
+                    STRING_HEAP_FLAG_U32 | (cap as u32),
+                ),
+            );
+        }
+        return .Ok(own out);
+    }
+
+    /// Validates `bytes` as UTF-8 and transfers ownership into `String` in $O(1)$ without copying when `cap <= 2 GiB`.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn from_utf8(bytes: own Vec[u8], /) -> String!Utf8Error {
+        if validate_utf8_detailed_from(bytes.as_slice(), 0) is .Some(err) {
+            return .Err(err);
+        }
+        let (ptr, len, cap, alloc) = (own bytes).into_raw_parts();
+        if cap == 0 {
+            if not alloc.is_arena_or_static() {
+                return .Ok(Self.new());
+            }
+            var arena_empty = Self { raw_bytes: [0_u8; 24] };
+            unsafe {
+                @ptr_write(
+                    &raw mut arena_empty.raw_bytes as *mut HeapRepr,
+                    (ActivePtrOps {}).pack_heap(
+                        dangling_u8_ptr(),
+                        alloc,
+                        0_u32,
+                        STRING_HEAP_FLAG_U32,
+                    ),
+                );
+            }
+            return .Ok(own arena_empty);
+        }
+        if cap > (STRING_CAP_MASK_U32 as usize) {
+            let valid_view: str = unsafe {
+                @str_from_utf8_unchecked(@slice_from_raw_parts(ptr as *u8, len))
+            };
+            let copied: Self = Self.from_str(valid_view);
+            if not alloc.is_arena_or_static() {
+                alloc.dealloc(ptr, Layout { size: cap, alignment: 1 });
+            }
+            return .Ok(own copied);
+        }
+        var out = Self { raw_bytes: [0_u8; 24] };
+        unsafe {
+            @ptr_write(
+                &raw mut out.raw_bytes as *mut HeapRepr,
+                (ActivePtrOps {}).pack_heap(
+                    ptr,
+                    alloc,
+                    len as u32,
+                    STRING_HEAP_FLAG_U32 | (cap as u32),
+                ),
+            );
+        }
+        return .Ok(own out);
+    }
+
+    /// Formats `args` into a new `String` (staying 100% stack/SSO-resident when output `<= 23` bytes).
+    @overload
+    pub fn fmt(args: FmtArgs, /) -> Self {
+        var out: Self = Self.new();
+        out.write_fmt(args);
+        return out;
+    }
+
+    /// Returns `true` if `self` currently stores its bytes inline (`raw_bytes[23] < 0x80`).
+    @inline @no_alloc @no_panic
+    pub fn is_inline(&self) -> bool {
+        return (self.raw_bytes[23] & STRING_HEAP_FLAG_U8) == 0_u8;
+    }
+
+    /// Returns the UTF-8 byte length of `self`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub fn len(&self) -> usize {
+        let tag_byte: u8 = self.raw_bytes[23];
+        if (tag_byte & STRING_HEAP_FLAG_U8) == 0_u8 {
+            return tag_byte as usize;
+        }
+        let heap: HeapRepr = unsafe {
+            @ptr_read(&raw self.raw_bytes as *HeapRepr)
+        };
+        return heap.len as usize;
+    }
+
+    /// Returns the UTF-8 byte capacity (`23` when inline, `0` for static `.rodata`, or heap capacity).
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub fn capacity(&self) -> usize {
+        if self.is_inline() {
+            return STRING_INLINE_CAP;
+        }
+        let heap: HeapRepr = unsafe {
+            @ptr_read(&raw self.raw_bytes as *HeapRepr)
+        };
+        return (heap.flagged_cap & STRING_CAP_MASK_U32) as usize;
+    }
+
+    /// Returns `true` if `self` has byte length `0`.
+    @inline @no_alloc @no_panic
+    pub fn is_empty(&self) -> bool {
+        return self.len() == 0;
+    }
+
+    /// Borrows `self` as a zero-allocation `str` slice.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub fn as_str(&self) -> str {
+        let tag_byte: u8 = self.raw_bytes[23];
+        if (tag_byte & STRING_HEAP_FLAG_U8) == 0_u8 {
+            return unsafe {
+                @str_from_utf8_unchecked(
+                    @slice_from_raw_parts(&raw self.raw_bytes[0], tag_byte as usize),
+                )
+            };
+        }
+        let heap: HeapRepr = unsafe {
+            @ptr_read(&raw self.raw_bytes as *HeapRepr)
+        };
+        return unsafe {
+            @str_from_utf8_unchecked(@slice_from_raw_parts(heap.ptr as *u8, heap.len as usize))
+        };
+    }
+
+    /// Borrows `self` as a UTF-8 byte slice `&[u8]`.
+    @inline @no_alloc @no_panic
+    pub fn as_bytes(&self) -> &[u8] {
+        return self.as_str().as_bytes();
+    }
+
+    /// Ensures non-inline `HeapRepr` with mutable capacity `>= required_len`, preserving `arena` handles.
+    @std_cap_boundary(clears: [unsafe_op])
+    fn reserve_non_inline(&mut self, required_len: usize, /) -> unit!AllocError {
+        if required_len > (STRING_CAP_MASK_U32 as usize) {
+            return .Err(.OutOfMemory);
+        }
+        if self.is_inline() {
+            let cur_len: usize = self.raw_bytes[23] as usize;
+            var next_cap: usize = 32;
+            if next_cap < required_len {
+                next_cap = required_len;
+            }
+            let target_alloc: AllocatorHandle = context.allocator;
+            let new_ptr: *mut u8 = target_alloc.alloc(Layout { size: next_cap, alignment: 1 })?;
+            if cur_len > 0 {
+                unsafe {
+                    @memcpy(new_ptr as *mut opaque, &raw self.raw_bytes[0] as *opaque, cur_len);
+                }
+            }
+            unsafe {
+                @ptr_write(
+                    &raw mut self.raw_bytes as *mut HeapRepr,
+                    (ActivePtrOps {}).pack_heap(
+                        new_ptr,
+                        target_alloc,
+                        cur_len as u32,
+                        STRING_HEAP_FLAG_U32 | (next_cap as u32),
+                    ),
+                );
+            }
+            return .Ok(());
+        }
+
+        let heap: HeapRepr = unsafe {
+            @ptr_read(&raw self.raw_bytes as *HeapRepr)
+        };
+        let old_cap: usize = (heap.flagged_cap & STRING_CAP_MASK_U32) as usize;
+        let is_rodata: bool = heap.alloc.raw_tagged_ptr == 2_usize;
+        if not is_rodata and old_cap >= required_len {
+            return .Ok(());
+        }
+
+        let grown: usize = if old_cap < 64 {
+            if old_cap == 0 {
+                32
+            } else {
+                old_cap << 1_usize
+            }
+        } else {
+            old_cap +% (old_cap >> 1_usize)
+        };
+        let unclamped: usize = if grown < required_len {
+            required_len
+        } else {
+            grown
+        };
+        let next_cap: usize = if unclamped > (STRING_CAP_MASK_U32 as usize) {
+            STRING_CAP_MASK_U32 as usize
+        } else {
+            unclamped
+        };
+
+        let target_alloc: AllocatorHandle = if is_rodata {
+            context.allocator
+        } else {
+            heap.alloc
+        };
+        let new_ptr: *mut u8 = if is_rodata or old_cap == 0 {
+            let fresh: *mut u8 = target_alloc.alloc(Layout { size: next_cap, alignment: 1 })?;
+            if heap.len > 0_u32 {
+                unsafe {
+                    @memcpy(fresh as *mut opaque, heap.ptr as *opaque, heap.len as usize);
+                }
+            }
+            fresh
+        } else {
+            target_alloc.realloc(heap.ptr, Layout { size: old_cap, alignment: 1 }, next_cap)?
+        };
+
+        unsafe {
+            @ptr_write(
+                &raw mut self.raw_bytes as *mut HeapRepr,
+                (ActivePtrOps {}).pack_heap(
+                    new_ptr,
+                    target_alloc,
+                    heap.len,
+                    STRING_HEAP_FLAG_U32 | (next_cap as u32),
+                ),
+            );
+        }
+        return .Ok(());
+    }
+
+    /// Appends `extra` to `self`, panicking on `AllocError`.
+    pub fn push_str(&mut self, extra: str, /) {
+        self.try_push_str(extra) catch {
+            panic("String.push_str out of memory");
+        };
+    }
+
+    /// Fallibly appends `extra` to `self` without panicking on `AllocError`.
+    @inline
+    pub fn try_push_str(&mut self, extra: str, /) -> unit!AllocError {
+        return string_try_push_raw_bytes(self, extra.as_bytes());
+    }
+
+    /// Encodes and appends Unicode scalar `ch` to `self`.
+    pub fn push_char(&mut self, ch: char, /) {
+        self.try_push_char(ch) catch {
+            panic("String.push_char out of memory");
+        };
+    }
+
+    /// Fallibly encodes and appends Unicode scalar `ch` to `self`.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn try_push_char(&mut self, ch: char, /) -> unit!AllocError {
+        var encoded: [u8; 4] = [0_u8; 4];
+        let width: usize = encode_utf8_char(ch, &mut encoded);
+        return string_try_push_raw_bytes(
+            self,
+            unsafe {
+                @slice_from_raw_parts(&raw encoded[0], width)
+            },
+        );
+    }
+
+    /// Appends formatted `args` directly into `self`, verifying UTF-8 validity on the appended span.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn write_fmt(&mut self, args: FmtArgs, /) {
+        let old_len: usize = self.len();
+        var sink = StringSink { target: &raw mut self.* };
+        var writer = FmtWriter {
+            ctx: &raw mut sink as *mut opaque,
+            write_fn: string_sink_write,
+        };
+        @fmt_write(&mut writer, args) catch {
+            string_rollback_len(self, old_len);
+            panic("String.write_fmt out of memory");
+        };
+        let new_len: usize = self.len();
+        if new_len > old_len {
+            let base_ptr: *u8 = if self.is_inline() {
+                &raw self.raw_bytes[0]
+            } else {
+                (
+                    unsafe {
+                        @ptr_read(&raw self.raw_bytes as *HeapRepr)
+                    }
+                ).ptr as *u8
+            };
+            let appended: &[u8] = unsafe {
+                @slice_from_raw_parts(base_ptr.add(old_len), new_len -% old_len)
+            };
+            if not validate_utf8(appended) {
+                string_rollback_len(self, old_len);
+                panic("invalid UTF-8 written to FmtWriter");
+            }
+        }
+    }
+
+    /// Resets `self` to empty (`""`) while retaining any allocated heap/arena buffer.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn clear(&mut self) {
+        if self.is_inline() {
+            self.raw_bytes[23] = 0_u8;
+        } else {
+            var heap_cur: HeapRepr = unsafe {
+                @ptr_read(&raw self.raw_bytes as *HeapRepr)
+            };
+            heap_cur.len = 0_u32;
+            unsafe {
+                @ptr_write(&raw mut self.raw_bytes as *mut HeapRepr, heap_cur);
+            }
+        }
+    }
+
+    /// Shortens `self` to `new_byte_len`, asserting `new_byte_len` lies on a UTF-8 character boundary.
+    @std_cap_boundary(clears: [unsafe_op, alloc])
+    @no_alloc
+    pub fn truncate(&mut self, new_byte_len: usize, /) {
+        let bytes: &[u8] = self.as_bytes();
+        if new_byte_len >= bytes.len() {
+            return;
+        }
+        assert(
+            is_utf8_char_boundary_byte(bytes[new_byte_len]),
+            "String.truncate: index is not on a UTF-8 character boundary",
+        );
+        if self.is_inline() {
+            self.raw_bytes[23] = new_byte_len as u8;
+        } else {
+            var heap_cur: HeapRepr = unsafe {
+                @ptr_read(&raw self.raw_bytes as *HeapRepr)
+            };
+            heap_cur.len = new_byte_len as u32;
+            unsafe {
+                @ptr_write(&raw mut self.raw_bytes as *mut HeapRepr, heap_cur);
+            }
+        }
+    }
+
+    /// Consumes `self` into `Vec[u8]` (`O(1)` zero-copy transfer when heap/arena-backed).
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn into_bytes(own self) -> Vec[u8] {
+        if self.is_inline() {
+            let inline_len: usize = self.raw_bytes[23] as usize;
+            if inline_len == 0 {
+                @forget(own self);
+                return ByteVec.new();
+            }
+            let view: &[u8] = unsafe {
+                @slice_from_raw_parts(&raw self.raw_bytes[0], inline_len)
+            };
+            let copied: Vec[u8] = ByteVec.from_slice(view);
+            @forget(own self);
+            return copied;
+        }
+        let heap: HeapRepr = unsafe {
+            @ptr_read(&raw self.raw_bytes as *HeapRepr)
+        };
+        if heap.alloc.raw_tagged_ptr == 2_usize {
+            let view: &[u8] = unsafe {
+                @slice_from_raw_parts(heap.ptr as *u8, heap.len as usize)
+            };
+            @forget(own self);
+            return ByteVec.from_slice(view);
+        }
+        let cap: usize = (heap.flagged_cap & STRING_CAP_MASK_U32) as usize;
+        @forget(own self);
+        return unsafe {
+            ByteVec.from_raw_parts(heap.ptr, heap.len as usize, cap, heap.alloc)
+        };
+    }
+}
+
+impl AutoDrop for String {
+    /// Frees general-heap `String` buffers (`0` ops when inline SSO, `STATIC_RODATA`, or `Arena`).
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub fn drop(&mut self) {
+        if (self.raw_bytes[23] & STRING_HEAP_FLAG_U8) != 0_u8 {
+            let heap: HeapRepr = unsafe {
+                @ptr_read(&raw self.raw_bytes as *HeapRepr)
+            };
+            let cap: usize = (heap.flagged_cap & STRING_CAP_MASK_U32) as usize;
+            if cap != 0 and not heap.alloc.is_arena_or_static() {
+                heap.alloc.dealloc(heap.ptr, Layout { size: cap, alignment: 1 });
+            }
+            self.raw_bytes[23] = 0_u8;
+        }
+    }
+}
+
+impl Default for String {
+    /// Returns an empty inline `String`.
+    @inline @no_alloc @no_panic
+    pub fn default() -> Self {
+        return Self.new();
+    }
+}
+
+impl Clone for String {
+    /// Clones `self` (`0` heap allocs when `len() <= 23` or `STATIC_RODATA`).
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn clone(&self) -> Self {
+        if self.is_inline() {
+            return Self { raw_bytes: self.raw_bytes };
+        }
+        let heap: HeapRepr = unsafe {
+            @ptr_read(&raw self.raw_bytes as *HeapRepr)
+        };
+        if heap.alloc.raw_tagged_ptr == 2_usize {
+            return Self { raw_bytes: self.raw_bytes };
+        }
+        return Self.from_str(self.as_str());
+    }
+}
+
+impl Equatable for String {
+    /// Compares two `String` values by UTF-8 byte content.
+    @inline @no_alloc @no_panic
+    pub fn eq(&self, other: &Self, /) -> bool {
+        return self.as_str() == other.as_str();
+    }
+}
+
+impl Comparable for String {
+    /// Orders two `String` values lexicographically by UTF-8 bytes.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn cmp(&self, other: &Self, /) -> Ordering {
+        let lhs_b: &[u8] = self.as_bytes();
+        let rhs_b: &[u8] = other.as_bytes();
+        let lhs_len: usize = lhs_b.len();
+        let rhs_len: usize = rhs_b.len();
+        let common: usize = if lhs_len < rhs_len {
+            lhs_len
+        } else {
+            rhs_len
+        };
+        let lhs_ptr: *u8 = lhs_b.as_ptr();
+        let rhs_ptr: *u8 = rhs_b.as_ptr();
+        var i: usize = 0;
+        while i < common {
+            let lb: u8 = unsafe {
+                lhs_ptr.add(i).read()
+            };
+            let rb: u8 = unsafe {
+                rhs_ptr.add(i).read()
+            };
+            if lb < rb {
+                return .Less;
+            } else if lb > rb {
+                return .Greater;
+            }
+            i = i +% 1;
+        }
+        if lhs_len < rhs_len {
+            return .Less;
+        } else if lhs_len > rhs_len {
+            return .Greater;
+        }
+        return .Equal;
+    }
+}
+
+impl Hash for String {
+    /// Hashes `self` identically to `str` (bytes + `0xFF` framing byte) so `String` and `str` hashes match.
+    @inline @no_alloc @no_panic
+    pub fn hash[H: Hasher](&self, state: &mut H, /) {
+        self.as_str().hash(state);
+    }
+}
+
+impl Display for String {
+    /// Streams `self.as_str()` into `out` honoring padding in `spec`.
+    @inline @no_alloc @overload
+    pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        return out.write_padded(self.as_bytes(), spec);
+    }
+}
+
+impl Debug for String {
+    /// Formats `self` as an escaped quoted string literal into `out`.
+    @no_alloc
+    pub fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        _ = spec;
+        return @fmt_write(out, "{self.as_str():?}");
+    }
+}
+
+// ------------------- Clone-on-Write CowStr --------------------
+impl Default for CowStr {
+    /// Returns `.Borrowed("")`.
+    @inline @no_alloc @no_panic
+    pub fn default() -> Self {
+        return .Borrowed("");
+    }
+}
+
+impl Clone for CowStr {
+    /// Clones `self` (`0` allocs when `.Borrowed` or inline `.Owned`).
+    pub fn clone(&self) -> Self {
+        return match self {
+            .Borrowed(view) => .Borrowed(view),
+            .Owned(buf) => .Owned(buf.clone()),
+        };
+    }
+}
+
+impl Equatable for CowStr {
+    /// Compares two `CowStr` values by UTF-8 content.
+    @inline @no_alloc @no_panic
+    pub fn eq(&self, other: &Self, /) -> bool {
+        return self.as_str() == other.as_str();
+    }
+}
+
+impl Comparable for CowStr {
+    /// Orders two `CowStr` values lexicographically.
+    @inline @no_alloc @no_panic
+    pub fn cmp(&self, other: &Self, /) -> Ordering {
+        let lhs_view: str = self.as_str();
+        let rhs_view: str = other.as_str();
+        if lhs_view < rhs_view {
+            return .Less;
+        } else if lhs_view > rhs_view {
+            return .Greater;
+        }
+        return .Equal;
+    }
+}
+
+impl Hash for CowStr {
+    /// Hashes `self.as_str()`.
+    @inline @no_alloc @no_panic
+    pub fn hash[H: Hasher](&self, state: &mut H, /) {
+        self.as_str().hash(state);
+    }
+}
+
+impl Display for CowStr {
+    /// Formats `self.as_str()` with `spec`.
+    @inline @no_alloc
+    pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        return out.write_padded(self.as_bytes(), spec);
+    }
+}
+
+impl Debug for CowStr {
+    /// Formats `self` as a debug-escaped string literal.
+    @no_alloc
+    pub fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        _ = spec;
+        return @fmt_write(out, "{self.as_str():?}");
+    }
+}
+
+// ------------------- Inherent str Slice API -------------------
+impl str {
+    /// Returns `true` if `self` begins with `prefix` (`self` passed by value as 16B `Copy` slice).
+    @inline @no_alloc @no_panic
+    pub fn starts_with(self, prefix: str, /) -> bool {
+        let hay: &[u8] = self.as_bytes();
+        let pre: &[u8] = prefix.as_bytes();
+        if pre.len() > hay.len() {
+            return false;
+        }
+        return is_bytes_equal_at(hay.as_ptr(), 0, pre.as_ptr(), pre.len());
+    }
+
+    /// Returns `true` if `self` ends with `suffix`.
+    @inline @no_alloc @no_panic
+    pub fn ends_with(self, suffix: str, /) -> bool {
+        let hay: &[u8] = self.as_bytes();
+        let suf: &[u8] = suffix.as_bytes();
+        if suf.len() > hay.len() {
+            return false;
+        }
+        return is_bytes_equal_at(hay.as_ptr(), hay.len() -% suf.len(), suf.as_ptr(), suf.len());
+    }
+
+    /// Strips `prefix` from the start of `self`, returning `.Some(rest)` or `.None`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub fn strip_prefix(self, prefix: str, /) -> str? {
+        if not self.starts_with(prefix) {
+            return .None;
+        }
+        let p_len: usize = prefix.len();
+        let s_len: usize = self.len();
+        return .Some(
+            unsafe {
+                @str_from_utf8_unchecked(
+                    @slice_from_raw_parts(self.as_ptr().add(p_len), s_len -% p_len),
+                )
+            },
+        );
+    }
+
+    /// Strips `suffix` from the end of `self`, returning `.Some(head)` or `.None`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @inline @no_alloc @no_panic
+    pub fn strip_suffix(self, suffix: str, /) -> str? {
+        if not self.ends_with(suffix) {
+            return .None;
+        }
+        let keep_len: usize = self.len() -% suffix.len();
+        return .Some(
+            unsafe {
+                @str_from_utf8_unchecked(@slice_from_raw_parts(self.as_ptr(), keep_len))
+            },
+        );
+    }
+
+    /// Returns the first byte index of `needle` inside `self` (16-byte SIMD filter + scalar tail), or `.None`.
+    @no_alloc @no_panic
+    pub fn find(self, needle: str, /) -> usize? {
+        return (ActiveStrOps {}).find_bytes(self.as_bytes(), needle.as_bytes());
+    }
+
+    /// Returns `true` if `needle` occurs anywhere inside `self`.
+    @inline @no_alloc @no_panic
+    pub fn contains(self, needle: str, /) -> bool {
+        return self.find(needle) is .Some(_);
+    }
+
+    /// Returns the last byte index of `needle` inside `self`, or `.None`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn rfind(self, needle: str, /) -> usize? {
+        let hay: &[u8] = self.as_bytes();
+        let ndl: &[u8] = needle.as_bytes();
+        let n_len: usize = ndl.len();
+        let h_len: usize = hay.len();
+        if n_len == 0 {
+            return .Some(h_len);
+        }
+        if n_len > h_len {
+            return .None;
+        }
+        let hay_ptr: *u8 = hay.as_ptr();
+        let ndl_ptr: *u8 = ndl.as_ptr();
+        let first_b: u8 = ndl[0];
+        let last_off: usize = n_len -% 1;
+        let last_b: u8 = ndl[last_off];
+        var pos: usize = h_len -% n_len +% 1;
+        while pos > 0 {
+            pos = pos -% 1;
+            if unsafe {
+                hay_ptr.add(pos).read()
+            } == first_b and unsafe {
+                hay_ptr.add(pos +% last_off).read()
+            } == last_b and (
+                n_len <= 2 or is_bytes_equal_at(
+                    hay_ptr,
+                    pos +% 1,
+                    unsafe {
+                        ndl_ptr.add(1_usize)
+                    },
+                    n_len -% 2,
+                )
+            ) {
+                return .Some(pos);
+            }
+        }
+        return .None;
+    }
+
+    /// Compares `self` and `other` for ASCII case-insensitive equality (`A..Z` == `a..z`).
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn eq_ascii_ignore_case(self, other: str, /) -> bool {
+        let len: usize = self.len();
+        if len != other.len() {
+            return false;
+        }
+        let lhs_ptr: *u8 = self.as_ptr();
+        let rhs_ptr: *u8 = other.as_ptr();
+        var i: usize = 0;
+        while i < len {
+            let lb: u8 = unsafe {
+                lhs_ptr.add(i).read()
+            };
+            let rb: u8 = unsafe {
+                rhs_ptr.add(i).read()
+            };
+            if lb != rb {
+                let lb_lo: u8 = if lb >= b'A' and lb <= b'Z' {
+                    lb | 0x20_u8
+                } else {
+                    lb
+                };
+                let rb_lo: u8 = if rb >= b'A' and rb <= b'Z' {
+                    rb | 0x20_u8
+                } else {
+                    rb
+                };
+                if lb_lo != rb_lo {
+                    return false;
+                }
+            }
+            i = i +% 1;
+        }
+        return true;
+    }
+
+    /// Returns `true` if every byte in `self` is `< 0x80` (`8`-byte `u64` `0x8080…` SWAR scan).
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn is_ascii(self) -> bool {
+        let bytes: &[u8] = self.as_bytes();
+        let len: usize = bytes.len();
+        let ptr: *u8 = bytes.as_ptr();
+        var i: usize = 0;
+        while i +% 8 <= len {
+            if (
+                read_u64_unaligned(
+                    unsafe {
+                        ptr.add(i)
+                    },
+                ) & ASCII_HIGH_MASK_U64
+            ) != 0_u64 {
+                return false;
+            }
+            i = i +% 8;
+        }
+        while i < len {
+            if unsafe {
+                ptr.add(i).read()
+            } >= 0x80_u8 {
+                return false;
+            }
+            i = i +% 1;
+        }
+        return true;
+    }
+
+    /// Trims leading characters present in `chars` (default `" \t\r\n"`), returning a zero-alloc `str` sub-slice.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn trim_start(self, *, chars: str = " \t\r\n") -> str {
+        if chars.is_empty() {
+            return self;
+        }
+        let bytes: &[u8] = self.as_bytes();
+        let total: usize = bytes.len();
+        var start: usize = 0;
+        while start < total {
+            let (ch, width) = decode_utf8_first(bytes[start..total]);
+            if not is_char_in_trim_set(chars, ch) {
+                break;
+            }
+            start = start +% width;
+        }
+        return unsafe {
+            @str_from_utf8_unchecked(@slice_from_raw_parts(self.as_ptr().add(start), total -% start))
+        };
+    }
+
+    /// Trims trailing characters present in `chars` (default `" \t\r\n"`), returning a zero-alloc `str` sub-slice.
+    @std_cap_boundary(clears: [unsafe_op, may_panic])
+    @no_alloc @no_panic
+    pub fn trim_end(self, *, chars: str = " \t\r\n") -> str {
+        if chars.is_empty() {
+            return self;
+        }
+        let bytes: &[u8] = self.as_bytes();
+        var end_idx: usize = bytes.len();
+        while end_idx > 0 {
+            let (ch, width) = decode_utf8_last(bytes[0..end_idx]);
+            if not is_char_in_trim_set(chars, ch) {
+                break;
+            }
+            end_idx = end_idx -% width;
+        }
+        return unsafe {
+            @str_from_utf8_unchecked(@slice_from_raw_parts(self.as_ptr(), end_idx))
+        };
+    }
+
+    /// Trims both leading and trailing characters present in `chars` (default `" \t\r\n"`).
+    @std_cap_boundary(clears: [may_panic])
+    @no_alloc @no_panic
+    pub fn trim(self, *, chars: str = " \t\r\n") -> str {
+        return self.trim_start(chars: chars).trim_end(chars: chars);
+    }
+
+    /// Returns a lazy zero-allocation iterator splitting `self` around `sep`.
+    @inline @no_alloc @no_panic
+    pub fn split(self, sep: str = " ", /, *, keep_empty: bool = true) -> SplitIter {
+        return SplitIter {
+            text: self,
+            sep: sep,
+            keep_empty: keep_empty,
+            done: false,
+        };
+    }
+
+    /// Returns a lazy zero-allocation iterator yielding non-empty Unicode-whitespace-separated words.
+    @inline @no_alloc @no_panic
+    pub fn split_whitespace(self) -> SplitWhitespaceIter {
+        return SplitWhitespaceIter { rem: self };
+    }
+
+    /// Splits `self` on the first occurrence of `sep`, returning `(before, after)` or `.None`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn split_once(self, sep: str, /) -> (str, str)? {
+        if self.find(sep) is .Some(idx) {
+            let ptr: *u8 = self.as_ptr();
+            let after_start: usize = idx +% sep.len();
+            let head: str = unsafe {
+                @str_from_utf8_unchecked(@slice_from_raw_parts(ptr, idx))
+            };
+            let tail: str = unsafe {
+                @str_from_utf8_unchecked(
+                    @slice_from_raw_parts(ptr.add(after_start), self.len() -% after_start),
+                )
+            };
+            return .Some((head, tail));
+        }
+        return .None;
+    }
+
+    /// Splits `self` on the last occurrence of `sep`, returning `(before, after)` or `.None`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn rsplit_once(self, sep: str, /) -> (str, str)? {
+        if self.rfind(sep) is .Some(idx) {
+            let ptr: *u8 = self.as_ptr();
+            let after_start: usize = idx +% sep.len();
+            let head: str = unsafe {
+                @str_from_utf8_unchecked(@slice_from_raw_parts(ptr, idx))
+            };
+            let tail: str = unsafe {
+                @str_from_utf8_unchecked(
+                    @slice_from_raw_parts(ptr.add(after_start), self.len() -% after_start),
+                )
+            };
+            return .Some((head, tail));
+        }
+        return .None;
+    }
+
+    /// Returns a lazy line iterator stripping `\n` and `\r\n` endings.
+    @inline @no_alloc @no_panic
+    pub fn lines(self) -> LinesIter {
+        return LinesIter { rem: self };
+    }
+
+    /// Returns a lazy iterator over the decoded `char` Unicode scalars of `self`.
+    @inline @no_alloc @no_panic
+    pub fn chars(self) -> CharsIter {
+        return CharsIter { rem: self.as_bytes() };
+    }
+
+    /// Returns a lazy iterator yielding `(byte_offset, char)` pairs across `self`.
+    @inline @no_alloc @no_panic
+    pub fn char_indices(self) -> CharIndicesIter {
+        return CharIndicesIter {
+            rem: self.as_bytes(),
+            offset: 0,
+        };
+    }
+
+    /// Returns a lazy iterator yielding UAX #29 Extended Grapheme Cluster `str` slices.
+    @inline @no_alloc @no_panic
+    pub fn graphemes(self) -> GraphemeIter {
+        return GraphemeIter { rem: self.as_bytes() };
+    }
+
+    /// Returns a lazy iterator yielding `(byte_offset, grapheme_str)` pairs across `self`.
+    @inline @no_alloc @no_panic
+    pub(pkg) fn grapheme_indices(self) -> GraphemeIndicesIter {
+        return GraphemeIndicesIter {
+            rem: self.as_bytes(),
+            offset: 0,
+        };
+    }
+
+    /// Computes terminal display columns using ONLY `WCWIDTH_*` + scalar RI/ZWJ/VS16/skin-tone state (`0` `GCB_*` refs!).
+    @std_cap_boundary(clears: [may_panic])
+    @no_alloc @no_panic
+    pub fn display_width(self) -> usize {
+        var total_cols: usize = 0;
+        var prev_was_zwj: bool = false;
+        var ri_odd: bool = false;
+        var prev_base_cols: usize = 0;
+        var rem: &[u8] = self.as_bytes();
+
+        while rem.len() > 0 {
+            let (ch, width) = decode_utf8_first(rem);
+            rem = rem[width..rem.len()];
+            let codepoint: u32 = ch as u32;
+            if codepoint == 0x200D_u32 {
+                prev_was_zwj = true;
+                ri_odd = false;
+            } else if codepoint == 0xFE0F_u32 {
+                if prev_base_cols == 1 {
+                    total_cols = total_cols +% 1;
+                    prev_base_cols = 2;
+                }
+                prev_was_zwj = false;
+            } else if codepoint == 0xFE0E_u32 {
+                if prev_base_cols == 2 {
+                    total_cols = total_cols -% 1;
+                    prev_base_cols = 1;
+                }
+                prev_was_zwj = false;
+            } else if codepoint >= 0x1F3FB_u32 and codepoint <= 0x1F3FF_u32 {
+                if prev_base_cols == 0 {
+                    total_cols = total_cols +% 2;
+                    prev_base_cols = 2;
+                }
+                prev_was_zwj = false;
+                ri_odd = false;
+            } else if codepoint >= 0x1F1E6_u32 and codepoint <= 0x1F1FF_u32 {
+                if ri_odd {
+                    ri_odd = false;
+                } else {
+                    total_cols = total_cols +% 2;
+                    ri_odd = true;
+                    prev_base_cols = 2;
+                }
+                prev_was_zwj = false;
+            } else {
+                ri_odd = false;
+                let raw_width: i8 = char_width(ch);
+                let cols: usize = if raw_width <= 0 {
+                    0
+                } else {
+                    raw_width as usize
+                };
+                if prev_was_zwj {
+                    prev_was_zwj = false;
+                } else if cols > 0 {
+                    total_cols = total_cols +% cols;
+                    prev_base_cols = cols;
+                }
+            }
+        }
+        return total_cols;
+    }
+
+    /// Returns a new `String` with ASCII `A..Z` mapped to `a..z` in place (`0` heap allocs when `<= 23` bytes).
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn to_ascii_lowercase(self) -> String {
+        var out: String = String.from_str(self);
+        let len: usize = out.len();
+        if len == 0 {
+            return out;
+        }
+        let buf_ptr: *mut u8 = if out.is_inline() {
+            &raw mut out.raw_bytes[0]
+        } else {
+            (
+                unsafe {
+                    @ptr_read(&raw out.raw_bytes as *HeapRepr)
+                }
+            ).ptr
+        };
+        var i: usize = 0;
+        while i < len {
+            let byte_ptr: *mut u8 = unsafe {
+                buf_ptr.add(i)
+            };
+            let byte_val: u8 = unsafe {
+                byte_ptr.read()
+            };
+            if byte_val >= b'A' and byte_val <= b'Z' {
+                unsafe {
+                    byte_ptr.write(byte_val | 0x20_u8);
+                }
+            }
+            i += 1;
+        }
+        return out;
+    }
+
+    /// Returns a new `String` with ASCII `a..z` mapped to `A..Z` in place (`0` heap allocs when `<= 23` bytes).
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn to_ascii_uppercase(self) -> String {
+        var out: String = String.from_str(self);
+        let len: usize = out.len();
+        if len == 0 {
+            return out;
+        }
+        let buf_ptr: *mut u8 = if out.is_inline() {
+            &raw mut out.raw_bytes[0]
+        } else {
+            (
+                unsafe {
+                    @ptr_read(&raw out.raw_bytes as *HeapRepr)
+                }
+            ).ptr
+        };
+        var i: usize = 0;
+        while i < len {
+            let byte_ptr: *mut u8 = unsafe {
+                buf_ptr.add(i)
+            };
+            let byte_val: u8 = unsafe {
+                byte_ptr.read()
+            };
+            if byte_val >= b'a' and byte_val <= b'z' {
+                unsafe {
+                    byte_ptr.write(byte_val & ~0x20_u8);
+                }
+            }
+            i += 1;
+        }
+        return out;
+    }
+
+    /// Replaces up to `max_count` non-overlapping occurrences of `from` with `to`, returning an SSO `String`.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn replace(self, from: str, to: str, /, *, max_count: usize = usize.MAX) -> String {
+        if max_count == 0 {
+            return String.from_str(self);
+        }
+        var out: String = String.with_capacity(self.len());
+        if from.is_empty() {
+            var count: usize = 0;
+            var rem: &[u8] = self.as_bytes();
+            while rem.len() > 0 {
+                if count < max_count {
+                    out.push_str(to);
+                    count = count +% 1;
+                }
+                let cur_rem: &[u8] = rem;
+                let (ch, width) = decode_utf8_first(cur_rem);
+                out.push_char(ch);
+                if width <= cur_rem.len() {
+                    rem = cur_rem[width..cur_rem.len()];
+                } else {
+                    break;
+                }
+            }
+            if count < max_count {
+                out.push_str(to);
+            }
+            return out;
+        }
+
+        var cursor: str = self;
+        var replaced: usize = 0;
+        let from_len: usize = from.len();
+        while replaced < max_count {
+            if cursor.find(from) is .Some(idx) {
+                let ptr: *u8 = cursor.as_ptr();
+                let prefix_part: str = unsafe {
+                    @str_from_utf8_unchecked(@slice_from_raw_parts(ptr, idx))
+                };
+                out.push_str(prefix_part);
+                out.push_str(to);
+                let next_start: usize = idx +% from_len;
+                cursor = unsafe {
+                    @str_from_utf8_unchecked(
+                        @slice_from_raw_parts(ptr.add(next_start), cursor.len() -% next_start),
+                    )
+                };
+                replaced = replaced +% 1;
+            } else {
+                break;
+            }
+        }
+        out.push_str(cursor);
+        return out;
+    }
+
+    /// Replaces up to `max_count` occurrences of `from` with `to` directly inside `arena`, returning `str`.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn replace_in(
+        self,
+        arena: &mut Arena,
+        from: str,
+        to: str,
+        /,
+        *,
+        max_count: usize = usize.MAX,
+    ) -> str {
+        if max_count == 0 {
+            return self;
+        }
+        var builder: String = String.in_arena(arena);
+        if from.is_empty() {
+            var count: usize = 0;
+            var rem: &[u8] = self.as_bytes();
+            while rem.len() > 0 {
+                if count < max_count {
+                    builder.push_str(to);
+                    count = count +% 1;
+                }
+                let cur_rem: &[u8] = rem;
+                let (ch, width) = decode_utf8_first(cur_rem);
+                builder.push_char(ch);
+                if width <= cur_rem.len() {
+                    rem = cur_rem[width..cur_rem.len()];
+                } else {
+                    break;
+                }
+            }
+            if count < max_count {
+                builder.push_str(to);
+            }
+            let heap_empty: HeapRepr = unsafe {
+                @ptr_read(&raw builder.raw_bytes as *HeapRepr)
+            };
+            return unsafe {
+                @str_from_utf8_unchecked(
+                    @slice_from_raw_parts(heap_empty.ptr as *u8, heap_empty.len as usize),
+                )
+            };
+        }
+
+        var cursor: str = self;
+        var replaced: usize = 0;
+        let from_len: usize = from.len();
+        while replaced < max_count {
+            if cursor.find(from) is .Some(idx) {
+                let ptr: *u8 = cursor.as_ptr();
+                let prefix_part: str = unsafe {
+                    @str_from_utf8_unchecked(@slice_from_raw_parts(ptr, idx))
+                };
+                builder.push_str(prefix_part);
+                builder.push_str(to);
+                let next_start: usize = idx +% from_len;
+                cursor = unsafe {
+                    @str_from_utf8_unchecked(
+                        @slice_from_raw_parts(ptr.add(next_start), cursor.len() -% next_start),
+                    )
+                };
+                replaced = replaced +% 1;
+            } else {
+                break;
+            }
+        }
+        if replaced == 0 {
+            return self;
+        }
+        builder.push_str(cursor);
+        let heap_done: HeapRepr = unsafe {
+            @ptr_read(&raw builder.raw_bytes as *HeapRepr)
+        };
+        return unsafe {
+            @str_from_utf8_unchecked(
+                @slice_from_raw_parts(heap_done.ptr as *u8, heap_done.len as usize),
+            )
+        };
+    }
+
+    /// Convenience method forwarding `self.parse_int[T](radix: …)` to `cx.str.parse_int`.
+    @std_cap_boundary(clears: [may_panic])
+    @inline @no_alloc @no_panic
+    pub fn parse_int[T: Integer](self, *, radix: u8 is 2..=36 = DEFAULT_RADIX) -> T!ParseIntError {
+        return parse_int[T](self, radix: radix);
+    }
+
+    /// Convenience method forwarding `self.parse_float[T]()` to `cx.str.parse_float`.
+    @inline @no_alloc @no_panic
+    pub fn parse_float[T: Float](self) -> T!ParseFloatError {
+        return parse_float[T](self);
+    }
+}
+
+// -------------- Iterator .next() Implementations --------------
+impl CharsIter {
+    /// Decodes and returns the next `char`, or `.None` when exhausted.
+    @std_cap_boundary(clears: [may_panic])
+    @inline @no_alloc @no_panic
+    pub fn next(&mut self) -> char? {
+        if self.rem.is_empty() {
+            return .None;
+        }
+        let (ch, width) = decode_utf8_first(self.rem);
+        self.rem = self.rem[width..self.rem.len()];
+        return .Some(ch);
+    }
+}
+
+impl CharIndicesIter {
+    /// Decodes and returns the next `(byte_offset, char)` pair, or `.None` when exhausted.
+    @std_cap_boundary(clears: [may_panic])
+    @inline @no_alloc @no_panic
+    pub fn next(&mut self) -> (usize, char)? {
+        if self.rem.is_empty() {
+            return .None;
+        }
+        let cur_off: usize = self.offset;
+        let (ch, width) = decode_utf8_first(self.rem);
+        self.rem = self.rem[width..self.rem.len()];
+        self.offset = cur_off +% width;
+        return .Some((cur_off, ch));
+    }
+}
+
+impl GraphemeIter {
+    /// Segments and returns the next UAX #29 Extended Grapheme Cluster `str`, or `.None` when empty.
+    @std_cap_boundary(clears: [unsafe_op, may_panic])
+    @no_alloc @no_panic
+    pub fn next(&mut self) -> str? {
+        if self.rem.is_empty() {
+            return .None;
+        }
+        let (first_ch, first_w) = decode_utf8_first(self.rem);
+        let (_, init_state) = step_grapheme_dfa(0_u8, first_ch);
+        var state: u8 = init_state;
+        var cluster_len: usize = first_w;
+        let total: usize = self.rem.len();
+
+        while cluster_len < total {
+            let (next_ch, next_w) = decode_utf8_first(self.rem[cluster_len..total]);
+            let (should_break, next_state) = step_grapheme_dfa(state, next_ch);
+            if should_break {
+                break;
+            }
+            state = next_state;
+            cluster_len = cluster_len +% next_w;
+        }
+
+        let cluster_str: str = unsafe {
+            @str_from_utf8_unchecked(@slice_from_raw_parts(self.rem.as_ptr(), cluster_len))
+        };
+        self.rem = self.rem[cluster_len..total];
+        return .Some(cluster_str);
+    }
+}
+
+impl SplitIter {
+    /// Advances and returns the next delimited `str` segment, or `.None` when exhausted.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn next(&mut self) -> str? {
+        while not self.done {
+            if self.sep.is_empty() {
+                if self.text.is_empty() {
+                    self.done = true;
+                    if self.keep_empty {
+                        return .Some("");
+                    }
+                    return .None;
+                }
+                let bytes: &[u8] = self.text.as_bytes();
+                let (_, width) = decode_utf8_first(bytes);
+                let ptr: *u8 = self.text.as_ptr();
+                let head: str = unsafe {
+                    @str_from_utf8_unchecked(@slice_from_raw_parts(ptr, width))
+                };
+                self.text = unsafe {
+                    @str_from_utf8_unchecked(
+                        @slice_from_raw_parts(ptr.add(width), bytes.len() -% width),
+                    )
+                };
+                if self.text.is_empty() {
+                    self.done = true;
+                }
+                return .Some(head);
+            }
+
+            if self.text.split_once(self.sep) is .Some((head, tail)) {
+                self.text = tail;
+                if self.keep_empty or not head.is_empty() {
+                    return .Some(head);
+                }
+            } else {
+                let last_seg: str = self.text;
+                self.text = "";
+                self.done = true;
+                if self.keep_empty or not last_seg.is_empty() {
+                    return .Some(last_seg);
+                }
+            }
+        }
+        return .None;
+    }
+}
+
+impl SplitWhitespaceIter {
+    /// Advances past Unicode whitespace and returns the next non-empty word `str`, or `.None`.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn next(&mut self) -> str? {
+        let bytes: &[u8] = self.rem.as_bytes();
+        let total: usize = bytes.len();
+        var start: usize = 0;
+        while start < total {
+            let (ch, width) = decode_utf8_first(bytes[start..total]);
+            if not is_unicode_whitespace(ch) {
+                break;
+            }
+            start = start +% width;
+        }
+        if start >= total {
+            self.rem = "";
+            return .None;
+        }
+        var end_idx: usize = start;
+        while end_idx < total {
+            let (ch, width) = decode_utf8_first(bytes[end_idx..total]);
+            if is_unicode_whitespace(ch) {
+                break;
+            }
+            end_idx = end_idx +% width;
+        }
+        let ptr: *u8 = self.rem.as_ptr();
+        let word: str = unsafe {
+            @str_from_utf8_unchecked(@slice_from_raw_parts(ptr.add(start), end_idx -% start))
+        };
+        self.rem = unsafe {
+            @str_from_utf8_unchecked(@slice_from_raw_parts(ptr.add(end_idx), total -% end_idx))
+        };
+        return .Some(word);
+    }
+}
+
+impl LinesIter {
+    /// Returns the next line stripped of `\n` or `\r\n`, or `.None` when empty.
+    @std_cap_boundary(clears: [unsafe_op])
+    @no_alloc @no_panic
+    pub fn next(&mut self) -> str? {
+        if self.rem.is_empty() {
+            return .None;
+        }
+        if self.rem.split_once("\n") is .Some((raw_line, rest)) {
+            self.rem = rest;
+            if raw_line.strip_suffix("\r") is .Some(trimmed_cr) {
+                return .Some(trimmed_cr);
+            }
+            return .Some(raw_line);
+        }
+        let final_line: str = self.rem;
+        self.rem = "";
+        if final_line.strip_suffix("\r") is .Some(trimmed_final) {
+            return .Some(trimmed_final);
+        }
+        return .Some(final_line);
+    }
+}
+
+// -------------- Join, UTF-8, Width & Numeric API --------------
+/// Concatenates `parts` separated by `sep` into a `String` (`0` heap allocs when result `<= 23` bytes).
+pub fn join(parts: &[str], sep: str = "", /) -> String {
+    let count: usize = parts.len();
+    if count == 0 {
+        return String.new();
+    }
+    let total_bytes: usize = checked_join_byte_len(parts, sep);
+    var out: String = String.with_capacity(total_bytes);
+    var idx: usize = 0;
+    while idx < count {
+        if idx > 0 and not sep.is_empty() {
+            out.push_str(sep);
+        }
+        out.push_str(parts[idx]);
+        idx += 1;
+    }
+    return out;
+}
+
+/// Concatenates `parts` separated by `sep` directly inside `arena`, returning a borrowed `str`.
+@std_cap_boundary(clears: [unsafe_op])
+pub fn join_in(arena: &mut Arena, parts: &[str], sep: str = "", /) -> str {
+    let count: usize = parts.len();
+    if count == 0 {
+        return "";
+    }
+    if count == 1 {
+        return parts[0];
+    }
+    let total_bytes: usize = checked_join_byte_len(parts, sep);
+    if total_bytes == 0 {
+        return "";
+    }
+    let buf_ptr: *mut u8 = arena.as_handle().alloc(Layout { size: total_bytes, alignment: 1 }) catch {
+        panic("join_in({total_bytes=}) out of memory");
+    };
+    var pos: usize = 0;
+    let sep_len: usize = sep.len();
+    let sep_ptr: *u8 = sep.as_ptr();
+    var idx: usize = 0;
+    while idx < count {
+        if idx > 0 and sep_len > 0 {
+            unsafe {
+                @memcpy(buf_ptr.add(pos) as *mut opaque, sep_ptr as *opaque, sep_len);
+            }
+            pos = pos +% sep_len;
+        }
+        let part_len: usize = parts[idx].len();
+        if part_len > 0 {
+            unsafe {
+                @memcpy(buf_ptr.add(pos) as *mut opaque, parts[idx].as_ptr() as *opaque, part_len);
+            }
+            pos = pos +% part_len;
+        }
+        idx += 1;
+    }
+    return unsafe {
+        @str_from_utf8_unchecked(@slice_from_raw_parts(buf_ptr as *u8, total_bytes))
+    };
+}
+
+/// Validates `bytes` as well-formed UTF-8 using Keiser–Lemire SIMD + 8-byte SWAR.
+@inline @no_alloc @no_panic
+pub fn validate_utf8(bytes: &[u8], /) -> bool {
+    return (ActiveStrOps {}).validate_utf8_fast(bytes);
+}
+
+/// Validates `bytes` as UTF-8 and borrows it as `str` (`0` allocs), or returns exact `Utf8Error`.
+@std_cap_boundary(clears: [unsafe_op])
+@no_alloc @no_panic
+pub fn from_utf8(bytes: &[u8], /) -> str!Utf8Error {
+    if (ActiveStrOps {}).validate_utf8_fast(bytes) {
+        return .Ok(
+            unsafe {
+                @str_from_utf8_unchecked(bytes)
+            },
+        );
+    }
+    if validate_utf8_detailed_from(bytes, 0) is .Some(err) {
+        return .Err(err);
+    }
+    return .Ok(
+        unsafe {
+            @str_from_utf8_unchecked(bytes)
+        },
+    );
+}
+
+/// Returns the Markus Kuhn / Unicode 16.0 terminal column width of `ch` (`-1` for C0/C1 controls, `0`, `1`, or `2`).
+@inline @no_alloc @no_panic
+pub fn char_width(ch: char, /) -> i8 {
+    let codepoint: u32 = ch as u32;
+    if codepoint < 0xA0_u32 {
+        if codepoint == 0_u32 {
+            return 0;
+        }
+        return if codepoint < 0x20_u32 or codepoint >= 0x7F_u32 {
+            -1
+        } else {
+            1
+        };
+    }
+    if (codepoint >= 0x3400_u32 and codepoint <= 0x4DBF_u32) or (
+        codepoint >= 0x4E00_u32 and codepoint <= 0x9FFF_u32
+    ) or (codepoint >= 0xAC00_u32 and codepoint <= 0xD7A3_u32) {
+        return 2;
+    }
+    if codepoint >= 0x20000_u32 {
+        if codepoint <= 0x3FFFD_u32 {
+            return 2;
+        } else if codepoint >= 0xE0000_u32 and codepoint <= 0xE0FFF_u32 {
+            return 0;
+        }
+        return 1;
+    }
+    let byte_idx: usize = ((codepoint >> 2_u32) & 0x7FFF_u32) as usize;
+    let s2_blk: usize = WCWIDTH_S1[(byte_idx >> 6_usize) & 0x1FF_usize] as usize;
+    let raw_s2_idx: usize = (s2_blk << 3_usize) | ((byte_idx >> 3_usize) & 0x7_usize);
+    if raw_s2_idx >= 824_usize {
+        return 1;
+    }
+    let pool_off: usize = WCWIDTH_S2[raw_s2_idx] as usize;
+    let raw_pool_idx: usize = pool_off +% (byte_idx & 0x7_usize);
+    if raw_pool_idx >= 1042_usize {
+        return 1;
+    }
+    let packed_byte: u8 = WCWIDTH_POOL[raw_pool_idx];
+    let crumb_shift: u8 = (((codepoint & 3_u32) << 1_u32) as u8) & 7_u8;
+    return ((packed_byte >> crumb_shift) & 0x3_u8) as i8;
+}
+
+/// Parses `text` in base `radix` (`2..=36`, keyword-only) into integer `T` without overflow traps.
+@std_cap_boundary(clears: [may_panic])
+@no_alloc @no_panic
+pub fn parse_int[T: Integer](text: str, /, *, radix: u8 is 2..=36 = DEFAULT_RADIX) -> T!ParseIntError {
+    let bytes: &[u8] = text.as_bytes();
+    let total: usize = bytes.len();
+    if total == 0 {
+        return .Err(.Empty);
+    }
+
+    let is_signed: bool = @implements[T, Signed]();
+    var idx: usize = 0;
+    var is_neg: bool = false;
+    if bytes[0] == b'-' {
+        if not is_signed {
+            return .Err(.InvalidDigit);
+        }
+        is_neg = true;
+        idx = 1;
+    } else if bytes[0] == b'+' {
+        idx = 1;
+    }
+    if idx >= total {
+        return .Err(.InvalidDigit);
+    }
+
+    let bit_width: u128 = (@size_of[T]() as u128) *% 8_u128;
+    let max_mag: u128 = if is_signed {
+        let sign_bit: u128 = 1_u128 << ((bit_width -% 1_u128) & 127_u128);
+        if is_neg {
+            sign_bit
+        } else {
+            sign_bit -% 1_u128
+        }
+    } else if bit_width >= 128_u128 {
+        ~0_u128
+    } else {
+        (1_u128 << (bit_width & 127_u128)) -% 1_u128
+    };
+    let raw_radix: u8 = radix;
+    let rad_128: u128 = raw_radix as u128;
+    let pre_mul_cap: u128 = max_mag / rad_128;
+    let pre_add_rem: u128 = max_mag % rad_128;
+
+    var acc: u128 = 0_u128;
+    while idx < total {
+        let ch_b: u8 = bytes[idx];
+        let dig_val: u8 = if ch_b >= b'0' and ch_b <= b'9' {
+            ch_b -% b'0'
+        } else if ch_b >= b'a' and ch_b <= b'z' {
+            (ch_b -% b'a') +% 10_u8
+        } else if ch_b >= b'A' and ch_b <= b'Z' {
+            (ch_b -% b'A') +% 10_u8
+        } else {
+            255_u8
+        };
+        if dig_val >= raw_radix {
+            return .Err(.InvalidDigit);
+        }
+        let dig_128: u128 = dig_val as u128;
+        if acc > pre_mul_cap or (acc == pre_mul_cap and dig_128 > pre_add_rem) {
+            return .Err(.Overflow);
+        }
+        acc = acc *% rad_128 +% dig_128;
+        idx = idx +% 1;
+    }
+
+    if is_neg {
+        return .Ok(((0_u128 -% acc) as i128) as T);
+    }
+    return .Ok(acc as T);
+}
+
+/// Parses IEEE-754 `f32` or `f64` from `text` via `Eisel–Lemire` + Nigel Tao's `[u8; 864]` exact fallback.
+@std_cap_boundary(clears: [unsafe_op])
+@no_alloc @no_panic
+pub fn parse_float[T: Float](text: str, /) -> T!ParseFloatError {
+    comptime if @size_of[T]() == 8 {
+        let bits64: u64 = parse_float_bits_core(text, true)?;
+        return .Ok(
+            unsafe {
+                @ptr_read(&raw bits64 as *T)
+            },
+        );
+    }
+    let bits32: u32 = parse_float_bits_core(text, false)? as u32;
+    return .Ok(
+        unsafe {
+            @ptr_read(&raw bits32 as *T)
+        },
+    );
+}
+
+/// Formats `value` into `buf` in base `radix` (`2..=36`), using `jeaiii` 2-digit fast path for base 10.
+@std_cap_boundary(clears: [unsafe_op, may_panic])
+@no_alloc @no_panic
+pub fn format_int[T: Integer](
+    buf: &mut [u8],
+    value: T,
+    /,
+    *,
+    radix: u8 is 2..=36 = DEFAULT_RADIX,
+    upper: bool = false,
+) -> str!FmtError {
+    let is_neg: bool = @implements[T, Signed]() and (value < (0 as T));
+    let abs_mag: u128 = if is_neg {
+        0_u128 -% ((value as i128) as u128)
+    } else {
+        value as u128
+    };
+
+    let raw_radix: u8 = radix;
+    if raw_radix == 10_u8 and abs_mag <= (0xFFFF_FFFF_FFFF_FFFF_u64 as u128) {
+        var fast_tmp: [u8; 24] = [0_u8; 24];
+        var start_off: usize = 0;
+        if is_neg {
+            fast_tmp[0] = b'-';
+            start_off = 1;
+        }
+        let dig_len: usize = format_u64_jeaiii(
+            unsafe {
+                (&raw mut fast_tmp[0]).add(start_off)
+            },
+            abs_mag as u64,
+        );
+        let total_len: usize = start_off +% dig_len;
+        if buf.len() < total_len {
+            return .Err(.BufferFull);
+        }
+        unsafe {
+            @memcpy(buf.as_mut_ptr() as *mut opaque, &raw fast_tmp[0] as *opaque, total_len);
+            return .Ok(@str_from_utf8_unchecked(@slice_from_raw_parts(buf.as_ptr(), total_len)));
+        }
+    }
+
+    var rev_buf: [u8; 130] = [0_u8; 130];
+    var write_cursor: usize = 130;
+    let rad_128: u128 = raw_radix as u128;
+    let alpha_base: u8 = if upper {
+        b'A'
+    } else {
+        b'a'
+    };
+    var rem_val: u128 = abs_mag;
+    if rem_val == 0_u128 {
+        write_cursor = 129;
+        rev_buf[129] = b'0';
+    } else {
+        while rem_val > 0_u128 {
+            let quo: u128 = rem_val / rad_128;
+            let dig: u8 = (rem_val -% (quo *% rad_128)) as u8;
+            write_cursor = write_cursor -% 1;
+            rev_buf[write_cursor % 130_usize] = if dig < 10_u8 {
+                b'0' +% dig
+            } else {
+                alpha_base +% (dig -% 10_u8)
+            };
+            rem_val = quo;
+        }
+    }
+    if is_neg {
+        write_cursor = write_cursor -% 1;
+        rev_buf[write_cursor % 130_usize] = b'-';
+    }
+    let out_len: usize = 130 -% write_cursor;
+    if buf.len() < out_len {
+        return .Err(.BufferFull);
+    }
+    unsafe {
+        @memcpy(
+            buf.as_mut_ptr() as *mut opaque,
+            (&raw rev_buf[0]).add(write_cursor) as *opaque,
+            out_len,
+        );
+        return .Ok(@str_from_utf8_unchecked(@slice_from_raw_parts(buf.as_ptr(), out_len)));
+    }
+}
+
+/// Formats `value` (`f32` or `f64`) into `buf` with shortest IEEE-754 round-trip `Schubfach` output.
+@std_cap_boundary(clears: [unsafe_op])
+@no_alloc @no_panic
+pub fn format_float[T: Float](buf: &mut [u8], value: T, /) -> str!FmtError {
+    comptime if @size_of[T]() == 8 {
+        let bits64: u64 = unsafe {
+            @ptr_read(&raw value as *u64)
+        };
+        let is_neg: bool = (bits64 >> 63_u64) != 0_u64;
+        let exp_bits: u64 = (bits64 >> 52_u64) & 0x7FF_u64;
+        let sig_bits: u64 = bits64 & ((1_u64 << 52_u64) - 1_u64);
+        if exp_bits == 0x7FF_u64 {
+            if sig_bits != 0_u64 {
+                return copy_ascii_to_buf(buf, "NaN");
+            }
+            return copy_ascii_to_buf(
+                buf,
+                if is_neg {
+                    "-inf"
+                } else {
+                    "inf"
+                },
+            );
+        }
+        if exp_bits == 0_u64 and sig_bits == 0_u64 {
+            return copy_ascii_to_buf(
+                buf,
+                if is_neg {
+                    "-0.0"
+                } else {
+                    "0.0"
+                },
+            );
+        }
+        let (dec_sig, exp10) = schubfach_to_decimal_f64(
+            @bit_cast[f64](bits64 & 0x7FFF_FFFF_FFFF_FFFF_u64),
+        );
+        return render_schubfach_decimal(buf, is_neg, dec_sig, exp10, 16);
+    }
+
+    let bits32: u32 = unsafe {
+        @ptr_read(&raw value as *u32)
+    };
+    let is_neg32: bool = (bits32 >> 31_u32) != 0_u32;
+    let exp32: u32 = (bits32 >> 23_u32) & 0xFF_u32;
+    let sig32: u32 = bits32 & ((1_u32 << 23_u32) - 1_u32);
+    if exp32 == 0xFF_u32 {
+        if sig32 != 0_u32 {
+            return copy_ascii_to_buf(buf, "NaN");
+        }
+        return copy_ascii_to_buf(
+            buf,
+            if is_neg32 {
+                "-inf"
+            } else {
+                "inf"
+            },
+        );
+    }
+    if exp32 == 0_u32 and sig32 == 0_u32 {
+        return copy_ascii_to_buf(
+            buf,
+            if is_neg32 {
+                "-0.0"
+            } else {
+                "0.0"
+            },
+        );
+    }
+    let (dec_sig32, exp10_32) = schubfach_to_decimal_f32(@bit_cast[f32](bits32 & 0x7FFF_FFFF_u32));
+    return render_schubfach_decimal(buf, is_neg32, dec_sig32 as u64, exp10_32, 9);
+}
+
+/// Formats `args` directly into stack/caller byte slice `buf` (`@no_alloc`), returning `.Err(.IoFailure)` on invalid UTF-8.
+@std_cap_boundary(clears: [unsafe_op])
+@no_alloc
+pub fn format_into(buf: &mut [u8], args: FmtArgs, /) -> str!FmtError {
+    var sink = SliceSink {
+        ptr: buf.as_mut_ptr(),
+        cap: buf.len(),
+        pos: 0,
+    };
+    var writer = FmtWriter {
+        ctx: &raw mut sink as *mut opaque,
+        write_fn: slice_sink_write,
+    };
+    render_fmt_args(&mut writer, args)?;
+    let written: &[u8] = unsafe {
+        @slice_from_raw_parts(buf.as_ptr(), sink.pos)
+    };
+    if not validate_utf8(written) {
+        return .Err(.IoFailure);
+    }
+    return .Ok(
+        unsafe {
+            @str_from_utf8_unchecked(written)
+        },
+    );
+}
