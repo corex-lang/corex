@@ -12145,6 +12145,10 @@ fn dispatchSingleJsonMessage(
         },
         error.OutOfMemory => return error.OutOfMemory,
         else => {
+            if (session.log_writer) |log_w| {
+                log_w.print("[corex-lsp] error in {s}: {s}\n", .{ method_str, @errorName(err) }) catch {};
+                log_w.flush() catch {};
+            }
             if (!is_notification) {
                 try sendJsonRpcError(session, out_writer, rpc_id, JSONRPC_INTERNAL_ERROR, "internal compiler error");
             }

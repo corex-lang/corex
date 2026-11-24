@@ -2587,3 +2587,137 @@ test "test_lsp_document_symbol_multi_impl_hierarchy_and_early_cutoff_shift" {
         std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":8").?, "\"line\":16,\"character\":7") != null,
     );
 }
+
+test "test_lsp_stdlib_cx_signature_syntax_error_and_recovery_no_cycle" {
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const ws_dir = try createTempWorkspaceDir(allocator, io, "stdlib_sig_cycle");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, ws_dir) catch {};
+        allocator.free(ws_dir);
+    }
+
+    const core_root_src =
+        "pub fn identity_f64(val: f64) -> f64 {\n" ++
+        "    return val;\n" ++
+        "}\n";
+    const cx_mod_src =
+        "pub mod math;\n";
+    const math_src =
+        "fn helper_step(r1: f64, hfx: f64) -> f64 {\n" ++
+        "    let t_val: f64 = 3.0 - r1 * hfx;\n" ++
+        "    return r1 * t_val;\n" ++
+        "}\n" ++
+        "fn ln_f64(x: f64, /) -> f64 {\n" ++
+        "    return helper_step(x, 0.5);\n" ++
+        "}\n";
+
+    try writeWorkspaceFile(allocator, io, ws_dir, "core/root.cx", core_root_src);
+    try writeWorkspaceFile(allocator, io, ws_dir, "stdlib/cx/mod.cx", cx_mod_src);
+    try writeWorkspaceFile(allocator, io, ws_dir, "stdlib/cx/math.cx", math_src);
+
+    const root_uri = try resolvePathToFileUri(allocator, io, ws_dir);
+    defer allocator.free(root_uri);
+    const math_disk_path = try std.fmt.allocPrint(allocator, "{s}/stdlib/cx/math.cx", .{ws_dir});
+    defer allocator.free(math_disk_path);
+    const math_uri = try resolvePathToFileUri(allocator, io, math_disk_path);
+    defer allocator.free(math_uri);
+
+    var inbound: std.ArrayListUnmanaged(u8) = .empty;
+    defer inbound.deinit(allocator);
+
+    const init_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{" ++
+            "\"rootUri\":\"{s}\",\"capabilities\":{{\"general\":{{\"positionEncodings\":[\"utf-16\"]}}}}}}}}",
+        .{root_uri},
+    );
+    defer allocator.free(init_body);
+    try appendLspFrame(allocator, &inbound, init_body);
+    try appendLspFrame(allocator, &inbound, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}");
+    try appendDidOpenFrame(allocator, &inbound, math_uri, 1, math_src);
+
+    const frames_to_send = [_][]const u8{
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/semanticTokens/full\"," ++
+                "\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+            .{math_uri},
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\",\"version\":2}}," ++
+                "\"contentChanges\":[{{\"range\":{{\"start\":{{\"line\":4,\"character\":11}}," ++
+                "\"end\":{{\"line\":4,\"character\":16}}}},\"text\":\"\"}}]}}}}",
+            .{math_uri},
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/semanticTokens/full/delta\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"previousResultId\":\"0000000000000001\"}}}}",
+            .{math_uri},
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/hover\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":2,\"character\":17}}}}}}",
+            .{math_uri},
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\",\"version\":3}}," ++
+                "\"contentChanges\":[{{\"range\":{{\"start\":{{\"line\":4,\"character\":11}}," ++
+                "\"end\":{{\"line\":4,\"character\":11}}}},\"text\":\": f64\"}}]}}}}",
+            .{math_uri},
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/hover\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":2,\"character\":17}}}}}}",
+            .{math_uri},
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"textDocument/definition\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":2,\"character\":17}}}}}}",
+            .{math_uri},
+        ),
+    };
+    defer for (frames_to_send) |owned_f| allocator.free(owned_f);
+    for (frames_to_send) |frame_str| {
+        try appendLspFrame(allocator, &inbound, frame_str);
+    }
+    try appendLspFrame(allocator, &inbound, "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"shutdown\",\"params\":null}");
+    try appendLspFrame(allocator, &inbound, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}");
+
+    var outcome = try executeLspTranscript(allocator, io, inbound.items, null, .{ .is_internal_core = true });
+    defer outcome.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), outcome.exit_code);
+
+    // Verify ZERO `-32603` internal compiler errors across all responses:
+    for (outcome.frames) |frame| {
+        try std.testing.expect(std.mem.indexOf(u8, frame, "-32603") == null);
+    }
+    // Verify v2 `publishDiagnostics` emitted a syntax error for `fn ln_f64(x, /)` and v3 cleared diagnostics back to `[]`:
+    var saw_v2_diag_err = false;
+    var saw_v3_diag_clean = false;
+    for (outcome.frames) |frame| {
+        if (std.mem.indexOf(u8, frame, "\"version\":2,\"diagnostics\":[{") != null) saw_v2_diag_err = true;
+        if (std.mem.indexOf(u8, frame, "\"version\":3,\"diagnostics\":[]") != null) saw_v3_diag_clean = true;
+    }
+    try std.testing.expect(saw_v2_diag_err);
+    try std.testing.expect(saw_v3_diag_clean);
+
+    // Verify `semanticTokens/full/delta`, `hover`, and `definition` all succeeded during and after the broken signature edit:
+    try std.testing.expect(std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":3").?, "\"result\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":4").?, "t_val: f64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":5").?, "t_val: f64") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":6").?, "\"line\":1,\"character\":8") != null,
+    );
+}

@@ -8425,31 +8425,35 @@ pub const CompilerDb = struct {
     pub fn fetchQuery(self: *CompilerDb, key: QueryKey) QueryError!MemoHeader {
         try self.unwindIfCanceled();
 
-        // [1] Record `key` as a direct dependency of the enclosing active query frame:
-        if (self.active_stack.items.len > 0) {
-            try self.recordDependencyEdge(key);
-        }
-
-        // [2] Reject dependency cycles immediately if `key` is already on `active_stack`:
+        // [1] Reject dependency cycles immediately before recording an edge if `key` is already on `active_stack`:
         if (self.in_flight_keys.contains(key.asU64())) {
             return error.DependencyCycle;
         }
 
-        // [3] Check existing memo by value (never holding a pointer across recursive calls):
+        // [2] Check existing memo by value (never holding a pointer across recursive calls):
         if (self.memos.get(key.asU64())) |existing_memo| {
             if (existing_memo.verified_at == self.current_revision) {
+                if (self.active_stack.items.len > 0) {
+                    try self.recordDependencyEdge(key);
+                }
                 self.propagateToParent(existing_memo);
                 return existing_memo;
             }
 
             _ = try self.maybeChangedAfter(key, existing_memo.verified_at);
             const verified_memo = self.memos.get(key.asU64()).?;
+            if (self.active_stack.items.len > 0) {
+                try self.recordDependencyEdge(key);
+            }
             self.propagateToParent(verified_memo);
             return verified_memo;
         }
 
-        // [4] First execution of `key`:
+        // [3] First execution of `key`:
         const computed_memo = try self.executeAndBackdate(key);
+        if (self.active_stack.items.len > 0) {
+            try self.recordDependencyEdge(key);
+        }
         self.propagateToParent(computed_memo);
         return computed_memo;
     }
@@ -8463,7 +8467,8 @@ pub const CompilerDb = struct {
         try self.unwindIfCanceled();
 
         if (self.in_flight_keys.contains(key.asU64())) {
-            return error.DependencyCycle;
+            // An ancestor frame is actively recomputing `key`, so prior memos depending on `key` must take the Red Path:
+            return true;
         }
 
         const memo_snapshot = self.memos.get(key.asU64()) orelse {
@@ -10059,8 +10064,12 @@ pub const CompilerDb = struct {
         std.mem.sort(u32, root_mod_syms.items, {}, std.sort.asc(u32));
         var resolved_root_fids: std.AutoHashMapUnmanaged(u32, ScopeId) = .empty;
         defer resolved_root_fids.deinit(self.allocator);
+        const is_caller_core_kernel = self.symbol_table.isCoreKernelFile(file_id);
         for (root_mod_syms.items) |root_sym_raw| {
             const root_fid = self.root_module_files.get(root_sym_raw) orelse continue;
+            if (is_caller_core_kernel and !self.cx_stdlib_root_fid.isNone() and root_fid == self.cx_stdlib_root_fid) {
+                continue;
+            }
             if (resolved_root_fids.get(root_fid.asInt())) |cached_scope| {
                 if (!cached_scope.isNone()) {
                     try self.symbol_table.named_module_scopes.put(
@@ -10160,6 +10169,12 @@ pub const CompilerDb = struct {
         if (caller_pkg == .std_core) {
             for (root_mod_syms.items) |std_sym_raw| {
                 const std_root_fid = self.root_module_files.get(std_sym_raw) orelse continue;
+                if (is_caller_core_kernel and
+                    !self.cx_stdlib_root_fid.isNone() and
+                    std_root_fid == self.cx_stdlib_root_fid)
+                {
+                    continue;
+                }
                 if (self.symbol_table.getFilePackageId(std_root_fid) != .std_core) continue;
                 try self.ensureModuleRootSubtreePass1(
                     std_root_fid,
