@@ -7,7 +7,7 @@
 //!   `LoopContractMeta` `8B`, `MirLoopContractEntry` `16B`, `TargetSpec` `4B`, `NicheSpec` `24B`,
 //!   `ResolvedTypeLayout` `32B`, `AbiParamRecipe` `16B`, `ProvenValueRange` `24B`).
 //! - Phase 7 CLI/driver diagnostics (`E0006`, `E0007`, `E0008`), all 7 canonical target triples,
-//!   `TypeLayoutResolver` native vs `@repr(C)`/`@packed`/`@cache_aligned`/`#soa`/niche parity,
+//!   `TypeLayoutResolver` native vs `@repr(C)`/`@repr(C, packed: …)`/`@repr(align: .CacheLine)`/`#soa`/niche parity,
 //!   `AbiClassifier` (`cx_native`, `cx_result_cc` `[CRITICAL-06]`, `SysV`, `Win64`, `AAPCS64`, `wasm32`),
 //!   `@must_vectorize`/`@vectorize_width`, `MirConst.raw_blob`, `computeBodyProvenRanges`, all 17
 //!   Phase 7 intrinsics in `MirVm` oracle mode, and `Prune-02` `atomicWriteOutputFile`.
@@ -179,18 +179,17 @@ test "test_type_layout_resolver_struct_reordering_repr_c_packed_cache_aligned_so
         \\    pub count: u64,
         \\    pub tag_b: u8,
         \\}
-        \\@packed
+        \\@repr(C, packed: true)
         \\pub struct PackedStruct {
         \\    pub flag: bool,
         \\    pub count: u64,
         \\    pub tag_b: u8,
         \\}
-        \\@cache_aligned
+        \\@repr(align: .CacheLine)
         \\pub struct CacheLineCounter {
         \\    pub val: u64,
         \\}
-        \\@align(32)
-        \\@link_name("cx_aligned_block")
+        \\@repr(align: 32)
         \\pub struct ExplicitAligned {
         \\    pub byte_val: u8,
         \\}
@@ -199,7 +198,7 @@ test "test_type_layout_resolver_struct_reordering_repr_c_packed_cache_aligned_so
         \\    pub flags: u8,
         \\}
         \\@extern("C")
-        \\@link_name("puts")
+        \\@link(name: "puts")
         \\pub fn c_puts(msg: *u8) -> i32;
     ;
 
@@ -207,7 +206,7 @@ test "test_type_layout_resolver_struct_reordering_repr_c_packed_cache_aligned_so
     defer tc_res.deinit();
     try std.testing.expect(!tc_res.diagnostics.hasErrors());
 
-    // Verify `@link_name` extracted on `c_puts`.
+    // Verify `@link(name: …)` extracted on `c_puts`.
     var has_link_name = false;
     for (tc_res.symbol_table.symbols.items) |sym_rec| {
         if (std.mem.eql(u8, sym_rec.name_text, "c_puts")) {
@@ -266,7 +265,7 @@ test "test_type_layout_resolver_struct_reordering_repr_c_packed_cache_aligned_so
     try std.testing.expectEqual(@as(u64, 32), explicit_layout.size_bytes);
     try std.testing.expectEqual(@as(u8, 5), explicit_layout.align_log2);
 
-    // [2] `@cache_aligned` on `aarch64-macos` (`D-10A`) aligns to `128B` (`align_log2 == 7`):
+    // [2] `@repr(align: .CacheLine)` on `aarch64-macos` (`D-10A`) aligns to `128B` (`align_log2 == 7`):
     var resolver_mac = TypeLayoutResolver.init(
         std.testing.allocator,
         &tc_res.type_pool,
@@ -816,4 +815,103 @@ test "test_phase76_dr22_opaque_ptr_source_loc_fmt_bencher_layouts_and_c_variadic
     try std.testing.expectEqual(@as(u64, 8), (try res_wasm.resolveType(.fmt_spec_ty)).size_bytes);
     try std.testing.expectEqual(@as(u64, 16), (try res_wasm.resolveType(.fmt_args_ty)).size_bytes);
     try std.testing.expectEqual(@as(u64, 8), (try res_wasm.resolveType(.bencher_ty)).size_bytes);
+}
+
+test "test_dr24_codegen_abi_transparent_packed_cap_inline_fmt_and_inline_if" {
+    const dr24_src =
+        \\/# DR-24 Layout, ABI, Inline Mode, Format String, and Inline `if` Verification
+        \\@repr(transparent)
+        \\pub struct RefHandle {
+        \\    pub ptr: &i32,
+        \\    pub tag_zst: (),
+        \\}
+        \\@repr(C, packed: 2, align: 16, zero_pad: true)
+        \\pub struct PackedCapAligned {
+        \\    pub head: u8,
+        \\    pub word: u32,
+        \\    pub tail: u16,
+        \\}
+        \\@inline(always)
+        \\pub fn fast_add(lhs_val: i32, rhs_val: i32) -> i32 {
+        \\    return lhs_val + rhs_val;
+        \\}
+        \\@inline(never)
+        \\pub fn cold_pick(seed: i32, maybe_bonus: i32?) -> i32 {
+        \\    return if (scaled := seed * 2) > 4 and maybe_bonus is .Some(bonus_val) => fast_add(scaled, bonus_val) else 0;
+        \\}
+        \\pub fn probe_dr24_vm() -> i32 {
+        \\    let cell_val: i32 = 9;
+        \\    let wrapped = RefHandle { ptr: &cell_val, tag_zst: () };
+        \\    let hdr = PackedCapAligned { head: 3, word: 0x0102_0304, tail: 5 };
+        \\    let pad_bytes: &[u8] = hdr.as_bytes();
+        \\    let plain_brace: str = "{literal}";
+        \\    let fmt_a: str = f"v={wrapped.ptr.*}";
+        \\    let fmt_b: str = f#"q="{hdr.head}""#;
+        \\    let multi_s: str = "
+        \\        row1
+        \\        row2
+        \\        ";
+        \\    let score = cold_pick(4, .Some(7));
+        \\    return score + (plain_brace.len() as i32) + (fmt_a.len() as i32) +
+        \\        (fmt_b.len() as i32) + (multi_s.len() as i32) + (pad_bytes[1] as i32);
+        \\}
+    ;
+
+    var tc_res = try corex.typecheckSource(std.testing.allocator, FileId.fromInt(24), dr24_src);
+    defer tc_res.deinit();
+    try std.testing.expect(!tc_res.diagnostics.hasErrors());
+
+    var seen_always = false;
+    var seen_never = false;
+    for (tc_res.symbol_table.symbols.items) |sym_rec| {
+        if (std.mem.eql(u8, sym_rec.name_text, "fast_add")) {
+            try std.testing.expectEqual(corex.symbol_resolver.InlineAttrMode.always, sym_rec.inlineMode());
+            seen_always = true;
+        } else if (std.mem.eql(u8, sym_rec.name_text, "cold_pick")) {
+            try std.testing.expectEqual(corex.symbol_resolver.InlineAttrMode.never, sym_rec.inlineMode());
+            seen_never = true;
+        }
+    }
+    try std.testing.expect(seen_always and seen_never);
+
+    const handle_ty = try lookupNamedTypeId(&tc_res.symbol_table, "RefHandle");
+    const opt_handle_ty = try tc_res.type_pool.internOptional(handle_ty);
+    const packed_ty = try lookupNamedTypeId(&tc_res.symbol_table, "PackedCapAligned");
+
+    var resolver_x64 = TypeLayoutResolver.init(
+        std.testing.allocator,
+        &tc_res.type_pool,
+        &tc_res.symbol_table,
+        TargetSpec.X86_64_LINUX,
+    );
+    defer resolver_x64.deinit();
+
+    // [1] `@repr(transparent)` preserves exact `8B` size, alignment, and non-null `Option` niche:
+    const handle_layout = try resolver_x64.resolveType(handle_ty);
+    try std.testing.expectEqual(@as(u64, 8), handle_layout.size_bytes);
+    try std.testing.expectEqual(@as(u32, 8), handle_layout.alignBytes());
+    try std.testing.expectEqual(@as(u64, 8), (try resolver_x64.resolveType(opt_handle_ty)).size_bytes);
+
+    // [2] `@repr(C, packed: 2, align: 16, zero_pad: true)` places `word` at offset `2` and pads size to `16`:
+    const packed_layout = try resolver_x64.resolveType(packed_ty);
+    try std.testing.expectEqual(@as(u64, 16), packed_layout.size_bytes);
+    try std.testing.expectEqual(@as(u32, 16), packed_layout.alignBytes());
+    try std.testing.expect(packed_layout.reprFlags().is_packed);
+    try std.testing.expect(packed_layout.reprFlags().has_padding);
+    const packed_fields = resolver_x64.getFieldsByDecl(packed_layout);
+    try std.testing.expectEqual(@as(u64, 0), packed_fields[0].byte_offset);
+    try std.testing.expectEqual(@as(u64, 2), packed_fields[1].byte_offset);
+    try std.testing.expectEqual(@as(u64, 6), packed_fields[2].byte_offset);
+
+    // [3] `MirVm` evaluates `f"…"`, `f#"…"#`, `"<newline> … "`, `zero_pad`, and `if … => … else …`:
+    const vm_out = try evalFunctionInOracleVm(
+        std.testing.allocator,
+        dr24_src,
+        "probe_dr24_vm",
+        TargetSpec.X86_64_LINUX,
+        null,
+        null,
+    );
+    // `score = 15`, `plain_brace = 9`, `fmt_a = 3`, `fmt_b = 5`, `multi_s = 9`, `pad_bytes[1] = 0` -> `41`:
+    try std.testing.expectEqual(@as(i64, 41), vm_out.slot.scalar_i64);
 }

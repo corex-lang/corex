@@ -111,8 +111,7 @@ hir_module : unit
         hir_var_ref : PacketFlags _l29 (flags)
         hir_const_val : u16 = 5
       hir_local_decl : unit _l30
-        hir_block : i32
-          hir_const_val : i32 = 10
+        hir_const_val : i32 = 10
       hir_local_decl : unit _l31
         hir_const_val : i32 = 0
       hir_block : unit

@@ -675,12 +675,12 @@ test "test_phase11_std01_red_team_stage4_regressions_and_stage0_seams" {
         "    // [5] CRITICAL-06: `format_into` rejects invalid UTF-8 (`0xFF`) and accepts split 4-byte UTF-8:\n" ++
         "    var fmt_buf: [u8; 32] = [0_u8; 32];\n" ++
         "    let bad_val = BadRawUtf8 {};\n" ++
-        "    match str.format_into(&mut fmt_buf, \"{bad_val}\") {\n" ++
+        "    match str.format_into(&mut fmt_buf, f\"{bad_val}\") {\n" ++
         "        .Ok(_) => return 10,\n" ++
         "        .Err(err_kind) => if err_kind != .IoFailure { return 11; },\n" ++
         "    }\n" ++
         "    let split_val = SplitFourByteUtf8 {};\n" ++
-        "    let ok_utf8 = str.format_into(&mut fmt_buf, \"{split_val}\") catch { return 12; };\n" ++
+        "    let ok_utf8 = str.format_into(&mut fmt_buf, f\"{split_val}\") catch { return 12; };\n" ++
         "    let ok_bytes = ok_utf8.as_bytes();\n" ++
         "    if ok_bytes.len() != 4_usize or ok_bytes[0] != 0xF0_u8 or ok_bytes[3] != 0x80_u8 { return 13; }\n" ++
         "\n" ++
@@ -792,7 +792,7 @@ test "test_phase11_std01_gate1_zero_pre_main_static_initializers" {
         "use cx.str;\n" ++
         "\n" ++
         "@export\n" ++
-        "@link_name(\"cx_gate1_entry\")\n" ++
+        "@link(name: \"cx_gate1_entry\")\n" ++
         "pub fn cx_gate1_entry() -> u64 {\n" ++
         "    var arena = Arena.new();\n" ++
         "    var looked_up: u64 = 0_u64;\n" ++
@@ -823,7 +823,7 @@ test "test_phase11_std01_gate1_zero_pre_main_static_initializers" {
         "use cx.str;\n" ++
         "\n" ++
         "@export\n" ++
-        "@link_name(\"cx_gate1_entry\")\n" ++
+        "@link(name: \"cx_gate1_entry\")\n" ++
         "pub fn cx_gate1_entry() -> u64 {\n" ++
         "    var first_item: u64 = 0_u64;\n" ++
         "    var arena = Arena.new();\n" ++
@@ -1240,7 +1240,7 @@ test "test_phase11_std01_gate3_scratch_exclusivity_e0328_and_sim_determinism" {
         "    }\n" ++
         "}\n" ++
         "\n" ++
-        "@align(16)\n" ++
+        "@repr(align: 16)\n" ++
         "pub struct AlignedBacking512 {\n" ++
         "    pub bytes: [u8; 512],\n" ++
         "}\n" ++
@@ -1370,7 +1370,7 @@ test "test_phase11_std01_gate4_pentagon_zero_trap_and_ram_budget" {
         "use cx.mem.Arena;\n" ++
         "use cx.str;\n" ++
         "\n" ++
-        "@noinline\n" ++
+        "@inline(never)\n" ++
         "pub fn arena_no_drop_probe() -> usize {\n" ++
         "    var arena = Arena.new();\n" ++
         "    var total: usize = 0_usize;\n" ++
@@ -1726,7 +1726,7 @@ test "test_phase11_std01_gate5_four_tier_ucd16_float_math_and_wasm_profiles" {
         "@export\n" ++
         "pub fn run_profile_b(val: u32, dst_ptr: *mut u8, cap: usize) -> usize {\n" ++
         "    let dst: &mut [u8] = unsafe { @slice_from_raw_parts_mut(dst_ptr, cap) };\n" ++
-        "    let hex_out = str.format_into(dst, \"{val:#06x}\") catch { return 0_usize; };\n" ++
+        "    let hex_out = str.format_into(dst, f\"{val:#06x}\") catch { return 0_usize; };\n" ++
         "    var dec_buf: [u8; 16] = [0_u8; 16];\n" ++
         "    let dec_out = str.format_int(&mut dec_buf, val) catch { return 0_usize; };\n" ++
         "    return hex_out.len() +% dec_out.len();\n" ++

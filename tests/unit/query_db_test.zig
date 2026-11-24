@@ -234,11 +234,11 @@ test "test_query_db_early_cutoff_at_lower_ast_on_whitespace_and_comment_edits" {
     try std.testing.expectEqual(@as(u64, 1), db.telemetry.countExecutions(.typecheck_body));
     try std.testing.expectEqual(@as(u64, 1), db.telemetry.countExecutions(.verify_sast_mir));
 
-    // Inject module doc comments, doc comments, block comments, line comments, and extra blank lines:
+    // Inject ordinary `//` line comments and extra blank lines (non-doc trivia preserves `ItemTree`):
     const source_commented =
-        "//! Module documentation header\n\n" ++
-        "/// Doc comment on add_pair\n" ++
-        "pub fn add_pair(   lhs: i32 , /* inline block */ rhs: i32   ) -> i32 {\n\n\n" ++
+        "// File header banner comment\n\n" ++
+        "// Implementation note on add_pair\n" ++
+        "pub fn add_pair(\n    lhs: i32, // first operand\n    rhs: i32 // second operand\n) -> i32 {\n\n\n" ++
         "    // Explaining addition step:\n" ++
         "    return lhs + rhs; // trailing comment\n" ++
         "}\n";

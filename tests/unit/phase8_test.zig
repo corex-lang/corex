@@ -289,9 +289,9 @@ test "test_phase8_eleven_target_cross_compile_headers_archives_coff_def_and_sub_
     try std.Io.Dir.cwd().createDirPath(io, scratch_dir);
 
     const kernel_src =
-        "//! Portable Cross-Target Arithmetic Kernel\n" ++
+        "/# Portable Cross-Target Arithmetic Kernel\n" ++
         "@export\n" ++
-        "@link_name(\"cx_cross_dot2\")\n" ++
+        "@link(name: \"cx_cross_dot2\")\n" ++
         "pub fn cross_dot2(lhs_a: i32, lhs_b: i32, rhs_a: i32, rhs_b: i32) -> i32 {\n" ++
         "    return (lhs_a *% rhs_a) +% (lhs_b *% rhs_b);\n" ++
         "}\n";
@@ -361,7 +361,7 @@ test "test_phase8_eleven_target_cross_compile_headers_archives_coff_def_and_sub_
 
     // [2] Compile exported `.cx` function to `wasm32-unknown-freestanding` `--release` `.wasm` (< 10 KB) in Tier A & Tier B:
     const wasm_src =
-        "//! Freestanding WebAssembly Exported Kernel\n" ++
+        "/# Freestanding WebAssembly Exported Kernel\n" ++
         "@wasm_export(\"cx_wasm_mix\")\n" ++
         "pub fn cx_wasm_mix(seed_a: u32, seed_b: u32) -> u32 {\n" ++
         "    return ((seed_a ^ (seed_b << 5)) *% 0x9E37_79B9_u32) +% seed_b;\n" ++
@@ -518,6 +518,42 @@ test "test_phase8_translate_c_c_import_bitfields_and_live_native_c_ffi_roundtrip
     try std.testing.expectEqual(TypeId.i64_ty, arm_view.ret_ty);
     try std.testing.expectEqual(TypeId.u8_ty, arm_view.getParamType(1));
 
+    // Verify `c_translate.translateHeaderSource` emits canonical `DR-24` `/#`, `@repr(C, packed: …, align: …)`, and `@link(name: …)`:
+    {
+        const dr24_c_hdr =
+            "#include <stdint.h>\n" ++
+            "#define JSON_BRACE_LIT \"{\\\"ok\\\":1}\"\n" ++
+            "#pragma pack(push, 2)\n" ++
+            "struct __attribute__((aligned(8))) PackedAlignedHdr {\n" ++
+            "    uint8_t tag;\n" ++
+            "    uint32_t word;\n" ++
+            "};\n" ++
+            "#pragma pack(pop)\n" ++
+            "int fn(int val);\n";
+        var tr_sink = DiagnosticSink.init(allocator);
+        defer tr_sink.deinit();
+        const translated_cx = try c_translate.translateHeaderSource(
+            allocator,
+            dr24_c_hdr,
+            "dr24_ffi.h",
+            .none,
+            .{ .target = TargetSpec.X86_64_LINUX_GNU },
+            .{ .has_header_comment = true },
+            &tr_sink,
+        );
+        defer allocator.free(translated_cx);
+        try std.testing.expectEqual(@as(u32, 0), tr_sink.error_count);
+        try std.testing.expect(std.mem.startsWith(u8, translated_cx, "/# Auto-Translated"));
+        try std.testing.expect(std.mem.indexOf(u8, translated_cx, "//!") == null);
+        try std.testing.expect(std.mem.indexOf(u8, translated_cx, "///") == null);
+        try std.testing.expect(std.mem.indexOf(u8, translated_cx, "@repr(C, packed: 2, align: 8)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, translated_cx, "@link(name: \"fn\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, translated_cx, "@packed") == null);
+        try std.testing.expect(std.mem.indexOf(u8, translated_cx, "@align(") == null);
+        try std.testing.expect(std.mem.indexOf(u8, translated_cx, "@link_name") == null);
+        try std.testing.expect(std.mem.indexOf(u8, translated_cx, "{{") == null);
+    }
+
     // [2] Live native C helper `.c` -> `.o` (`zig cc`) linked with CoreX in BOTH Tier A (`-ofmt=c`) and Tier B (`LLVM`):
     const host_spec = TargetSpec.host();
     const ffi_dir = ".zig-cache/phase8_unit_live_ffi";
@@ -588,7 +624,7 @@ test "test_phase8_translate_c_c_import_bitfields_and_live_native_c_ffi_roundtrip
     try std.testing.expect(cc_compile.term.success());
 
     const live_cx_src =
-        "//! Live C <-> CoreX FFI Round-Trip Verification Module\n" ++
+        "/# Live C <-> CoreX FFI Round-Trip Verification Module\n" ++
         "@repr(C)\n" ++
         "@derive(Copy)\n" ++
         "pub struct CPointPair {\n" ++
@@ -620,7 +656,7 @@ test "test_phase8_translate_c_c_import_bitfields_and_live_native_c_ffi_roundtrip
         "    }\n" ++
         "}\n\n" ++
         "@export\n" ++
-        "@link_name(\"cx_exported_scale_cb\")\n" ++
+        "@link(name: \"cx_exported_scale_cb\")\n" ++
         "pub fn exported_scale_cb(raw_val: i32, factor: i32) -> i32 {\n" ++
         "    return raw_val *% factor;\n" ++
         "}\n\n" ++
@@ -911,10 +947,10 @@ test "test_phase8_four_tier_async_await_frame_pinned_task_group_cancel_and_conte
     try std.testing.expectEqual(@as(i64, 42), report_ctx.outcomes[0].return_scalar_i64);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 302, 301 }, report_ctx.outcomes[0].drop_trace);
 
-    // [3] 4-tier regression; `@align(64)` `&blk` and `FmtArgs` across `yield_now().await`, generic
+    // [3] 4-tier regression; `@repr(align: 64)` `&blk` and `FmtArgs` across `yield_now().await`, generic
     //     `async fn` `@size_of[T]()`, and indirect `async fn` pointers sharing the same `i32` return type:
     const aligned_async_src =
-        "@align(64)\n" ++
+        "@repr(align: 64)\n" ++
         "pub struct AlignedBlock64 {\n" ++
         "    pub lanes: [u64; 8],\n" ++
         "}\n\n" ++
@@ -928,9 +964,9 @@ test "test_phase8_four_tier_async_await_frame_pinned_task_group_cancel_and_conte
         "    return sum_aligned_edges(blk_ref);\n" ++
         "}\n\n" ++
         "pub async fn format_across_yield(num: u32, tag_str: str) -> i32 {\n" ++
-        "    let fmt_msg: FmtArgs = \"v={num:04x}:{tag_str}\";\n" ++
+        "    let fmt_msg: FmtArgs = f\"v={num:04x}:{tag_str}\";\n" ++
         "    cx.async.yield_now().await;\n" ++
-        "    let rendered: str = \"{fmt_msg}\";\n" ++
+        "    let rendered: str = f\"{fmt_msg}\";\n" ++
         "    let _wrote: isize = @sys_write(1, rendered);\n" ++
         "    return rendered.len() as i32;\n" ++
         "}\n\n" ++

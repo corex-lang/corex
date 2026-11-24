@@ -471,15 +471,15 @@ inline fn isW0202SuppressedAtSpan(checker: *const TypeChecker, span: Span) bool 
     return checker.getAllowedMaskAtSpan(span).has_allow_idiom_w0202;
 }
 
-/// Returns `true` if `kind` is a line, doc, module-doc, or block comment trivia piece.
+/// Returns `true` if `kind` is a line, outer doc (`/|`), or module doc (`/#`) comment trivia piece.
 inline fn isCommentTriviaKind(kind: TriviaKind) bool {
     return switch (kind) {
-        .line_comment, .doc_comment, .module_doc_comment, .block_comment => true,
+        .line_comment, .doc_comment, .module_doc_comment => true,
         else => false,
     };
 }
 
-/// Returns `true` if any `TriviaPiece` in `pieces` is a comment (or coalesced trivia containing `/` + `/`/`*`).
+/// Returns `true` if any `TriviaPiece` in `pieces` is a comment (or coalesced trivia containing `//`, `/|`, `/#`, or `/*`).
 fn hasCommentInTriviaSlice(source: []const u8, pieces: []const TriviaPiece) bool {
     for (pieces) |piece| {
         if (isCommentTriviaKind(piece.kind)) return true;
@@ -488,6 +488,8 @@ fn hasCommentInTriviaSlice(source: []const u8, pieces: []const TriviaPiece) bool
             const end_idx: usize = @min(start_idx + @as(usize, piece.byte_len), source.len);
             const raw_slice = source[start_idx..end_idx];
             if (std.mem.indexOf(u8, raw_slice, "//") != null or
+                std.mem.indexOf(u8, raw_slice, "/|") != null or
+                std.mem.indexOf(u8, raw_slice, "/#") != null or
                 std.mem.indexOf(u8, raw_slice, "/*") != null)
             {
                 return true;
@@ -497,7 +499,7 @@ fn hasCommentInTriviaSlice(source: []const u8, pieces: []const TriviaPiece) bool
     return false;
 }
 
-/// Scans `[piece_start .. piece_end)` in `source` for any `//…` or `/*…*/` comment overlapping `[start_byte, end_byte)`.
+/// Scans `[piece_start .. piece_end)` in `source` for any `//`, `/|`, `/#`, or `/*…*/` comment overlapping `[start_byte, end_byte)`.
 fn hasCoalescedCommentOverlappingRange(
     source: []const u8,
     piece_start: u32,
@@ -509,7 +511,9 @@ fn hasCoalescedCommentOverlappingRange(
     const scan_hi: usize = @min(@as(usize, piece_end), source.len);
     var cursor: usize = scan_lo;
     while (cursor + 1 < scan_hi) {
-        if (source[cursor] == '/' and source[cursor + 1] == '/') {
+        if (source[cursor] == '/' and
+            (source[cursor + 1] == '/' or source[cursor + 1] == '|' or source[cursor + 1] == '#'))
+        {
             const comment_lo: u32 = @intCast(cursor);
             cursor += 2;
             while (cursor < scan_hi and source[cursor] != '\n') : (cursor += 1) {}
@@ -973,6 +977,7 @@ fn matchRedundantOuterParenCst(
     }
     if (hasWalrusInSubtree(checker.cst_arena, checker.token_buffer, inner_cst)) return null;
     if (hasStructLitOrBlockInSubtree(checker.cst_arena, checker.token_buffer, inner_cst)) return null;
+    if (isFatArrowIfCstNode(checker.cst_arena, checker.token_buffer, inner_cst)) return null;
 
     return .{
         .lparen_tok = open_leaf.token,
@@ -2290,6 +2295,1050 @@ fn lintBoolReturnIfElse(
     return true;
 }
 
+/// Returns `true` if `if_cst` uses fat-arrow `=>` inline arm syntax (`if cond => a else b`).
+fn isFatArrowIfCstNode(
+    cst_arena: *const LosslessCstArena,
+    token_buffer: *const TokenBuffer,
+    if_cst: CstNodeIndex,
+) bool {
+    if (if_cst.isNone() or if_cst.asInt() >= cst_arena.countNodes()) return false;
+    const rec = cst_arena.getNode(if_cst);
+    const end_idx = @min(@as(usize, if_cst.asInt()) + @max(@as(usize, rec.subtree_size), 1), cst_arena.countNodes());
+    var cur: usize = if_cst.asInt() + 1;
+    while (cur < end_idx) {
+        const sub = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+        if (sub.subtree_size <= 1 and !sub.token.isNone() and sub.token.asInt() < token_buffer.countTokens()) {
+            const tk = token_buffer.getToken(sub.token).kind;
+            if (tk == .fat_arrow) return true;
+            if (tk == .lbrace) return false;
+        } else if (sub.kind == .block) {
+            return false;
+        }
+        cur += @max(@as(usize, sub.subtree_size), 1);
+    }
+    return false;
+}
+
+/// Extracts a boolean literal value (`true` / `false`) from either `expr` or a 0-statement `{ expr }` block.
+fn extractSingleBoolValueBranch(
+    checker: *const TypeChecker,
+    branch_ast_id: NodeIndex,
+) ?BoolReturnBranchInfo {
+    if (branch_ast_id.isNone() or branch_ast_id.asInt() >= checker.ast_arena.countNodes()) return null;
+    const branch_node = checker.ast_arena.getNode(branch_ast_id);
+    const val_id: NodeIndex = if (branch_node.tag == .block) blk: {
+        if (branch_node.rhs.tag != .node) return null;
+        if (branch_node.lhs.tag == .extra and checker.getNodeExtraSlice(branch_ast_id, false).len != 0) return null;
+        break :blk NodeIndex.fromInt(branch_node.rhs.payload);
+    } else branch_ast_id;
+
+    if (val_id.isNone() or val_id.asInt() >= checker.ast_arena.countNodes()) return null;
+    const val_node = checker.ast_arena.getNode(val_id);
+    if (val_node.tag != .bool_lit or val_node.main_token.isNone() or
+        val_node.main_token.asInt() >= checker.token_buffer.countTokens())
+    {
+        return null;
+    }
+    const lit_tok = checker.token_buffer.getToken(val_node.main_token);
+    if (lit_tok.flags.is_synthesized) return null;
+    return switch (lit_tok.kind) {
+        .kw_true => .{ .is_true_literal = true },
+        .kw_false => .{ .is_true_literal = false },
+        else => null,
+    };
+}
+
+/// Lints value `if cond { true } else { false }` and `if cond => true else false` -> `cond` / `not cond`.
+fn lintBoolValueIfElse(
+    checker: *TypeChecker,
+    if_ast_id: NodeIndex,
+    if_cst: CstNodeIndex,
+    parent_cst: CstNodeIndex,
+    sink_opt: ?*DiagnosticSink,
+) !bool {
+    if (if_ast_id.isNone() or if_ast_id.asInt() >= checker.ast_arena.countNodes()) return false;
+    if (getRecordedNodeType(checker, if_ast_id) != .bool_ty) return false;
+
+    // Skip statement-position discarded `if` expressions:
+    if (!parent_cst.isNone() and parent_cst.asInt() < checker.cst_arena.countNodes()) {
+        const parent_kind = checker.cst_arena.getNode(parent_cst).kind;
+        if (parent_kind == .expr_stmt) return false;
+        if (parent_kind == .block and parent_cst.asInt() < checker.cst_to_ast.len) {
+            const blk_ast = checker.cst_to_ast[parent_cst.asInt()];
+            if (!blk_ast.isNone() and blk_ast.asInt() < checker.ast_arena.countNodes()) {
+                const blk_node = checker.ast_arena.getNode(blk_ast);
+                if (!(blk_node.rhs.tag == .node and blk_node.rhs.payload == if_ast_id.asInt())) return false;
+            }
+        }
+    }
+
+    const if_node = checker.ast_arena.getNode(if_ast_id);
+    if (if_node.tag != .if_expr or if_node.lhs.tag != .node or if_node.rhs.tag != .extra) return false;
+    const cond_id = NodeIndex.fromInt(if_node.lhs.payload);
+    if (getRecordedNodeType(checker, cond_id) != .bool_ty) return false;
+
+    const branches = checker.getNodeExtraSlice(if_ast_id, true);
+    if (branches.len != 2) return false;
+    const then_id = NodeIndex.fromInt(branches[0]);
+    const else_id = NodeIndex.fromInt(branches[1]);
+    if (!else_id.isNone() and else_id.asInt() < checker.ast_arena.countNodes() and
+        checker.ast_arena.getNode(else_id).tag == .if_expr)
+    {
+        return false;
+    }
+
+    const then_bool = extractSingleBoolValueBranch(checker, then_id) orelse return false;
+    const else_bool = extractSingleBoolValueBranch(checker, else_id) orelse return false;
+    if (then_bool.is_true_literal == else_bool.is_true_literal) return false;
+
+    const cond_cst = checker.ast_arena.getCstOrigin(cond_id);
+    if (hasWalrusInSubtree(checker.cst_arena, checker.token_buffer, cond_cst)) return false;
+    if (hasIsBindingInExprAst(checker, cond_id, 0)) return false;
+
+    const if_span = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, if_cst) orelse return false;
+    if (isW0202SuppressedAtSpan(checker, if_span)) return true;
+
+    var clean_cond_cst = cond_cst;
+    if (!cond_cst.isNone()) {
+        if (try matchRedundantOuterParenCst(checker, cond_cst)) |unwrapped_cond| {
+            clean_cond_cst = unwrapped_cond.inner_cst;
+        }
+    }
+    const cond_span = getCstSubtreeSpan(
+        checker.file_id,
+        checker.cst_arena,
+        checker.token_buffer,
+        clean_cond_cst,
+    ) orelse checker.getAstNodeSpan(cond_id);
+
+    const has_lost_comments =
+        hasCommentsInByteRange(checker.source, checker.token_buffer, if_span.start_byte, cond_span.start_byte) or
+        hasCommentsInByteRange(checker.source, checker.token_buffer, cond_span.end_byte, if_span.end_byte);
+    if (has_lost_comments) return false;
+
+    const cond_slice = checker.source[cond_span.start_byte..cond_span.end_byte];
+    var repl_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer repl_buf.deinit(checker.allocator);
+
+    if (then_bool.is_true_literal) {
+        const wrap_outer = isIdentityBoolUnwrapNeedingParens(checker, parent_cst, cond_id, clean_cond_cst);
+        if (wrap_outer) try repl_buf.append(checker.allocator, '(');
+        try repl_buf.appendSlice(checker.allocator, cond_slice);
+        if (wrap_outer) try repl_buf.append(checker.allocator, ')');
+    } else {
+        const wrap_outer = if (!parent_cst.isNone() and parent_cst.asInt() < checker.cst_arena.countNodes()) blk_w: {
+            const pk = checker.cst_arena.getNode(parent_cst).kind;
+            break :blk_w (pk == .field_or_method_expr or pk == .index_expr or pk == .call_expr or
+                pk == .postfix_try_expr or pk == .postfix_await_expr or pk == .postfix_deref_expr or
+                pk == .cast_expr);
+        } else false;
+        if (wrap_outer) try repl_buf.append(checker.allocator, '(');
+        if (isNotOperandNeedingParens(checker, cond_id)) {
+            try repl_buf.appendSlice(checker.allocator, "not (");
+            try repl_buf.appendSlice(checker.allocator, cond_slice);
+            try repl_buf.append(checker.allocator, ')');
+        } else {
+            try repl_buf.appendSlice(checker.allocator, "not ");
+            try repl_buf.appendSlice(checker.allocator, cond_slice);
+        }
+        if (wrap_outer) try repl_buf.append(checker.allocator, ')');
+    }
+
+    try emitIdiomWarning(
+        sink_opt,
+        if_span,
+        "redundant boolean `if`/`else` expression; use the boolean condition directly",
+        "simplify redundant boolean `if`/`else`",
+        "simplify boolean `if`/`else` expression",
+        &.{.{
+            .file_id = checker.file_id,
+            .start_byte = if_span.start_byte,
+            .end_byte = if_span.end_byte,
+            .replacement_id = try checker.interner.intern(repl_buf.items),
+        }},
+    );
+    return true;
+}
+
+/// Returns `true` when `expr_id` is a pure side-effect-free syntactic scrutinee (`ident`, `self`, field, index, deref).
+fn isPureScrutineeExprAst(checker: *const TypeChecker, expr_id: NodeIndex, depth: u32) bool {
+    if (expr_id.isNone() or expr_id.asInt() >= checker.ast_arena.countNodes() or depth > 16) return false;
+    const node = checker.ast_arena.getNode(expr_id);
+    return switch (node.tag) {
+        .ident_expr, .self_val => true,
+        .field_access, .deref_expr => node.lhs.tag == .node and
+            isPureScrutineeExprAst(checker, NodeIndex.fromInt(node.lhs.payload), depth + 1),
+        .index_expr => node.lhs.tag == .node and node.rhs.tag == .node and
+            isPureScrutineeExprAst(checker, NodeIndex.fromInt(node.lhs.payload), depth + 1) and
+            isPureScrutineeExprAst(checker, NodeIndex.fromInt(node.rhs.payload), depth + 1),
+        else => false,
+    };
+}
+
+/// Returns `true` when `expr_id` is a constant literal, enum variant, or `const_sym` valid in a `match` arm pattern.
+fn isConstOrVariantMatchPatAst(checker: *const TypeChecker, expr_id: NodeIndex) bool {
+    if (expr_id.isNone() or expr_id.asInt() >= checker.ast_arena.countNodes()) return false;
+    const node = checker.ast_arena.getNode(expr_id);
+    return switch (node.tag) {
+        .int_lit, .char_lit, .byte_lit, .string_lit, .byte_string_lit, .contextual_variant => true,
+        .unary_expr => !node.main_token.isNone() and
+            node.main_token.asInt() < checker.token_buffer.countTokens() and
+            checker.token_buffer.getToken(node.main_token).kind == .minus and
+            node.lhs.tag == .node and
+            checker.ast_arena.getNode(NodeIndex.fromInt(node.lhs.payload)).tag == .int_lit,
+        .ident_expr => blk: {
+            if (expr_id.asInt() < checker.node_symbols.len) {
+                const sym_idx = checker.node_symbols[expr_id.asInt()];
+                if (!sym_idx.isNone() and sym_idx.asInt() < checker.sym_table.countSymbols() and
+                    checker.sym_table.getSymbol(sym_idx).kind == .const_sym)
+                {
+                    break :blk true;
+                }
+            }
+            break :blk !node.main_token.isNone() and
+                node.main_token.asInt() < checker.token_buffer.countTokens() and
+                checker.token_buffer.getToken(node.main_token).kind == .const_ident;
+        },
+        .field_access, .path_expr => blk: {
+            if (expr_id.asInt() < checker.node_symbols.len) {
+                const sym_idx = checker.node_symbols[expr_id.asInt()];
+                if (!sym_idx.isNone() and sym_idx.asInt() < checker.sym_table.countSymbols()) {
+                    const sk = checker.sym_table.getSymbol(sym_idx).kind;
+                    if (sk == .enum_variant_sym or sk == .const_sym) break :blk true;
+                }
+            }
+            break :blk node.tag == .field_access and node.rhs.tag == .token and
+                node.rhs.payload < checker.token_buffer.countTokens() and
+                checker.token_buffer.getToken(TokenIndex.fromInt(node.rhs.payload)).kind == .type_ident;
+        },
+        else => false,
+    };
+}
+
+/// Strips redundant outer `( … )` around a non-tuple `is (Pat)` pattern slice for clean `match` arm emission.
+fn trimOuterNonTuplePatParens(checker: *const TypeChecker, pat_id: NodeIndex, raw_pat: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, raw_pat, " \t\r\n");
+    if (pat_id.isNone() or pat_id.asInt() >= checker.ast_arena.countNodes()) return trimmed;
+    if (checker.ast_arena.getNode(pat_id).tag == .tuple_pat) return trimmed;
+    if (trimmed.len < 2 or trimmed[0] != '(' or trimmed[trimmed.len - 1] != ')') return trimmed;
+
+    var depth: u32 = 0;
+    for (trimmed, 0..) |ch, idx| {
+        if (ch == '(') {
+            depth += 1;
+        } else if (ch == ')') {
+            depth -= 1;
+            if (depth == 0 and idx + 1 < trimmed.len) return trimmed;
+        } else if (depth == 1 and ch == ',') {
+            return trimmed;
+        }
+    }
+    return std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+}
+
+/// Extracts `(scrut_node, scrut_slice)` and appends `|`-joined `match` pattern text for `cond_id` (`Priority 1`).
+fn extractMatchArmPatternFromCond(
+    checker: *const TypeChecker,
+    cond_id: NodeIndex,
+    pat_out: *std.ArrayListUnmanaged(u8),
+    depth: u32,
+) !?struct { scrut_node: NodeIndex, scrut_slice: []const u8, uses_equality: bool } {
+    if (cond_id.isNone() or cond_id.asInt() >= checker.ast_arena.countNodes() or depth > 16) return null;
+    const node = checker.ast_arena.getNode(cond_id);
+
+    if (node.tag == .is_expr and !node.main_token.isNone() and
+        node.main_token.asInt() < checker.token_buffer.countTokens() and
+        checker.token_buffer.getToken(node.main_token).kind == .kw_is and
+        node.lhs.tag == .node and node.rhs.tag == .node)
+    {
+        const scrut_id = NodeIndex.fromInt(node.lhs.payload);
+        const pat_id = NodeIndex.fromInt(node.rhs.payload);
+        if (!isPureScrutineeExprAst(checker, scrut_id, 0)) return null;
+        const scrut_cst = checker.ast_arena.getCstOrigin(scrut_id);
+        const pat_cst = checker.ast_arena.getCstOrigin(pat_id);
+        const scrut_sp = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, scrut_cst) orelse return null;
+        const pat_sp = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, pat_cst) orelse return null;
+        const clean_pat = trimOuterNonTuplePatParens(checker, pat_id, checker.source[pat_sp.start_byte..pat_sp.end_byte]);
+        if (clean_pat.len == 0) return null;
+        try pat_out.appendSlice(checker.allocator, clean_pat);
+        return .{
+            .scrut_node = scrut_id,
+            .scrut_slice = std.mem.trim(u8, checker.source[scrut_sp.start_byte..scrut_sp.end_byte], " \t\r\n"),
+            .uses_equality = false,
+        };
+    }
+
+    if (node.tag == .binary_expr and !node.main_token.isNone() and
+        node.main_token.asInt() < checker.token_buffer.countTokens() and
+        node.lhs.tag == .node and node.rhs.tag == .node)
+    {
+        const op_kind = checker.token_buffer.getToken(node.main_token).kind;
+        const lhs_id = NodeIndex.fromInt(node.lhs.payload);
+        const rhs_id = NodeIndex.fromInt(node.rhs.payload);
+
+        if (op_kind == .kw_or) {
+            const left_info = (try extractMatchArmPatternFromCond(checker, lhs_id, pat_out, depth + 1)) orelse return null;
+            try pat_out.appendSlice(checker.allocator, " | ");
+            const right_info = (try extractMatchArmPatternFromCond(checker, rhs_id, pat_out, depth + 1)) orelse return null;
+            if (!std.mem.eql(u8, left_info.scrut_slice, right_info.scrut_slice)) return null;
+            return .{
+                .scrut_node = left_info.scrut_node,
+                .scrut_slice = left_info.scrut_slice,
+                .uses_equality = left_info.uses_equality or right_info.uses_equality,
+            };
+        }
+
+        if (op_kind == .eqeq) {
+            const matched_pair: ?struct { scrut: NodeIndex, pat: NodeIndex } =
+                if (isPureScrutineeExprAst(checker, lhs_id, 0) and isConstOrVariantMatchPatAst(checker, rhs_id))
+                    .{ .scrut = lhs_id, .pat = rhs_id }
+                else if (isPureScrutineeExprAst(checker, rhs_id, 0) and isConstOrVariantMatchPatAst(checker, lhs_id))
+                    .{ .scrut = rhs_id, .pat = lhs_id }
+                else
+                    null;
+            if (matched_pair) |pair| {
+                const scrut_sp = getCstSubtreeSpan(
+                    checker.file_id,
+                    checker.cst_arena,
+                    checker.token_buffer,
+                    checker.ast_arena.getCstOrigin(pair.scrut),
+                ) orelse return null;
+                const pat_sp = getCstSubtreeSpan(
+                    checker.file_id,
+                    checker.cst_arena,
+                    checker.token_buffer,
+                    checker.ast_arena.getCstOrigin(pair.pat),
+                ) orelse return null;
+                try pat_out.appendSlice(
+                    checker.allocator,
+                    std.mem.trim(u8, checker.source[pat_sp.start_byte..pat_sp.end_byte], " \t\r\n"),
+                );
+                return .{
+                    .scrut_node = pair.scrut,
+                    .scrut_slice = std.mem.trim(u8, checker.source[scrut_sp.start_byte..scrut_sp.end_byte], " \t\r\n"),
+                    .uses_equality = true,
+                };
+            }
+        }
+    }
+    return null;
+}
+
+/// Records covered enum variant ordinals into `mask_out` when `cond_id` matches unit/irrefutable variants of `enum_scope`.
+fn collectCoveredEnumVariantsFromCond(
+    checker: *const TypeChecker,
+    enum_scope: symbol_resolver.ScopeId,
+    cond_id: NodeIndex,
+    mask_out: *u64,
+    depth: u32,
+) bool {
+    if (cond_id.isNone() or cond_id.asInt() >= checker.ast_arena.countNodes() or depth > 16) return false;
+    const node = checker.ast_arena.getNode(cond_id);
+    if (node.tag == .binary_expr and !node.main_token.isNone() and
+        node.main_token.asInt() < checker.token_buffer.countTokens() and
+        node.lhs.tag == .node and node.rhs.tag == .node)
+    {
+        const op_kind = checker.token_buffer.getToken(node.main_token).kind;
+        const lhs_id = NodeIndex.fromInt(node.lhs.payload);
+        const rhs_id = NodeIndex.fromInt(node.rhs.payload);
+        if (op_kind == .kw_or) {
+            return collectCoveredEnumVariantsFromCond(checker, enum_scope, lhs_id, mask_out, depth + 1) and
+                collectCoveredEnumVariantsFromCond(checker, enum_scope, rhs_id, mask_out, depth + 1);
+        }
+        if (op_kind == .eqeq) {
+            const pat_id = if (isConstOrVariantMatchPatAst(checker, rhs_id))
+                rhs_id
+            else if (isConstOrVariantMatchPatAst(checker, lhs_id))
+                lhs_id
+            else
+                return false;
+            const pat_node = checker.ast_arena.getNode(pat_id);
+            const var_tok: TokenIndex = switch (pat_node.tag) {
+                .contextual_variant => if (pat_node.lhs.tag == .token) TokenIndex.fromInt(pat_node.lhs.payload) else pat_node.main_token,
+                .field_access => if (pat_node.rhs.tag == .token) TokenIndex.fromInt(pat_node.rhs.payload) else .none,
+                else => .none,
+            };
+            if (var_tok.isNone() or var_tok.asInt() >= checker.token_buffer.countTokens()) return false;
+            const var_name = symbol_resolver.extractTokenSlice(checker.source, checker.token_buffer, var_tok);
+            var cur_ord: u32 = 0;
+            for (checker.sym_table.getScopeMembers(enum_scope)) |mem_idx| {
+                const mem_sym = checker.sym_table.getSymbol(mem_idx).*;
+                if (mem_sym.kind != .enum_variant_sym) continue;
+                if (std.mem.eql(u8, mem_sym.name_text, var_name)) {
+                    if (cur_ord >= 64) return false;
+                    mask_out.* |= (@as(u64, 1) << @intCast(cur_ord));
+                    return true;
+                }
+                cur_ord += 1;
+            }
+        }
+    }
+    return false;
+}
+
+/// Returns `true` when `cond_ids` already cover every declared variant of `scrut_ty` (`<= 64` variants).
+fn isPriority1ChainExhaustiveOnEnum(
+    checker: *const TypeChecker,
+    scrut_ty: TypeId,
+    cond_ids: []const NodeIndex,
+) bool {
+    const unwrapped_ty = checker.pool.unwrapUnderlyingType(scrut_ty);
+    if (unwrapped_ty.isError() or checker.pool.getNode(unwrapped_ty).tag != .enum_ty) return false;
+    const enum_sym_idx = SymbolIndex.fromInt(checker.pool.getNode(unwrapped_ty).rhs);
+    if (enum_sym_idx.isNone() or enum_sym_idx.asInt() >= checker.sym_table.countSymbols()) return false;
+    const enum_scope = checker.sym_table.getSymbol(enum_sym_idx).target_scope;
+    if (enum_scope.isNone()) return false;
+
+    var total_variants: u32 = 0;
+    for (checker.sym_table.getScopeMembers(enum_scope)) |mem_idx| {
+        if (checker.sym_table.getSymbol(mem_idx).kind == .enum_variant_sym) total_variants += 1;
+    }
+    if (total_variants == 0 or total_variants > 64) return false;
+
+    var covered_mask: u64 = 0;
+    for (cond_ids) |cond_id| {
+        if (!collectCoveredEnumVariantsFromCond(checker, enum_scope, cond_id, &covered_mask, 0)) return false;
+    }
+    return covered_mask == (if (total_variants == 64)
+        std.math.maxInt(u64)
+    else
+        (@as(u64, 1) << @intCast(total_variants)) - 1);
+}
+
+/// Returns `true` if `else_ast_id` is a side-effect-free pure literal/identifier expression or `{ pure }` block.
+fn isSideEffectFreeElseFallback(checker: *const TypeChecker, else_ast_id: NodeIndex) bool {
+    if (else_ast_id.isNone() or else_ast_id.asInt() >= checker.ast_arena.countNodes()) return false;
+    var cur = else_ast_id;
+    const outer = checker.ast_arena.getNode(cur);
+    if (outer.tag == .block) {
+        const stmts = if (outer.lhs.tag == .extra) checker.getNodeExtraSlice(cur, false) else &[_]u32{};
+        if (stmts.len != 0 or outer.rhs.tag != .node) return false;
+        cur = NodeIndex.fromInt(outer.rhs.payload);
+        if (cur.isNone() or cur.asInt() >= checker.ast_arena.countNodes()) return false;
+    }
+    return switch (checker.ast_arena.getNode(cur).tag) {
+        .int_lit, .float_lit, .bool_lit, .char_lit, .byte_lit, .string_lit, .byte_string_lit, .ident_expr, .contextual_variant => true,
+        .unary_expr => checker.ast_arena.getNode(cur).lhs.tag == .node and
+            isSideEffectFreeElseFallback(checker, NodeIndex.fromInt(checker.ast_arena.getNode(cur).lhs.payload)),
+        else => false,
+    };
+}
+
+/// Returns `true` if `scrut_ty` is a non-float, non-`bool` type valid for `Priority 1` `match` rewriting.
+fn isValidPriority1ScrutineeType(
+    checker: *const TypeChecker,
+    scrut_ty: TypeId,
+    uses_equality: bool,
+) bool {
+    if (scrut_ty.isError() or scrut_ty == .bool_ty or
+        scrut_ty == .f32_ty or scrut_ty == .f64_ty or
+        scrut_ty == .unit_ty or scrut_ty == .never_ty)
+    {
+        return false;
+    }
+    const base_ty = checker.pool.unwrapRefinementBase(scrut_ty);
+    if (base_ty.isError() or base_ty == .bool_ty or
+        base_ty == .f32_ty or base_ty == .f64_ty)
+    {
+        return false;
+    }
+    if (!uses_equality) return true;
+
+    // For `==` equality chains, ensure `base_ty` supports literal/variant/constant `match` patterns directly:
+    if (base_ty == .i8_ty or base_ty == .i16_ty or base_ty == .i32_ty or base_ty == .i64_ty or base_ty == .i128_ty or
+        base_ty == .isize_ty or base_ty == .u8_ty or base_ty == .u16_ty or base_ty == .u32_ty or base_ty == .u64_ty or
+        base_ty == .u128_ty or base_ty == .usize_ty or base_ty == .char_ty or base_ty == .str_ty)
+    {
+        return true;
+    }
+    const ty_tag = checker.pool.getNode(base_ty).tag;
+    return ty_tag == .enum_ty or ty_tag == .optional_ty or ty_tag == .result_ty;
+}
+
+/// Returns `true` if `arm_tag` is a control-flow or block construct excluded from single-line `if … => …` arms.
+inline fn isDisallowedFatArrowArmAstTag(arm_tag: syntax_arenas.AstTag) bool {
+    return switch (arm_tag) {
+        .if_expr,
+        .match_expr,
+        .block,
+        .with_expr,
+        .for_stmt,
+        .while_stmt,
+        .loop_expr,
+        .return_stmt,
+        .break_stmt,
+        .continue_stmt,
+        => true,
+        else => false,
+    };
+}
+
+/// Renders an arm AST node (`Expr` or `{ … }` `.block`) for a synthesized `match` arm body (`Priority 1`).
+fn extractMatchArmBodySlice(checker: *const TypeChecker, arm_ast_id: NodeIndex) ?[]const u8 {
+    if (arm_ast_id.isNone() or arm_ast_id.asInt() >= checker.ast_arena.countNodes()) return null;
+    const arm_node = checker.ast_arena.getNode(arm_ast_id);
+    if (arm_node.tag == .block and arm_node.rhs.tag == .node) {
+        const stmts = if (arm_node.lhs.tag == .extra) checker.getNodeExtraSlice(arm_ast_id, false) else &[_]u32{};
+        if (stmts.len == 0) {
+            const tail_id = NodeIndex.fromInt(arm_node.rhs.payload);
+            if (!tail_id.isNone() and !isDisallowedFatArrowArmAstTag(checker.ast_arena.getNode(tail_id).tag)) {
+                if (getCstSubtreeSpan(
+                    checker.file_id,
+                    checker.cst_arena,
+                    checker.token_buffer,
+                    checker.ast_arena.getCstOrigin(tail_id),
+                )) |tail_sp| {
+                    const tail_str = std.mem.trim(u8, checker.source[tail_sp.start_byte..tail_sp.end_byte], " \t\r\n");
+                    if (tail_str.len > 0 and tail_str[0] != '{' and std.mem.indexOfScalar(u8, tail_str, '\n') == null) {
+                        return tail_str;
+                    }
+                }
+            }
+        }
+    }
+    const arm_sp = getCstSubtreeSpan(
+        checker.file_id,
+        checker.cst_arena,
+        checker.token_buffer,
+        checker.ast_arena.getCstOrigin(arm_ast_id),
+    ) orelse return null;
+    return std.mem.trim(u8, checker.source[arm_sp.start_byte..arm_sp.end_byte], " \t\r\n");
+}
+
+/// Finds the outermost single-expression `( … )` `.tuple_or_paren_expr` inside `scope_cst` wrapping `inner_cst`.
+fn findEnclosingGroupingParenInScope(
+    checker: *const TypeChecker,
+    scope_cst: CstNodeIndex,
+    inner_cst: CstNodeIndex,
+) CstNodeIndex {
+    const cst_count = checker.cst_arena.countNodes();
+    if (scope_cst.isNone() or inner_cst.isNone() or
+        scope_cst.asInt() >= cst_count or inner_cst.asInt() >= cst_count or
+        scope_cst.asInt() >= inner_cst.asInt())
+    {
+        return inner_cst;
+    }
+    const inner_sp = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, inner_cst) orelse
+        return inner_cst;
+
+    var outer_paren: CstNodeIndex = .none;
+    var cur_idx: usize = scope_cst.asInt();
+    while (cur_idx < inner_cst.asInt()) {
+        const cur_cst = CstNodeIndex.fromInt(@intCast(cur_idx));
+        const cur_rec = checker.cst_arena.getNode(cur_cst);
+        const cur_end = @min(cur_idx + @max(@as(usize, cur_rec.subtree_size), 1), cst_count);
+        if (inner_cst.asInt() >= cur_end) break;
+
+        var is_grouping_paren = false;
+        if (cur_rec.kind == .tuple_or_paren_expr) {
+            if (getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, cur_cst)) |cur_sp| {
+                if (cur_sp.start_byte < inner_sp.start_byte and cur_sp.end_byte > inner_sp.end_byte) {
+                    const between_left = std.mem.trim(
+                        u8,
+                        checker.source[cur_sp.start_byte..inner_sp.start_byte],
+                        " \t\r\n(",
+                    );
+                    const between_right = std.mem.trim(
+                        u8,
+                        checker.source[inner_sp.end_byte..cur_sp.end_byte],
+                        " \t\r\n)",
+                    );
+                    if (between_left.len == 0 and between_right.len == 0) {
+                        is_grouping_paren = true;
+                    }
+                }
+            }
+        }
+        if (is_grouping_paren) {
+            if (outer_paren.isNone()) outer_paren = cur_cst;
+        } else {
+            outer_paren = .none;
+        }
+
+        var next_child = cur_idx + 1;
+        while (next_child < cur_end) {
+            const child_rec = checker.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(next_child)));
+            const child_end = @min(next_child + @max(@as(usize, child_rec.subtree_size), 1), cur_end);
+            if (inner_cst.asInt() < child_end) break;
+            next_child = child_end;
+        }
+        if (next_child <= cur_idx or next_child >= cur_end) break;
+        cur_idx = next_child;
+    }
+    return if (!outer_paren.isNone()) outer_paren else inner_cst;
+}
+
+/// Enforces the non-oscillating 3-tier `W0202` conditional/`match` hierarchy (plus value boolean `if` simplification)
+/// on outermost `.if_expr` chains (`Priority 1: match` > `Priority 2: =>` > `Priority 3: { }`).
+fn lintConditionalIfHierarchy(
+    checker: *TypeChecker,
+    root_if_cst: CstNodeIndex,
+    parent_cst: CstNodeIndex,
+    is_in_no_struct_lit_header: bool,
+    suppressed_headers: *std.AutoHashMapUnmanaged(u32, void),
+    sink_opt: ?*DiagnosticSink,
+) !void {
+    if (root_if_cst.isNone() or root_if_cst.asInt() >= checker.cst_to_ast.len) return;
+    if (hasSyntaxErrorInSubtree(checker.cst_arena, checker.token_buffer, root_if_cst)) return;
+    const root_if_ast = checker.cst_to_ast[root_if_cst.asInt()];
+    if (root_if_ast.isNone() or root_if_ast.asInt() >= checker.ast_arena.countNodes()) return;
+
+    // [0] Value boolean simplification (`if cond { true } else { false }` / `if cond => true else false`):
+    if (try lintBoolValueIfElse(checker, root_if_ast, root_if_cst, parent_cst, sink_opt)) {
+        try suppressed_headers.put(checker.allocator, root_if_cst.asInt(), {});
+        return;
+    }
+
+    // Walk the complete `if` / `else if` / `[else]` chain starting at `root_if_ast`:
+    var cond_ids: std.ArrayListUnmanaged(NodeIndex) = .empty;
+    defer cond_ids.deinit(checker.allocator);
+    var arm_ids: std.ArrayListUnmanaged(NodeIndex) = .empty;
+    defer arm_ids.deinit(checker.allocator);
+    var chain_csts: std.ArrayListUnmanaged(CstNodeIndex) = .empty;
+    defer chain_csts.deinit(checker.allocator);
+
+    const is_fat_arrow_chain = isFatArrowIfCstNode(checker.cst_arena, checker.token_buffer, root_if_cst);
+    var has_trailing_else = false;
+    var cur_if_ast = root_if_ast;
+    var steps: usize = 0;
+
+    while (!cur_if_ast.isNone() and cur_if_ast.asInt() < checker.ast_arena.countNodes() and steps < 64) : (steps += 1) {
+        const cur_node = checker.ast_arena.getNode(cur_if_ast);
+        if (cur_node.tag != .if_expr or cur_node.lhs.tag != .node) return;
+        const cur_cst = checker.ast_arena.getCstOrigin(cur_if_ast);
+        if (!cur_cst.isNone()) try chain_csts.append(checker.allocator, cur_cst);
+
+        try cond_ids.append(checker.allocator, NodeIndex.fromInt(cur_node.lhs.payload));
+        if (cur_node.rhs.tag == .node) {
+            try arm_ids.append(checker.allocator, NodeIndex.fromInt(cur_node.rhs.payload));
+            has_trailing_else = false;
+            break;
+        }
+        if (cur_node.rhs.tag != .extra) return;
+        const branches = checker.getNodeExtraSlice(cur_if_ast, true);
+        if (branches.len != 2) return;
+        const then_id = NodeIndex.fromInt(branches[0]);
+        const else_id = NodeIndex.fromInt(branches[1]);
+        if (then_id.isNone() or else_id.isNone() or
+            then_id.asInt() >= checker.ast_arena.countNodes() or
+            else_id.asInt() >= checker.ast_arena.countNodes())
+        {
+            return;
+        }
+        if (checker.ast_arena.getNode(else_id).tag == .expr_hole) return;
+        try arm_ids.append(checker.allocator, then_id);
+
+        if (checker.ast_arena.getNode(else_id).tag == .if_expr) {
+            cur_if_ast = else_id;
+            continue;
+        }
+        try arm_ids.append(checker.allocator, else_id);
+        has_trailing_else = true;
+        break;
+    }
+
+    if (!has_trailing_else or cond_ids.items.len == 0 or arm_ids.items.len != cond_ids.items.len + 1) return;
+    const if_span = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, root_if_cst) orelse return;
+    const has_interior_comments = hasCommentsInByteRange(
+        checker.source,
+        checker.token_buffer,
+        if_span.start_byte,
+        if_span.end_byte,
+    );
+
+    // [1] Priority 1: `K >= 3` conditions testing ONE pure non-float, non-`bool` scrutinee -> `match`:
+    if (cond_ids.items.len >= 3) {
+        var pat_buffers: std.ArrayListUnmanaged(std.ArrayListUnmanaged(u8)) = .empty;
+        defer {
+            for (pat_buffers.items) |*pb| pb.deinit(checker.allocator);
+            pat_buffers.deinit(checker.allocator);
+        }
+        var shared_scrut_slice: ?[]const u8 = null;
+        var shared_scrut_node: NodeIndex = .none;
+        var any_equality = false;
+        var is_all_single_scrut = true;
+
+        for (cond_ids.items) |cond_id| {
+            var pat_buf: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer pat_buf.deinit(checker.allocator);
+            if (try extractMatchArmPatternFromCond(checker, cond_id, &pat_buf, 0)) |info| {
+                if (shared_scrut_slice) |existing_scrut| {
+                    if (!std.mem.eql(u8, existing_scrut, info.scrut_slice)) {
+                        pat_buf.deinit(checker.allocator);
+                        is_all_single_scrut = false;
+                        break;
+                    }
+                } else {
+                    shared_scrut_slice = info.scrut_slice;
+                    shared_scrut_node = info.scrut_node;
+                }
+                if (info.uses_equality) any_equality = true;
+                try pat_buffers.append(checker.allocator, pat_buf);
+            } else {
+                pat_buf.deinit(checker.allocator);
+                is_all_single_scrut = false;
+                break;
+            }
+        }
+
+        if (is_all_single_scrut and shared_scrut_slice != null and
+            isValidPriority1ScrutineeType(checker, getRecordedNodeType(checker, shared_scrut_node), any_equality))
+        {
+            for (chain_csts.items) |c_cst| {
+                try suppressed_headers.put(checker.allocator, c_cst.asInt(), {});
+            }
+            if (isW0202SuppressedAtSpan(checker, if_span)) return;
+
+            if (has_interior_comments) {
+                try emitIdiomWarning(
+                    sink_opt,
+                    if_span,
+                    "chained `if` tests a single value across 3 or more arms; rewrite as `match`",
+                    "prefer exhaustive `match` over 3+ single-scrutinee `if` arms",
+                    "rewrite chained `if` to `match`",
+                    &.{},
+                );
+                return;
+            }
+
+            const is_enum_exhaustive = isPriority1ChainExhaustiveOnEnum(
+                checker,
+                getRecordedNodeType(checker, shared_scrut_node),
+                cond_ids.items,
+            );
+            const else_arm_id = arm_ids.items[cond_ids.items.len];
+            if (is_enum_exhaustive and !isSideEffectFreeElseFallback(checker, else_arm_id)) {
+                try emitIdiomWarning(
+                    sink_opt,
+                    if_span,
+                    "chained `if` tests a single value across 3 or more arms; rewrite as `match`",
+                    "prefer exhaustive `match` over 3+ single-scrutinee `if` arms",
+                    "rewrite chained `if` to `match`",
+                    &.{},
+                );
+                return;
+            }
+
+            var match_buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer match_buf.deinit(checker.allocator);
+            try match_buf.appendSlice(checker.allocator, "match ");
+            try match_buf.appendSlice(checker.allocator, shared_scrut_slice.?);
+            try match_buf.appendSlice(checker.allocator, " {\n");
+            for (pat_buffers.items, 0..) |pat_b, arm_i| {
+                const body_slice = extractMatchArmBodySlice(checker, arm_ids.items[arm_i]) orelse return;
+                try match_buf.appendSlice(checker.allocator, "    ");
+                try match_buf.appendSlice(checker.allocator, pat_b.items);
+                try match_buf.appendSlice(checker.allocator, " => ");
+                try match_buf.appendSlice(checker.allocator, body_slice);
+                try match_buf.appendSlice(checker.allocator, ",\n");
+            }
+            if (is_enum_exhaustive) {
+                try match_buf.append(checker.allocator, '}');
+            } else {
+                const else_slice = extractMatchArmBodySlice(checker, else_arm_id) orelse return;
+                try match_buf.appendSlice(checker.allocator, "    _ => ");
+                try match_buf.appendSlice(checker.allocator, else_slice);
+                try match_buf.appendSlice(checker.allocator, ",\n}");
+            }
+
+            try emitIdiomWarning(
+                sink_opt,
+                if_span,
+                "chained `if` tests a single value across 3 or more arms; rewrite as `match`",
+                "prefer exhaustive `match` over 3+ single-scrutinee `if` arms",
+                "rewrite chained `if` to `match`",
+                &.{.{
+                    .file_id = checker.file_id,
+                    .start_byte = if_span.start_byte,
+                    .end_byte = if_span.end_byte,
+                    .replacement_id = try checker.interner.intern(match_buf.items),
+                }},
+            );
+            return;
+        }
+    }
+
+    // [2] Priority 2: Braced value `if { a } else { b }` (`1 <= K <= 4`, `0` stmts, `0` comments, single-line arms) -> `=>`:
+    if (!is_fat_arrow_chain and cond_ids.items.len <= 4 and !has_interior_comments) {
+        const if_ty = getRecordedNodeType(checker, root_if_ast);
+        var is_stmt_discarded = false;
+        if (!parent_cst.isNone() and parent_cst.asInt() < checker.cst_arena.countNodes()) {
+            const pk = checker.cst_arena.getNode(parent_cst).kind;
+            if (pk == .expr_stmt) {
+                is_stmt_discarded = true;
+            } else if (pk == .block and parent_cst.asInt() < checker.cst_to_ast.len) {
+                const blk_ast = checker.cst_to_ast[parent_cst.asInt()];
+                if (!blk_ast.isNone() and blk_ast.asInt() < checker.ast_arena.countNodes()) {
+                    const blk_node = checker.ast_arena.getNode(blk_ast);
+                    if (!(blk_node.rhs.tag == .node and blk_node.rhs.payload == root_if_ast.asInt())) {
+                        is_stmt_discarded = true;
+                    }
+                }
+            }
+        }
+
+        if (!is_stmt_discarded and !if_ty.isError() and if_ty != .unit_ty and if_ty != .never_ty) {
+            var cond_slices: [4][]const u8 = undefined;
+            var arm_slices: [5][]const u8 = undefined;
+            var is_p2_eligible = true;
+            var has_brace_ambig_subexpr = false;
+
+            for (cond_ids.items, 0..) |cond_id, ci| {
+                const base_c_cst = checker.ast_arena.getCstOrigin(cond_id);
+                var clean_c_cst = findEnclosingGroupingParenInScope(checker, root_if_cst, base_c_cst);
+                var unwrap_steps: usize = 0;
+                while (!clean_c_cst.isNone() and unwrap_steps < 16) : (unwrap_steps += 1) {
+                    if (try matchRedundantOuterParenCst(checker, clean_c_cst)) |unwrapped| {
+                        clean_c_cst = unwrapped.inner_cst;
+                    } else {
+                        break;
+                    }
+                }
+                if (clean_c_cst == base_c_cst and
+                    (checker.ast_arena.getNode(cond_id).tag == .struct_lit or
+                        hasStructLitOrBlockInSubtree(checker.cst_arena, checker.token_buffer, clean_c_cst)))
+                {
+                    has_brace_ambig_subexpr = true;
+                }
+                const csp = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, clean_c_cst) orelse {
+                    is_p2_eligible = false;
+                    break;
+                };
+                const c_str = std.mem.trim(u8, checker.source[csp.start_byte..csp.end_byte], " \t\r\n");
+                if (c_str.len == 0 or std.mem.indexOfScalar(u8, c_str, '\n') != null) {
+                    is_p2_eligible = false;
+                    break;
+                }
+                cond_slices[ci] = c_str;
+            }
+
+            if (is_p2_eligible) {
+                for (arm_ids.items, 0..) |blk_id, ai| {
+                    const blk_node = checker.ast_arena.getNode(blk_id);
+                    if (blk_node.tag != .block or blk_node.rhs.tag != .node) {
+                        is_p2_eligible = false;
+                        break;
+                    }
+                    const stmts = if (blk_node.lhs.tag == .extra)
+                        checker.getNodeExtraSlice(blk_id, false)
+                    else
+                        &[_]u32{};
+                    if (stmts.len != 0) {
+                        is_p2_eligible = false;
+                        break;
+                    }
+                    const tail_id = NodeIndex.fromInt(blk_node.rhs.payload);
+                    const tail_tag = if (!tail_id.isNone()) checker.ast_arena.getNode(tail_id).tag else .expr_hole;
+                    if (tail_id.isNone() or isDisallowedFatArrowArmAstTag(tail_tag)) {
+                        is_p2_eligible = false;
+                        break;
+                    }
+                    const base_tail_cst = checker.ast_arena.getCstOrigin(tail_id);
+                    const tail_cst = if (tail_tag == .tuple_lit)
+                        base_tail_cst
+                    else
+                        findEnclosingGroupingParenInScope(checker, root_if_cst, base_tail_cst);
+                    if (tail_cst == base_tail_cst and
+                        (tail_tag == .struct_lit or
+                            hasStructLitOrBlockInSubtree(checker.cst_arena, checker.token_buffer, tail_cst)))
+                    {
+                        has_brace_ambig_subexpr = true;
+                    }
+                    const tsp = getCstSubtreeSpan(
+                        checker.file_id,
+                        checker.cst_arena,
+                        checker.token_buffer,
+                        tail_cst,
+                    ) orelse {
+                        is_p2_eligible = false;
+                        break;
+                    };
+                    const t_str = std.mem.trim(u8, checker.source[tsp.start_byte..tsp.end_byte], " \t\r\n");
+                    if (t_str.len == 0 or t_str[0] == '{' or std.mem.indexOfScalar(u8, t_str, '\n') != null) {
+                        is_p2_eligible = false;
+                        break;
+                    }
+                    arm_slices[ai] = t_str;
+                }
+            }
+
+            if (is_p2_eligible) {
+                const parent_kind: ?CstNodeKind = if (!parent_cst.isNone() and
+                    parent_cst.asInt() < checker.cst_arena.countNodes())
+                    checker.cst_arena.getNode(parent_cst).kind
+                else
+                    null;
+
+                var needs_parens = if (parent_kind) |pk_val| switch (pk_val) {
+                    .field_or_method_expr,
+                    .call_expr,
+                    .postfix_try_expr,
+                    .postfix_await_expr,
+                    .postfix_deref_expr,
+                    .prefix_expr,
+                    .infix_expr,
+                    .cast_expr,
+                    => true,
+                    .index_expr => blk_idx: {
+                        var idx_children: std.ArrayListUnmanaged(CstNodeIndex) = .empty;
+                        defer idx_children.deinit(checker.allocator);
+                        try collectDirectCstChildren(checker.allocator, checker.cst_arena, parent_cst, &idx_children);
+                        for (idx_children.items) |sub_child| {
+                            const sub_rec = checker.cst_arena.getNode(sub_child);
+                            if (sub_rec.subtree_size <= 1 and !sub_rec.token.isNone() and
+                                checker.token_buffer.getToken(sub_rec.token).kind == .lbracket)
+                            {
+                                break :blk_idx if_span.start_byte < checker.token_buffer.getToken(sub_rec.token).byte_offset;
+                            }
+                        }
+                        break :blk_idx true;
+                    },
+                    else => false,
+                } else false;
+
+                if (is_in_no_struct_lit_header and has_brace_ambig_subexpr) {
+                    needs_parens = true;
+                }
+
+                const is_direct_fn_expr_body = (parent_kind == .fn_expr_body);
+                if (try fmt_engine.fitsInlineFatArrowIfLineBudget(
+                    checker.allocator,
+                    checker.source,
+                    if_span.start_byte,
+                    if_span.end_byte,
+                    cond_slices[0..cond_ids.items.len],
+                    arm_slices[0..arm_ids.items.len],
+                    needs_parens,
+                    is_direct_fn_expr_body,
+                )) {
+                    for (chain_csts.items) |c_cst| {
+                        try suppressed_headers.put(checker.allocator, c_cst.asInt(), {});
+                    }
+                    if (isW0202SuppressedAtSpan(checker, if_span)) return;
+
+                    var arrow_buf: std.ArrayListUnmanaged(u8) = .empty;
+                    defer arrow_buf.deinit(checker.allocator);
+                    if (needs_parens) try arrow_buf.append(checker.allocator, '(');
+                    for (0..cond_ids.items.len) |ci| {
+                        try arrow_buf.appendSlice(checker.allocator, if (ci == 0) "if " else " else if ");
+                        try arrow_buf.appendSlice(checker.allocator, cond_slices[ci]);
+                        try arrow_buf.appendSlice(checker.allocator, " => ");
+                        try arrow_buf.appendSlice(checker.allocator, arm_slices[ci]);
+                    }
+                    try arrow_buf.appendSlice(checker.allocator, " else ");
+                    try arrow_buf.appendSlice(checker.allocator, arm_slices[cond_ids.items.len]);
+                    if (needs_parens) try arrow_buf.append(checker.allocator, ')');
+
+                    try emitIdiomWarning(
+                        sink_opt,
+                        if_span,
+                        "single-expression value `if { … } else { … }` can use inline `if cond => a else b` (`ADR-24D`)",
+                        "prefer inline `if … => … else …` value expression",
+                        "rewrite braced value `if` to `if cond => a else b`",
+                        &.{.{
+                            .file_id = checker.file_id,
+                            .start_byte = if_span.start_byte,
+                            .end_byte = if_span.end_byte,
+                            .replacement_id = try checker.interner.intern(arrow_buf.items),
+                        }},
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    // [3] Priority 3: Fat-arrow `if … => …` with `K >= 5` conditions OR multi-line arm expression -> `{ … }` blocks:
+    if (is_fat_arrow_chain) {
+        var has_multiline_arm_or_cond = false;
+        var cond_slices: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer cond_slices.deinit(checker.allocator);
+        var arm_slices: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer arm_slices.deinit(checker.allocator);
+
+        for (cond_ids.items) |cond_id| {
+            const cond_cst = findEnclosingGroupingParenInScope(
+                checker,
+                root_if_cst,
+                checker.ast_arena.getCstOrigin(cond_id),
+            );
+            const csp = getCstSubtreeSpan(
+                checker.file_id,
+                checker.cst_arena,
+                checker.token_buffer,
+                cond_cst,
+            ) orelse return;
+            const c_str = std.mem.trim(u8, checker.source[csp.start_byte..csp.end_byte], " \t\r\n");
+            if (c_str.len == 0) return;
+            if (std.mem.indexOfScalar(u8, c_str, '\n') != null) has_multiline_arm_or_cond = true;
+            try cond_slices.append(checker.allocator, c_str);
+        }
+        for (arm_ids.items) |arm_id| {
+            const base_arm_cst = checker.ast_arena.getCstOrigin(arm_id);
+            const arm_cst = if (!arm_id.isNone() and checker.ast_arena.getNode(arm_id).tag == .tuple_lit)
+                base_arm_cst
+            else
+                findEnclosingGroupingParenInScope(checker, root_if_cst, base_arm_cst);
+            const asp = getCstSubtreeSpan(
+                checker.file_id,
+                checker.cst_arena,
+                checker.token_buffer,
+                arm_cst,
+            ) orelse return;
+            const a_str = std.mem.trim(u8, checker.source[asp.start_byte..asp.end_byte], " \t\r\n");
+            if (a_str.len == 0) return;
+            if (std.mem.indexOfScalar(u8, a_str, '\n') != null) has_multiline_arm_or_cond = true;
+            try arm_slices.append(checker.allocator, a_str);
+        }
+
+        if (cond_ids.items.len >= 5 or has_multiline_arm_or_cond) {
+            for (chain_csts.items) |c_cst| {
+                try suppressed_headers.put(checker.allocator, c_cst.asInt(), {});
+            }
+            if (isW0202SuppressedAtSpan(checker, if_span)) return;
+
+            if (has_interior_comments) {
+                try emitIdiomWarning(
+                    sink_opt,
+                    if_span,
+                    "inline `if … => …` chain has 5+ conditions or multi-line arms; rewrite with `{ … }` blocks (`ADR-24D`)",
+                    "prefer `{ … }` blocks for 5+ conditions or multi-line arms",
+                    "rewrite `if … => …` to braced `{ … }` blocks",
+                    &.{},
+                );
+                return;
+            }
+
+            var braced_buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer braced_buf.deinit(checker.allocator);
+            for (cond_slices.items, 0..) |c_str, ci| {
+                try braced_buf.appendSlice(checker.allocator, if (ci == 0) "if " else " else if ");
+                try braced_buf.appendSlice(checker.allocator, c_str);
+                try braced_buf.appendSlice(checker.allocator, " {\n    ");
+                try braced_buf.appendSlice(checker.allocator, arm_slices.items[ci]);
+                try braced_buf.appendSlice(checker.allocator, "\n}");
+            }
+            try braced_buf.appendSlice(checker.allocator, " else {\n    ");
+            try braced_buf.appendSlice(checker.allocator, arm_slices.items[cond_slices.items.len]);
+            try braced_buf.appendSlice(checker.allocator, "\n}");
+
+            try emitIdiomWarning(
+                sink_opt,
+                if_span,
+                "inline `if … => …` chain has 5+ conditions or multi-line arms; rewrite with `{ … }` blocks (`ADR-24D`)",
+                "prefer `{ … }` blocks for 5+ conditions or multi-line arms",
+                "rewrite `if … => …` to braced `{ … }` blocks",
+                &.{.{
+                    .file_id = checker.file_id,
+                    .start_byte = if_span.start_byte,
+                    .end_byte = if_span.end_byte,
+                    .replacement_id = try checker.interner.intern(braced_buf.items),
+                }},
+            );
+        }
+    }
+}
+
 /// Returns `true` if `kind` is an item declaration CST node gated by `@cfg(…)`.
 fn isCfgGateableItemCstKind(kind: CstNodeKind) bool {
     return switch (kind) {
@@ -2376,6 +3425,7 @@ fn walkAndLintCstSubtree(
     grandparent_cst: CstNodeIndex,
     is_signature_mode: bool,
     is_inside_trait_item: bool,
+    is_in_no_struct_lit_header: bool,
     suppressed_headers: *std.AutoHashMapUnmanaged(u32, void),
     sink_opt: ?*DiagnosticSink,
     depth: u32,
@@ -2390,11 +3440,27 @@ fn walkAndLintCstSubtree(
     if (isCfgGateableItemCstKind(node.kind) and !checker.isCstNodeCfgEnabled(cst_idx)) return;
     if (!checker.is_including_tests and (node.kind == .test_item or node.kind == .bench_item)) return;
 
-    // [1] In body mode, check `.block` statements first so Idioms 5 & 6 suppress duplicate Idiom 1 hits:
+    // [1] In body mode, check `.block` statements and outermost `.if_expr` chains before Idiom 1 header parens:
     if (!is_signature_mode and node.kind == .block and cst_idx.asInt() < checker.cst_to_ast.len) {
         const block_ast = checker.cst_to_ast[cst_idx.asInt()];
         if (!block_ast.isNone()) {
             try lintBlockStatementsAst(checker, block_ast, suppressed_headers, sink_opt);
+        }
+    }
+    if (!is_signature_mode and node.kind == .if_expr and !suppressed_headers.contains(cst_idx.asInt())) {
+        const is_else_if_child = !parent_cst.isNone() and
+            checker.cst_arena.getNode(parent_cst).kind == .else_branch and
+            !grandparent_cst.isNone() and
+            checker.cst_arena.getNode(grandparent_cst).kind == .if_expr;
+        if (!is_else_if_child) {
+            try lintConditionalIfHierarchy(
+                checker,
+                cst_idx,
+                parent_cst,
+                is_in_no_struct_lit_header,
+                suppressed_headers,
+                sink_opt,
+            );
         }
     }
 
@@ -2457,9 +3523,21 @@ fn walkAndLintCstSubtree(
 
     const is_next_in_trait = is_inside_trait_item or (node.kind == .trait_item);
     var has_passed_const_eq = false;
+    var has_passed_header_open_delim = false;
 
     for (children.items, 0..) |child_cst, child_pos| {
         const child_node = checker.cst_arena.getNode(child_cst);
+        if (child_node.subtree_size <= 1 and !child_node.token.isNone() and
+            child_node.token.asInt() < checker.token_buffer.countTokens())
+        {
+            const tok_kind = checker.token_buffer.getToken(child_node.token).kind;
+            if ((node.kind == .match_expr and tok_kind == .lbrace) or
+                (node.kind == .index_expr and tok_kind == .lbracket) or
+                (node.kind == .call_expr and tok_kind == .lparen))
+            {
+                has_passed_header_open_delim = true;
+            }
+        }
         if (is_signature_mode) {
             if (node.kind == .fn_item and !is_inside_trait_item and
                 (child_node.kind == .block or child_node.kind == .fn_expr_body))
@@ -2492,6 +3570,35 @@ fn walkAndLintCstSubtree(
                 continue;
             }
         }
+        const next_in_no_struct_lit_header = switch (child_node.kind) {
+            .if_cond, .while_header, .for_header, .context_binding => true,
+            .tuple_or_paren_expr,
+            .block,
+            .array_expr,
+            .call_arg,
+            .struct_lit_expr,
+            .field_init,
+            .view_block_expr,
+            .match_arm,
+            .local_decl_stmt,
+            .return_stmt,
+            .assign_stmt,
+            .expr_stmt,
+            .const_item,
+            .fn_item,
+            .fn_expr_body,
+            .test_item,
+            .bench_item,
+            .subscript_arm,
+            => false,
+            else => if ((node.kind == .match_expr or node.kind == .while_stmt or
+                node.kind == .for_stmt or node.kind == .with_expr) and !has_passed_header_open_delim)
+                true
+            else if ((node.kind == .index_expr or node.kind == .call_expr) and has_passed_header_open_delim)
+                false
+            else
+                is_in_no_struct_lit_header,
+        };
         try walkAndLintCstSubtree(
             checker,
             child_cst,
@@ -2499,6 +3606,7 @@ fn walkAndLintCstSubtree(
             parent_cst,
             is_signature_mode,
             is_next_in_trait,
+            next_in_no_struct_lit_header,
             suppressed_headers,
             sink_opt,
             depth + 1,
@@ -2531,6 +3639,7 @@ fn lintSingleItemBodyAst(
             .none,
             false,
             false,
+            false,
             suppressed_headers,
             sink_opt,
             0,
@@ -2555,6 +3664,7 @@ fn lintSingleItemBodyAst(
                         .none,
                         false,
                         false,
+                        false,
                         suppressed_headers,
                         sink_opt,
                         1,
@@ -2568,6 +3678,7 @@ fn lintSingleItemBodyAst(
                         child_cst,
                         item_cst,
                         .none,
+                        false,
                         false,
                         false,
                         suppressed_headers,
@@ -2588,6 +3699,7 @@ fn lintSingleItemBodyAst(
                                 arm_part,
                                 child_cst,
                                 item_cst,
+                                false,
                                 false,
                                 false,
                                 suppressed_headers,
@@ -2611,6 +3723,7 @@ fn lintSingleItemBodyAst(
                         child_cst,
                         item_cst,
                         .none,
+                        false,
                         false,
                         false,
                         suppressed_headers,
@@ -2660,16 +3773,23 @@ fn collectEditableRootCandidates(
     }
     std.mem.sort(FileId, candidate_ids.items, {}, compareFileIdAsc);
 
+    const is_explicit_candidate = options.candidate_files != null;
     for (candidate_ids.items) |fid| {
-        if (db.symbol_table.getFilePackageId(fid) != .root) continue;
-        if (db.isStdlibFile(fid)) continue;
+        const file_pkg_id = db.symbol_table.getFilePackageId(fid);
+        if (!is_explicit_candidate) {
+            if (file_pkg_id != .root or db.isStdlibFile(fid)) continue;
+        } else if (file_pkg_id != .root and file_pkg_id != .std_core) {
+            continue;
+        }
 
         var is_open = false;
         var has_disk = false;
         var resolved_path: []const u8 = "";
         if (options.vfs) |vfs_ptr| {
             if (vfs_ptr.getFileEntry(fid)) |entry| {
-                if (entry.package_id != .root or entry.backing_kind == .cxtree_archive) continue;
+                if (entry.backing_kind == .cxtree_archive) continue;
+                if (!is_explicit_candidate and entry.package_id != .root) continue;
+                if (is_explicit_candidate and entry.package_id != .root and entry.package_id != .std_core) continue;
                 is_open = entry.is_open_in_editor;
                 has_disk = entry.has_disk_backing;
                 const os_path = vfs_ptr.interner.get(entry.resolved_os_path);
@@ -3535,7 +4655,9 @@ pub fn isGeneratedSourceHeader(source: []const u8) bool {
             cursor += 1;
             continue;
         }
-        if (cursor + 1 < scan_limit and ch_byte == '/' and source[cursor + 1] == '/') {
+        if (cursor + 1 < scan_limit and ch_byte == '/' and
+            (source[cursor + 1] == '/' or source[cursor + 1] == '|' or source[cursor + 1] == '#'))
+        {
             const rest = source[cursor..scan_limit];
             const nl_rel = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
             if (hasGeneratedMarkerSubstring(rest[0..nl_rel])) return true;
@@ -3607,6 +4729,7 @@ pub fn lintFileSignaturesW0202(
         .none,
         .none,
         true,
+        false,
         false,
         &suppressed_headers,
         sink_opt,
@@ -4475,12 +5598,14 @@ pub fn renderExplainCapsReport(
 
 test "test_check_audit_is_generated_source_header" {
     try std.testing.expect(isGeneratedSourceHeader("// @generated by corex translate-c\npub fn init() {}\n"));
+    try std.testing.expect(isGeneratedSourceHeader("/# @generated module bindings\npub fn init() {}\n"));
+    try std.testing.expect(isGeneratedSourceHeader("/| DO NOT EDIT item bindings\npub fn init() {}\n"));
     try std.testing.expect(isGeneratedSourceHeader("/* Code generated – DO NOT EDIT. */\npub struct Wire {}\n"));
     try std.testing.expect(isGeneratedSourceHeader(
-        "\xEF\xBB\xBF#!/usr/bin/env corex\n---\n[dependencies]\n---\n//! @generated bindings\npub fn call() {}\n",
+        "\xEF\xBB\xBF#!/usr/bin/env corex\n---\n[dependencies]\n---\n/# @generated bindings\npub fn call() {}\n",
     ));
     try std.testing.expect(!isGeneratedSourceHeader("pub fn regular() {\n    // @generated inside body\n}\n"));
-    try std.testing.expect(!isGeneratedSourceHeader("//! Normal hand-written module header\npub fn ok() {}\n"));
+    try std.testing.expect(!isGeneratedSourceHeader("/# Normal hand-written module header\npub fn ok() {}\n"));
 
     const padded = try std.testing.allocator.alloc(u8, 4200);
     defer std.testing.allocator.free(padded);
@@ -4834,4 +5959,77 @@ test "test_script_frontmatter_check_fix_disk_preservation_and_coalesced_comments
     try std.testing.expect(std.mem.startsWith(u8, mode_b_after, mode_b_prefix));
     try std.testing.expect(std.mem.indexOf(u8, mode_b_after, "opt: i32?") != null);
     try std.testing.expect(std.mem.indexOf(u8, mode_b_after, "return flag;") != null);
+}
+
+test "test_check_audit_w0202_three_tier_conditional_match_hierarchy_non_oscillating" {
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var vfs = VfsSourceMap.init(std.testing.allocator, &interner);
+    defer vfs.deinit(std.testing.io);
+    var db = try CompilerDb.init(std.testing.allocator);
+    defer db.deinit();
+
+    const raw_src =
+        \\pub enum Verb: u8 {
+        \\    Get = 0,
+        \\    Post = 1,
+        \\    Put = 2,
+        \\    Delete = 3,
+        \\}
+        \\
+        \\pub fn tier_showcase(verb: Verb, code: u32, delta: i32, flag: bool) -> i32 {
+        \\    let bool_arrow = if flag => true else false;
+        \\    let bool_neg = if flag { false } else { true };
+        \\    let by_verb = if verb == .Get {
+        \\        1_i32
+        \\    } else if verb == .Post or verb == .Put {
+        \\        2_i32
+        \\    } else if verb == .Delete {
+        \\        3_i32
+        \\    } else {
+        \\        0_i32
+        \\    };
+        \\    let by_code = if code == 10_u32 => 1_i32 else if code == 20_u32 => 2_i32 else if code == 30_u32 => 3_i32 else 0_i32;
+        \\    let sign_val = if delta < 0 { -1_i32 } else if delta > 0 { 1_i32 } else { 0_i32 };
+        \\    let five_conds = if delta == 1 => 1_i32
+        \\        else if delta == 2 => 2_i32
+        \\        else if delta > 100 => 3_i32
+        \\        else if delta < -100 => -3_i32
+        \\        else if flag => 9_i32
+        \\        else 0_i32;
+        \\    _ = bool_arrow;
+        \\    _ = bool_neg;
+        \\    return by_verb +% by_code +% sign_val +% five_conds;
+        \\}
+    ++ "\n";
+
+    const fid = try vfs.setOverlay("src/cond_tiers.cx", raw_src, .root);
+    _ = try db.setInput(fid, raw_src, .low);
+    try db.setFilePath(fid, "src/cond_tiers.cx");
+
+    const rep1 = try applyCheckFixesOnDb(std.testing.allocator, &db, .{
+        .vfs = &vfs,
+        .is_writing_to_disk = false,
+        .candidate_files = &.{fid},
+    });
+    try std.testing.expect(!rep1.is_rolled_back);
+    try std.testing.expect(rep1.applied_fix_count >= 6);
+
+    const fixed_src = try db.getSourceText(fid);
+    try std.testing.expect(std.mem.indexOf(u8, fixed_src, "let bool_arrow = flag;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fixed_src, "let bool_neg = not flag;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fixed_src, "match verb {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fixed_src, ".Post | .Put => 2_i32,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fixed_src, "match code {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fixed_src, "if delta < 0 => -1_i32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fixed_src, "if delta == 1 {\n        1_i32\n    }") != null);
+
+    // Non-oscillation proof: running `applyCheckFixesOnDb` again must apply 0 fixes!
+    const rep2 = try applyCheckFixesOnDb(std.testing.allocator, &db, .{
+        .vfs = &vfs,
+        .is_writing_to_disk = false,
+        .candidate_files = &.{fid},
+    });
+    try std.testing.expectEqual(@as(u32, 0), rep2.applied_fix_count);
+    try std.testing.expectEqualStrings(fixed_src, try db.getSourceText(fid));
 }

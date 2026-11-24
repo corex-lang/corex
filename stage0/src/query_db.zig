@@ -625,7 +625,7 @@ pub const ItemKind = enum(u8) {
 pub const DocTriviaSpan = extern struct {
     /// Leading-trivia anchor token index (`std.math.maxInt(u32)` when undocumented).
     doc_first_tok: u32 = std.math.maxInt(u32),
-    /// Contiguous attached `///` or file-top `//!` line count (`0` when undocumented).
+    /// Contiguous attached `/|` or file-top `/#` line count (`0` when undocumented).
     doc_line_count: u16 = 0,
     /// Reserved bit-flags for fenced code block or `@doc` metadata (`0` by default).
     flags: u16 = 0,
@@ -634,7 +634,7 @@ pub const DocTriviaSpan = extern struct {
         std.debug.assert(@sizeOf(DocTriviaSpan) == 8);
     }
 
-    /// Returns `true` when at least one `///` or `//!` line is attached to this span.
+    /// Returns `true` when at least one `/|` or `/#` line is attached to this span.
     pub inline fn hasDocs(self: DocTriviaSpan) bool {
         return self.doc_line_count > 0 and self.doc_first_tok != std.math.maxInt(u32);
     }
@@ -660,7 +660,7 @@ pub const ItemTreeEntry = struct {
     body_ast_node: NodeIndex,
     /// Body CST node index (`block` CST node for functions/tests/benches, init CST for `const_decl`, `.none` otherwise).
     body_cst_node: CstNodeIndex,
-    /// Outer `///` doc-comment span (excluded from `signature_fingerprint` to preserve 100% Early Cutoff).
+    /// Outer `/|` doc-comment span (excluded from `signature_fingerprint` to preserve 100% Early Cutoff).
     doc_span: DocTriviaSpan = .{},
     /// Position-independent 128-bit fingerprint of the item's signature (excluding function/accessor body blocks).
     signature_fingerprint: Fingerprint128,
@@ -681,7 +681,7 @@ pub const ItemTree = struct {
     file_id: FileId = .none,
     /// Whether `test` and `bench` declarations were retained when extracting `entries`.
     is_including_tests: bool = true,
-    /// Top-of-file `//!` module doc-comment span (excluded from `tree_fingerprint` to preserve Early Cutoff).
+    /// Top-of-file `/#` module doc-comment span (excluded from `tree_fingerprint` to preserve Early Cutoff).
     mod_doc: DocTriviaSpan = .{},
     /// 128-bit fingerprint of all item signatures in this file (excluding function bodies).
     tree_fingerprint: Fingerprint128 = Fingerprint128.ZERO,
@@ -2755,7 +2755,7 @@ fn findConstInitCst(
     return .none;
 }
 
-/// Skips an optional UTF-8 BOM (`0xEF 0xBB 0xBF`) and leading `#!` shebang line in `source[0..limit]`.
+/// Skips an optional UTF-8 BOM (`0xEF 0xBB 0xBF`), `#!` shebang, and `---` script frontmatter in `source[0..limit]`.
 fn skipLeadingBomAndShebangInPrefix(source: []const u8, limit: usize) usize {
     var cursor: usize = 0;
     if (limit >= 3 and source[0] == 0xEF and source[1] == 0xBB and source[2] == 0xBF) {
@@ -2765,16 +2765,21 @@ fn skipLeadingBomAndShebangInPrefix(source: []const u8, limit: usize) usize {
         while (cursor < limit and source[cursor] != '\n') : (cursor += 1) {}
         if (cursor < limit and source[cursor] == '\n') cursor += 1;
     }
+    if (lexer.matchScriptFrontmatterEnd(source[0..limit], cursor)) |frontmatter_end| {
+        cursor = frontmatter_end;
+        if (cursor < limit and source[cursor] == '\r') cursor += 1;
+        if (cursor < limit and source[cursor] == '\n') cursor += 1;
+    }
     return cursor;
 }
 
-/// Extracts the 8-byte `DocTriviaSpan` for contiguous top-of-file `//!` module doc comments (`DR-23` §2.4).
+/// Extracts the 8-byte `DocTriviaSpan` for contiguous top-of-file `/#` module doc comments (`DR-23` §2.4, `ADR-24A`).
 fn extractFileModuleDocSpan(source: []const u8, token_buffer: *const TokenBuffer) DocTriviaSpan {
     if (token_buffer.countTokens() == 0) return .{};
     const limit = @min(source.len, @as(usize, token_buffer.getToken(TokenIndex.fromInt(0)).byte_offset));
     var cursor = skipLeadingBomAndShebangInPrefix(source, limit);
 
-    // Skip blank/whitespace-only lines from masked `---` script frontmatter before the `//!` header:
+    // Skip blank/whitespace-only lines from masked `---` script frontmatter before the `/#` header:
     while (cursor < limit) {
         var probe = cursor;
         while (probe < limit and (source[probe] == ' ' or source[probe] == '\t' or source[probe] == '\r')) {
@@ -2793,7 +2798,7 @@ fn extractFileModuleDocSpan(source: []const u8, token_buffer: *const TokenBuffer
         while (line_end < limit and source[line_end] != '\n') : (line_end += 1) {}
         const raw_line = std.mem.trimEnd(u8, source[cursor..line_end], "\r");
         const trimmed_start = std.mem.trimStart(u8, raw_line, " \t");
-        if (!std.mem.startsWith(u8, trimmed_start, "//!")) break;
+        if (!std.mem.startsWith(u8, trimmed_start, "/#")) break;
         line_count +|= 1;
         cursor = if (line_end < limit) line_end + 1 else limit;
     }
@@ -2806,7 +2811,7 @@ fn extractFileModuleDocSpan(source: []const u8, token_buffer: *const TokenBuffer
     };
 }
 
-/// Extracts the 8-byte `DocTriviaSpan` for outer `///` doc comments attached to `item_cst_node` (`DR-23` §2.4).
+/// Extracts the 8-byte `DocTriviaSpan` for outer `/|` doc comments attached to `item_cst_node` (`DR-23` §2.4, `ADR-24A`).
 fn extractItemOuterDocSpan(
     source: []const u8,
     token_buffer: *const TokenBuffer,
@@ -2856,11 +2861,12 @@ fn extractItemOuterDocSpan(
                 break;
             }
             if (source[skip_cur] == '/' and skip_cur + 1 < region_end) {
-                if (source[skip_cur + 1] == '/') {
+                const next_byte = source[skip_cur + 1];
+                if (next_byte == '/' or next_byte == '|' or next_byte == '#') {
                     while (skip_cur < region_end and source[skip_cur] != '\n') : (skip_cur += 1) {}
                     if (skip_cur < region_end and source[skip_cur] == '\n') skip_cur += 1;
                     break;
-                } else if (source[skip_cur + 1] == '*') {
+                } else if (next_byte == '*') {
                     skip_cur += 2;
                     var blk_depth: u32 = 1;
                     while (skip_cur < region_end and blk_depth > 0) {
@@ -2897,12 +2903,11 @@ fn extractItemOuterDocSpan(
                 doc_line_count = 0;
             }
             cursor += 1;
-        } else if (byte_val == '/' and cursor + 1 < region_end and source[cursor + 1] == '/') {
-            const com_start = cursor;
+        } else if (byte_val == '/' and cursor + 1 < region_end and
+            (source[cursor + 1] == '|' or source[cursor + 1] == '/' or source[cursor + 1] == '#'))
+        {
+            const is_outer_doc = source[cursor + 1] == '|';
             while (cursor < region_end and source[cursor] != '\n') : (cursor += 1) {}
-            const raw_comment = std.mem.trimEnd(u8, source[com_start..cursor], "\r\n");
-            const is_outer_doc = std.mem.startsWith(u8, raw_comment, "///") and
-                !std.mem.startsWith(u8, raw_comment, "////");
             if (is_outer_doc) {
                 consecutive_newlines = 0;
                 doc_line_count +|= 1;
@@ -11724,13 +11729,23 @@ pub const CompilerDb = struct {
                 );
                 if (cst_start < cst_end) {
                     var min_ast: u32 = std.math.maxInt(u32);
+                    var max_ast: u32 = 0;
                     for (cst_map[cst_start..cst_end]) |mapped_ast| {
-                        if (!mapped_ast.isNone() and mapped_ast.asInt() < min_ast) {
-                            min_ast = mapped_ast.asInt();
+                        if (!mapped_ast.isNone()) {
+                            if (mapped_ast.asInt() < min_ast) min_ast = mapped_ast.asInt();
+                            if (mapped_ast.asInt() > max_ast) max_ast = mapped_ast.asInt();
                         }
                     }
-                    if (min_ast != std.math.maxInt(u32) and min_ast != st_ptr.ast_start) {
-                        st_ptr.rebaseWindow(min_ast);
+                    if (min_ast != std.math.maxInt(u32)) {
+                        const live_span_len = (max_ast - min_ast) + 1;
+                        const cached_span_len = st_ptr.ast_end -| st_ptr.ast_start;
+                        if (live_span_len != cached_span_len) {
+                            _ = try self.computeTypecheckBody(def_id);
+                            return;
+                        }
+                        if (min_ast != st_ptr.ast_start) {
+                            st_ptr.rebaseWindow(min_ast);
+                        }
                     }
                 }
             }
@@ -14033,7 +14048,7 @@ test "test_set_input_noop_durability_upgrade_and_comment_early_cutoff" {
 
     // [5] Editing comments and whitespace bumps Revision to 3, but triggers Early Cutoff at `lower_ast`:
     const commented_src =
-        "// Header comment added\n/// Doc comment\npub fn compute(   val: i32 ) -> i32 {\n\n    // Inner comment\n    return val + 1;\n}\n";
+        "// Header comment added\n/| Doc comment\npub fn compute(   val: i32 ) -> i32 {\n\n    // Inner comment\n    return val + 1;\n}\n";
     const rev3 = try db.setInput(file_id, commented_src, .medium);
     try std.testing.expect(rev3.isAfter(rev2));
 
@@ -14850,14 +14865,14 @@ test "test_phase76_expr_fn_positional_slash_test_bench_items_and_cxi_visibility_
     try std.testing.expect(Fingerprint128.eql(cxi_fp_v1, vis_sigs_v2.public_interface_fingerprint));
     try std.testing.expect(!Fingerprint128.eql(intra_fp_v1, vis_sigs_v2.signatures_fingerprint));
 
-    // [5] `DR-23` §2.4 8-byte `DocTriviaSpan` updates on doc edits with 100% `signature_fingerprint` Early Cutoff:
+    // [5] `DR-23` §2.4 & `ADR-24A` 8-byte `DocTriviaSpan` updates on doc edits with 100% `signature_fingerprint` Early Cutoff:
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(DocTriviaSpan));
     const doc_file = FileId.fromInt(90);
     const doc_v1 =
-        \\//! Module Header Line One
-        \\//! Module Header Line Two
+        \\/# Module Header Line One
+        \\/# Module Header Line Two
         \\
-        \\/// Computes initial checksum.
+        \\/| Computes initial checksum.
         \\pub fn compute_crc(seed: u32) -> u32 { return seed; }
     ;
     _ = try db.setInput(doc_file, doc_v1, .low);
@@ -14873,12 +14888,13 @@ test "test_phase76_expr_fn_positional_slash_test_bench_items_and_cxi_visibility_
     const sig_execs_before = db.telemetry.countExecutions(.resolve_signatures);
 
     const doc_v2 =
-        \\//! Module Header Line One
-        \\//! Module Header Line Two
-        \\//! Module Header Line Three
+        \\/# Module Header Line One
+        \\/# Module Header Line Two
+        \\/# Module Header Line Three
         \\
-        \\/// Computes expanded checksum.
-        \\/// Preserves Early Cutoff across callers.
+        \\///| Commented-out draft doc line
+        \\/| Computes expanded checksum.
+        \\/| Preserves Early Cutoff across callers.
         \\pub fn compute_crc(seed: u32) -> u32 { return seed; }
     ;
     _ = try db.setInput(doc_file, doc_v2, .low);

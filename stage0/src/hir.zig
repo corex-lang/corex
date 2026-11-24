@@ -5202,7 +5202,7 @@ const HirLowerer = struct {
         self.recursion_depth -= 1;
     }
 
-    /// Lowers a lexical `.block` expression, routing `async { … }` blocks to `lowerAsyncBlockExpr`.
+    /// Lowers a lexical `.block` expression or an `InlineIfExpr` non-block arm (`ADR-24D`), routing `async { … }` to `lowerAsyncBlockExpr`.
     fn lowerBlockExpr(
         self: *HirLowerer,
         block_id: NodeIndex,
@@ -5211,6 +5211,76 @@ const HirLowerer = struct {
     ) anyerror!HirIndex {
         if (block_id.isNone() or block_id.asInt() >= self.ast_arena.countNodes()) {
             return self.emitUnitConst(TokenIndex.fromInt(0), .none);
+        }
+        const block_node = self.ast_arena.getNode(block_id);
+        if (block_node.tag != .block) {
+            if (!try self.enterDepth(block_id)) {
+                return self.emitErrorHole(block_node.main_token, block_id, expected_ty);
+            }
+            defer self.leaveDepth();
+
+            const was_in_cond_scope = self.is_in_cond_scope;
+            self.is_in_cond_scope = false;
+            const local_checkpoint = self.local_shadow_log.items.len;
+            const ct_checkpoint = self.comptime_shadow_log.items.len;
+            const zip_checkpoint = self.zip_shadow_log.items.len;
+            defer {
+                self.popZipBindingsTo(zip_checkpoint);
+                self.popComptimeBindingsTo(ct_checkpoint);
+                self.popLexicalLocalsTo(local_checkpoint);
+                self.is_in_cond_scope = was_in_cond_scope;
+            }
+
+            const val_hir = try self.lowerExpr(block_id, expected_ty);
+            const val_ty = if (!val_hir.isNone()) self.store.getNode(val_hir).type_id else .unit_ty;
+            if (val_ty == .never_ty) {
+                const extra_idx = try self.store.appendLenPrefixedExtra(&[1]u32{val_hir.asInt()});
+                return self.emitNode(.{
+                    .tag = .hir_block,
+                    .flags = .{
+                        .category = .diverging,
+                        .is_synthetic = false,
+                        .is_unsafe = self.is_in_unsafe,
+                    },
+                    .type_id = .never_ty,
+                    .origin_token = block_node.main_token,
+                    .data = .{ .lhs = extra_idx, .rhs = HirIndex.none.asInt() },
+                }, block_id);
+            }
+            if (is_auto_return_fn_body) {
+                const err_kind = self.classifyReturnExpr(val_hir, expected_ty);
+                const ret_node = try self.emitNode(.{
+                    .tag = .hir_return,
+                    .flags = .{ .category = .diverging, .is_synthetic = true, .is_unsafe = self.is_in_unsafe },
+                    .type_id = .never_ty,
+                    .origin_token = block_node.main_token,
+                    .data = .{ .lhs = val_hir.asInt(), .rhs = @backingInt(err_kind) },
+                }, block_id);
+                const extra_idx = try self.store.appendLenPrefixedExtra(&[1]u32{ret_node.asInt()});
+                return self.emitNode(.{
+                    .tag = .hir_block,
+                    .flags = .{
+                        .category = .diverging,
+                        .is_synthetic = false,
+                        .is_unsafe = self.is_in_unsafe,
+                    },
+                    .type_id = .never_ty,
+                    .origin_token = block_node.main_token,
+                    .data = .{ .lhs = extra_idx, .rhs = HirIndex.none.asInt() },
+                }, block_id);
+            }
+            const extra_idx = try self.store.appendLenPrefixedExtra(&.{});
+            return self.emitNode(.{
+                .tag = .hir_block,
+                .flags = .{
+                    .category = .rvalue,
+                    .is_synthetic = false,
+                    .is_unsafe = self.is_in_unsafe,
+                },
+                .type_id = self.concreteType(val_ty),
+                .origin_token = block_node.main_token,
+                .data = .{ .lhs = extra_idx, .rhs = val_hir.asInt() },
+            }, block_id);
         }
         if (!is_auto_return_fn_body and
             self.hasKeywordInCst(self.ast_arena.getCstOrigin(block_id), .kw_async))
@@ -8297,8 +8367,8 @@ const HirLowerer = struct {
             },
             .byte_string_lit => blk: {
                 const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, ast_node.main_token);
-                const cooked = lexer.cookStringLiteral(self.allocator, lexeme) catch
-                    try self.allocator.dupe(u8, "");
+                const cooked = symbol_resolver.decodeDr24PlainStringAlloc(self.allocator, lexeme) catch
+                    (lexer.cookStringLiteral(self.allocator, lexeme) catch try self.allocator.dupe(u8, ""));
                 defer self.allocator.free(cooked);
                 const bytes_sym = try self.interner.intern(cooked);
                 const arr_ty = try self.pool.internArray(.u8_ty, @intCast(cooked.len), false);
@@ -8311,7 +8381,8 @@ const HirLowerer = struct {
                     false,
                 );
             },
-            .string_lit => try self.lowerStringLitOrInterp(expr_id, target_ty),
+            .string_lit => try self.lowerPlainStringLit(expr_id, target_ty),
+            .fmt_string_lit => try self.lowerFmtStringLit(expr_id, target_ty),
             .self_val, .ident_expr, .path_expr => try self.lowerIdentOrPathExpr(expr_id, target_ty),
             .contextual_variant => try self.lowerContextualVariant(expr_id, target_ty),
             .tuple_lit => try self.lowerTupleLit(expr_id, target_ty),
@@ -9004,8 +9075,47 @@ const HirLowerer = struct {
         return hir_id;
     }
 
-    /// Lowers `.string_lit`, `"""…"""`, and `r"…"` literals, supporting dual-mode `FmtArgs` vs `String` (`SE-12`).
-    fn lowerStringLitOrInterp(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) !HirIndex {
+    /// Resolves the 1-arg `cx.str.String.fmt(args: FmtArgs) -> String` `SymbolIndex` for `string_ty` (`ADR-24B`).
+    fn findStringFmtFnSymbol(self: *const HirLowerer, string_ty: TypeId) SymbolIndex {
+        const unwrapped = self.pool.unwrapUnderlyingType(string_ty);
+        if (unwrapped.isError() or self.pool.getTag(unwrapped) != .struct_ty) return .none;
+        const struct_sym_idx = SymbolIndex.fromInt(self.pool.getNode(unwrapped).rhs);
+        if (struct_sym_idx.isNone() or struct_sym_idx.asInt() >= self.sym_table.symbols.items.len) return .none;
+        const struct_sym = self.sym_table.getSymbol(struct_sym_idx).*;
+        if (struct_sym.target_scope.isNone()) return .none;
+        const fmt_name_id = self.interner.lookup("fmt") orelse return .none;
+        const found_idx = self.sym_table.lookupInScopeDirect(
+            struct_sym.target_scope,
+            fmt_name_id,
+            NamespaceMask.VALUE_ONLY,
+        );
+        if (found_idx.isNone()) return .none;
+        const found_sym = self.sym_table.getSymbol(found_idx).*;
+        if (found_sym.kind == .fn_sym) {
+            if (self.pool.getFnSignatureView(found_sym.type_id)) |sig| {
+                if (sig.paramCount() == 1 and sig.getParamType(0) == .fmt_args_ty) {
+                    return found_idx;
+                }
+            }
+            return .none;
+        }
+        if (self.sym_table.getOverloadSet(struct_sym.target_scope, fmt_name_id)) |ov_set| {
+            for (ov_set.members.items) |mem_idx| {
+                const mem_sym = self.sym_table.getSymbol(mem_idx).*;
+                if (mem_sym.kind == .fn_sym) {
+                    if (self.pool.getFnSignatureView(mem_sym.type_id)) |sig| {
+                        if (sig.paramCount() == 1 and sig.getParamType(0) == .fmt_args_ty) {
+                            return mem_idx;
+                        }
+                    }
+                }
+            }
+        }
+        return .none;
+    }
+
+    /// Lowers plain `.string_lit` (`"…"`, `r"…"`, `r#"…"#`, 1-line or `"<newline> … "`) with literal `{`/`}` (`ADR-24B`).
+    fn lowerPlainStringLit(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) !HirIndex {
         const ast_node = self.ast_arena.getNode(expr_id);
         const tok = ast_node.main_token;
         const raw_lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, tok);
@@ -9013,73 +9123,52 @@ const HirLowerer = struct {
         const is_fmt_args_mode = (if (interp_meta_opt) |meta| meta.is_fmt_args_mode else false) or
             target_ty == .fmt_args_ty;
 
-        // Check raw string literal `r"…"`, `r#"…"#`, `r"""…"""`, or `r#"""…"""#` with verbatim UTF-8 bytes:
-        if (raw_lex.len > 0 and raw_lex[0] == 'r') {
-            const cooked_raw = lexer.cookStringLiteral(self.allocator, raw_lex) catch
-                try self.allocator.dupe(u8, type_system.extractRawStringContent(raw_lex) orelse "");
-            defer self.allocator.free(cooked_raw);
-            const raw_id = try self.interner.intern(cooked_raw);
-            const str_hir = try self.emitConstVal(.{ .str_val = raw_id }, .str_ty, tok, expr_id, false);
-            if (is_fmt_args_mode) {
-                const fmt_extra = try self.store.appendExtraSlice(&[3]u32{ 1, 0, str_hir.asInt() });
-                return self.emitNode(.{
-                    .tag = .hir_construct,
-                    .flags = .{ .category = .rvalue, .is_synthetic = true },
-                    .type_id = .fmt_args_ty,
-                    .origin_token = tok,
-                    .data = .{ .lhs = @backingInt(HirConstructKind.fmt_args), .rhs = fmt_extra },
-                }, expr_id);
-            }
-            return str_hir;
-        }
+        const cooked = symbol_resolver.decodeDr24PlainStringAlloc(self.allocator, raw_lex) catch
+            (lexer.cookStringLiteral(self.allocator, raw_lex) catch try self.allocator.dupe(u8, ""));
+        defer self.allocator.free(cooked);
 
-        const is_multiline = raw_lex.len >= 6 and std.mem.startsWith(u8, raw_lex, "\"\"\"") and
-            std.mem.endsWith(u8, raw_lex, "\"\"\"");
-        var body_slice = if (is_multiline) raw_lex[3 .. raw_lex.len - 3] else extractQuotedBody(raw_lex);
-        var dedent_cols: usize = 0;
-        if (is_multiline) {
-            if (body_slice.len >= 2 and body_slice[0] == '\r' and body_slice[1] == '\n') {
-                body_slice = body_slice[2..];
-            } else if (body_slice.len >= 1 and body_slice[0] == '\n') {
-                body_slice = body_slice[1..];
-            }
-            if (std.mem.lastIndexOfScalar(u8, body_slice, '\n')) |last_nl| {
-                const closing_indent = body_slice[last_nl + 1 ..];
-                var is_all_ws = true;
-                for (closing_indent) |ch| {
-                    if (ch != ' ' and ch != '\t') {
-                        is_all_ws = false;
-                        break;
-                    }
-                }
-                if (is_all_ws) {
-                    dedent_cols = closing_indent.len;
-                    body_slice = if (last_nl > 0 and body_slice[last_nl - 1] == '\r')
-                        body_slice[0 .. last_nl - 1]
-                    else
-                        body_slice[0..last_nl];
-                }
-            }
+        const str_id = try self.interner.intern(cooked);
+        const str_hir = try self.emitConstVal(.{ .str_val = str_id }, .str_ty, tok, expr_id, false);
+        if (is_fmt_args_mode) {
+            const fmt_extra = try self.store.appendExtraSlice(&[3]u32{ 1, 0, str_hir.asInt() });
+            return self.emitNode(.{
+                .tag = .hir_construct,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = .fmt_args_ty,
+                .origin_token = tok,
+                .data = .{ .lhs = @backingInt(HirConstructKind.fmt_args), .rhs = fmt_extra },
+            }, expr_id);
         }
+        return str_hir;
+    }
 
-        if (type_system.scanNextInterpolationSegment(body_slice, 0) == null) {
-            const cooked = lexer.cookStringLiteral(self.allocator, raw_lex) catch
-                try type_system.decodeStandardStringSegment(self.allocator, body_slice);
-            defer self.allocator.free(cooked);
-            const str_id = try self.interner.intern(cooked);
-            const str_hir = try self.emitConstVal(.{ .str_val = str_id }, .str_ty, tok, expr_id, false);
-            if (is_fmt_args_mode) {
-                const fmt_extra = try self.store.appendExtraSlice(&[3]u32{ 1, 0, str_hir.asInt() });
-                return self.emitNode(.{
-                    .tag = .hir_construct,
-                    .flags = .{ .category = .rvalue, .is_synthetic = true },
-                    .type_id = .fmt_args_ty,
-                    .origin_token = tok,
-                    .data = .{ .lhs = @backingInt(HirConstructKind.fmt_args), .rhs = fmt_extra },
-                }, expr_id);
-            }
-            return str_hir;
-        }
+    /// Lowers explicit `.fmt_string_lit` (`f"…"` / `f#"…"#`, `ADR-24B`), supporting `FmtArgs`, `cx.str.String`, and `str`.
+    fn lowerFmtStringLit(self: *HirLowerer, expr_id: NodeIndex, target_ty: TypeId) !HirIndex {
+        const ast_node = self.ast_arena.getNode(expr_id);
+        const tok = ast_node.main_token;
+        const raw_lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, tok);
+        const recorded_ty = self.concreteType(self.nodeType(expr_id));
+        const resolved_ty = if (!target_ty.isError())
+            self.concreteType(target_ty)
+        else if (!recorded_ty.isError())
+            recorded_ty
+        else
+            .str_ty;
+        const interp_meta_opt = if (self.side_tables) |tables| tables.getStringInterp(expr_id) else null;
+        const is_fmt_args_mode = (if (interp_meta_opt) |meta| meta.is_fmt_args_mode else false) or
+            resolved_ty == .fmt_args_ty;
+
+        const body_view = symbol_resolver.extractDr24StringBodyView(raw_lex);
+        const body_slice = if (body_view) |view|
+            (if (view.is_multiline) view.multiline_content else view.raw_inner)
+        else
+            extractQuotedBody(raw_lex);
+        const is_multiline = if (body_view) |view| view.is_multiline else false;
+        const is_raw_fmt = if (body_view) |view| view.is_raw else false;
+        const dedent_cols: usize = if (body_view) |view|
+            (if (view.is_multiline) @as(usize, view.closing_indent) else 0)
+        else
+            0;
 
         var piece_hirs: std.ArrayListUnmanaged(u32) = .empty;
         defer piece_hirs.deinit(self.allocator);
@@ -9092,17 +9181,18 @@ const HirLowerer = struct {
 
         var scan_pos: usize = 0;
         var is_at_line_start = is_multiline;
-        while (type_system.scanNextInterpolationSegment(body_slice, scan_pos)) |seg| {
+        while (type_system.scanNextInterpolationSegmentMode(body_slice, scan_pos, is_raw_fmt)) |seg| {
             const raw_seg = body_slice[scan_pos..seg.open_brace];
             const hole_raw = body_slice[seg.expr_start..seg.expr_end];
             const split = type_system.splitInterpolationHole(hole_raw);
 
             var piece_buf: std.ArrayListUnmanaged(u8) = .empty;
             defer piece_buf.deinit(self.allocator);
-            const decoded_lit = try decodeInterpolatedStaticPiece(
+            const decoded_lit = try decodeInterpolatedStaticPieceMode(
                 self.allocator,
                 raw_seg,
                 dedent_cols,
+                is_raw_fmt,
                 &is_at_line_start,
             );
             defer self.allocator.free(decoded_lit);
@@ -9139,10 +9229,11 @@ const HirLowerer = struct {
             scan_pos = seg.after_close;
         }
 
-        const tail_decoded = try decodeInterpolatedStaticPiece(
+        const tail_decoded = try decodeInterpolatedStaticPieceMode(
             self.allocator,
             body_slice[scan_pos..],
             dedent_cols,
+            is_raw_fmt,
             &is_at_line_start,
         );
         defer self.allocator.free(tail_decoded);
@@ -9150,49 +9241,84 @@ const HirLowerer = struct {
         const tail_hir = try self.emitConstVal(.{ .str_val = tail_id }, .str_ty, tok, .none, true);
         try piece_hirs.append(self.allocator, tail_hir.asInt());
 
-        // [1] Checking Mode (`FmtArgs`, `SE-12`): stack-scoped `[FmtArg; k]` + static `pieces` with zero `alloc` taint!
-        if (is_fmt_args_mode) {
+        var string_fmt_sym_idx: SymbolIndex = .none;
+        if (!is_fmt_args_mode and resolved_ty != .str_ty) {
+            const recorded_sym = self.nodeSymbol(expr_id);
+            if (!recorded_sym.isNone() and
+                recorded_sym.asInt() < self.sym_table.symbols.items.len and
+                self.sym_table.getSymbol(recorded_sym).kind == .fn_sym)
+            {
+                string_fmt_sym_idx = recorded_sym;
+            } else {
+                string_fmt_sym_idx = self.findStringFmtFnSymbol(resolved_ty);
+            }
+        }
+
+        // [1] `FmtArgs` Checking Mode OR `cx.str.String.fmt(args: FmtArgs)` Synthesis Mode (`ADR-24B`):
+        if (is_fmt_args_mode or !string_fmt_sym_idx.isNone()) {
             var extra_words: std.ArrayListUnmanaged(u32) = .empty;
             defer extra_words.deinit(self.allocator);
             try extra_words.append(self.allocator, @intCast(piece_hirs.items.len));
             try extra_words.append(self.allocator, @intCast(hole_hirs.items.len));
             try extra_words.appendSlice(self.allocator, piece_hirs.items);
 
-            for (hole_hirs.items, 0..) |h_hir, idx| {
+            for (hole_hirs.items, 0..) |hole_hir, idx| {
                 const spec_u64 = hole_specs.items[idx];
-                try extra_words.append(self.allocator, h_hir.asInt());
+                try extra_words.append(self.allocator, hole_hir.asInt());
                 try extra_words.append(self.allocator, @truncate(spec_u64));
                 try extra_words.append(self.allocator, @truncate(spec_u64 >> 32));
             }
             const fmt_extra = try self.store.appendExtraSlice(extra_words.items);
-            return self.emitNode(.{
+            const fmt_args_hir = try self.emitNode(.{
                 .tag = .hir_construct,
                 .flags = .{ .category = .rvalue, .is_synthetic = true },
                 .type_id = .fmt_args_ty,
                 .origin_token = tok,
                 .data = .{ .lhs = @backingInt(HirConstructKind.fmt_args), .rhs = fmt_extra },
+            }, if (is_fmt_args_mode) expr_id else .none);
+            if (is_fmt_args_mode) return fmt_args_hir;
+
+            const fmt_sym = self.sym_table.getSymbol(string_fmt_sym_idx).*;
+            const callee_hir = try self.emitNode(.{
+                .tag = .hir_global_ref,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = self.concreteType(fmt_sym.type_id),
+                .origin_token = tok,
+                .data = .{ .lhs = fmt_sym.def_id.asInt(), .rhs = string_fmt_sym_idx.asInt() },
+            }, .none);
+            const proj_arg = try self.wrapArgProjection(fmt_args_hir, .let_mode, tok);
+            const call_extra = try self.store.appendLenPrefixedExtra(&[1]u32{proj_arg.asInt()});
+            return self.emitNode(.{
+                .tag = .hir_call,
+                .flags = .{ .category = .rvalue, .is_synthetic = true },
+                .type_id = resolved_ty,
+                .origin_token = tok,
+                .data = .{ .lhs = callee_hir.asInt(), .rhs = call_extra },
             }, expr_id);
         }
 
-        // [2] Synthesis Mode (`str` / `String`, `SE-12`): interleave non-empty pieces and formatted hole values!
+        // [2] `str` Fallback Mode (`cx.str.String` unavailable or explicit `str` target):
+        if (hole_hirs.items.len == 0) {
+            return HirIndex.fromInt(piece_hirs.items[0]);
+        }
         var part_hirs: std.ArrayListUnmanaged(u32) = .empty;
         defer part_hirs.deinit(self.allocator);
-        for (hole_hirs.items, 0..) |h_hir, idx| {
-            const p_hir = HirIndex.fromInt(piece_hirs.items[idx]);
-            const p_node = self.store.getNode(p_hir);
-            if (p_node.tag == .hir_const_val and p_node.data.lhs < self.store.const_pool.items.len) {
-                const cval = self.store.const_pool.items[p_node.data.lhs];
+        for (hole_hirs.items, 0..) |hole_hir, idx| {
+            const piece_hir = HirIndex.fromInt(piece_hirs.items[idx]);
+            const piece_node = self.store.getNode(piece_hir);
+            if (piece_node.tag == .hir_const_val and piece_node.data.lhs < self.store.const_pool.items.len) {
+                const cval = self.store.const_pool.items[piece_node.data.lhs];
                 if (cval == .str_val and self.interner.get(cval.str_val).len > 0) {
-                    try part_hirs.append(self.allocator, p_hir.asInt());
+                    try part_hirs.append(self.allocator, piece_hir.asInt());
                 }
             }
-            const h_ty = self.store.getNode(h_hir).type_id;
-            if (h_ty == .str_ty and !hole_has_spec.items[idx]) {
-                try part_hirs.append(self.allocator, h_hir.asInt());
+            const hole_ty = self.store.getNode(hole_hir).type_id;
+            if (hole_ty == .str_ty and !hole_has_spec.items[idx]) {
+                try part_hirs.append(self.allocator, hole_hir.asInt());
             } else {
                 const spec_u64 = hole_specs.items[idx];
                 const fv_extra = try self.store.appendExtraSlice(&[3]u32{
-                    h_hir.asInt(),
+                    hole_hir.asInt(),
                     @truncate(spec_u64),
                     @truncate(spec_u64 >> 32),
                 });
@@ -9206,12 +9332,12 @@ const HirLowerer = struct {
                 try part_hirs.append(self.allocator, fv_hir.asInt());
             }
         }
-        const last_p_hir = HirIndex.fromInt(piece_hirs.items[piece_hirs.items.len - 1]);
-        const last_p_node = self.store.getNode(last_p_hir);
-        if (last_p_node.tag == .hir_const_val and last_p_node.data.lhs < self.store.const_pool.items.len) {
-            const cval = self.store.const_pool.items[last_p_node.data.lhs];
+        const last_piece_hir = HirIndex.fromInt(piece_hirs.items[piece_hirs.items.len - 1]);
+        const last_piece_node = self.store.getNode(last_piece_hir);
+        if (last_piece_node.tag == .hir_const_val and last_piece_node.data.lhs < self.store.const_pool.items.len) {
+            const cval = self.store.const_pool.items[last_piece_node.data.lhs];
             if (cval == .str_val and self.interner.get(cval.str_val).len > 0) {
-                try part_hirs.append(self.allocator, last_p_hir.asInt());
+                try part_hirs.append(self.allocator, last_piece_hir.asInt());
             }
         }
 
@@ -16080,7 +16206,10 @@ const HirLowerer = struct {
                     else => false,
                 };
                 if (is_taken) {
-                    return self.lowerBlockExpr(then_id, target_ty, false);
+                    return if (self.ast_arena.getNode(then_id).tag == .block)
+                        self.lowerBlockExpr(then_id, target_ty, false)
+                    else
+                        self.lowerExpr(then_id, target_ty);
                 }
                 self.popComptimeBindingsTo(ct_checkpoint);
                 if (else_id.isNone()) {
@@ -16089,7 +16218,10 @@ const HirLowerer = struct {
                 if (self.ast_arena.getNode(else_id).tag == .if_expr) {
                     return self.lowerIfExpr(else_id, target_ty, true);
                 }
-                return self.lowerBlockExpr(else_id, target_ty, false);
+                return if (self.ast_arena.getNode(else_id).tag == .block)
+                    self.lowerBlockExpr(else_id, target_ty, false)
+                else
+                    self.lowerExpr(else_id, target_ty);
             }
         }
 
@@ -18516,18 +18648,8 @@ const HirLowerer = struct {
                     },
                     .string_lit => {
                         const raw_str = symbol_resolver.extractTokenSlice(self.source, self.tokens, tok);
-                        const unescaped = lexer.cookStringLiteral(self.allocator, raw_str) catch blk_fallback: {
-                            if (raw_str.len > 0 and raw_str[0] == 'r') {
-                                break :blk_fallback try self.allocator.dupe(
-                                    u8,
-                                    type_system.extractRawStringContent(raw_str) orelse "",
-                                );
-                            }
-                            break :blk_fallback try type_system.decodeStandardStringSegment(
-                                self.allocator,
-                                extractQuotedBody(raw_str),
-                            );
-                        };
+                        const unescaped = symbol_resolver.decodeDr24PlainStringAlloc(self.allocator, raw_str) catch
+                            (lexer.cookStringLiteral(self.allocator, raw_str) catch try self.allocator.dupe(u8, ""));
                         defer self.allocator.free(unescaped);
                         const str_id = try self.interner.intern(unescaped);
                         return self.store.appendPat(.{
@@ -18538,8 +18660,8 @@ const HirLowerer = struct {
                     },
                     .byte_string_lit => {
                         const raw_str = symbol_resolver.extractTokenSlice(self.source, self.tokens, tok);
-                        const cooked = lexer.cookStringLiteral(self.allocator, raw_str) catch
-                            try self.allocator.dupe(u8, "");
+                        const cooked = symbol_resolver.decodeDr24PlainStringAlloc(self.allocator, raw_str) catch
+                            (lexer.cookStringLiteral(self.allocator, raw_str) catch try self.allocator.dupe(u8, ""));
                         defer self.allocator.free(cooked);
                         const bytes_id = try self.interner.intern(cooked);
                         return self.store.appendPat(.{
@@ -19300,18 +19422,8 @@ const HirLowerer = struct {
                         self.tokens,
                         pat_node.main_token,
                     );
-                    const unescaped = lexer.cookStringLiteral(self.allocator, raw_str) catch blk_fallback: {
-                        if (raw_str.len > 0 and raw_str[0] == 'r') {
-                            break :blk_fallback try self.allocator.dupe(
-                                u8,
-                                type_system.extractRawStringContent(raw_str) orelse "",
-                            );
-                        }
-                        break :blk_fallback try type_system.decodeStandardStringSegment(
-                            self.allocator,
-                            extractQuotedBody(raw_str),
-                        );
-                    };
+                    const unescaped = symbol_resolver.decodeDr24PlainStringAlloc(self.allocator, raw_str) catch
+                        (lexer.cookStringLiteral(self.allocator, raw_str) catch return false);
                     defer self.allocator.free(unescaped);
                     return std.mem.eql(u8, self.interner.get(scrut_str_id), unescaped);
                 }
@@ -19897,23 +20009,49 @@ const HirLowerer = struct {
             },
             .byte_string_lit => {
                 const lexeme = symbol_resolver.extractTokenSlice(self.source, self.tokens, tok);
-                const cooked = lexer.cookStringLiteral(self.allocator, lexeme) catch return null;
+                const cooked = symbol_resolver.decodeDr24PlainStringAlloc(self.allocator, lexeme) catch
+                    (lexer.cookStringLiteral(self.allocator, lexeme) catch return null);
                 defer self.allocator.free(cooked);
                 return .{ .bytes_val = try self.interner.intern(cooked) };
             },
             .string_lit => {
                 const raw_lex = symbol_resolver.extractTokenSlice(self.source, self.tokens, tok);
-                if (raw_lex.len > 0 and raw_lex[0] == 'r') {
-                    const cooked_raw = lexer.cookStringLiteral(self.allocator, raw_lex) catch return null;
-                    defer self.allocator.free(cooked_raw);
-                    return .{ .str_val = try self.interner.intern(cooked_raw) };
-                }
-                const body = extractQuotedBody(raw_lex);
-                if (type_system.scanNextInterpolationSegment(body, 0) != null) return null;
-                const cooked = lexer.cookStringLiteral(self.allocator, raw_lex) catch
-                    try type_system.decodeStandardStringSegment(self.allocator, body);
+                const cooked = symbol_resolver.decodeDr24PlainStringAlloc(self.allocator, raw_lex) catch
+                    (lexer.cookStringLiteral(self.allocator, raw_lex) catch return null);
                 defer self.allocator.free(cooked);
                 return .{ .str_val = try self.interner.intern(cooked) };
+            },
+            .block => {
+                if (self.getAstExtraSlice(expr_id, false).len == 0 and ast_node.rhs.tag == .node) {
+                    return self.tryEvalAstComptime(NodeIndex.fromInt(ast_node.rhs.payload), expected_ty);
+                }
+                return null;
+            },
+            .if_expr => {
+                const cond_id = if (ast_node.lhs.tag == .node) NodeIndex.fromInt(ast_node.lhs.payload) else return null;
+                var then_id: NodeIndex = .none;
+                var else_id: NodeIndex = .none;
+                if (ast_node.rhs.tag == .node) {
+                    then_id = NodeIndex.fromInt(ast_node.rhs.payload);
+                } else {
+                    const branches = self.getAstExtraSlice(expr_id, true);
+                    if (branches.len >= 1) then_id = NodeIndex.fromInt(branches[0]);
+                    if (branches.len >= 2) else_id = NodeIndex.fromInt(branches[1]);
+                }
+                const ct_checkpoint = self.comptime_shadow_log.items.len;
+                defer self.popComptimeBindingsTo(ct_checkpoint);
+                const cond_val = (try self.tryEvalAstComptime(cond_id, .bool_ty)) orelse return null;
+                const is_taken = switch (cond_val) {
+                    .bool_val => |flag| flag,
+                    .int_val => |num| num != 0,
+                    else => return null,
+                };
+                if (is_taken) {
+                    return self.tryEvalAstComptime(then_id, expected_ty);
+                }
+                self.popComptimeBindingsTo(ct_checkpoint);
+                if (else_id.isNone()) return .unit_val;
+                return self.tryEvalAstComptime(else_id, expected_ty);
             },
             .tuple_lit, .array_lit => {
                 const elems = self.getAstExtraSlice(expr_id, false);
@@ -21083,6 +21221,17 @@ fn decodeInterpolatedStaticPiece(
     dedent_cols: usize,
     is_at_line_start: *bool,
 ) ![]u8 {
+    return decodeInterpolatedStaticPieceMode(allocator, raw_seg, dedent_cols, false, is_at_line_start);
+}
+
+/// Decodes a static literal piece inside `f"…"` (`is_raw == false`) or `f#"…"#` (`is_raw == true`), dedenting multiline lines.
+fn decodeInterpolatedStaticPieceMode(
+    allocator: std.mem.Allocator,
+    raw_seg: []const u8,
+    dedent_cols: usize,
+    is_raw: bool,
+    is_at_line_start: *bool,
+) ![]u8 {
     var pre_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer pre_buf.deinit(allocator);
     var cursor: usize = 0;
@@ -21121,6 +21270,9 @@ fn decodeInterpolatedStaticPiece(
         }
         try pre_buf.append(allocator, raw_seg[cursor]);
         cursor += 1;
+    }
+    if (is_raw) {
+        return pre_buf.toOwnedSlice(allocator);
     }
     return type_system.decodeStandardStringSegment(allocator, pre_buf.items);
 }
@@ -22522,7 +22674,7 @@ test "test_redteam_3a_hir_conjunctive_is_shadow_isolation_comptime_for_and_opera
         \\    let cloned_pkt: Packet = pkt.clone();
         \\    _ = cloned_pkt.hash();
         \\    let raw_s: str = r"a\nb";
-        \\    let fmt_str: str = "raw={raw_s} hex=\x41 uni=\u{03B1} sum={unrolled_sum}";
+        \\    let fmt_str: str = f"raw={raw_s} hex=\x41 uni=\u{03B1} sum={unrolled_sum}";
         \\    _ = fmt_str;
         \\    return saved_outer + outer_shadow + else_hits + matched_shadow + unrolled_sum + piped;
         \\}
@@ -22702,18 +22854,18 @@ test "test_phase76_stage4_hir_subscript_single_def_raw_multiline_caller_loc_and_
             \\    let zero_cap_fn: fn() -> u32 = || -> u32 {
             \\        return capture_line();
             \\    };
-            \\    let raw_multi: str = r"""
+            \\    let raw_multi: str = r"
             \\        alpha\n
             \\        beta
-            \\        """;
-            \\    let raw_hashed: str = r#"""
+            \\        ";
+            \\    let raw_hashed: str = r#"
             \\        "quoted"
-            \\        """#;
+            \\        "#;
             \\    let matched_tag: u32 = match raw_multi {
-            \\        r"""
+            \\        r"
             \\            alpha\n
             \\            beta
-            \\            """ => 10,
+            \\            " => 10,
             \\        _ => 0,
             \\    };
             \\    _ = raw_hashed;
@@ -23022,4 +23174,63 @@ test "test_hir_async_block_borrow_loans_nested_mutation_scan_and_pipe_variadic_p
         }
     }
     try std.testing.expect(has_verified_pipe_call);
+}
+
+test "test_dr24_hir_plain_vs_fmt_strings_inline_if_blocks_and_const_if_folding" {
+    const allocator = std.testing.allocator;
+    const dr24_src =
+        \\const INLINE_FOLDED: i32 = if true => 42 else 0;
+        \\
+        \\pub fn eval_dr24(flag: bool, count: i32) -> i32 {
+        \\    let plain_braces: str = "{{literal}}";
+        \\    let fmt_ml: str = f"
+        \\        item={count}
+        \\        ";
+        \\    let picked: i32 = if flag => return INLINE_FOLDED else count + 1;
+        \\    _ = (plain_braces, fmt_ml);
+        \\    return picked;
+        \\}
+    ;
+    var bundle = try lowerSourceToHir(allocator, dr24_src, TargetLayout.NATIVE_64);
+    defer bundle.deinit();
+    try std.testing.expect(!bundle.diagnostics.hasErrors());
+
+    var has_plain_braces_eleven = false;
+    var has_dedented_fmt_prefix = false;
+    var has_folded_42 = false;
+    for (bundle.hir_store.const_pool.items) |const_item| {
+        switch (const_item) {
+            .str_val => |str_sym| {
+                const text = bundle.interner.get(str_sym);
+                if (std.mem.eql(u8, text, "{{literal}}")) has_plain_braces_eleven = true;
+                if (std.mem.eql(u8, text, "item=")) has_dedented_fmt_prefix = true;
+            },
+            .int_val => |int_val| {
+                if (int_val == 42) has_folded_42 = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(has_plain_braces_eleven);
+    try std.testing.expect(has_dedented_fmt_prefix);
+    try std.testing.expect(has_folded_42);
+
+    var has_real_inline_if_diverging_block = false;
+    for (0..bundle.hir_store.nodes.len) |node_idx| {
+        const node = bundle.hir_store.getNode(HirIndex.fromInt(@intCast(node_idx)));
+        if (node.tag == .hir_if and node.data.rhs + 2 <= bundle.hir_store.extra_data.items.len) {
+            const then_hir = HirIndex.fromInt(bundle.hir_store.extra_data.items[node.data.rhs]);
+            const else_hir = HirIndex.fromInt(bundle.hir_store.extra_data.items[node.data.rhs + 1]);
+            const then_node = bundle.hir_store.getNode(then_hir);
+            const else_node = bundle.hir_store.getNode(else_hir);
+            try std.testing.expectEqual(HirTag.hir_block, then_node.tag);
+            try std.testing.expectEqual(HirTag.hir_block, else_node.tag);
+            try std.testing.expect(!then_node.flags.is_synthetic);
+            try std.testing.expect(!else_node.flags.is_synthetic);
+            if (then_node.type_id == .never_ty and then_node.flags.category == .diverging) {
+                has_real_inline_if_diverging_block = true;
+            }
+        }
+    }
+    try std.testing.expect(has_real_inline_if_diverging_block);
 }

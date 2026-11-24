@@ -362,7 +362,7 @@ pub const SymbolRecord = symbol_resolver.SymbolRecord;
 pub const DeclContractFlags = symbol_resolver.DeclContractFlags;
 /// Canonical ambient capability bit positions for `@std_cap_boundary` (`DR-17` §3.1).
 pub const CapabilityBits = symbol_resolver.CapabilityBits;
-/// Returns `true` when a `@link_section` name targets a forbidden executable/CTOR/TLS section (`E0327`).
+/// Returns `true` when a `@link(section: …)` name targets a forbidden executable/CTOR/TLS section (`E0327`).
 pub const isForbiddenExecutableSection = symbol_resolver.isForbiddenExecutableSection;
 /// Explicit `@overload` function group.
 pub const OverloadSet = symbol_resolver.OverloadSet;

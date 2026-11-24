@@ -691,7 +691,7 @@ test "test_parser_all_four_dr03_showcase_programs_lossless_and_zero_diagnostics"
         \\    while reader.next_line()? is .Some(line) {
         \\        if line.contains(opts.pattern) {
         \\            matches_found += 1;
-        \\            out.write_fmt("{opts.file_path}: {line}\n")?;
+        \\            out.write_fmt(f"{opts.file_path}: {line}\n")?;
         \\        }
         \\    }
         \\    .Ok(matches_found)
@@ -747,9 +747,9 @@ test "test_parser_all_four_dr03_showcase_programs_lossless_and_zero_diagnostics"
         \\    let is_critical = Computed.new(|| cpu_sig.get() >= 80.0);
         \\    Card(padding: 16, border_color: theme.border_subtle) {
         \\        Row(justify: .SpaceBetween, align: .Center) {
-        \\            Text(value: "Node: {node_name}", weight: .Bold, size: 18);
+        \\            Text(value: f"Node: {node_name}", weight: .Bold, size: 18);
         \\            Button(
-        \\                label: if is_paused { "Resume" } else { "Pause" },
+        \\                label: if is_paused => "Resume" else "Pause",
         \\                on_click: || { is_paused = not is_paused; },
         \\            );
         \\        }
@@ -1631,69 +1631,69 @@ test "test_parser_dr22_visibility_zones_subscript_test_bench_fsm_and_e0219_throu
 // ----------- Phase 10.6 (DR-23) Surface Diagnostics -----------
 
 test "test_parser_dr23_doc_attachment_impl_elif_discard_and_colon_diagnostics" {
-    // [1] Positive `ADR-23A` & `ADR-23E`; top-of-file `//!`, valid `///` attachments, and `_ = expr;`:
+    // [1] Positive `ADR-23A`/`ADR-24A` & `ADR-23E`; top-of-file `/#`, valid `/|` attachments, and `_ = expr;`:
     const valid_dr23_src =
-        \\//! Canonical Phase 10.6 module header (`ADR-23A`).
+        \\/# Canonical module header (`ADR-24A`).
         \\
         \\use cx.mem.size_of_type;
         \\
-        \\/// Child module declaration.
+        \\/| Child module declaration.
         \\pub mod child;
-        \\/// Module-level constant.
+        \\/| Module-level constant.
         \\pub const RING_SLOTS: usize = 8;
-        \\/// Type alias declaration.
+        \\/| Type alias declaration.
         \\pub type SlotIdx = u32;
-        \\/// Contiguous struct declaration.
+        \\/| Contiguous struct declaration.
         \\pub struct PairSlot {
-        \\    /// First 32-bit lane.
+        \\    /| First 32-bit lane.
         \\    pub first_lane: u32,
-        \\    /// Second 32-bit lane.
+        \\    /| Second 32-bit lane.
         \\    pub second_lane: u32,
         \\}
-        \\/// Tagged enum declaration.
+        \\/| Tagged enum declaration.
         \\pub enum SlotState: u8 {
-        \\    /// Empty slot state.
+        \\    /| Empty slot state.
         \\    Empty = 0,
-        \\    /// Populated slot state.
+        \\    /| Populated slot state.
         \\    Ready = 1,
         \\}
-        \\/// Packed hardware bitfield declaration.
+        \\/| Packed hardware bitfield declaration.
         \\pub bit_field CtrlWord: u16 {
-        \\    /// Active enable bit.
+        \\    /| Active enable bit.
         \\    pub enabled: bool | 1,
-        \\    /// Remaining payload bits.
+        \\    /| Remaining payload bits.
         \\    pub rest: u16 | 15,
         \\}
-        \\/// Raw C-compatible union declaration.
+        \\/| Raw C-compatible union declaration.
         \\pub union WordBits {
-        \\    /// Unsigned integer view.
+        \\    /| Unsigned integer view.
         \\    pub word: u32,
-        \\    /// Floating-point view.
+        \\    /| Floating-point view.
         \\    pub ratio: f32,
         \\}
-        \\/// Trait contract declaration.
+        \\/| Trait contract declaration.
         \\pub trait Inspectable {
-        \\    /// Returns slot score.
+        \\    /| Returns slot score.
         \\    fn score(&self) -> u32;
         \\}
-        \\/// Foreign block declaration.
+        \\/| Foreign block declaration.
         \\extern "C" {
-        \\    /// Foreign status poll prototype.
+        \\    /| Foreign status poll prototype.
         \\    fn c_poll_status() -> i32;
         \\}
-        \\/// Foreign standalone function declaration.
+        \\/| Foreign standalone function declaration.
         \\extern "C" fn c_fast_nop() -> i32;
-        \\/// Inherent implementation block.
+        \\/| Inherent implementation block.
         \\impl PairSlot {
-        \\    /// Computes lane sum.
+        \\    /| Computes lane sum.
         \\    pub fn sum(&self) -> u32 = self.first_lane + self.second_lane;
-        \\    /// Projects lane by index.
+        \\    /| Projects lane by index.
         \\    pub subscript(idx: usize) -> u32 {
         \\        let { yield self.first_lane; }
         \\        inout { yield &mut self.first_lane; }
         \\    }
         \\}
-        \\/// Standalone function exercising canonical `_ =` and partial destructuring.
+        \\/| Standalone function exercising canonical `_ =` and partial destructuring.
         \\pub fn exercise_discards(pair_in: (u32, u32)) -> u32 {
         \\    let (bound_first, _) = pair_in;
         \\    var mut_lane: u32 = 0;
@@ -1701,11 +1701,11 @@ test "test_parser_dr23_doc_attachment_impl_elif_discard_and_colon_diagnostics" {
         \\    _ = size_of_type[PairSlot]();
         \\    return bound_first + mut_lane;
         \\}
-        \\/// Prose unit test item.
+        \\/| Prose unit test item.
         \\test "dr23 doc attachment smoke" {
         \\    _ = exercise_discards((1, 2));
         \\}
-        \\/// Prose microbenchmark item.
+        \\/| Prose microbenchmark item.
         \\bench "dr23 discard bench" (bencher: &mut Bencher) {
         \\    _ = bencher;
         \\}
@@ -1727,34 +1727,34 @@ test "test_parser_dr23_doc_attachment_impl_elif_discard_and_colon_diagnostics" {
         /// Minimum number of occurrences of `expected_code` expected in `sink`.
         min_hits: usize = 1,
     }{
-        // `E0229`; mid-file `//!` after an item and `//!` inside `mod inner { … }`:
+        // `E0229`; mid-file `/#` after an item and `/#` inside `mod inner { … }`:
         .{
-            .source = "pub const SEED: u32 = 1;\n//! misplaced module doc\npub fn after() {}\n",
+            .source = "pub const SEED: u32 = 1;\n/# misplaced module doc\npub fn after() {}\n",
             .expected_code = .e0229_misplaced_module_doc_comment,
         },
         .{
-            .source = "pub mod inner {\n    //! inner module doc forbidden\n    pub fn f() {}\n}\n",
+            .source = "pub mod inner {\n    /# inner module doc forbidden\n    pub fn f() {}\n}\n",
             .expected_code = .e0229_misplaced_module_doc_comment,
         },
-        // `E0230`; `///` before `use`, local `let`, blank line, `//` comment, and `EOF`:
+        // `E0230`; `/|` before `use`, local `let`, blank line, `//` comment, and `EOF`:
         .{
-            .source = "/// doc on use\nuse cx.mem;\npub fn f() {}\n",
+            .source = "/| doc on use\nuse cx.mem;\npub fn f() {}\n",
             .expected_code = .e0230_unattached_doc_comment,
         },
         .{
-            .source = "pub fn f() -> i32 {\n    /// doc on local let\n    let local_x = 1;\n    return local_x;\n}\n",
+            .source = "pub fn f() -> i32 {\n    /| doc on local let\n    let local_x = 1;\n    return local_x;\n}\n",
             .expected_code = .e0230_unattached_doc_comment,
         },
         .{
-            .source = "/// detached by blank line\n\npub fn f() {}\n",
+            .source = "/| detached by blank line\n\npub fn f() {}\n",
             .expected_code = .e0230_unattached_doc_comment,
         },
         .{
-            .source = "/// detached by line comment\n// ordinary comment\npub fn f() {}\n",
+            .source = "/| detached by line comment\n// ordinary comment\npub fn f() {}\n",
             .expected_code = .e0230_unattached_doc_comment,
         },
         .{
-            .source = "pub fn f() {}\n/// trailing eof doc comment\n",
+            .source = "pub fn f() {}\n/| trailing eof doc comment\n",
             .expected_code = .e0230_unattached_doc_comment,
         },
         // `E0231`; visibility modifier on `impl` block:
@@ -1875,5 +1875,252 @@ test "test_parser_dr23_doc_attachment_impl_elif_discard_and_colon_diagnostics" {
             if (diag_item.code == tc.expected_code) hit_count += 1;
         }
         try std.testing.expect(hit_count >= tc.min_hits);
+    }
+}
+
+// ---------- Phase 11.1b (DR-24) Surface Diagnostics -----------
+
+test "test_parser_dr24_inline_if_fmt_strings_and_retired_grouped_attributes" {
+    // [1] Positive `ADR-24B`–`ADR-24D`: `.fmt_string_lit`, `if cond => a else b` chains, `StructLiteral`, `is`, and `:=`:
+    const valid_dr24_src =
+        \\/# Canonical DR-24 parser test.
+        \\
+        \\@repr(C, align: .CacheLine, zero_pad: true)
+        \\pub struct Point {
+        \\    pub x: i32,
+        \\    pub y: i32,
+        \\}
+        \\
+        \\/| Evaluates inline `if … => … else …` with `is` and `:=` flow conditions.
+        \\pub fn select_point(opt_val: i32?, alt: bool) -> str {
+        \\    let chosen = if opt_val is .Some(val) and (doubled := val * 2) > 0 => Point { x: doubled, y: val }
+        \\        else if alt => Point { x: 1, y: 2 }
+        \\        else Point { x: 0, y: 0 };
+        \\    if if alt => chosen.x > 0 else chosen.y >= 0 {
+        \\        return f"pt=({chosen.x}, {chosen.y})";
+        \\    }
+        \\    "fallback {literal}"
+        \\}
+    ;
+    {
+        var ok_toks = TokenBuffer.init(std.testing.allocator);
+        defer ok_toks.deinit();
+        var ok_cst = LosslessCstArena.init(std.testing.allocator);
+        defer ok_cst.deinit();
+        var ok_ast = AstArena.init(std.testing.allocator);
+        defer ok_ast.deinit();
+        var ok_sink = DiagnosticSink.init(std.testing.allocator);
+        defer ok_sink.deinit();
+        var ok_intern = try StringInterner.init(std.testing.allocator);
+        defer ok_intern.deinit();
+
+        _ = try corex.parseSource(
+            valid_dr24_src,
+            FileId.fromInt(70),
+            &ok_toks,
+            &ok_cst,
+            &ok_ast,
+            &ok_sink,
+            &ok_intern,
+        );
+        try std.testing.expectEqual(@as(u32, 0), ok_sink.error_count);
+        try std.testing.expectEqual(@as(u32, 0), ok_sink.warning_count);
+        try expectValidCstAndAstInvariants(valid_dr24_src, &ok_toks, &ok_cst, &ok_ast);
+
+        var has_fmt_string_node = false;
+        for (ok_ast.nodes.items(.tag)) |node_tag| {
+            if (node_tag == .fmt_string_lit) has_fmt_string_node = true;
+        }
+        try std.testing.expect(has_fmt_string_node);
+    }
+
+    // [2] Negative `E0237` (missing `else`), `E0238` (mixed `=>` + `{ }`), nested `if` in `=>` (`E0201`), and `@[…]`/`@(…)` (`E0239`):
+    const dr24_negative_cases = [_]struct {
+        source: []const u8,
+        expected_code: DiagnosticCode,
+        min_hits: usize = 1,
+    }{
+        .{
+            .source = "pub fn missing_else(flag: bool) {\n    if flag => 1;\n}\n",
+            .expected_code = .e0237_inline_if_missing_else,
+        },
+        .{
+            .source =
+            \\pub fn mixed_forms(flag: bool) -> i32 {
+            \\    let first_val = if flag => { 1 } else { 2 };
+            \\    let second_val = if flag => 1 else { 2 };
+            \\    let third_val = if flag { 1 } else => 2;
+            \\    return first_val + second_val + third_val;
+            \\}
+            ,
+            .expected_code = .e0238_mixed_if_arrow_and_block,
+            .min_hits = 3,
+        },
+        .{
+            .source = "pub fn nested_arrow(c1: bool, c2: bool) -> i32 = if c1 => if c2 => 1 else 2 else 3;\n",
+            .expected_code = .e0201_unexpected_token,
+        },
+        .{
+            .source = "@[inline, must_use]\n@(cold)\npub fn grouped_attrs() -> i32 = 1;\n",
+            .expected_code = .e0239_retired_layout_or_link_attribute,
+            .min_hits = 2,
+        },
+    };
+
+    for (dr24_negative_cases, 0..) |neg_case, idx| {
+        var token_buf = TokenBuffer.init(std.testing.allocator);
+        defer token_buf.deinit();
+        var cst_arena = LosslessCstArena.init(std.testing.allocator);
+        defer cst_arena.deinit();
+        var ast_arena = AstArena.init(std.testing.allocator);
+        defer ast_arena.deinit();
+        var sink = DiagnosticSink.init(std.testing.allocator);
+        defer sink.deinit();
+        var interner = try StringInterner.init(std.testing.allocator);
+        defer interner.deinit();
+
+        _ = try corex.parseSource(
+            neg_case.source,
+            FileId.fromInt(@intCast(80 + idx)),
+            &token_buf,
+            &cst_arena,
+            &ast_arena,
+            &sink,
+            &interner,
+        );
+        try expectValidCstAndAstInvariants(neg_case.source, &token_buf, &cst_arena, &ast_arena);
+
+        var matched_count: usize = 0;
+        for (sink.asSlice()) |diag_item| {
+            if (diag_item.code == neg_case.expected_code) matched_count += 1;
+        }
+        try std.testing.expect(matched_count >= neg_case.min_hits);
+    }
+}
+
+test "test_parser_dr24_parenthesized_vs_unparenthesized_nested_if_and_incremental_nested_fmt" {
+    // [1] Parenthesized `(if b => 1 else 2)` inside `=>` is allowed (`0` errors):
+    const paren_nested_src =
+        \\pub fn paren_inline(cond_a: bool, cond_b: bool) -> i32 {
+        \\    let direct_val = if cond_a => (if cond_b => 1 else 2) else 3;
+        \\    let sum_val = if cond_a => 10 + (if cond_b => 1 else 2) else 3;
+        \\    return direct_val + sum_val;
+        \\}
+    ;
+    {
+        var ok_toks = TokenBuffer.init(std.testing.allocator);
+        defer ok_toks.deinit();
+        var ok_cst = LosslessCstArena.init(std.testing.allocator);
+        defer ok_cst.deinit();
+        var ok_ast = AstArena.init(std.testing.allocator);
+        defer ok_ast.deinit();
+        var ok_sink = DiagnosticSink.init(std.testing.allocator);
+        defer ok_sink.deinit();
+        var ok_intern = try StringInterner.init(std.testing.allocator);
+        defer ok_intern.deinit();
+
+        _ = try corex.parseSource(
+            paren_nested_src,
+            FileId.fromInt(90),
+            &ok_toks,
+            &ok_cst,
+            &ok_ast,
+            &ok_sink,
+            &ok_intern,
+        );
+        try std.testing.expectEqual(@as(u32, 0), ok_sink.error_count);
+        try expectValidCstAndAstInvariants(paren_nested_src, &ok_toks, &ok_cst, &ok_ast);
+    }
+
+    // [2] Unparenthesized nested `if` inside binary subexpression `1 + if b => 2 else 3` emits `E0201`:
+    const unparen_bin_src =
+        "pub fn unparen_bin(cond_a: bool, cond_b: bool) -> i32 = if cond_a => 1 + if cond_b => 2 else 3 else 4;\n";
+    {
+        var bad_toks = TokenBuffer.init(std.testing.allocator);
+        defer bad_toks.deinit();
+        var bad_cst = LosslessCstArena.init(std.testing.allocator);
+        defer bad_cst.deinit();
+        var bad_ast = AstArena.init(std.testing.allocator);
+        defer bad_ast.deinit();
+        var bad_sink = DiagnosticSink.init(std.testing.allocator);
+        defer bad_sink.deinit();
+        var bad_intern = try StringInterner.init(std.testing.allocator);
+        defer bad_intern.deinit();
+
+        _ = try corex.parseSource(
+            unparen_bin_src,
+            FileId.fromInt(91),
+            &bad_toks,
+            &bad_cst,
+            &bad_ast,
+            &bad_sink,
+            &bad_intern,
+        );
+        try expectValidCstAndAstInvariants(unparen_bin_src, &bad_toks, &bad_cst, &bad_ast);
+        var has_e0201 = false;
+        for (bad_sink.asSlice()) |diag_item| {
+            if (diag_item.code == .e0201_unexpected_token) has_e0201 = true;
+        }
+        try std.testing.expect(has_e0201);
+    }
+
+    // [3] `reparseIncremental` falls back when a reused item contains nested 0-hole `f"{f"static"}"` (`W0119`):
+    const inc_before =
+        \\pub fn outer_fmt() -> str {
+        \\    return f"{f"static"}";
+        \\}
+        \\
+        \\pub fn tail_num() -> u32 {
+        \\    return 10;
+        \\}
+    ;
+    const inc_after =
+        \\pub fn outer_fmt() -> str {
+        \\    return f"{f"static"}";
+        \\}
+        \\
+        \\pub fn tail_num() -> u32 {
+        \\    return 200;
+        \\}
+    ;
+    {
+        var inc_toks = TokenBuffer.init(std.testing.allocator);
+        defer inc_toks.deinit();
+        var inc_cst = LosslessCstArena.init(std.testing.allocator);
+        defer inc_cst.deinit();
+        var inc_ast = AstArena.init(std.testing.allocator);
+        defer inc_ast.deinit();
+        var inc_sink = DiagnosticSink.init(std.testing.allocator);
+        defer inc_sink.deinit();
+        var inc_intern = try StringInterner.init(std.testing.allocator);
+        defer inc_intern.deinit();
+
+        _ = try corex.parseSource(
+            inc_before,
+            FileId.fromInt(92),
+            &inc_toks,
+            &inc_cst,
+            &inc_ast,
+            &inc_sink,
+            &inc_intern,
+        );
+        try std.testing.expectEqual(@as(u32, 1), inc_sink.warning_count);
+
+        inc_sink.deinit();
+        inc_sink = DiagnosticSink.init(std.testing.allocator);
+        const edit_off: u32 = @intCast(std.mem.indexOf(u8, inc_before, "10").?);
+        const inc_stats = try corex.reparseIncremental(
+            inc_after,
+            FileId.fromInt(92),
+            .{ .start_byte = edit_off, .old_end_byte = edit_off + 2, .new_end_byte = edit_off + 3 },
+            &inc_toks,
+            &inc_cst,
+            &inc_ast,
+            &inc_sink,
+            &inc_intern,
+        );
+        try std.testing.expect(!inc_stats.is_fast_splice);
+        try std.testing.expectEqual(@as(u32, 1), inc_sink.warning_count);
+        try std.testing.expectEqual(DiagnosticCode.w0119_useless_format_string, inc_sink.asSlice()[0].code);
     }
 }

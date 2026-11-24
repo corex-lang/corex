@@ -345,8 +345,7 @@ test "test_phase6_ownership_tiers_trivial_arena_drop_secret_context_and_wire_e03
         \\    pub used: usize,
         \\}
         \\pub struct Context {}
-        \\@zero_pad
-        \\@repr(C)
+        \\@repr(C, zero_pad: true)
         \\pub struct WireHeader {
         \\    pub kind: u8,
         \\    pub length: u32,
@@ -1608,11 +1607,11 @@ test "test_phase6_max_stack_e0316_malformed_attr_and_contracts_e0320_to_e0323" {
 test "test_phase6_fix17_gates_a_to_f_sandbox_policies_and_fix06b_vacated_w0329" {
     const allocator = std.testing.allocator;
 
-    // [1] `Fix-17` Gate B/C: `@link_section(".init_array")` & user `@std_cap_boundary` emit `E0327`:
+    // [1] `Fix-17` Gate B/C: `@link(section: ".init_array")` & user `@std_cap_boundary` emit `E0327`:
     try std.testing.expect(symbol_resolver.isForbiddenExecutableSection(".init_array"));
     try std.testing.expect(symbol_resolver.isForbiddenExecutableSection(".CRT$XCU"));
     const bypass_attr_src =
-        \\@link_section(".init_array")
+        \\@link(section: ".init_array")
         \\pub fn ctor_hook() {}
         \\@std_cap_boundary(emits: [fs])
         \\pub fn spoofed_boundary() {}
@@ -3546,7 +3545,7 @@ test "test_phase76_dr22_sast_raw_uninit_out_leak_e0422_struct_move_and_parallel_
         \\@no_alloc
         \\pub fn check_code_no_alloc(code: u32, label: str) -> u32 {
         \\    if code == 0 {
-        \\        @panic("invalid {code=:#06x} in {label}");
+        \\        @panic(f"invalid {code=:#06x} in {label}");
         \\    }
         \\    if code == 999 {
         \\        @panic(label);
@@ -3561,4 +3560,105 @@ test "test_phase76_dr22_sast_raw_uninit_out_leak_e0422_struct_move_and_parallel_
     ;
     var spread_bundle = try verifyCleanSast(allocator, 553, no_alloc_panic_and_partial_spread_src, .{});
     defer spread_bundle.deinit();
+}
+
+test "test_mir_sast_dr24_w0333_redundant_private_contracts_and_inline_if_loans" {
+    const allocator = std.testing.allocator;
+
+    const dr24_sast_src =
+        \\@repr(C, packed: true, align: .CacheLine, zero_pad: true)
+        \\pub struct AlignedPackedSlot {
+        \\    pub aligned_word: u64,
+        \\    pub flag: u8,
+        \\    pub word: u32,
+        \\}
+        \\
+        \\@no_alloc
+        \\@no_panic
+        \\@no_block
+        \\fn redundant_private_helper(val: i32) -> i32 {
+        \\    return val +% 1;
+        \\}
+        \\
+        \\@allow(W0333)
+        \\@no_alloc
+        \\fn suppressed_private_helper(val: i32) -> i32 {
+        \\    return val +% 2;
+        \\}
+        \\
+        \\@no_alloc
+        \\fn reified_private_cb(val: i32) -> i32 {
+        \\    return val +% 3;
+        \\}
+        \\
+        \\@no_alloc @no_panic
+        \\pub fn verify_dr24_contracts(slot: &AlignedPackedSlot, opt_ref: (&i32)?, fallback: i32) -> i32 {
+        \\    let aligned_loan: &u64 = &slot.aligned_word;
+        \\    let cb: @no_alloc fn(i32) -> i32 = reified_private_cb;
+        \\    let chosen = if opt_ref is .Some(loan) => loan.* else fallback;
+        \\    return (aligned_loan.* as i32) +% chosen +% redundant_private_helper(1) +% suppressed_private_helper(2) +% cb(3);
+        \\}
+    ;
+
+    var bundle = try corex.lowerAndVerifySourceMirSast(
+        allocator,
+        FileId.fromInt(560),
+        dr24_sast_src,
+        TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer bundle.deinit();
+    try std.testing.expect(!bundle.diagnostics.hasErrors());
+    try std.testing.expect(hasDiagnosticCode(&bundle.diagnostics, .w0333_redundant_private_contract));
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        countDiagnosticCode(&bundle.diagnostics, .w0333_redundant_private_contract),
+    );
+}
+
+test "test_mir_sast_lower_if_indirect_call_nll_ghost_borrows_and_gpu_kernel_w0333" {
+    const allocator = std.testing.allocator;
+
+    // [1] Conflicting mutation `val_a = 99` while `loan` returned from `fp(if flag => &mut val_a else &mut val_b)` is live (`E0305`):
+    const conflict_if_loan_src =
+        \\pub fn conflicting_if_loan(fp: fn(&mut i32) -> &mut i32, flag: bool) -> i32 {
+        \\    var val_a: i32 = 10;
+        \\    var val_b: i32 = 20;
+        \\    let loan = fp(if flag => &mut val_a else &mut val_b);
+        \\    val_a = 99;
+        \\    return loan.*;
+        \\}
+    ;
+    try expectSastDiagnostic(allocator, 561, conflict_if_loan_src, .{}, .e0305_exclusivity_violation);
+
+    // [2] NLL last-use release + `@gpu_kernel` private `@no_alloc` exemption (`0` errors and `0` `W0333` warnings):
+    const nll_clean_and_gpu_src =
+        \\@gpu_kernel
+        \\@no_alloc
+        \\fn device_saxpy_kernel(scale: i32, elem: i32) -> i32 {
+        \\    return scale *% elem;
+        \\}
+        \\
+        \\pub fn nll_after_last_use(fp: fn(&mut i32) -> &mut i32, flag: bool) -> i32 {
+        \\    var val_a: i32 = 10;
+        \\    var val_b: i32 = 20;
+        \\    let loan = fp(if flag => &mut val_a else &mut val_b);
+        \\    let read_val = loan.*;
+        \\    val_a = 99;
+        \\    return read_val +% val_a +% device_saxpy_kernel(2, val_b);
+        \\}
+    ;
+    var clean_bundle = try corex.lowerAndVerifySourceMirSast(
+        allocator,
+        FileId.fromInt(562),
+        nll_clean_and_gpu_src,
+        TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer clean_bundle.deinit();
+    try std.testing.expect(!clean_bundle.diagnostics.hasErrors());
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countDiagnosticCode(&clean_bundle.diagnostics, .w0333_redundant_private_contract),
+    );
 }

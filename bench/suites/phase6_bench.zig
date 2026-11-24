@@ -173,18 +173,15 @@ const SYNTHETIC_PHASE6_PREAMBLE =
     "    return items;\n" ++
     "}\n" ++
     "\n" ++
-    "@no_alloc\n" ++
-    "@no_block\n" ++
+    "@no_alloc @no_block\n" ++
     "pub fn mask_lane(val: i64, mask_seed: i64) -> i64 {\n" ++
     "    return (val ^ mask_seed) & 1023;\n" ++
     "}\n\n";
 
 /// Representative Phase 6 worker repeated `124` times (`4 + 124 = 128` functions, ~64 KiB total).
 const SYNTHETIC_PHASE6_WORKER =
-    "/// Exercises NLL borrows, `drop_in_place` + `drop_if_live`, contracts, and Pentagon slice BCE.\n" ++
-    "@no_alloc\n" ++
-    "@no_block\n" ++
-    "@max_stack(2048)\n" ++
+    "/| Exercises NLL borrows, `drop_in_place` + `drop_if_live`, contracts, and Pentagon slice BCE.\n" ++
+    "@no_alloc @no_block @max_stack(2048)\n" ++
     "pub fn eval_phase6_work000(seed_val: i64, probe_idx: usize, take_move: bool) -> i64 {\n" ++
     "    let outer_guard = TrackedGuard { id: 100 };\n" ++
     "    let branch_guard = TrackedGuard { id: 200 };\n" ++
@@ -217,10 +214,8 @@ const SYNTHETIC_PHASE6_MODULE_64K: [SYNTHETIC_PHASE6_MODULE_LEN]u8 = blk: {
     var buf: [SYNTHETIC_PHASE6_MODULE_LEN]u8 = undefined;
     @memcpy(buf[0..SYNTHETIC_PHASE6_PREAMBLE.len], SYNTHETIC_PHASE6_PREAMBLE);
 
-    const digits_prefix_len = ("/// Exercises NLL borrows, `drop_in_place` + `drop_if_live`, contracts, and Pentagon slice BCE.\n" ++
-        "@no_alloc\n" ++
-        "@no_block\n" ++
-        "@max_stack(2048)\n" ++
+    const digits_prefix_len = ("/| Exercises NLL borrows, `drop_in_place` + `drop_if_live`, contracts, and Pentagon slice BCE.\n" ++
+        "@no_alloc @no_block @max_stack(2048)\n" ++
         "pub fn eval_phase6_work").len;
 
     var i: usize = 0;
@@ -251,7 +246,7 @@ fn buildPentagon4kKernelSource(allocator: std.mem.Allocator) ![]u8 {
 
     try src_buf.appendSlice(
         allocator,
-        "@no_alloc\n@no_block\n" ++
+        "@no_alloc @no_block\n" ++
             "pub fn heavy_pentagon_kernel(data: &[i64], raw_idx: usize) -> i64 {\n" ++
             "    let fixed_lut: [i64; 8] = [3, 5, 7, 11, 13, 17, 19, 23];\n" ++
             "    var acc: i64 = fixed_lut[raw_idx & 7];\n" ++

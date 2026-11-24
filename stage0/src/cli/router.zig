@@ -4436,7 +4436,7 @@ fn executeUpgradeSubcommand(
                     "unknown upgrade rule `{s}` for `--explain`",
                     .{rule_str},
                 ),
-                .notes = &.{"help: run `corex upgrade --list` to see all 22 canonical Zero-Legacy upgrade rules"},
+                .notes = &.{"help: run `corex upgrade --list` to see all 29 canonical Zero-Legacy upgrade rules"},
             });
             try diag_renderer.renderAll(stderr_writer, sink);
             return 1;
@@ -4837,7 +4837,11 @@ fn executeUpgradeSubcommand(
             try sink.emit(.{
                 .code = .e0004_source_file_io_error,
                 .severity = .err,
-                .message = "failed to read or write workspace files during `corex upgrade`",
+                .message = try std.fmt.allocPrint(
+                    sink.arena.asAllocator(),
+                    "failed to read or write workspace files during `corex upgrade` ({s})",
+                    .{@errorName(upg_err)},
+                ),
             });
             try diag_renderer.renderAll(stderr_writer, sink);
             return 1;

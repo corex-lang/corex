@@ -101,19 +101,18 @@ const PreparedVmMemoState = struct {
 
 /// Shared 32-line preamble defining `FramePair` and 2 helpers (`pipe_boost`, `lift_seed`).
 const SYNTHETIC_PREAMBLE_32_LOC =
-    "/// Aggregate accumulator candidate for SROA scalar promotion.\n" ++
+    "/| Aggregate accumulator candidate for SROA scalar promotion.\n" ++
     "pub struct FramePair {\n" ++
     "    pub sum: i32,\n" ++
     "    pub count: i32,\n" ++
     "}\n" ++
     "\n" ++
-    "/// Generic `Number` pipeline helper exercising `D5` monomorphization and `R1` inlining.\n" ++
-    "@inline\n" ++
+    "/| Generic `Number` pipeline helper exercising `D5` monomorphization and `R1` inlining.\n" ++
     "pub fn pipe_boost(val: Number, factor: Number) -> Number {\n" ++
     "    return val * factor + val;\n" ++
     "}\n" ++
     "\n" ++
-    "/// Fallible helper exercising `T!E` `?` propagation and `catch` fallback.\n" ++
+    "/| Fallible helper exercising `T!E` `?` propagation and `catch` fallback.\n" ++
     "pub fn lift_seed(val: i32) -> i32!u32 {\n" ++
     "    if val < 0 {\n" ++
     "        return .Err(1);\n" ++
@@ -122,6 +121,7 @@ const SYNTHETIC_PREAMBLE_32_LOC =
     "}\n" ++
     "\n" ++
     "// Padding lines to keep total module line count at an exact 2,048 LOC (32 + 126 * 16):\n" ++
+    "// [line 21]\n" ++
     "// [line 22]\n" ++
     "// [line 23]\n" ++
     "// [line 24]\n" ++
@@ -136,7 +136,7 @@ const SYNTHETIC_PREAMBLE_32_LOC =
 
 /// Representative 16-line `.cx` worker function repeated 126 times (`2 + 126 = 128` functions, `2,048` LOC).
 const SYNTHETIC_WORKER_16_LOC =
-    "/// Evaluates pipelines, `?`/`catch`, `match`, `for` loops, structs, and `defer`.\n" ++
+    "/| Evaluates pipelines, `?`/`catch`, `match`, `for` loops, structs, and `defer`.\n" ++
     "pub fn eval_phase5_work000(seed_val: i32, flag_byte: u8) -> i32!u32 {\n" ++
     "    var cleanup_acc: i32 = 0;\n" ++
     "    defer { cleanup_acc += 1; }\n" ++
@@ -162,7 +162,7 @@ const SYNTHETIC_PHASE5_MODULE_64K: [SYNTHETIC_MODULE_LEN]u8 = blk: {
     var buf: [SYNTHETIC_MODULE_LEN]u8 = undefined;
     @memcpy(buf[0..SYNTHETIC_PREAMBLE_32_LOC.len], SYNTHETIC_PREAMBLE_32_LOC);
 
-    const worker_prefix_len = ("/// Evaluates pipelines, `?`/`catch`, `match`, `for` loops, structs, and `defer`.\n" ++
+    const worker_prefix_len = ("/| Evaluates pipelines, `?`/`catch`, `match`, `for` loops, structs, and `defer`.\n" ++
         "pub fn eval_phase5_work").len;
 
     var i: usize = 0;

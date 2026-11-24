@@ -1370,3 +1370,92 @@ test "test_mir_opt_differential_dev_vs_release_across_native64_and_wasm32_target
         try std.testing.expectEqual(dev_neg.scalar_i64, rel_neg.scalar_i64);
     }
 }
+
+test "test_mir_opt_dr24_inline_if_branch_folding_and_dev_release_parity" {
+    const allocator = std.testing.allocator;
+
+    const dr24_opt_src =
+        \\@inline(always)
+        \\fn scale_fast(val: i64) -> i64 {
+        \\    return if val > 0 => val * 3 else 0;
+        \\}
+        \\
+        \\@inline(never)
+        \\fn cold_fallback(val: i64) -> i64 {
+        \\    return val - 1;
+        \\}
+        \\
+        \\pub fn eval_dr24_opt(seed: i64) -> i64 {
+        \\    let const_folded: i64 = if true => 10 else 99;
+        \\    let selected = if seed > 10 => scale_fast(seed)
+        \\        else if seed == 0 => const_folded
+        \\        else cold_fallback(seed);
+        \\    return selected + const_folded;
+        \\}
+    ;
+
+    var bundle = try mir.lowerSourceToMir(
+        allocator,
+        FileId.fromInt(99),
+        dr24_opt_src,
+        TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer bundle.deinit();
+    try std.testing.expect(!bundle.hir_bundle.diagnostics.hasErrors());
+    try std.testing.expectEqual(@as(usize, 0), bundle.hir_bundle.diagnostics.diagnostics.items.len);
+
+    var dev_sink = DiagnosticSink.init(allocator);
+    defer dev_sink.deinit();
+    var dev_res = try runOptimizeOnBundle(
+        allocator,
+        &bundle,
+        dr24_opt_src,
+        false,
+        false,
+        TargetLayout.NATIVE_64,
+        &dev_sink,
+    );
+    defer dev_res.deinit();
+    try std.testing.expect(!dev_sink.hasErrors());
+
+    var rel_sink = DiagnosticSink.init(allocator);
+    defer rel_sink.deinit();
+    var rel_res = try runOptimizeOnBundle(
+        allocator,
+        &bundle,
+        dr24_opt_src,
+        true,
+        false,
+        TargetLayout.NATIVE_64,
+        &rel_sink,
+    );
+    defer rel_res.deinit();
+    try std.testing.expect(!rel_sink.hasErrors());
+
+    for (dev_res.bodies.items) |*dev_body| {
+        try mir.verifyMirBody(allocator, dev_body, &bundle.hir_bundle.pool, &bundle.hir_bundle.sym_table, null);
+    }
+    for (rel_res.bodies.items) |*rel_body| {
+        try mir.verifyMirBody(allocator, rel_body, &bundle.hir_bundle.pool, &bundle.hir_bundle.sym_table, null);
+    }
+
+    const dev_val = try evalOptimizedFnSlot(
+        allocator,
+        &bundle,
+        &dev_res,
+        "eval_dr24_opt",
+        &.{.{ .scalar_i64 = 12 }},
+        TargetLayout.NATIVE_64,
+    );
+    const rel_val = try evalOptimizedFnSlot(
+        allocator,
+        &bundle,
+        &rel_res,
+        "eval_dr24_opt",
+        &.{.{ .scalar_i64 = 12 }},
+        TargetLayout.NATIVE_64,
+    );
+    try std.testing.expectEqual(@as(i64, 46), dev_val.scalar_i64);
+    try std.testing.expectEqual(dev_val.scalar_i64, rel_val.scalar_i64);
+}

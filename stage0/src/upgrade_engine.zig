@@ -1,10 +1,10 @@
-//! Zero-Legacy Automated Source & Manifest Upgrade Engine (`DR-14`, `DR-17`, `DR-21`, `DR-22`, & `DR-23`)
+//! Zero-Legacy Automated Source & Manifest Upgrade Engine (`DR-14`, `DR-17`, `DR-21`, `DR-22`, `DR-23`, & `DR-24`)
 //!
 //! Implements the bounded 4-pass multi-stage rewrite pipeline (`corex upgrade` / `corex fix`) covering
-//! Tier 1 pre-CST lexical shims (`UR-21-00`, `UR-22-00`, `UR-23-00`, `UR-23-02`), Tier 2 lossless CST/AST
-//! structural rewrites (`UR-21-01`–`UR-21-03`, `UR-22-01`–`UR-22-05`, `UR-23-01`, `UR-23-03`, `UR-23-06`),
-//! Tier 3 `CompilerDb` `TypeId`-aware semantic modernizers (`UR-21-04`–`UR-21-07`, `UR-22-06`, `UR-23-04`,
-//! `UR-23-05`, `@deprecated` `W0403`), `corex.toml` canonicalization, and `--accept-caps`.
+//! Tier 1 pre-CST lexical shims (`UR-21-00`, `UR-22-00`, `UR-23-00`, `UR-23-02`, `UR-24-00`–`UR-24-02`), Tier 2
+//! lossless CST/AST structural rewrites (`UR-21-01`–`UR-21-03`, `UR-22-01`–`UR-22-05`, `UR-23-01`, `UR-23-03`,
+//! `UR-23-06`, `UR-24-03`, `UR-24-04`), Tier 3 `CompilerDb` `TypeId`-aware semantic modernizers (`UR-21-04`–`UR-21-07`,
+//! `UR-22-06`, `UR-23-04`, `UR-23-05`, `UR-24-05`, `UR-24-06`, `@deprecated` `W0403`), and `corex.toml` / `--accept-caps`.
 //!
 //! Every candidate byte edit is scheduled through `TransactionalPatcher` (`16B` `TextEdit` records),
 //! formatted via `fmt_engine` on completion, and protected by an atomic syntax-error-count rollback guard.
@@ -113,6 +113,8 @@ pub const UpgradeOptions = struct {
     environ_map: ?*const std.process.Environ.Map = null,
     /// Additional pending migration items (e.g., `--accept-caps` drift) merged during `--check`.
     extra_pending_items: []const PendingUpgradeItem = &.{},
+    /// `true` when upgrading a synthetic single-expression wrapper (`{expr}` hole) that must skip `formatSource`.
+    skip_post_format: bool = false,
 };
 
 // ----------------- Upgrade Outcomes & Reports -----------------
@@ -447,7 +449,7 @@ const PerFileState = struct {
 
 // ------------------ Canonical Rule Examples -------------------
 
-/// Bitmask enabling all 22 canonical Zero-Legacy upgrade rules (`0x003F_FFFF`).
+/// Bitmask enabling all 29 canonical Zero-Legacy upgrade rules (`0x1FFF_FFFF`).
 pub const ALL_UPGRADE_RULES_MASK: u32 = (@as(u32, 1) << @intCast(upgrade_rules.UPGRADE_RULE_COUNT)) - 1;
 
 /// Maximum multi-pass fixed-point synergy iterations per file (`DR-14` §2.3 & `DR-21` §3.3).
@@ -456,7 +458,7 @@ pub const MAX_SYNERGY_PASSES: u8 = upgrade_rules.MAX_SYNERGY_PASSES;
 /// Maximum leading byte prefix inspected for `@generated` or `DO NOT EDIT` header comments.
 pub const GENERATED_HEADER_SCAN_LIMIT: usize = check_audit.GENERATED_HEADER_SCAN_BYTES;
 
-/// Canonical 22-entry explanation and before/after showcase table indexed by `@backingInt(UpgradeRuleId)`.
+/// Canonical 29-entry explanation and before/after showcase table indexed by `@backingInt(UpgradeRuleId)`.
 pub const UPGRADE_RULE_EXAMPLES: [upgrade_rules.UPGRADE_RULE_COUNT]UpgradeRuleExample = .{
     .{
         .id = .ur_21_00_path_coloncolon_and_std_root,
@@ -693,26 +695,26 @@ pub const UPGRADE_RULE_EXAMPLES: [upgrade_rules.UPGRADE_RULE_COUNT]UpgradeRuleEx
         \\pub fn crc32(data: &[u8]) -> u32 { return 0; }
         ,
         .after_cx =
-        \\/// Computes CRC-32 over `packets/*`.
+        \\/| Computes CRC-32 over `packets/*`.
         \\pub fn crc32(data: &[u8]) -> u32 { return 0; }
         ,
     },
     .{
         .id = .ur_23_01_doc_comment_placement_and_attachment,
-        .explanation = "Module '//!' doc comments are valid exclusively at file top; inline 'mod' blocks " ++
-            "use outer '///' docs, and '///' must immediately precede a documentable declaration.",
+        .explanation = "Module '/#' doc comments are valid exclusively at file top; inline 'mod' blocks " ++
+            "use outer '/|' docs, and '/|' must immediately precede a documentable declaration.",
         .before_cx =
         \\pub mod codec {
-        \\    //! Wire framing helpers.
-        \\    /// Decodes frame header.
+        \\    /# Wire framing helpers.
+        \\    /| Decodes frame header.
         \\
         \\    pub fn decode() {}
         \\}
         ,
         .after_cx =
-        \\/// Wire framing helpers.
+        \\/| Wire framing helpers.
         \\pub mod codec {
-        \\    /// Decodes frame header.
+        \\    /| Decodes frame header.
         \\    pub fn decode() {}
         \\}
         ,
@@ -798,6 +800,117 @@ pub const UPGRADE_RULE_EXAMPLES: [upgrade_rules.UPGRADE_RULE_COUNT]UpgradeRuleEx
         \\pub fn add_pair(lhs: u32, rhs: u32) -> u32 {
         \\    let sum: u32 = lhs + rhs;
         \\    return sum;
+        \\}
+        ,
+    },
+    .{
+        .id = .ur_24_00_doc_prefixes_block_comments_and_tabs,
+        .explanation = "CoreX unifies comments onto <=2-character line prefixes ('//' comment, '/|' item doc, " ++
+            "'/#' module doc), retiring '/* … */', '///', '//!', and hard '\\t' tab indentation.",
+        .before_cx =
+        \\//! Ring buffer primitives.
+        \\
+        \\/// Capacity in elements.
+        \\pub const RING_CAP: usize = /* power of two */ 64;
+        ,
+        .after_cx =
+        \\/# Ring buffer primitives.
+        \\
+        \\/| Capacity in elements.
+        \\// power of two
+        \\pub const RING_CAP: usize = 64;
+        ,
+    },
+    .{
+        .id = .ur_24_01_f_strings_and_multiline_dedent,
+        .explanation = "Explicit 'f\"…\"' / 'f#\"…\"#' marks string interpolation at byte 0 while retiring fat " ++
+            "'\"\"\"' fences in favor of dedented '\"<newline> … \"' multiline literals.",
+        .before_cx =
+        \\pub fn banner(port: u16) -> String {
+        \\    return """
+        \\        listening on 0.0.0.0:{port}
+        \\        """;
+        \\}
+        ,
+        .after_cx =
+        \\pub fn banner(port: u16) -> String {
+        \\    return f"
+        \\        listening on 0.0.0.0:{port}
+        \\        ";
+        \\}
+        ,
+    },
+    .{
+        .id = .ur_24_02_plain_string_brace_unescape,
+        .explanation = "Plain '\"…\"' strings are 100% literal UTF-8 'str' slices where '{' and '}' require " ++
+            "zero '{{' / '}}' escaping across JSON, SQL, regex, and C codegen snippets.",
+        .before_cx =
+        \\const SELECT_SQL: str = "SELECT id FROM sessions WHERE meta != '{{}}'";
+        ,
+        .after_cx =
+        \\const SELECT_SQL: str = "SELECT id FROM sessions WHERE meta != '{}'";
+        ,
+    },
+    .{
+        .id = .ur_24_03_consolidated_repr_and_link_attrs,
+        .explanation = "Memory layout and symbol linkage modifiers consolidate into '@repr(…)' and '@link(…)' " ++
+            "so 'corex fmt' packs attributes horizontally within <=100 columns.",
+        .before_cx =
+        \\@repr_c
+        \\@cache_aligned
+        \\@zero_pad
+        \\pub struct SlabHeader { pub addr: u64 }
+        ,
+        .after_cx =
+        \\@repr(C, align: .CacheLine, zero_pad: true)
+        \\pub struct SlabHeader {
+        \\    pub addr: u64,
+        \\}
+        ,
+    },
+    .{
+        .id = .ur_24_04_unwrap_grouped_attribute_lists,
+        .explanation = "CoreX uses bracket-free '@attr' annotations packed horizontally by 'corex fmt' rather " ++
+            "than Rust/Odin-style '@[…]' or '@(…)' outer list wrappers.",
+        .before_cx =
+        \\@[must_use, no_alloc, no_panic]
+        \\pub fn is_valid(tag: u8) -> bool = tag != 0_u8;
+        ,
+        .after_cx =
+        \\@no_alloc @no_panic @must_use
+        \\pub fn is_valid(tag: u8) -> bool = tag != 0_u8;
+        ,
+    },
+    .{
+        .id = .ur_24_05_strip_redundant_private_contracts,
+        .explanation = "Interprocedural SAST and MIR inlining infer effects and inline intra-package/generic/'= expr;' " ++
+            "helpers automatically, reserving '@no_alloc'/'@no_panic'/'@inline' for 'pub' SemVer boundaries.",
+        .before_cx =
+        \\@inline
+        \\@no_alloc
+        \\@no_panic
+        \\fn step_gen(cur: u16) -> u16 {
+        \\    return cur +% 1_u16;
+        \\}
+        ,
+        .after_cx =
+        \\fn step_gen(cur: u16) -> u16 {
+        \\    return cur +% 1_u16;
+        \\}
+        ,
+    },
+    .{
+        .id = .ur_24_06_inline_fat_arrow_if_expr,
+        .explanation = "Pure single-expression conditional values use 'if cond => a else b', reserving braced " ++
+            "'if cond { … }' strictly for conditional statements and multi-statement blocks.",
+        .before_cx =
+        \\pub fn flag_bits(urgent: bool) -> u16 {
+        \\    return if urgent { 1_u16 } else { 0_u16 };
+        \\}
+        ,
+        .after_cx =
+        \\pub fn flag_bits(urgent: bool) -> u16 {
+        \\    return if urgent => 1_u16 else 0_u16;
         \\}
         ,
     },
@@ -967,6 +1080,51 @@ const MAX_UPGRADE_MOD_DISCOVERY_DEPTH: u32 = 64;
 const RETIRED_EDITION_SET = std.StaticStringMap(void).initComptime(.{
     .{ "2024", {} },
     .{ "2025", {} },
+});
+
+/// $O(1)$ set of layout and linkage attribute names coalesced by `UR-24-03` (`@repr(…)` / `@link(…)`).
+const DR24_COALESCED_ATTR_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "align", {} },
+    .{ "cache_aligned", {} },
+    .{ "link", {} },
+    .{ "link_name", {} },
+    .{ "link_section", {} },
+    .{ "packed", {} },
+    .{ "repr", {} },
+    .{ "repr_c", {} },
+    .{ "zero_pad", {} },
+});
+
+/// $O(1)$ set of ABI/entry-point attributes exempting functions from `UR-24-05` (`W0333`) stripping.
+const DR24_ABI_BOUNDARY_ATTR_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "export", {} },
+    .{ "gpu_kernel", {} },
+    .{ "ifunc", {} },
+    .{ "link_name", {} },
+    .{ "link_section", {} },
+    .{ "std_cap_boundary", {} },
+    .{ "wasm_export", {} },
+});
+
+/// $O(1)$ set of effect-contract attributes stripped on private internal helpers by `UR-24-05`.
+const DR24_PRIVATE_CONTRACT_ATTR_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "no_alloc", {} },
+    .{ "no_block", {} },
+    .{ "no_panic", {} },
+});
+
+/// $O(1)$ set of scoped `@allow(…)` identifiers that suppress `W0333` / `UR-24-05`.
+const DR24_ALLOW_W0333_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "W0333", {} },
+    .{ "redundant_private_contract", {} },
+});
+
+/// $O(1)$ set of `@align` / `@repr` cache-line alignment aliases canonicalized to `.CacheLine` (`ADR-24C`).
+const CACHE_LINE_ALIAS_SET = std.StaticStringMap(void).initComptime(.{
+    .{ ".CacheLine", {} },
+    .{ ".cache_line", {} },
+    .{ "cache_aligned", {} },
+    .{ "cache_line", {} },
 });
 
 /// Canonical ASCII-sorted `LOCKFILE_CAP_BITS` (`0x033F`) table verified at comptime against `MANIFEST_CAPABILITY_MAP`.
@@ -1568,11 +1726,11 @@ fn collectBlockDocCommentTier1Fixes(
                     const is_file_top_mod_doc = is_first_gap and !has_seen_non_mod_comment and !has_code_before and
                         (is_bang_doc or rec.kind == .eof or rec.kind == .kw_use or after_newlines >= 2 or has_comment_after);
                     const target_prefix: []const u8 = if (is_file_top_mod_doc)
-                        "//!"
+                        "/#"
                     else if (is_bang_doc)
                         "//"
                     else
-                        "///";
+                        "/|";
 
                     const repl_lines = try fmt_engine.renderBlockDocAsLineComments(
                         allocator,
@@ -1595,7 +1753,7 @@ fn collectBlockDocCommentTier1Fixes(
                                 abs_start,
                                 base_offset +| @as(u32, @intCast(same_ln)),
                                 with_nl,
-                                "UR-23-00: rewrite block doc comment to line doc comments (`E0118`)",
+                                "UR-23-00: rewrite block doc comment to `/#` or `/|` line doc comments (`E0118`)",
                             );
                         } else {
                             try collector.appendSingleEdit(
@@ -1603,7 +1761,7 @@ fn collectBlockDocCommentTier1Fixes(
                                 abs_start,
                                 base_offset +| @as(u32, @intCast(cmt_end)),
                                 repl_lines,
-                                "UR-23-00: rewrite block doc comment to line doc comments (`E0118`)",
+                                "UR-23-00: rewrite block doc comment to `/#` or `/|` line doc comments (`E0118`)",
                             );
                         }
                     } else {
@@ -1612,7 +1770,7 @@ fn collectBlockDocCommentTier1Fixes(
                             abs_start,
                             base_offset +| @as(u32, @intCast(cmt_end)),
                             repl_lines,
-                            "UR-23-00: rewrite block doc comment to line doc comments (`E0118`)",
+                            "UR-23-00: rewrite block doc comment to `/#` or `/|` line doc comments (`E0118`)",
                         );
                     }
                     if (!is_file_top_mod_doc) has_seen_non_mod_comment = true;
@@ -1670,7 +1828,1115 @@ fn isForeignElifBranchToken(tok_buf: *const TokenBuffer, tok_idx: usize) bool {
     return false;
 }
 
-/// Tokenizes `source` (rebased at `base_offset`) and emits Tier 1 `UR-21-00`, `UR-22-00`, `UR-23-00`, and `UR-23-02` fixes.
+/// Wrapper prefix used when recursively upgrading `{Expr}` hole expressions inside strings (`UR-24-01`).
+const HOLE_UPGRADE_WRAP_PREFIX = "pub fn __cx_up_hole__() {\n    __cx_up_sink__(";
+/// Wrapper suffix used when recursively upgrading `{Expr}` hole expressions inside strings (`UR-24-01`).
+const HOLE_UPGRADE_WRAP_SUFFIX = ");\n}\n";
+
+/// Computes the minimum `#` guard count (`>= min_hashes`) so `"` followed by `h` `#`s never occurs in `body`.
+fn computeRequiredQuoteGuardHashes(body: []const u8, min_hashes: usize) usize {
+    var needed: usize = min_hashes;
+    var idx: usize = 0;
+    while (idx < body.len) {
+        if (body[idx] == '"') {
+            var hash_run: usize = 0;
+            var h_pos = idx + 1;
+            while (h_pos < body.len and body[h_pos] == '#') : (h_pos += 1) {
+                hash_run += 1;
+            }
+            if (hash_run + 1 > needed) {
+                needed = hash_run + 1;
+            }
+            idx = h_pos;
+        } else {
+            idx += 1;
+        }
+    }
+    return @min(needed, 15);
+}
+
+/// Normalizes leading `\t` tabs on multiline string lines to 4 spaces and optionally escapes content `\t` to `\t`.
+fn appendNormalizedStringSegment(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    segment: []const u8,
+    is_at_line_start_io: *bool,
+    is_multiline: bool,
+    should_escape_inner_tabs: bool,
+    should_escape_unescaped_quotes: bool,
+) !void {
+    var idx: usize = 0;
+    while (idx < segment.len) {
+        const ch = segment[idx];
+        if (ch == '\n') {
+            try out.append(allocator, '\n');
+            is_at_line_start_io.* = true;
+            idx += 1;
+            continue;
+        }
+        if (ch == '\r') {
+            try out.append(allocator, '\r');
+            idx += 1;
+            continue;
+        }
+        if (is_multiline and is_at_line_start_io.* and (ch == ' ' or ch == '\t')) {
+            if (ch == '\t') {
+                try out.appendSlice(allocator, "    ");
+            } else {
+                try out.append(allocator, ' ');
+            }
+            idx += 1;
+            continue;
+        }
+        is_at_line_start_io.* = false;
+
+        if (ch == '\\') {
+            var bs_run: usize = 0;
+            while (idx + bs_run < segment.len and segment[idx + bs_run] == '\\') : (bs_run += 1) {}
+            try out.appendNTimes(allocator, '\\', bs_run);
+            idx += bs_run;
+            if ((bs_run % 2) == 1 and idx < segment.len) {
+                try out.append(allocator, segment[idx]);
+                idx += 1;
+            }
+            continue;
+        }
+        if (ch == '\t' and should_escape_inner_tabs) {
+            try out.appendSlice(allocator, "\\t");
+            idx += 1;
+            continue;
+        }
+        if (ch == '"' and should_escape_unescaped_quotes) {
+            try out.appendSlice(allocator, "\\\"");
+            idx += 1;
+            continue;
+        }
+        try out.append(allocator, ch);
+        idx += 1;
+    }
+}
+
+/// Ensures a migrated multiline `"""…"""` body ends with `\n[ ]*` at `<= min_content_indent` (`E0115`, `E0116`).
+fn ensureValidMultilineClosingIndentAlloc(
+    allocator: std.mem.Allocator,
+    raw_body_after_open: []const u8,
+    is_raw: bool,
+    is_fmt: bool,
+) ![]u8 {
+    var open_nl_end: usize = 0;
+    if (raw_body_after_open.len > 0 and raw_body_after_open[0] == '\n') {
+        open_nl_end = 1;
+    } else if (raw_body_after_open.len >= 2 and raw_body_after_open[0] == '\r' and raw_body_after_open[1] == '\n') {
+        open_nl_end = 2;
+    }
+    if (open_nl_end == 0) return allocator.dupe(u8, raw_body_after_open);
+
+    const after_nl = raw_body_after_open[open_nl_end..];
+    var last_lf: ?usize = null;
+    var min_content_spaces: usize = std.math.maxInt(usize);
+    var line_start: usize = 0;
+    var cur: usize = 0;
+
+    while (cur < after_nl.len) {
+        if (!is_raw and after_nl[cur] == '\\' and cur + 1 < after_nl.len) {
+            cur += 2;
+            continue;
+        }
+        if (is_fmt and !is_raw and after_nl[cur] == '{') {
+            if (cur + 1 < after_nl.len and after_nl[cur + 1] == '{') {
+                cur += 2;
+                continue;
+            }
+            cur = scanHoleEndWithoutEdits(after_nl, cur + 1, after_nl.len);
+            continue;
+        }
+        if (after_nl[cur] == '\n') {
+            const clean_end = if (cur > line_start and after_nl[cur - 1] == '\r') cur - 1 else cur;
+            const ln = after_nl[line_start..clean_end];
+            if (ln.len > 0) {
+                var sp_cols: usize = 0;
+                var has_non_ws = false;
+                for (ln) |b_val| {
+                    if (b_val == ' ') {
+                        sp_cols += 1;
+                    } else if (b_val == '\t') {
+                        sp_cols += 4;
+                    } else {
+                        has_non_ws = true;
+                        break;
+                    }
+                }
+                if (has_non_ws) {
+                    min_content_spaces = @min(min_content_spaces, sp_cols);
+                }
+            }
+            last_lf = cur;
+            line_start = cur + 1;
+        }
+        cur += 1;
+    }
+
+    const tail = if (last_lf) |lf_i| after_nl[lf_i + 1 ..] else after_nl;
+    var tail_only_ws = true;
+    var tail_spaces: usize = 0;
+    for (tail) |b_val| {
+        if (b_val == ' ') {
+            tail_spaces += 1;
+        } else if (b_val == '\t') {
+            tail_spaces += 4;
+        } else {
+            tail_only_ws = false;
+            break;
+        }
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '\n');
+
+    if (!tail_only_ws) {
+        var sp_cols: usize = 0;
+        for (tail) |b_val| {
+            if (b_val == ' ') sp_cols += 1 else if (b_val == '\t') sp_cols += 4 else break;
+        }
+        min_content_spaces = @min(min_content_spaces, sp_cols);
+        const close_indent = if (min_content_spaces == std.math.maxInt(usize)) 0 else min_content_spaces;
+        var at_bol = true;
+        try appendNormalizedStringSegment(allocator, &out, after_nl, &at_bol, true, false, false);
+        try out.append(allocator, '\n');
+        try out.appendNTimes(allocator, ' ', close_indent);
+        return out.toOwnedSlice(allocator);
+    }
+
+    const content_prefix = if (last_lf) |lf_i| after_nl[0 .. lf_i + 1] else "";
+    const clamped_close = if (min_content_spaces == std.math.maxInt(usize))
+        tail_spaces
+    else
+        @min(tail_spaces, min_content_spaces);
+    var at_bol = true;
+    try appendNormalizedStringSegment(allocator, &out, content_prefix, &at_bol, true, false, false);
+    try out.appendNTimes(allocator, ' ', clamped_close);
+    return out.toOwnedSlice(allocator);
+}
+
+/// Splits `{Expr[=][:Spec]}` inside an upgrade hole scan into `(expr_slice, spec_with_colon, has_debug_eq)`.
+fn splitUpgradeHoleParts(raw_hole: []const u8) struct {
+    expr_slice: []const u8,
+    spec_with_colon: []const u8,
+    has_debug_eq: bool,
+} {
+    var spec_colon_idx: ?usize = null;
+    var nesting_depth: u32 = 0;
+    var pos: usize = 0;
+    while (pos < raw_hole.len) {
+        const ch = raw_hole[pos];
+        if (ch == '(' or ch == '[' or ch == '{') {
+            nesting_depth += 1;
+            pos += 1;
+        } else if (ch == ')' or ch == ']' or ch == '}') {
+            nesting_depth -|= 1;
+            pos += 1;
+        } else if ((ch == 'r' or ch == 'b' or ch == 'f') and pos + 1 < raw_hole.len and
+            !(pos > 0 and isIdentContinueByte(raw_hole[pos - 1])))
+        {
+            var probe = pos + 1;
+            if (ch == 'b' and probe < raw_hole.len and raw_hole[probe] == 'r') probe += 1;
+            var hashes: usize = 0;
+            while (probe < raw_hole.len and raw_hole[probe] == '#') : (probe += 1) hashes += 1;
+            if (probe < raw_hole.len and (raw_hole[probe] == '"' or (ch == 'b' and raw_hole[probe] == '\''))) {
+                const delim = raw_hole[probe];
+                const is_triple = delim == '"' and probe + 2 < raw_hole.len and
+                    raw_hole[probe + 1] == '"' and raw_hole[probe + 2] == '"';
+                const is_raw_inner = ch == 'r' or (pos + 1 < raw_hole.len and raw_hole[pos + 1] == 'r');
+                pos = probe + (if (is_triple) @as(usize, 3) else 1);
+                while (pos < raw_hole.len) {
+                    if (!is_raw_inner and raw_hole[pos] == '\\' and pos + 1 < raw_hole.len) {
+                        pos += 2;
+                        continue;
+                    }
+                    if (is_triple) {
+                        if (pos + 2 + hashes < raw_hole.len and raw_hole[pos] == '"' and
+                            raw_hole[pos + 1] == '"' and raw_hole[pos + 2] == '"')
+                        {
+                            var h_ok = true;
+                            for (0..hashes) |hi| {
+                                if (raw_hole[pos + 3 + hi] != '#') h_ok = false;
+                            }
+                            if (h_ok) {
+                                pos += 3 + hashes;
+                                break;
+                            }
+                        }
+                    } else if (raw_hole[pos] == delim and pos + hashes < raw_hole.len) {
+                        var h_ok = true;
+                        for (0..hashes) |hi| {
+                            if (raw_hole[pos + 1 + hi] != '#') h_ok = false;
+                        }
+                        if (h_ok) {
+                            pos += 1 + hashes;
+                            break;
+                        }
+                    }
+                    pos += 1;
+                }
+                continue;
+            }
+            pos += 1;
+        } else if (ch == '"' or ch == '\'') {
+            const delim = ch;
+            const is_triple = delim == '"' and pos + 2 < raw_hole.len and
+                raw_hole[pos + 1] == '"' and raw_hole[pos + 2] == '"';
+            pos += if (is_triple) 3 else 1;
+            while (pos < raw_hole.len) {
+                if (raw_hole[pos] == '\\' and pos + 1 < raw_hole.len) {
+                    pos += 2;
+                    continue;
+                }
+                if (is_triple) {
+                    if (pos + 2 < raw_hole.len and raw_hole[pos] == '"' and
+                        raw_hole[pos + 1] == '"' and raw_hole[pos + 2] == '"')
+                    {
+                        pos += 3;
+                        break;
+                    }
+                } else if (raw_hole[pos] == delim) {
+                    pos += 1;
+                    break;
+                }
+                pos += 1;
+            }
+        } else if (nesting_depth == 0 and ch == ':' and pos > 0 and
+            !(pos + 1 < raw_hole.len and raw_hole[pos + 1] == ':'))
+        {
+            if (lexer.parseFormatSpec(raw_hole[pos + 1 ..], false)) |_| {
+                spec_colon_idx = pos;
+                break;
+            } else |_| {
+                pos += 1;
+            }
+        } else if (nesting_depth == 0 and ch == ':' and pos > 0 and
+            pos + 2 < raw_hole.len and raw_hole[pos + 1] == ':' and
+            (raw_hole[pos + 2] == '<' or raw_hole[pos + 2] == '^' or raw_hole[pos + 2] == '>'))
+        {
+            if (lexer.parseFormatSpec(raw_hole[pos + 1 ..], false)) |_| {
+                spec_colon_idx = pos;
+                break;
+            } else |_| {
+                pos += 1;
+            }
+        } else {
+            pos += 1;
+        }
+    }
+
+    const before_spec = if (spec_colon_idx) |c_idx| raw_hole[0..c_idx] else raw_hole;
+    const spec_with_colon = if (spec_colon_idx) |c_idx| raw_hole[c_idx..] else "";
+    const trimmed_before = std.mem.trim(u8, before_spec, " \t");
+    if (trimmed_before.len >= 2 and trimmed_before[trimmed_before.len - 1] == '=') {
+        const prev_b = trimmed_before[trimmed_before.len - 2];
+        if (prev_b != '=' and prev_b != '!' and prev_b != '<' and prev_b != '>' and prev_b != ':') {
+            return .{
+                .expr_slice = std.mem.trimEnd(u8, trimmed_before[0 .. trimmed_before.len - 1], " \t"),
+                .spec_with_colon = spec_with_colon,
+                .has_debug_eq = true,
+            };
+        }
+    }
+    return .{
+        .expr_slice = before_spec,
+        .spec_with_colon = spec_with_colon,
+        .has_debug_eq = false,
+    };
+}
+
+/// Recursively upgrades an inner `{Expr}` hole expression via `upgradeSource` without full-file formatting.
+fn upgradeInnerHoleExprAlloc(
+    allocator: std.mem.Allocator,
+    expr_slice: []const u8,
+    file_id: FileId,
+    options: UpgradeOptions,
+    depth: u8,
+) anyerror![]u8 {
+    if (depth >= 4 or std.mem.trim(u8, expr_slice, " \t\r\n").len == 0) {
+        return allocator.dupe(u8, expr_slice);
+    }
+    const wrapped = try std.fmt.allocPrint(
+        allocator,
+        "{s}{s}{s}",
+        .{ HOLE_UPGRADE_WRAP_PREFIX, expr_slice, HOLE_UPGRADE_WRAP_SUFFIX },
+    );
+    defer allocator.free(wrapped);
+
+    var inner_opts = options;
+    inner_opts.has_explicit_rule_filter = true;
+    inner_opts.skip_post_format = true;
+    var sub_res = try upgradeSource(allocator, wrapped, file_id, inner_opts);
+    defer sub_res.deinit(allocator);
+
+    if (!sub_res.is_rolled_back and
+        std.mem.startsWith(u8, sub_res.upgraded_source, HOLE_UPGRADE_WRAP_PREFIX) and
+        std.mem.endsWith(u8, sub_res.upgraded_source, HOLE_UPGRADE_WRAP_SUFFIX))
+    {
+        const start_i = HOLE_UPGRADE_WRAP_PREFIX.len;
+        const end_i = sub_res.upgraded_source.len - HOLE_UPGRADE_WRAP_SUFFIX.len;
+        if (end_i >= start_i) {
+            return allocator.dupe(u8, sub_res.upgraded_source[start_i..end_i]);
+        }
+    }
+    return allocator.dupe(u8, expr_slice);
+}
+
+/// Emits `UR-24-00` fixes across inter-token trivia gaps: `//!`->`/#`, `///`->`/|`, `/* … */`->`// …`, and `\t`->4 spaces.
+fn collectDr24TriviaAndTabTier1Fixes(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    base_offset: u32,
+    tok_buf: *const TokenBuffer,
+    is_ur23_00_enabled: bool,
+    is_ur23_01_enabled: bool,
+    collector: *FixCollector,
+) !void {
+    const tok_count = tok_buf.countTokens();
+    if (tok_count == 0) return;
+
+    var prev_real_end: ?usize = null;
+    var prev_sig_kind_1: TokenKind = .eof;
+    var prev_sig_kind_2: TokenKind = .eof;
+    var prev_sig_kind_3: TokenKind = .eof;
+    var is_still_in_file_top_mod_doc = (base_offset == 0);
+
+    var tok_idx: usize = 0;
+    while (tok_idx < tok_count) : (tok_idx += 1) {
+        const rec = tok_buf.getToken(TokenIndex.fromInt(@intCast(tok_idx)));
+        if (rec.flags.is_synthesized) continue;
+        const gap_end: usize = @min(@as(usize, rec.byte_offset), source.len);
+        const raw_gap_start: usize = prev_real_end orelse 0;
+        const is_first_gap = prev_real_end == null and base_offset == 0;
+        const is_after_inline_mod_open = prev_sig_kind_1 == .lbrace and
+            prev_sig_kind_2 == .ident and
+            prev_sig_kind_3 == .kw_mod;
+        prev_real_end = @min(@as(usize, rec.byte_offset) + @as(usize, rec.byte_len), source.len);
+
+        if (raw_gap_start < gap_end) {
+            var cursor: usize = raw_gap_start;
+            if (is_first_gap) {
+                if (gap_end >= 3 and source[0] == 0xEF and source[1] == 0xBB and source[2] == 0xBF) cursor = 3;
+                if (cursor + 1 < gap_end and source[cursor] == '#' and source[cursor + 1] == '!') {
+                    while (cursor < gap_end and source[cursor] != '\n') : (cursor += 1) {}
+                    if (cursor < gap_end and source[cursor] == '\n') cursor += 1;
+                }
+            }
+
+            var consecutive_nl: u32 = 0;
+            var active_hoist_bol: ?usize = null;
+            var hoist_header_buf: std.ArrayList(u8) = .empty;
+            defer hoist_header_buf.deinit(allocator);
+            var hoist_edits: std.ArrayList(PendingByteEdit) = .empty;
+            defer hoist_edits.deinit(allocator);
+
+            while (cursor < gap_end) {
+                const ch = source[cursor];
+                if (ch == '\t') {
+                    const tab_start = cursor;
+                    while (cursor < gap_end and source[cursor] == '\t') : (cursor += 1) {}
+                    const tab_count = cursor - tab_start;
+                    const space_repl = try allocator.alloc(u8, tab_count * 4);
+                    defer allocator.free(space_repl);
+                    @memset(space_repl, ' ');
+                    try collector.appendSingleEdit(
+                        .syntax_canonicalization,
+                        base_offset +| @as(u32, @intCast(tab_start)),
+                        base_offset +| @as(u32, @intCast(cursor)),
+                        space_repl,
+                        "UR-24-00: replace hard `\\t` tab indentation with 4 spaces (`E0116`)",
+                    );
+                    continue;
+                }
+                if (ch == '\n') {
+                    consecutive_nl += 1;
+                    if (consecutive_nl >= 2 and !is_first_gap) {
+                        is_still_in_file_top_mod_doc = false;
+                    }
+                    cursor += 1;
+                    continue;
+                }
+                if (ch == ' ' or ch == '\r') {
+                    cursor += 1;
+                    continue;
+                }
+
+                if (ch == '/' and cursor + 1 < gap_end and
+                    (source[cursor + 1] == '/' or source[cursor + 1] == '|' or source[cursor + 1] == '#'))
+                {
+                    const cmt_start = cursor;
+                    while (cursor < gap_end and source[cursor] != '\n') : (cursor += 1) {}
+                    const raw_line = std.mem.trimEnd(u8, source[cmt_start..cursor], "\r\n");
+
+                    if (std.mem.startsWith(u8, raw_line, "//!")) {
+                        if (consecutive_nl >= 2) {
+                            // Still allow if no other comment kind preceded at file top, else `UR-23-01` handles it.
+                        }
+                        const repl_prefix: []const u8 = if (is_still_in_file_top_mod_doc or
+                            (is_after_inline_mod_open and is_ur23_01_enabled))
+                            "/#"
+                        else
+                            "//";
+                        try collector.appendSingleEdit(
+                            .syntax_canonicalization,
+                            base_offset +| @as(u32, @intCast(cmt_start)),
+                            base_offset +| @as(u32, @intCast(cmt_start + 3)),
+                            repl_prefix,
+                            "UR-24-00: migrate retired `//!` prefix (`E0118`)",
+                        );
+                    } else if (std.mem.startsWith(u8, raw_line, "///") and
+                        (raw_line.len == 3 or
+                            (raw_line[3] != '/' and raw_line[3] != '|' and raw_line[3] != '#')))
+                    {
+                        is_still_in_file_top_mod_doc = false;
+                        try collector.appendSingleEdit(
+                            .syntax_canonicalization,
+                            base_offset +| @as(u32, @intCast(cmt_start)),
+                            base_offset +| @as(u32, @intCast(cmt_start + 3)),
+                            "/|",
+                            "UR-24-00: migrate retired `///` doc prefix to `/|` (`E0118`)",
+                        );
+                    } else if (!std.mem.startsWith(u8, raw_line, "/#")) {
+                        is_still_in_file_top_mod_doc = false;
+                    }
+
+                    // Expand any literal `\t` tabs inside the comment body to 4 spaces:
+                    var body_i: usize = cmt_start + 2;
+                    while (body_i < cursor) {
+                        if (source[body_i] == '\t') {
+                            const t_s = body_i;
+                            while (body_i < cursor and source[body_i] == '\t') : (body_i += 1) {}
+                            const sp_buf = try allocator.alloc(u8, (body_i - t_s) * 4);
+                            defer allocator.free(sp_buf);
+                            @memset(sp_buf, ' ');
+                            try collector.appendSingleEdit(
+                                .syntax_canonicalization,
+                                base_offset +| @as(u32, @intCast(t_s)),
+                                base_offset +| @as(u32, @intCast(body_i)),
+                                sp_buf,
+                                "UR-24-00: replace hard `\\t` tab in comment with spaces (`E0116`)",
+                            );
+                        } else {
+                            body_i += 1;
+                        }
+                    }
+                    consecutive_nl = 0;
+                    continue;
+                }
+
+                if (ch == '/' and cursor + 1 < gap_end and source[cursor + 1] == '*') {
+                    const cmt_start = cursor;
+                    cursor += 2;
+                    var blk_depth: u32 = 1;
+                    while (cursor < gap_end and blk_depth > 0) {
+                        if (source[cursor] == '/' and cursor + 1 < gap_end and source[cursor + 1] == '*') {
+                            blk_depth += 1;
+                            cursor += 2;
+                        } else if (source[cursor] == '*' and cursor + 1 < gap_end and source[cursor + 1] == '/') {
+                            blk_depth -= 1;
+                            cursor += 2;
+                        } else {
+                            cursor += 1;
+                        }
+                    }
+                    const cmt_end = cursor;
+                    const cmt_len = cmt_end - cmt_start;
+                    const is_star_doc = blk_depth == 0 and cmt_len >= 5 and
+                        source[cmt_start + 2] == '*' and source[cmt_start + 3] != '*' and source[cmt_start + 3] != '/';
+                    const is_bang_doc = blk_depth == 0 and cmt_len >= 5 and source[cmt_start + 2] == '!';
+                    if (is_ur23_00_enabled and (is_star_doc or is_bang_doc)) {
+                        consecutive_nl = 0;
+                        continue;
+                    }
+                    is_still_in_file_top_mod_doc = false;
+                    if (blk_depth != 0 or cmt_len < 4) continue;
+
+                    var line_bol = cmt_start;
+                    while (line_bol > 0 and source[line_bol - 1] != '\n') : (line_bol -= 1) {}
+                    var indent_end = line_bol;
+                    var indent_cols: usize = 0;
+                    while (indent_end < cmt_start and (source[indent_end] == ' ' or source[indent_end] == '\t')) : (indent_end += 1) {
+                        indent_cols += if (source[indent_end] == '\t') 4 else 1;
+                    }
+                    const indent_spaces = try allocator.alloc(u8, indent_cols);
+                    defer allocator.free(indent_spaces);
+                    @memset(indent_spaces, ' ');
+
+                    const has_code_before = indent_end < cmt_start;
+                    var after_ws = cmt_end;
+                    while (after_ws < source.len and (source[after_ws] == ' ' or source[after_ws] == '\t')) : (after_ws += 1) {}
+                    const has_eol_immediately = after_ws >= source.len or
+                        source[after_ws] == '\n' or source[after_ws] == '\r' or
+                        (after_ws + 1 < source.len and source[after_ws] == '/' and source[after_ws + 1] == '/');
+                    const has_code_after = !has_eol_immediately;
+
+                    const raw_inner = source[cmt_start + 2 .. cmt_end - 2];
+                    if (has_code_before and has_code_after) {
+                        // Mid-line `/* cmt */`: hoist `// cmt` above `line_bol`!
+                        if (active_hoist_bol != null and active_hoist_bol.? != line_bol and hoist_edits.items.len > 0) {
+                            hoist_edits.items[0].replacement = hoist_header_buf.items;
+                            try collector.appendMultiEdits(
+                                .syntax_canonicalization,
+                                hoist_edits.items,
+                                "UR-24-00: hoist mid-line `/* … */` block comment to leading `//` comment (`E0118`)",
+                            );
+                            hoist_header_buf.clearRetainingCapacity();
+                            hoist_edits.clearRetainingCapacity();
+                            active_hoist_bol = null;
+                        }
+                        if (active_hoist_bol == null) {
+                            active_hoist_bol = line_bol;
+                            try hoist_edits.append(allocator, .{
+                                .start_byte = base_offset +| @as(u32, @intCast(line_bol)),
+                                .end_byte = base_offset +| @as(u32, @intCast(line_bol)),
+                                .replacement = "",
+                            });
+                        }
+                        const rendered_cmt = try fmt_engine.renderBlockDocAsLineComments(
+                            allocator,
+                            raw_inner,
+                            "//",
+                            indent_spaces,
+                            false,
+                        );
+                        defer allocator.free(rendered_cmt);
+                        try hoist_header_buf.appendSlice(allocator, indent_spaces);
+                        try hoist_header_buf.appendSlice(allocator, rendered_cmt);
+                        try hoist_header_buf.append(allocator, '\n');
+
+                        const del_end = @min(after_ws, gap_end);
+                        const needs_sep_space = cmt_start > 0 and del_end < source.len and
+                            !isAsciiWhitespace(source[cmt_start - 1]) and
+                            source[cmt_start - 1] != '(' and source[cmt_start - 1] != '[' and
+                            !isAsciiWhitespace(source[del_end]) and
+                            source[del_end] != ')' and source[del_end] != ']' and
+                            source[del_end] != ',' and source[del_end] != ';';
+                        try hoist_edits.append(allocator, .{
+                            .start_byte = base_offset +| @as(u32, @intCast(cmt_start)),
+                            .end_byte = base_offset +| @as(u32, @intCast(del_end)),
+                            .replacement = if (needs_sep_space) " " else "",
+                        });
+                        cursor = del_end;
+                    } else if (has_code_before) {
+                        // Trailing end-of-line `/* cmt */` -> `// cmt`:
+                        const rendered_cmt = try fmt_engine.renderBlockDocAsLineComments(
+                            allocator,
+                            raw_inner,
+                            "//",
+                            indent_spaces,
+                            false,
+                        );
+                        defer allocator.free(rendered_cmt);
+                        try collector.appendSingleEdit(
+                            .syntax_canonicalization,
+                            base_offset +| @as(u32, @intCast(cmt_start)),
+                            base_offset +| @as(u32, @intCast(cmt_end)),
+                            rendered_cmt,
+                            "UR-24-00: rewrite trailing `/* … */` block comment to `//` (`E0118`)",
+                        );
+                    } else {
+                        // Standalone / leading `/* cmt */` -> `// cmt`:
+                        const rendered_cmt = try fmt_engine.renderBlockDocAsLineComments(
+                            allocator,
+                            raw_inner,
+                            "//",
+                            indent_spaces,
+                            false,
+                        );
+                        defer allocator.free(rendered_cmt);
+                        if (has_code_after and after_ws <= gap_end) {
+                            const with_nl = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ rendered_cmt, indent_spaces });
+                            defer allocator.free(with_nl);
+                            try collector.appendSingleEdit(
+                                .syntax_canonicalization,
+                                base_offset +| @as(u32, @intCast(cmt_start)),
+                                base_offset +| @as(u32, @intCast(after_ws)),
+                                with_nl,
+                                "UR-24-00: rewrite leading `/* … */` block comment to `//` (`E0118`)",
+                            );
+                            cursor = after_ws;
+                        } else {
+                            try collector.appendSingleEdit(
+                                .syntax_canonicalization,
+                                base_offset +| @as(u32, @intCast(cmt_start)),
+                                base_offset +| @as(u32, @intCast(cmt_end)),
+                                rendered_cmt,
+                                "UR-24-00: rewrite `/* … */` block comment to `//` (`E0118`)",
+                            );
+                        }
+                    }
+                    consecutive_nl = 0;
+                    continue;
+                }
+                cursor += 1;
+            }
+
+            if (active_hoist_bol != null and hoist_edits.items.len > 0) {
+                hoist_edits.items[0].replacement = hoist_header_buf.items;
+                try collector.appendMultiEdits(
+                    .syntax_canonicalization,
+                    hoist_edits.items,
+                    "UR-24-00: hoist mid-line `/* … */` block comment to leading `//` comment (`E0118`)",
+                );
+            }
+        }
+
+        if (rec.kind != .eof) {
+            is_still_in_file_top_mod_doc = false;
+            prev_sig_kind_3 = prev_sig_kind_2;
+            prev_sig_kind_2 = prev_sig_kind_1;
+            prev_sig_kind_1 = rec.kind;
+        }
+    }
+}
+
+/// Emits Tier 1 `UR-24-01` & `UR-24-02` Branch A fixes (retired `"""`, `{{`/`}}`/`\{`/`\}`, and `\t` in literals).
+fn collectDr24Tier1StringLiteralFix(
+    allocator: std.mem.Allocator,
+    tok_kind: TokenKind,
+    lexeme: []const u8,
+    start_byte: u32,
+    end_byte: u32,
+    file_id: FileId,
+    options: UpgradeOptions,
+    depth: u8,
+    collector: *FixCollector,
+) anyerror!void {
+    const is_ur24_00 = isRuleEnabled(options.rule_mask, .ur_24_00_doc_prefixes_block_comments_and_tabs);
+    const is_ur24_01 = isRuleEnabled(options.rule_mask, .ur_24_01_f_strings_and_multiline_dedent);
+    const is_ur24_02 = isRuleEnabled(options.rule_mask, .ur_24_02_plain_string_brace_unescape);
+
+    if (tok_kind == .char_lit or tok_kind == .byte_lit) {
+        if (is_ur24_00 and std.mem.indexOfScalar(u8, lexeme, '\t') != null) {
+            var char_out: std.ArrayList(u8) = .empty;
+            defer char_out.deinit(allocator);
+            for (lexeme) |b_val| {
+                if (b_val == '\t') {
+                    try char_out.appendSlice(allocator, "\\t");
+                } else {
+                    try char_out.append(allocator, b_val);
+                }
+            }
+            try collector.appendSingleEdit(
+                .syntax_canonicalization,
+                start_byte,
+                end_byte,
+                char_out.items,
+                "UR-24-00: escape literal `\\t` tab inside character/byte literal (`E0116`)",
+            );
+        }
+        return;
+    }
+
+    const info = lexer.extractStringBodyInfo(tok_kind, lexeme);
+    const quote_len: usize = if (info.is_retired_triple) 3 else 1;
+    const close_suffix_len: usize = quote_len + @as(usize, info.hash_count);
+    const open_delim_end: usize = @as(usize, info.prefix_len) + @as(usize, info.hash_count) + quote_len;
+    if (lexeme.len < open_delim_end + close_suffix_len) return;
+    const close_quote_pos: usize = lexeme.len - close_suffix_len;
+    if (lexeme[close_quote_pos] != '"') return;
+    const raw_body = lexeme[open_delim_end..close_quote_pos];
+
+    // [1] Raw or byte string literals (`r"…"`, `r#"…"#`, `b"…"`, `br"…"`, `r"""…"""`, `b"""…"""`, `br"""…"""`):
+    if (info.is_raw or info.is_bytes) {
+        if (info.is_retired_triple and is_ur24_01) {
+            const norm_body = if (info.is_multiline)
+                try ensureValidMultilineClosingIndentAlloc(allocator, raw_body, info.is_raw, false)
+            else
+                try allocator.dupe(u8, raw_body);
+            defer allocator.free(norm_body);
+
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(allocator);
+            if (info.is_raw) {
+                const needed_hashes = computeRequiredQuoteGuardHashes(norm_body, info.hash_count);
+                if (info.is_bytes) try out.appendSlice(allocator, "br") else try out.append(allocator, 'r');
+                try out.appendNTimes(allocator, '#', needed_hashes);
+                try out.append(allocator, '"');
+                try out.appendSlice(allocator, norm_body);
+                try out.append(allocator, '"');
+                try out.appendNTimes(allocator, '#', needed_hashes);
+            } else {
+                try out.appendSlice(allocator, "b\"");
+                var at_bol = info.is_multiline;
+                try appendNormalizedStringSegment(
+                    allocator,
+                    &out,
+                    norm_body,
+                    &at_bol,
+                    info.is_multiline,
+                    is_ur24_00,
+                    true,
+                );
+                try out.append(allocator, '"');
+            }
+            try collector.appendSingleEdit(
+                .syntax_canonicalization,
+                start_byte,
+                end_byte,
+                out.items,
+                "UR-24-01: migrate retired `\"\"\"` string delimiter to dedented `\"` literal (`E0115`)",
+            );
+            return;
+        }
+        if (!info.is_raw and is_ur24_00 and std.mem.indexOfScalar(u8, raw_body, '\t') != null) {
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(allocator);
+            try out.appendSlice(allocator, lexeme[0..open_delim_end]);
+            var at_bol = info.is_multiline;
+            try appendNormalizedStringSegment(allocator, &out, raw_body, &at_bol, info.is_multiline, true, false);
+            try out.appendSlice(allocator, lexeme[close_quote_pos..]);
+            try collector.appendSingleEdit(
+                .syntax_canonicalization,
+                start_byte,
+                end_byte,
+                out.items,
+                "UR-24-00: normalize hard `\\t` tab inside byte string literal (`E0116`)",
+            );
+        }
+        return;
+    }
+
+    // [2] Already `f`-prefixed `.fmt_string_lit`: only migrate `f"""…"""` or stray `\t`:
+    if (info.is_fmt) {
+        if (info.is_retired_triple and is_ur24_01) {
+            const norm_body = if (info.is_multiline)
+                try ensureValidMultilineClosingIndentAlloc(allocator, raw_body, false, true)
+            else
+                try allocator.dupe(u8, raw_body);
+            defer allocator.free(norm_body);
+            const needed_hashes = computeRequiredQuoteGuardHashes(norm_body, info.hash_count);
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(allocator);
+            try out.append(allocator, 'f');
+            try out.appendNTimes(allocator, '#', needed_hashes);
+            try out.append(allocator, '"');
+            try out.appendSlice(allocator, norm_body);
+            try out.append(allocator, '"');
+            try out.appendNTimes(allocator, '#', needed_hashes);
+            try collector.appendSingleEdit(
+                .syntax_canonicalization,
+                start_byte,
+                end_byte,
+                out.items,
+                "UR-24-01: migrate retired `f\"\"\"` delimiter to `f\"` (`E0115`)",
+            );
+            return;
+        }
+        if (is_ur24_00 and std.mem.indexOfScalar(u8, raw_body, '\t') != null) {
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(allocator);
+            try out.appendSlice(allocator, lexeme[0..open_delim_end]);
+            var at_bol = info.is_multiline;
+            try appendNormalizedStringSegment(allocator, &out, raw_body, &at_bol, info.is_multiline, true, false);
+            try out.appendSlice(allocator, lexeme[close_quote_pos..]);
+            try collector.appendSingleEdit(
+                .syntax_canonicalization,
+                start_byte,
+                end_byte,
+                out.items,
+                "UR-24-00: normalize hard `\\t` tab inside `f\"…\"` literal (`E0116`)",
+            );
+        }
+        return;
+    }
+
+    // [3] Unprefixed `"…"` or `"""…"""`: scan with exact backslash parity (`Critic Amendment #6`):
+    var has_legacy_marker = info.is_retired_triple;
+    var has_cooked_escape = false;
+    var hole_ranges: std.ArrayList(ByteInterval) = .empty;
+    defer hole_ranges.deinit(allocator);
+
+    var pos: usize = 0;
+    while (pos < raw_body.len) {
+        if (raw_body[pos] == '\\') {
+            var bs_run: usize = 0;
+            while (pos + bs_run < raw_body.len and raw_body[pos + bs_run] == '\\') : (bs_run += 1) {}
+            if (bs_run >= 2) has_cooked_escape = true;
+            pos += bs_run;
+            if ((bs_run % 2) == 1) {
+                if (pos < raw_body.len) {
+                    const esc_ch = raw_body[pos];
+                    if (esc_ch == '{' or esc_ch == '}') {
+                        has_legacy_marker = true;
+                        pos += 1;
+                        continue;
+                    }
+                    if (esc_ch != '"') {
+                        has_cooked_escape = true;
+                    }
+                    if (esc_ch == 'u' and pos + 1 < raw_body.len and raw_body[pos + 1] == '{') {
+                        pos += 2;
+                        while (pos < raw_body.len and raw_body[pos] != '}') : (pos += 1) {}
+                        if (pos < raw_body.len) pos += 1;
+                        continue;
+                    }
+                    pos += 1;
+                }
+                continue;
+            }
+            if (pos >= raw_body.len) break;
+        }
+
+        if (raw_body[pos] == '{') {
+            if (pos + 1 < raw_body.len and raw_body[pos + 1] == '{') {
+                has_legacy_marker = true;
+                pos += 2;
+                continue;
+            }
+            const hole_end = scanHoleEndWithoutEdits(raw_body, pos + 1, raw_body.len);
+            if (hole_end > pos + 1 and hole_end <= raw_body.len and raw_body[hole_end - 1] == '}') {
+                try hole_ranges.append(allocator, .{ .start = pos, .end = hole_end });
+                pos = hole_end;
+                continue;
+            }
+        } else if (raw_body[pos] == '}' and pos + 1 < raw_body.len and raw_body[pos + 1] == '}') {
+            has_legacy_marker = true;
+            pos += 2;
+            continue;
+        }
+        pos += 1;
+    }
+
+    if (!has_legacy_marker) {
+        if (is_ur24_00 and std.mem.indexOfScalar(u8, raw_body, '\t') != null) {
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(allocator);
+            try out.append(allocator, '"');
+            var at_bol = info.is_multiline;
+            try appendNormalizedStringSegment(allocator, &out, raw_body, &at_bol, info.is_multiline, true, false);
+            try out.append(allocator, '"');
+            try collector.appendSingleEdit(
+                .syntax_canonicalization,
+                start_byte,
+                end_byte,
+                out.items,
+                "UR-24-00: normalize hard `\\t` tab inside string literal (`E0116`)",
+            );
+        }
+        return;
+    }
+
+    // Branch A1: `has_legacy_marker` AND `>= 1` unescaped `{…}` hole -> `f"…"` / `f#"…"#` (`UR-24-01`):
+    if (hole_ranges.items.len > 0) {
+        if (!is_ur24_01) return;
+        var rebuilt_body: std.ArrayList(u8) = .empty;
+        defer rebuilt_body.deinit(allocator);
+        var max_lit_quote_hashes: usize = 0;
+
+        var seg_cursor: usize = 0;
+        for (hole_ranges.items) |hr| {
+            const lit_seg = raw_body[seg_cursor..hr.start];
+            // Scan `lit_seg` for unescaped `"` (only possible in `"""…"""`) and rewrite `\{`/`\}` -> `{{`/`}}`:
+            var l_i: usize = 0;
+            while (l_i < lit_seg.len) {
+                if (lit_seg[l_i] == '\\') {
+                    var bs_run: usize = 0;
+                    while (l_i + bs_run < lit_seg.len and lit_seg[l_i + bs_run] == '\\') : (bs_run += 1) {}
+                    if ((bs_run % 2) == 1 and l_i + bs_run < lit_seg.len and
+                        (lit_seg[l_i + bs_run] == '{' or lit_seg[l_i + bs_run] == '}'))
+                    {
+                        try rebuilt_body.appendNTimes(allocator, '\\', bs_run - 1);
+                        const br_ch = lit_seg[l_i + bs_run];
+                        try rebuilt_body.appendNTimes(allocator, br_ch, 2);
+                        l_i += bs_run + 1;
+                        continue;
+                    }
+                    try rebuilt_body.appendNTimes(allocator, '\\', bs_run);
+                    l_i += bs_run;
+                    if ((bs_run % 2) == 1 and l_i < lit_seg.len) {
+                        try rebuilt_body.append(allocator, lit_seg[l_i]);
+                        l_i += 1;
+                    }
+                    continue;
+                }
+                if (lit_seg[l_i] == '"') {
+                    max_lit_quote_hashes = @max(
+                        max_lit_quote_hashes,
+                        computeRequiredQuoteGuardHashes(lit_seg[l_i..], 1),
+                    );
+                }
+                try rebuilt_body.append(allocator, lit_seg[l_i]);
+                l_i += 1;
+            }
+
+            const hole_inner = raw_body[hr.start + 1 .. hr.end - 1];
+            const split = splitUpgradeHoleParts(hole_inner);
+            const upg_expr = try upgradeInnerHoleExprAlloc(allocator, split.expr_slice, file_id, options, depth + 1);
+            defer allocator.free(upg_expr);
+
+            try rebuilt_body.append(allocator, '{');
+            try rebuilt_body.appendSlice(allocator, upg_expr);
+            if (split.has_debug_eq) try rebuilt_body.append(allocator, '=');
+            try rebuilt_body.appendSlice(allocator, split.spec_with_colon);
+            try rebuilt_body.append(allocator, '}');
+            seg_cursor = hr.end;
+        }
+
+        // Trailing literal text segment after the last `{…}` hole:
+        const tail_seg = raw_body[seg_cursor..];
+        var t_i: usize = 0;
+        while (t_i < tail_seg.len) {
+            if (tail_seg[t_i] == '\\') {
+                var bs_run: usize = 0;
+                while (t_i + bs_run < tail_seg.len and tail_seg[t_i + bs_run] == '\\') : (bs_run += 1) {}
+                if ((bs_run % 2) == 1 and t_i + bs_run < tail_seg.len and
+                    (tail_seg[t_i + bs_run] == '{' or tail_seg[t_i + bs_run] == '}'))
+                {
+                    try rebuilt_body.appendNTimes(allocator, '\\', bs_run - 1);
+                    const br_ch = tail_seg[t_i + bs_run];
+                    try rebuilt_body.appendNTimes(allocator, br_ch, 2);
+                    t_i += bs_run + 1;
+                    continue;
+                }
+                try rebuilt_body.appendNTimes(allocator, '\\', bs_run);
+                t_i += bs_run;
+                if ((bs_run % 2) == 1 and t_i < tail_seg.len) {
+                    try rebuilt_body.append(allocator, tail_seg[t_i]);
+                    t_i += 1;
+                }
+                continue;
+            }
+            if (tail_seg[t_i] == '"') {
+                max_lit_quote_hashes = @max(
+                    max_lit_quote_hashes,
+                    computeRequiredQuoteGuardHashes(tail_seg[t_i..], 1),
+                );
+            }
+            try rebuilt_body.append(allocator, tail_seg[t_i]);
+            t_i += 1;
+        }
+
+        const norm_f_body = if (info.is_multiline)
+            try ensureValidMultilineClosingIndentAlloc(allocator, rebuilt_body.items, false, true)
+        else
+            try allocator.dupe(u8, rebuilt_body.items);
+        defer allocator.free(norm_f_body);
+
+        const final_hashes = if (max_lit_quote_hashes > 0)
+            computeRequiredQuoteGuardHashes(norm_f_body, max_lit_quote_hashes)
+        else
+            0;
+
+        var final_out: std.ArrayList(u8) = .empty;
+        defer final_out.deinit(allocator);
+        try final_out.append(allocator, 'f');
+        try final_out.appendNTimes(allocator, '#', final_hashes);
+        try final_out.append(allocator, '"');
+        var at_bol = info.is_multiline;
+        try appendNormalizedStringSegment(
+            allocator,
+            &final_out,
+            norm_f_body,
+            &at_bol,
+            info.is_multiline,
+            is_ur24_00,
+            false,
+        );
+        try final_out.append(allocator, '"');
+        try final_out.appendNTimes(allocator, '#', final_hashes);
+
+        try collector.appendSingleEdit(
+            .syntax_canonicalization,
+            start_byte,
+            end_byte,
+            final_out.items,
+            "UR-24-01: upgrade interpolated string literal to `f\"…\"` (`ADR-24B`)",
+        );
+        return;
+    }
+
+    // Branch A2: `has_legacy_marker` AND `0` holes -> plain `"…"` or `r#"…"#` (`UR-24-02` / `UR-24-01`):
+    if (!is_ur24_02 and !(info.is_retired_triple and is_ur24_01)) return;
+    var unescaped_body: std.ArrayList(u8) = .empty;
+    defer unescaped_body.deinit(allocator);
+    var has_unescaped_quote = false;
+
+    var p_i: usize = 0;
+    while (p_i < raw_body.len) {
+        if (raw_body[p_i] == '\\') {
+            var bs_run: usize = 0;
+            while (p_i + bs_run < raw_body.len and raw_body[p_i + bs_run] == '\\') : (bs_run += 1) {}
+            if (is_ur24_02 and (bs_run % 2) == 1 and p_i + bs_run < raw_body.len and
+                (raw_body[p_i + bs_run] == '{' or raw_body[p_i + bs_run] == '}'))
+            {
+                try unescaped_body.appendNTimes(allocator, '\\', bs_run - 1);
+                try unescaped_body.append(allocator, raw_body[p_i + bs_run]);
+                p_i += bs_run + 1;
+                continue;
+            }
+            try unescaped_body.appendNTimes(allocator, '\\', bs_run);
+            p_i += bs_run;
+            if ((bs_run % 2) == 1 and p_i < raw_body.len) {
+                try unescaped_body.append(allocator, raw_body[p_i]);
+                p_i += 1;
+            }
+            continue;
+        }
+        if (is_ur24_02 and raw_body[p_i] == '{' and p_i + 1 < raw_body.len and raw_body[p_i + 1] == '{') {
+            try unescaped_body.append(allocator, '{');
+            p_i += 2;
+            continue;
+        }
+        if (is_ur24_02 and raw_body[p_i] == '}' and p_i + 1 < raw_body.len and raw_body[p_i + 1] == '}') {
+            try unescaped_body.append(allocator, '}');
+            p_i += 2;
+            continue;
+        }
+        if (raw_body[p_i] == '"') {
+            has_unescaped_quote = true;
+        }
+        try unescaped_body.append(allocator, raw_body[p_i]);
+        p_i += 1;
+    }
+
+    const norm_plain_body = if (info.is_multiline)
+        try ensureValidMultilineClosingIndentAlloc(allocator, unescaped_body.items, false, false)
+    else
+        try allocator.dupe(u8, unescaped_body.items);
+    defer allocator.free(norm_plain_body);
+
+    var plain_out: std.ArrayList(u8) = .empty;
+    defer plain_out.deinit(allocator);
+    if (has_unescaped_quote and !has_cooked_escape) {
+        const raw_hashes = computeRequiredQuoteGuardHashes(norm_plain_body, 1);
+        try plain_out.append(allocator, 'r');
+        try plain_out.appendNTimes(allocator, '#', raw_hashes);
+        try plain_out.append(allocator, '"');
+        try plain_out.appendSlice(allocator, norm_plain_body);
+        try plain_out.append(allocator, '"');
+        try plain_out.appendNTimes(allocator, '#', raw_hashes);
+    } else {
+        try plain_out.append(allocator, '"');
+        var at_bol = info.is_multiline;
+        try appendNormalizedStringSegment(
+            allocator,
+            &plain_out,
+            norm_plain_body,
+            &at_bol,
+            info.is_multiline,
+            is_ur24_00,
+            has_unescaped_quote,
+        );
+        try plain_out.append(allocator, '"');
+    }
+
+    if (!std.mem.eql(u8, plain_out.items, lexeme)) {
+        try collector.appendSingleEdit(
+            .syntax_canonicalization,
+            start_byte,
+            end_byte,
+            plain_out.items,
+            "UR-24-02: unescape literal braces and canonicalize 0-hole string literal (`ADR-24B`)",
+        );
+    }
+}
+
+/// Tokenizes `source` (rebased at `base_offset`) and emits Tier 1 `UR-21-00`, `UR-22-00`, `UR-23-00`, `UR-23-02`, & `UR-24-00`–`02` fixes.
 fn collectTier1FixesOnSlice(
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -1685,8 +2951,16 @@ fn collectTier1FixesOnSlice(
     const is_ur21_00 = isRuleEnabled(options.rule_mask, .ur_21_00_path_coloncolon_and_std_root);
     const is_ur22_00 = isRuleEnabled(options.rule_mask, .ur_22_00_lexical_token_canonicalization);
     const is_ur23_00 = isRuleEnabled(options.rule_mask, .ur_23_00_block_doc_comments_to_line_docs);
+    const is_ur23_01 = isRuleEnabled(options.rule_mask, .ur_23_01_doc_comment_placement_and_attachment);
     const is_ur23_02 = isRuleEnabled(options.rule_mask, .ur_23_02_elif_to_else_if);
-    if (!is_ur21_00 and !is_ur22_00 and !is_ur23_00 and !is_ur23_02) return;
+    const is_ur24_00 = isRuleEnabled(options.rule_mask, .ur_24_00_doc_prefixes_block_comments_and_tabs);
+    const is_ur24_01 = isRuleEnabled(options.rule_mask, .ur_24_01_f_strings_and_multiline_dedent);
+    const is_ur24_02 = isRuleEnabled(options.rule_mask, .ur_24_02_plain_string_brace_unescape);
+    if (!is_ur21_00 and !is_ur22_00 and !is_ur23_00 and !is_ur23_02 and
+        !is_ur24_00 and !is_ur24_01 and !is_ur24_02)
+    {
+        return;
+    }
 
     var tok_buf = TokenBuffer.init(allocator);
     defer tok_buf.deinit();
@@ -1699,6 +2973,17 @@ fn collectTier1FixesOnSlice(
 
     if (is_ur23_00) {
         try collectBlockDocCommentTier1Fixes(allocator, source, base_offset, &tok_buf, collector);
+    }
+    if (is_ur24_00) {
+        try collectDr24TriviaAndTabTier1Fixes(
+            allocator,
+            source,
+            base_offset,
+            &tok_buf,
+            is_ur23_00,
+            is_ur23_01,
+            collector,
+        );
     }
 
     var i: usize = 0;
@@ -1767,7 +3052,7 @@ fn collectTier1FixesOnSlice(
             }
         }
 
-        // [2] `UR-22-00`; `&&` -> `and`, `@noalloc` -> `@no_alloc`, `Numeric` -> `Number`, `\{`/`\}` -> `{{`/`}}`:
+        // [2] `UR-22-00`; `&&` -> `and`, `@noalloc` -> `@no_alloc`, `Numeric` -> `Number`:
         if (is_ur22_00) {
             if (rec.kind == .kw_and and rec.byte_len == 2 and std.mem.eql(u8, lexeme, "&&")) {
                 const is_needing_left_sp = local_start > 0 and !isAsciiWhitespace(source[local_start - 1]) and
@@ -1843,28 +3128,44 @@ fn collectTier1FixesOnSlice(
             continue;
         }
 
-        if (rec.kind == .string_lit and lexeme.len >= 2 and lexeme[0] != 'r' and lexeme[0] != 'b') {
-            const is_triple = lexeme.len >= 6 and std.mem.startsWith(u8, lexeme, "\"\"\"");
-            const open_len: usize = if (is_triple) 3 else 1;
-            _ = try scanStandardStringBodyForBraceEscapes(
-                allocator,
-                source,
-                @as(usize, local_start) + open_len,
-                @as(usize, local_end),
-                base_offset,
-                is_triple,
-                file_id,
-                options,
-                has_local_std,
-                has_local_numeric,
-                depth,
-                collector,
-            );
+        if (rec.kind == .string_lit or rec.kind == .byte_string_lit or rec.kind == .fmt_string_lit or
+            rec.kind == .char_lit or rec.kind == .byte_lit)
+        {
+            if (is_ur24_00 or is_ur24_01 or is_ur24_02) {
+                try collectDr24Tier1StringLiteralFix(
+                    allocator,
+                    rec.kind,
+                    lexeme,
+                    start_byte,
+                    end_byte,
+                    file_id,
+                    options,
+                    depth,
+                    collector,
+                );
+            } else if (rec.kind == .string_lit and lexeme.len >= 2 and lexeme[0] != 'r' and lexeme[0] != 'b') {
+                const is_triple = lexeme.len >= 6 and std.mem.startsWith(u8, lexeme, "\"\"\"");
+                const open_len: usize = if (is_triple) 3 else 1;
+                _ = try scanStandardStringBodyForBraceEscapes(
+                    allocator,
+                    source,
+                    @as(usize, local_start) + open_len,
+                    @as(usize, local_end),
+                    base_offset,
+                    is_triple,
+                    file_id,
+                    options,
+                    has_local_std,
+                    has_local_numeric,
+                    depth,
+                    collector,
+                );
+            }
         }
     }
 }
 
-/// Collects Sub-stage A Tier 1 pre-CST lexical rewrites (`UR-21-00`, `UR-22-00`, `UR-23-00`, `UR-23-02`) into `collector`.
+/// Collects Sub-stage A Tier 1 pre-CST lexical rewrites (`UR-21-00`, `UR-22-00`, `UR-23-00`, `UR-23-02`, `UR-24-00`–`02`).
 fn collectSubstageATier1Fixes(
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -1876,7 +3177,14 @@ fn collectSubstageATier1Fixes(
     const is_ur22_00 = isRuleEnabled(options.rule_mask, .ur_22_00_lexical_token_canonicalization);
     const is_ur23_00 = isRuleEnabled(options.rule_mask, .ur_23_00_block_doc_comments_to_line_docs);
     const is_ur23_02 = isRuleEnabled(options.rule_mask, .ur_23_02_elif_to_else_if);
-    if (!is_ur21_00 and !is_ur22_00 and !is_ur23_00 and !is_ur23_02) return;
+    const is_ur24_00 = isRuleEnabled(options.rule_mask, .ur_24_00_doc_prefixes_block_comments_and_tabs);
+    const is_ur24_01 = isRuleEnabled(options.rule_mask, .ur_24_01_f_strings_and_multiline_dedent);
+    const is_ur24_02 = isRuleEnabled(options.rule_mask, .ur_24_02_plain_string_brace_unescape);
+    if (!is_ur21_00 and !is_ur22_00 and !is_ur23_00 and !is_ur23_02 and
+        !is_ur24_00 and !is_ur24_01 and !is_ur24_02)
+    {
+        return;
+    }
 
     var tok_buf = TokenBuffer.init(allocator);
     defer tok_buf.deinit();
@@ -1927,6 +3235,7 @@ fn isCallArgExprStartToken(kind: TokenKind) bool {
         .int_lit,
         .float_lit,
         .string_lit,
+        .fmt_string_lit,
         .char_lit,
         .byte_lit,
         .byte_string_lit,
@@ -3504,6 +4813,8 @@ fn collectAttrEnumBitfieldAndUnitFixes(
     cst_arena: *const LosslessCstArena,
     tok_buf: *const TokenBuffer,
     rewritten_test_fns: *const std.AutoHashMapUnmanaged(u32, void),
+    is_ur24_03_enabled: bool,
+    rewritten_enum_items: *std.AutoHashMapUnmanaged(u32, void),
     collector: *FixCollector,
 ) !void {
     const cst_count = cst_arena.countNodes();
@@ -3513,9 +4824,19 @@ fn collectAttrEnumBitfieldAndUnitFixes(
         const rec = cst_arena.getNode(cst_id);
         const sub_end = @min(idx + @max(@as(usize, rec.subtree_size), 1), cst_count);
 
-        // [1] `@$attr($k = $v)` -> `@$attr($k: $v)`:
+        // [1] `@$attr($k = $v)` -> `@$attr($k: $v)` (deferring layout/link attrs to `UR-24-03` when active):
         if (rec.kind == .attribute) {
             if (extractCstTokenSpan(cst_arena, tok_buf, cst_id)) |attr_sp| {
+                if (is_ur24_03_enabled and attr_sp.first_tok.asInt() + 1 <= attr_sp.last_tok.asInt() and
+                    tok_buf.getToken(attr_sp.first_tok).kind == .at)
+                {
+                    const attr_name_lex = symbol_resolver.extractTokenSlice(
+                        source,
+                        tok_buf,
+                        TokenIndex.fromInt(attr_sp.first_tok.asInt() + 1),
+                    );
+                    if (DR24_COALESCED_ATTR_SET.has(attr_name_lex)) continue;
+                }
                 var paren_depth: u32 = 0;
                 var tok_i: u32 = attr_sp.first_tok.asInt();
                 while (tok_i <= attr_sp.last_tok.asInt()) : (tok_i += 1) {
@@ -3829,6 +5150,7 @@ fn collectAttrEnumBitfieldAndUnitFixes(
                                                 }
                                                 const clamped_erase_end: u32 = @intCast(@min(attr_erase_end, ins_byte));
                                                 if (!hasCommentsInByteRange(source, tok_buf, a_sp.start_byte, clamped_erase_end)) {
+                                                    try rewritten_enum_items.put(allocator, cst_id.asInt(), {});
                                                     const backing_ins = try std.fmt.allocPrint(allocator, ": {s}", .{sole_arg});
                                                     defer allocator.free(backing_ins);
                                                     try collector.appendDualEdits(
@@ -3859,6 +5181,7 @@ fn collectAttrEnumBitfieldAndUnitFixes(
                                                 null;
                                             if (int_prim_opt) |int_prim| {
                                                 if (!hasCommentsInByteRange(source, tok_buf, a_sp.start_byte, a_sp.end_byte)) {
+                                                    try rewritten_enum_items.put(allocator, cst_id.asInt(), {});
                                                     const backing_ins = try std.fmt.allocPrint(allocator, ": {s}", .{int_prim});
                                                     defer allocator.free(backing_ins);
                                                     try collector.appendDualEdits(
@@ -4524,7 +5847,15 @@ const ByteInterval = struct {
     end: usize,
 };
 
-/// Collects `UR-23-01` fixes: hoists inline `mod { //! … }`, downgrades mid-file `//!`, and heals `E0230` `///`.
+/// Single outer doc-comment line prefix span tracked by `UR-23-01`.
+const OuterDocPrefixSpan = struct {
+    /// Byte offset of `/` starting `/|` or `///`.
+    offset: u32,
+    /// Prefix byte width (`2` for `/|`, `3` for `///`).
+    prefix_len: u8,
+};
+
+/// Collects `UR-23-01` fixes: hoists inline `mod { /# … }`, downgrades mid-file `/#`, and heals `E0230` `/|`.
 fn collectDocCommentPlacementFixes(
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -4539,7 +5870,7 @@ fn collectDocCommentPlacementFixes(
     var hoisted_ranges: std.ArrayList(ByteInterval) = .empty;
     defer hoisted_ranges.deinit(allocator);
 
-    // [1] Hoist `mod foo { //! … }` inner module doc comments above `[Vis] mod foo {` as outer `/// …`:
+    // [1] Hoist `mod foo { /# … }` (or `//! …`) inner module doc comments above `[Vis] mod foo {` as outer `/| …`:
     var cst_i: usize = 0;
     while (cst_i < cst_count) : (cst_i += 1) {
         const mod_cst = CstNodeIndex.fromInt(@intCast(cst_i));
@@ -4589,11 +5920,16 @@ fn collectDocCommentPlacementFixes(
             while (line_end < source.len and source[line_end] != '\n') : (line_end += 1) {}
             const raw_line = std.mem.trimEnd(u8, source[scan_pos..line_end], "\r");
             const trimmed_start = std.mem.trimStart(u8, raw_line, " \t");
-            if (!std.mem.startsWith(u8, trimmed_start, "//!")) break;
+            const mod_prefix_len: usize = if (std.mem.startsWith(u8, trimmed_start, "/#"))
+                2
+            else if (std.mem.startsWith(u8, trimmed_start, "//!"))
+                3
+            else
+                break;
 
-            const payload = std.mem.trimEnd(u8, trimmed_start[3..], " \t");
+            const payload = std.mem.trimEnd(u8, trimmed_start[mod_prefix_len..], " \t");
             try outer_buf.appendSlice(allocator, mod_indent);
-            try outer_buf.appendSlice(allocator, "///");
+            try outer_buf.appendSlice(allocator, "/|");
             if (payload.len > 0) {
                 if (payload[0] != ' ' and payload[0] != '\t') try outer_buf.append(allocator, ' ');
                 try outer_buf.appendSlice(allocator, payload);
@@ -4605,7 +5941,7 @@ fn collectDocCommentPlacementFixes(
         }
 
         if (inner_line_count > 0) {
-            // Also strip a single trailing blank line right after the hoisted inner `//!` block:
+            // Also strip a single trailing blank line right after the hoisted inner `/#` / `//!` block:
             var blank_probe = inner_del_end;
             while (blank_probe < source.len and
                 (source[blank_probe] == ' ' or source[blank_probe] == '\t' or source[blank_probe] == '\r'))
@@ -4625,7 +5961,7 @@ fn collectDocCommentPlacementFixes(
                 @intCast(inner_del_start),
                 @intCast(inner_del_end),
                 "",
-                "UR-23-01: hoist inline `mod` `//!` module doc comments to outer `///`",
+                "UR-23-01: hoist inline `mod` `/#` module doc comments to outer `/|`",
             );
         }
     }
@@ -4673,7 +6009,7 @@ fn collectDocCommentPlacementFixes(
         }
     }
 
-    // [2] Scan inter-token trivia gaps for mid-file `//!` (`E0229`) and unattached/blank-separated `///` (`E0230`):
+    // [2] Scan inter-token trivia gaps for mid-file `/#`/`//!` (`E0229`) and unattached/blank-separated `/|`/`///` (`E0230`):
     var prev_real_end: ?usize = null;
     var tok_idx: usize = 0;
     while (tok_idx < tok_count) : (tok_idx += 1) {
@@ -4692,14 +6028,14 @@ fn collectDocCommentPlacementFixes(
                 while (cursor < gap_end and source[cursor] != '\n') : (cursor += 1) {}
                 if (cursor < gap_end and source[cursor] == '\n') cursor += 1;
             }
-            // Advance past masked `---` script frontmatter whitespace lines before legal top-of-file `//!`:
+            // Advance past masked `---` script frontmatter whitespace lines before legal top-of-file `/#`:
             while (cursor < gap_end) {
-                var ws_p = cursor;
-                while (ws_p < gap_end and (source[ws_p] == ' ' or source[ws_p] == '\t' or source[ws_p] == '\r')) {
-                    ws_p += 1;
+                var ws_pos = cursor;
+                while (ws_pos < gap_end and (source[ws_pos] == ' ' or source[ws_pos] == '\t' or source[ws_pos] == '\r')) {
+                    ws_pos += 1;
                 }
-                if (ws_p < gap_end and source[ws_p] == '\n') {
-                    cursor = ws_p + 1;
+                if (ws_pos < gap_end and source[ws_pos] == '\n') {
+                    cursor = ws_pos + 1;
                     continue;
                 }
                 break;
@@ -4711,20 +6047,22 @@ fn collectDocCommentPlacementFixes(
                     cursor += 1;
                     break;
                 }
-                if (source[cursor] == '/' and cursor + 1 < gap_end and source[cursor + 1] == '/') {
+                if (source[cursor] == '/' and cursor + 1 < gap_end and
+                    (source[cursor + 1] == '/' or source[cursor + 1] == '|' or source[cursor + 1] == '#'))
+                {
                     while (cursor < gap_end and source[cursor] != '\n') : (cursor += 1) {}
                     if (cursor < gap_end and source[cursor] == '\n') cursor += 1;
                     break;
                 }
                 if (source[cursor] == '/' and cursor + 1 < gap_end and source[cursor + 1] == '*') {
                     cursor += 2;
-                    var bd: u32 = 1;
-                    while (cursor < gap_end and bd > 0) {
+                    var block_depth: u32 = 1;
+                    while (cursor < gap_end and block_depth > 0) {
                         if (source[cursor] == '/' and cursor + 1 < gap_end and source[cursor + 1] == '*') {
-                            bd += 1;
+                            block_depth += 1;
                             cursor += 2;
                         } else if (source[cursor] == '*' and cursor + 1 < gap_end and source[cursor + 1] == '/') {
-                            bd -= 1;
+                            block_depth -= 1;
                             cursor += 2;
                         } else {
                             cursor += 1;
@@ -4737,7 +6075,7 @@ fn collectDocCommentPlacementFixes(
         }
 
         var is_in_legal_top_mod_doc = is_first_gap;
-        var active_outer_doc_offsets: std.ArrayList(u32) = .empty;
+        var active_outer_doc_offsets: std.ArrayList(OuterDocPrefixSpan) = .empty;
         defer active_outer_doc_offsets.deinit(allocator);
         var last_outer_doc_lf: ?usize = null;
         var consecutive_newlines: u32 = 0;
@@ -4752,47 +6090,64 @@ fn collectDocCommentPlacementFixes(
                     is_in_legal_top_mod_doc = false;
                 }
                 cursor += 1;
-            } else if (byte_val == '/' and cursor + 1 < gap_end and source[cursor + 1] == '/') {
+            } else if (byte_val == '/' and cursor + 1 < gap_end and
+                (source[cursor + 1] == '/' or source[cursor + 1] == '|' or source[cursor + 1] == '#'))
+            {
                 const cmt_start = cursor;
                 while (cursor < gap_end and source[cursor] != '\n') : (cursor += 1) {}
                 const raw_cmt = std.mem.trimEnd(u8, source[cmt_start..cursor], "\r\n");
-                const is_mod_doc = std.mem.startsWith(u8, raw_cmt, "//!");
-                const is_outer_doc = std.mem.startsWith(u8, raw_cmt, "///") and
-                    !std.mem.startsWith(u8, raw_cmt, "////");
+                const mod_doc_len: u8 = if (std.mem.startsWith(u8, raw_cmt, "/#"))
+                    2
+                else if (std.mem.startsWith(u8, raw_cmt, "//!"))
+                    3
+                else
+                    0;
+                const outer_doc_len: u8 = if (std.mem.startsWith(u8, raw_cmt, "/|"))
+                    2
+                else if (std.mem.startsWith(u8, raw_cmt, "///") and
+                    !std.mem.startsWith(u8, raw_cmt, "////") and
+                    !std.mem.startsWith(u8, raw_cmt, "///|") and
+                    !std.mem.startsWith(u8, raw_cmt, "///#"))
+                    3
+                else
+                    0;
 
-                if (is_outer_doc) {
+                if (outer_doc_len > 0) {
                     is_in_legal_top_mod_doc = false;
                     if (consecutive_newlines >= 2 and active_outer_doc_offsets.items.len > 0) {
-                        // Previous `///` block was orphaned before another `///` block; downgrade it to `//`:
-                        for (active_outer_doc_offsets.items) |doc_off| {
+                        // Previous `/|` / `///` block was orphaned before another doc block; downgrade it to `//`:
+                        for (active_outer_doc_offsets.items) |doc_entry| {
                             try collector.appendSingleEdit(
                                 .syntax_canonicalization,
-                                doc_off,
-                                doc_off + 3,
+                                doc_entry.offset,
+                                doc_entry.offset + doc_entry.prefix_len,
                                 "//",
-                                "UR-23-01: downgrade unattached `///` comment to `//` (`E0230`)",
+                                "UR-23-01: downgrade unattached `/|` doc comment to `//` (`E0230`)",
                             );
                         }
                         active_outer_doc_offsets.clearRetainingCapacity();
                     }
-                    try active_outer_doc_offsets.append(allocator, @intCast(cmt_start));
+                    try active_outer_doc_offsets.append(allocator, .{
+                        .offset = @intCast(cmt_start),
+                        .prefix_len = outer_doc_len,
+                    });
                     last_outer_doc_lf = if (cursor < gap_end and source[cursor] == '\n') cursor else null;
                     consecutive_newlines = 0;
                 } else {
                     if (active_outer_doc_offsets.items.len > 0) {
-                        for (active_outer_doc_offsets.items) |doc_off| {
+                        for (active_outer_doc_offsets.items) |doc_entry| {
                             try collector.appendSingleEdit(
                                 .syntax_canonicalization,
-                                doc_off,
-                                doc_off + 3,
+                                doc_entry.offset,
+                                doc_entry.offset + doc_entry.prefix_len,
                                 "//",
-                                "UR-23-01: downgrade unattached `///` comment to `//` (`E0230`)",
+                                "UR-23-01: downgrade unattached `/|` doc comment to `//` (`E0230`)",
                             );
                         }
                         active_outer_doc_offsets.clearRetainingCapacity();
                         last_outer_doc_lf = null;
                     }
-                    if (is_mod_doc) {
+                    if (mod_doc_len > 0) {
                         if (!is_in_legal_top_mod_doc) {
                             var is_already_hoisted = false;
                             for (hoisted_ranges.items) |hr| {
@@ -4805,9 +6160,9 @@ fn collectDocCommentPlacementFixes(
                                 try collector.appendSingleEdit(
                                     .syntax_canonicalization,
                                     @intCast(cmt_start),
-                                    @intCast(cmt_start + 3),
+                                    @intCast(cmt_start + mod_doc_len),
                                     "//",
-                                    "UR-23-01: downgrade misplaced mid-file `//!` comment to `//` (`E0229`)",
+                                    "UR-23-01: downgrade misplaced mid-file `/#` comment to `//` (`E0229`)",
                                 );
                             }
                         }
@@ -4819,26 +6174,26 @@ fn collectDocCommentPlacementFixes(
             } else if (byte_val == '/' and cursor + 1 < gap_end and source[cursor + 1] == '*') {
                 is_in_legal_top_mod_doc = false;
                 if (active_outer_doc_offsets.items.len > 0) {
-                    for (active_outer_doc_offsets.items) |doc_off| {
+                    for (active_outer_doc_offsets.items) |doc_entry| {
                         try collector.appendSingleEdit(
                             .syntax_canonicalization,
-                            doc_off,
-                            doc_off + 3,
+                            doc_entry.offset,
+                            doc_entry.offset + doc_entry.prefix_len,
                             "//",
-                            "UR-23-01: downgrade unattached `///` comment to `//` (`E0230`)",
+                            "UR-23-01: downgrade unattached `/|` doc comment to `//` (`E0230`)",
                         );
                     }
                     active_outer_doc_offsets.clearRetainingCapacity();
                     last_outer_doc_lf = null;
                 }
                 cursor += 2;
-                var bd: u32 = 1;
-                while (cursor < gap_end and bd > 0) {
+                var block_depth: u32 = 1;
+                while (cursor < gap_end and block_depth > 0) {
                     if (source[cursor] == '/' and cursor + 1 < gap_end and source[cursor + 1] == '*') {
-                        bd += 1;
+                        block_depth += 1;
                         cursor += 2;
                     } else if (source[cursor] == '*' and cursor + 1 < gap_end and source[cursor + 1] == '/') {
-                        bd -= 1;
+                        block_depth -= 1;
                         cursor += 2;
                     } else {
                         cursor += 1;
@@ -4864,7 +6219,7 @@ fn collectDocCommentPlacementFixes(
                                 @intCast(doc_lf + 1),
                                 @intCast(tok_bol),
                                 "",
-                                "UR-23-01: remove blank line separating `///` doc comment from declaration (`E0230`)",
+                                "UR-23-01: remove blank line separating `/|` doc comment from declaration (`E0230`)",
                             );
                         }
                     }
@@ -4880,9 +6235,9 @@ fn collectDocCommentPlacementFixes(
                 {}
                 const attr_indent = source[attr_bol..attr_indent_end];
 
-                var first_doc_bol: usize = active_outer_doc_offsets.items[0];
+                var first_doc_bol: usize = active_outer_doc_offsets.items[0].offset;
                 while (first_doc_bol > raw_gap_start and source[first_doc_bol - 1] != '\n') : (first_doc_bol -= 1) {}
-                const last_doc_off: usize = active_outer_doc_offsets.items[active_outer_doc_offsets.items.len - 1];
+                const last_doc_off: usize = active_outer_doc_offsets.items[active_outer_doc_offsets.items.len - 1].offset;
                 var del_end: usize = last_doc_off;
                 while (del_end < gap_end and source[del_end] != '\n') : (del_end += 1) {}
                 if (del_end < gap_end and source[del_end] == '\n') del_end += 1;
@@ -4890,11 +6245,16 @@ fn collectDocCommentPlacementFixes(
                 if (attr_bol <= first_doc_bol) {
                     var hoisted_doc_buf: std.ArrayList(u8) = .empty;
                     defer hoisted_doc_buf.deinit(allocator);
-                    for (active_outer_doc_offsets.items) |doc_off| {
-                        var ln_end: usize = doc_off;
+                    for (active_outer_doc_offsets.items) |doc_entry| {
+                        var ln_end: usize = doc_entry.offset;
                         while (ln_end < gap_end and source[ln_end] != '\n' and source[ln_end] != '\r') : (ln_end += 1) {}
                         try hoisted_doc_buf.appendSlice(allocator, attr_indent);
-                        try hoisted_doc_buf.appendSlice(allocator, source[doc_off..ln_end]);
+                        if (doc_entry.prefix_len == 3) {
+                            try hoisted_doc_buf.appendSlice(allocator, "/|");
+                            try hoisted_doc_buf.appendSlice(allocator, source[doc_entry.offset + 3 .. ln_end]);
+                        } else {
+                            try hoisted_doc_buf.appendSlice(allocator, source[doc_entry.offset..ln_end]);
+                        }
                         try hoisted_doc_buf.append(allocator, '\n');
                     }
                     try collector.appendDualEdits(
@@ -4905,27 +6265,27 @@ fn collectDocCommentPlacementFixes(
                         @intCast(first_doc_bol),
                         @intCast(del_end),
                         "",
-                        "UR-23-01: hoist `///` doc comments above `@attribute` annotations (`E0230`)",
+                        "UR-23-01: hoist `/|` doc comments above `@attribute` annotations (`E0230`)",
                     );
                 } else {
-                    for (active_outer_doc_offsets.items) |doc_off| {
+                    for (active_outer_doc_offsets.items) |doc_entry| {
                         try collector.appendSingleEdit(
                             .syntax_canonicalization,
-                            doc_off,
-                            doc_off + 3,
+                            doc_entry.offset,
+                            doc_entry.offset + doc_entry.prefix_len,
                             "//",
-                            "UR-23-01: downgrade unattached `///` comment to `//` (`E0230`)",
+                            "UR-23-01: downgrade unattached `/|` doc comment to `//` (`E0230`)",
                         );
                     }
                 }
             } else {
-                for (active_outer_doc_offsets.items) |doc_off| {
+                for (active_outer_doc_offsets.items) |doc_entry| {
                     try collector.appendSingleEdit(
                         .syntax_canonicalization,
-                        doc_off,
-                        doc_off + 3,
+                        doc_entry.offset,
+                        doc_entry.offset + doc_entry.prefix_len,
                         "//",
-                        "UR-23-01: downgrade unattached `///` comment to `//` (`E0230`)",
+                        "UR-23-01: downgrade unattached `/|` doc comment to `//` (`E0230`)",
                     );
                 }
             }
@@ -5279,7 +6639,7 @@ fn collectImplVisAndInlineTypeMethodFixes(
             var m_bol: usize = m_sp.start_byte;
             while (m_bol > prev_tok_end and source[m_bol - 1] != '\n') : (m_bol -= 1) {}
 
-            // Walk upward across contiguous `///` lines immediately above `m_bol`:
+            // Walk upward across contiguous `/|` or `///` lines immediately above `m_bol`:
             var extract_start = m_bol;
             while (extract_start > prev_tok_end) {
                 const prev_ln_end = extract_start - 1;
@@ -5290,7 +6650,12 @@ fn collectImplVisAndInlineTypeMethodFixes(
                     std.mem.trimEnd(u8, source[prev_ln_start..prev_ln_end], "\r"),
                     " \t",
                 );
-                if (std.mem.startsWith(u8, ln_trimmed, "///") and !std.mem.startsWith(u8, ln_trimmed, "////")) {
+                const is_doc_ln = std.mem.startsWith(u8, ln_trimmed, "/|") or
+                    (std.mem.startsWith(u8, ln_trimmed, "///") and
+                        !std.mem.startsWith(u8, ln_trimmed, "////") and
+                        !std.mem.startsWith(u8, ln_trimmed, "///|") and
+                        !std.mem.startsWith(u8, ln_trimmed, "///#"));
+                if (is_doc_ln) {
                     extract_start = prev_ln_start;
                 } else {
                     break;
@@ -5449,6 +6814,572 @@ fn collectMissingColonBeforeTypeFixes(
     }
 }
 
+/// Computes a comment-preserving deletion range `[start_byte .. end_byte)` for a removed `@attribute` span.
+fn computeSafeAttrRemovalRange(
+    source: []const u8,
+    file_id: FileId,
+    tok_buf: *const TokenBuffer,
+    attr_span: Span,
+    min_start_byte: u32,
+) ByteInterval {
+    const raw_rem = symbol_resolver.computeAttributeRemovalSpan(source, file_id, attr_span);
+    const clamped_start: u32 = @max(raw_rem.start_byte, min_start_byte);
+    const clamped_end: u32 = @max(raw_rem.end_byte, clamped_start);
+    if (!hasCommentsInByteRange(source, tok_buf, clamped_start, clamped_end)) {
+        return .{ .start = clamped_start, .end = clamped_end };
+    }
+    var tight_end: usize = @min(@as(usize, attr_span.end_byte), source.len);
+    while (tight_end < source.len and (source[tight_end] == ' ' or source[tight_end] == '\t')) : (tight_end += 1) {}
+    if (!hasCommentsInByteRange(source, tok_buf, attr_span.start_byte, @intCast(tight_end))) {
+        return .{ .start = @max(attr_span.start_byte, min_start_byte), .end = @max(@as(u32, @intCast(tight_end)), min_start_byte) };
+    }
+    return .{ .start = @max(attr_span.start_byte, min_start_byte), .end = @max(attr_span.end_byte, min_start_byte) };
+}
+
+/// Splits top-level comma-separated argument slices inside `inner_args` while respecting nested delimiters and strings.
+fn splitTopLevelAttrCommaArgsAlloc(
+    allocator: std.mem.Allocator,
+    inner_args: []const u8,
+) !std.ArrayListUnmanaged([]const u8) {
+    var parts: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer parts.deinit(allocator);
+    if (inner_args.len == 0) return parts;
+
+    var depth_paren: u32 = 0;
+    var depth_bracket: u32 = 0;
+    var depth_brace: u32 = 0;
+    var seg_start: usize = 0;
+    var cursor: usize = 0;
+    while (cursor < inner_args.len) {
+        const ch = inner_args[cursor];
+        if (ch == '"' or ch == '\'') {
+            const quote_ch = ch;
+            cursor += 1;
+            while (cursor < inner_args.len) {
+                if (inner_args[cursor] == '\\' and cursor + 1 < inner_args.len) {
+                    cursor += 2;
+                    continue;
+                }
+                if (inner_args[cursor] == quote_ch) {
+                    cursor += 1;
+                    break;
+                }
+                cursor += 1;
+            }
+            continue;
+        }
+        if ((ch == 'r' or ch == 'b' or ch == 'f') and cursor + 1 < inner_args.len) {
+            var hash_probe = cursor + 1;
+            if (ch == 'b' and hash_probe < inner_args.len and inner_args[hash_probe] == 'r') {
+                hash_probe += 1;
+            }
+            const hash_start = hash_probe;
+            while (hash_probe < inner_args.len and inner_args[hash_probe] == '#') : (hash_probe += 1) {}
+            const hash_n = hash_probe - hash_start;
+            if (hash_probe < inner_args.len and inner_args[hash_probe] == '"' and (hash_n > 0 or inner_args[cursor] != 'b')) {
+                cursor = hash_probe + 1;
+                while (cursor < inner_args.len) : (cursor += 1) {
+                    if (inner_args[cursor] == '"' and cursor + 1 + hash_n <= inner_args.len) {
+                        var is_closed = true;
+                        var hi: usize = 0;
+                        while (hi < hash_n) : (hi += 1) {
+                            if (inner_args[cursor + 1 + hi] != '#') {
+                                is_closed = false;
+                                break;
+                            }
+                        }
+                        if (is_closed) {
+                            cursor += 1 + hash_n;
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+        switch (ch) {
+            '(' => depth_paren += 1,
+            ')' => depth_paren -|= 1,
+            '[' => depth_bracket += 1,
+            ']' => depth_bracket -|= 1,
+            '{' => depth_brace += 1,
+            '}' => depth_brace -|= 1,
+            ',' => {
+                if (depth_paren == 0 and depth_bracket == 0 and depth_brace == 0) {
+                    const trimmed_seg = std.mem.trim(u8, inner_args[seg_start..cursor], " \t\r\n");
+                    if (trimmed_seg.len > 0) try parts.append(allocator, trimmed_seg);
+                    seg_start = cursor + 1;
+                }
+            },
+            else => {},
+        }
+        cursor += 1;
+    }
+    const tail_seg = std.mem.trim(u8, inner_args[seg_start..], " \t\r\n");
+    if (tail_seg.len > 0) try parts.append(allocator, tail_seg);
+    return parts;
+}
+
+/// Strips an optional `key:` or `key =` prefix from an attribute argument and trims whitespace.
+fn stripOptionalAttrKeyPrefix(raw_arg: []const u8, allowed_keys: []const []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, raw_arg, " \t\r\n");
+    for (allowed_keys) |key_name| {
+        if (trimmed.len > key_name.len and std.mem.startsWith(u8, trimmed, key_name)) {
+            const after_key = std.mem.trimStart(u8, trimmed[key_name.len..], " \t");
+            if (after_key.len > 0 and (after_key[0] == ':' or after_key[0] == '=')) {
+                return std.mem.trim(u8, after_key[1..], " \t\r\n");
+            }
+        }
+    }
+    return trimmed;
+}
+
+/// Normalizes an `@align(…)` / `@repr(align: …)` value (`cache_line` -> `.CacheLine`).
+fn normalizeReprAlignValue(raw_arg: []const u8) []const u8 {
+    const clean = stripOptionalAttrKeyPrefix(raw_arg, &.{ "bytes", "align" });
+    if (CACHE_LINE_ALIAS_SET.has(clean)) {
+        return ".CacheLine";
+    }
+    return clean;
+}
+
+/// Normalizes a `@packed` / `@packed(k)` / `@repr(packed: …)` value.
+fn normalizeReprPackedValue(raw_arg: []const u8) []const u8 {
+    const clean = stripOptionalAttrKeyPrefix(raw_arg, &.{ "packed", "align", "bytes" });
+    return if (clean.len > 0) clean else "true";
+}
+
+/// Participating CST attribute entry for `UR-24-03` `@repr(…)` / `@link(…)` coalescing.
+const CoalescedAttrCstEntry = struct {
+    /// Attribute identifier (`"repr"`, `"repr_c"`, `"align"`, `"link_name"`, etc.).
+    name: []const u8,
+    /// Full `@attr(…)` source byte span.
+    span: Span,
+    /// Trimmed interior of `( … )`, or `""` when parameterless.
+    inner_args: []const u8,
+    /// `true` when `name` is a retired standalone attribute rather than `@repr` / `@link`.
+    is_retired: bool,
+};
+
+/// Collects `UR-24-03` fixes coalescing retired layout/link attributes into canonical `@repr(…)` and `@link(…)`.
+fn collectConsolidatedReprAndLinkFixes(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    file_id: FileId,
+    cst_arena: *const LosslessCstArena,
+    tok_buf: *const TokenBuffer,
+    rewritten_enum_items: *const std.AutoHashMapUnmanaged(u32, void),
+    collector: *FixCollector,
+) !void {
+    const cst_count = cst_arena.countNodes();
+    if (cst_count == 0) return;
+
+    const visited_attr_cst = try allocator.alloc(bool, cst_count);
+    defer allocator.free(visited_attr_cst);
+    @memset(visited_attr_cst, false);
+
+    var idx: usize = 0;
+    while (idx < cst_count) : (idx += 1) {
+        const item_cst = CstNodeIndex.fromInt(@intCast(idx));
+        const item_rec = cst_arena.getNode(item_cst);
+        if (item_rec.kind == .attribute or item_rec.subtree_size <= 1) continue;
+        const sub_end = @min(idx + @max(@as(usize, item_rec.subtree_size), 1), cst_count);
+
+        var layout_entries: std.ArrayListUnmanaged(CoalescedAttrCstEntry) = .empty;
+        defer layout_entries.deinit(allocator);
+        var link_entries: std.ArrayListUnmanaged(CoalescedAttrCstEntry) = .empty;
+        defer link_entries.deinit(allocator);
+
+        var child_cur = idx + 1;
+        while (child_cur < sub_end) {
+            const child_id = CstNodeIndex.fromInt(@intCast(child_cur));
+            const child_rec = cst_arena.getNode(child_id);
+            if (child_rec.kind == .attribute and !visited_attr_cst[child_cur]) {
+                visited_attr_cst[child_cur] = true;
+                if (extractCstTokenSpan(cst_arena, tok_buf, child_id)) |attr_sp| {
+                    if (!hasCommentsInByteRange(source, tok_buf, attr_sp.start_byte, attr_sp.end_byte) and
+                        attr_sp.first_tok.asInt() + 1 <= attr_sp.last_tok.asInt() and
+                        tok_buf.getToken(attr_sp.first_tok).kind == .at)
+                    {
+                        const name_tok = TokenIndex.fromInt(attr_sp.first_tok.asInt() + 1);
+                        const attr_name = symbol_resolver.extractTokenSlice(source, tok_buf, name_tok);
+                        if (DR24_COALESCED_ATTR_SET.has(attr_name)) {
+                            var inner_args: []const u8 = "";
+                            var is_well_formed = true;
+                            if (attr_sp.first_tok.asInt() + 2 <= attr_sp.last_tok.asInt()) {
+                                const open_tok = TokenIndex.fromInt(attr_sp.first_tok.asInt() + 2);
+                                const close_tok = attr_sp.last_tok;
+                                if (tok_buf.getToken(open_tok).kind == .lparen and
+                                    tok_buf.getToken(close_tok).kind == .rparen)
+                                {
+                                    const open_rec = tok_buf.getToken(open_tok);
+                                    const close_rec = tok_buf.getToken(close_tok);
+                                    const body_lo: usize = @min(
+                                        @as(usize, open_rec.byte_offset) + @as(usize, open_rec.byte_len),
+                                        source.len,
+                                    );
+                                    const body_hi: usize = @min(@as(usize, close_rec.byte_offset), source.len);
+                                    if (body_lo <= body_hi) {
+                                        inner_args = std.mem.trim(u8, source[body_lo..body_hi], " \t\r\n");
+                                    }
+                                } else {
+                                    is_well_formed = false;
+                                }
+                            }
+                            if (is_well_formed) {
+                                const attr_span = Span.init(file_id, attr_sp.start_byte, attr_sp.end_byte);
+                                if (std.mem.startsWith(u8, attr_name, "link")) {
+                                    try link_entries.append(allocator, .{
+                                        .name = attr_name,
+                                        .span = attr_span,
+                                        .inner_args = inner_args,
+                                        .is_retired = !std.mem.eql(u8, attr_name, "link"),
+                                    });
+                                } else {
+                                    try layout_entries.append(allocator, .{
+                                        .name = attr_name,
+                                        .span = attr_span,
+                                        .inner_args = inner_args,
+                                        .is_retired = !std.mem.eql(u8, attr_name, "repr"),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            child_cur += @max(@as(usize, child_rec.subtree_size), 1);
+        }
+
+        // [1] Coalesce layout group (`@repr`, `@repr_c`, `@packed`, `@align`, `@cache_aligned`, `@zero_pad`):
+        if (layout_entries.items.len > 0 and !rewritten_enum_items.contains(item_cst.asInt())) {
+            var base_mode: ?[]const u8 = null;
+            var packed_val: ?[]const u8 = null;
+            var align_val: ?[]const u8 = null;
+            var zero_pad_val: ?[]const u8 = null;
+            var has_retired_or_multi = layout_entries.items.len > 1;
+            var is_layout_valid = true;
+
+            for (layout_entries.items) |entry| {
+                if (entry.is_retired) has_retired_or_multi = true;
+                if (std.mem.eql(u8, entry.name, "repr_c")) {
+                    if (entry.inner_args.len > 0) {
+                        is_layout_valid = false;
+                        break;
+                    }
+                    base_mode = "C";
+                } else if (std.mem.eql(u8, entry.name, "packed")) {
+                    packed_val = normalizeReprPackedValue(entry.inner_args);
+                    if (base_mode == null) base_mode = "C";
+                } else if (std.mem.eql(u8, entry.name, "align")) {
+                    const norm_align = normalizeReprAlignValue(entry.inner_args);
+                    if (norm_align.len == 0) {
+                        is_layout_valid = false;
+                        break;
+                    }
+                    align_val = norm_align;
+                } else if (std.mem.eql(u8, entry.name, "cache_aligned")) {
+                    if (entry.inner_args.len > 0) {
+                        is_layout_valid = false;
+                        break;
+                    }
+                    align_val = ".CacheLine";
+                } else if (std.mem.eql(u8, entry.name, "zero_pad")) {
+                    const clean_zp = stripOptionalAttrKeyPrefix(entry.inner_args, &.{"zero_pad"});
+                    zero_pad_val = if (clean_zp.len > 0) clean_zp else "true";
+                } else if (std.mem.eql(u8, entry.name, "repr")) {
+                    var sub_parts = try splitTopLevelAttrCommaArgsAlloc(allocator, entry.inner_args);
+                    defer sub_parts.deinit(allocator);
+                    if (sub_parts.items.len == 0) {
+                        is_layout_valid = false;
+                        break;
+                    }
+                    for (sub_parts.items) |part| {
+                        if (std.mem.eql(u8, part, "C") or std.mem.eql(u8, part, "c")) {
+                            base_mode = "C";
+                        } else if (std.mem.eql(u8, part, "transparent")) {
+                            base_mode = "transparent";
+                        } else if (std.mem.eql(u8, part, "packed")) {
+                            packed_val = "true";
+                            if (base_mode == null) base_mode = "C";
+                        } else if (std.mem.startsWith(u8, part, "packed") and
+                            part.len > 6 and
+                            (part[6] == ':' or part[6] == '=' or part[6] == ' ' or part[6] == '\t' or part[6] == '('))
+                        {
+                            if (part[6] == '(' and part[part.len - 1] == ')') {
+                                packed_val = normalizeReprPackedValue(part[7 .. part.len - 1]);
+                            } else {
+                                packed_val = normalizeReprPackedValue(part);
+                            }
+                            if (base_mode == null) base_mode = "C";
+                        } else if (CACHE_LINE_ALIAS_SET.has(part)) {
+                            align_val = ".CacheLine";
+                        } else if (std.mem.startsWith(u8, part, "align") and
+                            part.len > 5 and
+                            (part[5] == ':' or part[5] == '=' or part[5] == ' ' or part[5] == '\t' or part[5] == '('))
+                        {
+                            const norm_align = if (part[5] == '(' and part[part.len - 1] == ')')
+                                normalizeReprAlignValue(part[6 .. part.len - 1])
+                            else
+                                normalizeReprAlignValue(part);
+                            if (norm_align.len == 0) {
+                                is_layout_valid = false;
+                                break;
+                            }
+                            align_val = norm_align;
+                        } else if (std.mem.eql(u8, part, "zero_pad")) {
+                            zero_pad_val = "true";
+                        } else if (std.mem.startsWith(u8, part, "zero_pad") and
+                            part.len > 8 and
+                            (part[8] == ':' or part[8] == '=' or part[8] == ' ' or part[8] == '\t'))
+                        {
+                            const clean_zp = stripOptionalAttrKeyPrefix(part, &.{"zero_pad"});
+                            zero_pad_val = if (clean_zp.len > 0) clean_zp else "true";
+                        } else {
+                            // Unrecognized `@repr(…)` argument (e.g., enum integer backing before `UR-22-04`); skip:
+                            is_layout_valid = false;
+                            break;
+                        }
+                    }
+                    if (!is_layout_valid) break;
+                }
+            }
+
+            if (is_layout_valid and (base_mode != null or packed_val != null or align_val != null or zero_pad_val != null)) {
+                var repr_buf: std.ArrayList(u8) = .empty;
+                defer repr_buf.deinit(allocator);
+                try repr_buf.appendSlice(allocator, "@repr(");
+                var has_emitted_arg = false;
+                if (base_mode) |base_str| {
+                    try repr_buf.appendSlice(allocator, base_str);
+                    has_emitted_arg = true;
+                }
+                if (packed_val) |pk_str| {
+                    if (has_emitted_arg) try repr_buf.appendSlice(allocator, ", ");
+                    try repr_buf.appendSlice(allocator, "packed: ");
+                    try repr_buf.appendSlice(allocator, pk_str);
+                    has_emitted_arg = true;
+                }
+                if (align_val) |al_str| {
+                    if (has_emitted_arg) try repr_buf.appendSlice(allocator, ", ");
+                    try repr_buf.appendSlice(allocator, "align: ");
+                    try repr_buf.appendSlice(allocator, al_str);
+                    has_emitted_arg = true;
+                }
+                if (zero_pad_val) |zp_str| {
+                    if (has_emitted_arg) try repr_buf.appendSlice(allocator, ", ");
+                    try repr_buf.appendSlice(allocator, "zero_pad: ");
+                    try repr_buf.appendSlice(allocator, zp_str);
+                }
+                try repr_buf.append(allocator, ')');
+
+                const first_sp = layout_entries.items[0].span;
+                const first_raw = source[first_sp.start_byte..first_sp.end_byte];
+                if (has_retired_or_multi or !std.mem.eql(u8, first_raw, repr_buf.items)) {
+                    var edits: std.ArrayList(PendingByteEdit) = .empty;
+                    defer edits.deinit(allocator);
+                    try edits.append(allocator, .{
+                        .start_byte = first_sp.start_byte,
+                        .end_byte = first_sp.end_byte,
+                        .replacement = repr_buf.items,
+                    });
+                    var min_erase_start: u32 = first_sp.end_byte;
+                    for (layout_entries.items[1..]) |tail_entry| {
+                        const rem = computeSafeAttrRemovalRange(
+                            source,
+                            file_id,
+                            tok_buf,
+                            tail_entry.span,
+                            min_erase_start,
+                        );
+                        try edits.append(allocator, .{
+                            .start_byte = @intCast(rem.start),
+                            .end_byte = @intCast(rem.end),
+                            .replacement = "",
+                        });
+                        min_erase_start = @intCast(rem.end);
+                    }
+                    try collector.appendMultiEdits(
+                        .syntax_canonicalization,
+                        edits.items,
+                        "UR-24-03: coalesce layout attributes into canonical `@repr(…)` (`E0239`)",
+                    );
+                }
+            }
+        }
+
+        // [2] Coalesce linkage group (`@link`, `@link_name`, `@link_section`):
+        if (link_entries.items.len > 0) {
+            var link_name_val: ?[]const u8 = null;
+            var link_section_val: ?[]const u8 = null;
+            var has_retired_or_multi_link = link_entries.items.len > 1;
+            var is_link_valid = true;
+
+            for (link_entries.items) |entry| {
+                if (entry.is_retired) has_retired_or_multi_link = true;
+                if (std.mem.eql(u8, entry.name, "link_name")) {
+                    const clean_nm = stripOptionalAttrKeyPrefix(entry.inner_args, &.{"name"});
+                    if (clean_nm.len == 0) {
+                        is_link_valid = false;
+                        break;
+                    }
+                    link_name_val = clean_nm;
+                } else if (std.mem.eql(u8, entry.name, "link_section")) {
+                    const clean_sec = stripOptionalAttrKeyPrefix(entry.inner_args, &.{"section"});
+                    if (clean_sec.len == 0) {
+                        is_link_valid = false;
+                        break;
+                    }
+                    link_section_val = clean_sec;
+                } else if (std.mem.eql(u8, entry.name, "link")) {
+                    var sub_parts = try splitTopLevelAttrCommaArgsAlloc(allocator, entry.inner_args);
+                    defer sub_parts.deinit(allocator);
+                    if (sub_parts.items.len == 0) {
+                        is_link_valid = false;
+                        break;
+                    }
+                    for (sub_parts.items) |part| {
+                        if (std.mem.startsWith(u8, part, "name")) {
+                            const clean_nm = stripOptionalAttrKeyPrefix(part, &.{"name"});
+                            if (clean_nm.len == 0 or std.mem.eql(u8, clean_nm, part)) {
+                                is_link_valid = false;
+                                break;
+                            }
+                            link_name_val = clean_nm;
+                        } else if (std.mem.startsWith(u8, part, "section")) {
+                            const clean_sec = stripOptionalAttrKeyPrefix(part, &.{"section"});
+                            if (clean_sec.len == 0 or std.mem.eql(u8, clean_sec, part)) {
+                                is_link_valid = false;
+                                break;
+                            }
+                            link_section_val = clean_sec;
+                        } else {
+                            is_link_valid = false;
+                            break;
+                        }
+                    }
+                    if (!is_link_valid) break;
+                }
+            }
+
+            if (is_link_valid and (link_name_val != null or link_section_val != null)) {
+                var link_buf: std.ArrayList(u8) = .empty;
+                defer link_buf.deinit(allocator);
+                try link_buf.appendSlice(allocator, "@link(");
+                if (link_name_val) |nm_str| {
+                    try link_buf.appendSlice(allocator, "name: ");
+                    try link_buf.appendSlice(allocator, nm_str);
+                }
+                if (link_section_val) |sec_str| {
+                    if (link_name_val != null) try link_buf.appendSlice(allocator, ", ");
+                    try link_buf.appendSlice(allocator, "section: ");
+                    try link_buf.appendSlice(allocator, sec_str);
+                }
+                try link_buf.append(allocator, ')');
+
+                const first_sp = link_entries.items[0].span;
+                const first_raw = source[first_sp.start_byte..first_sp.end_byte];
+                if (has_retired_or_multi_link or !std.mem.eql(u8, first_raw, link_buf.items)) {
+                    var edits: std.ArrayList(PendingByteEdit) = .empty;
+                    defer edits.deinit(allocator);
+                    try edits.append(allocator, .{
+                        .start_byte = first_sp.start_byte,
+                        .end_byte = first_sp.end_byte,
+                        .replacement = link_buf.items,
+                    });
+                    var min_erase_start: u32 = first_sp.end_byte;
+                    for (link_entries.items[1..]) |tail_entry| {
+                        const rem = computeSafeAttrRemovalRange(
+                            source,
+                            file_id,
+                            tok_buf,
+                            tail_entry.span,
+                            min_erase_start,
+                        );
+                        try edits.append(allocator, .{
+                            .start_byte = @intCast(rem.start),
+                            .end_byte = @intCast(rem.end),
+                            .replacement = "",
+                        });
+                        min_erase_start = @intCast(rem.end);
+                    }
+                    try collector.appendMultiEdits(
+                        .syntax_canonicalization,
+                        edits.items,
+                        "UR-24-03: coalesce linkage attributes into canonical `@link(…)` (`E0239`)",
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Collects `UR-24-04` fixes unwrapping `@[a, b]` and `@(a, b)` grouped attribute lists into `@a @b`.
+fn collectUnwrapGroupedAttrListFixes(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tok_buf: *const TokenBuffer,
+    collector: *FixCollector,
+) !void {
+    const tok_count = tok_buf.countTokens();
+    var tok_i: usize = 0;
+    while (tok_i + 2 < tok_count) : (tok_i += 1) {
+        const at_rec = tok_buf.getToken(TokenIndex.fromInt(@intCast(tok_i)));
+        if (at_rec.flags.is_synthesized or at_rec.kind != .at) continue;
+        const open_rec = tok_buf.getToken(TokenIndex.fromInt(@intCast(tok_i + 1)));
+        if (open_rec.flags.is_synthesized or (open_rec.kind != .lbracket and open_rec.kind != .lparen)) continue;
+        const close_kind: TokenKind = if (open_rec.kind == .lbracket) .rbracket else .rparen;
+
+        var depth: u32 = 1;
+        var close_opt: ?usize = null;
+        var scan_i: usize = tok_i + 2;
+        while (scan_i < tok_count) : (scan_i += 1) {
+            const scan_rec = tok_buf.getToken(TokenIndex.fromInt(@intCast(scan_i)));
+            if (scan_rec.flags.is_synthesized) continue;
+            if (scan_rec.kind == open_rec.kind) {
+                depth += 1;
+            } else if (scan_rec.kind == close_kind) {
+                depth -= 1;
+                if (depth == 0) {
+                    close_opt = scan_i;
+                    break;
+                }
+            }
+        }
+        const close_idx = close_opt orelse continue;
+        const close_rec = tok_buf.getToken(TokenIndex.fromInt(@intCast(close_idx)));
+        const full_end: u32 = close_rec.byte_offset +| close_rec.byte_len;
+        if (hasCommentsInByteRange(source, tok_buf, at_rec.byte_offset, full_end)) continue;
+
+        const inner_lo: usize = @min(@as(usize, open_rec.byte_offset) + @as(usize, open_rec.byte_len), source.len);
+        const inner_hi: usize = @min(@as(usize, close_rec.byte_offset), source.len);
+        if (inner_lo >= inner_hi) continue;
+        var elems = try splitTopLevelAttrCommaArgsAlloc(allocator, source[inner_lo..inner_hi]);
+        defer elems.deinit(allocator);
+        if (elems.items.len == 0) continue;
+
+        var out_buf: std.ArrayList(u8) = .empty;
+        defer out_buf.deinit(allocator);
+        for (elems.items, 0..) |raw_elem, elem_i| {
+            if (elem_i > 0) try out_buf.append(allocator, ' ');
+            const clean_elem = if (std.mem.startsWith(u8, raw_elem, "@"))
+                std.mem.trimStart(u8, raw_elem[1..], " \t")
+            else
+                raw_elem;
+            try out_buf.append(allocator, '@');
+            try out_buf.appendSlice(allocator, clean_elem);
+        }
+        try collector.appendSingleEdit(
+            .syntax_canonicalization,
+            at_rec.byte_offset,
+            full_end,
+            out_buf.items,
+            "UR-24-04: unwrap grouped `@[…]` / `@(…)` attribute list into `@attr` sequence (`E0239`)",
+        );
+        tok_i = close_idx;
+    }
+}
+
 /// Collects all enabled Sub-stage B Tier 2 lossless CST/AST structural rewrites into `collector`.
 fn collectSubstageBTier2Fixes(
     allocator: std.mem.Allocator,
@@ -5469,10 +7400,13 @@ fn collectSubstageBTier2Fixes(
     const is_ur23_03 = isRuleEnabled(options.rule_mask, .ur_23_03_impl_visibility_and_inline_type_methods);
     const is_ur23_04 = isRuleEnabled(options.rule_mask, .ur_23_04_canonical_wildcard_discard_stmt);
     const is_ur23_06 = isRuleEnabled(options.rule_mask, .ur_23_06_missing_colon_before_type);
+    const is_ur24_03 = isRuleEnabled(options.rule_mask, .ur_24_03_consolidated_repr_and_link_attrs);
+    const is_ur24_04 = isRuleEnabled(options.rule_mask, .ur_24_04_unwrap_grouped_attribute_lists);
 
     if (!is_ur21_01 and !is_ur21_02 and !is_ur21_03 and !is_ur22_01 and
         !is_ur22_02 and !is_ur22_03 and !is_ur22_04 and !is_ur22_05 and
-        !is_ur23_01 and !is_ur23_03 and !is_ur23_04 and !is_ur23_06)
+        !is_ur23_01 and !is_ur23_03 and !is_ur23_04 and !is_ur23_06 and
+        !is_ur24_03 and !is_ur24_04)
     {
         return;
     }
@@ -5492,6 +7426,8 @@ fn collectSubstageBTier2Fixes(
     defer rewritten_stmt_nodes.deinit(allocator);
     var rewritten_test_fns: std.AutoHashMapUnmanaged(u32, void) = .empty;
     defer rewritten_test_fns.deinit(allocator);
+    var rewritten_enum_items: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer rewritten_enum_items.deinit(allocator);
 
     if (is_ur23_01) {
         try collectDocCommentPlacementFixes(allocator, source, &cst_arena, &tok_buf, collector);
@@ -5567,6 +7503,22 @@ fn collectSubstageBTier2Fixes(
             &cst_arena,
             &tok_buf,
             &rewritten_test_fns,
+            is_ur24_03,
+            &rewritten_enum_items,
+            collector,
+        );
+    }
+    if (is_ur24_04) {
+        try collectUnwrapGroupedAttrListFixes(allocator, source, &tok_buf, collector);
+    }
+    if (is_ur24_03) {
+        try collectConsolidatedReprAndLinkFixes(
+            allocator,
+            source,
+            file_id,
+            &cst_arena,
+            &tok_buf,
+            &rewritten_enum_items,
             collector,
         );
     }
@@ -5660,6 +7612,59 @@ fn unwrapAutoDerefType(type_pool: *const InternPool, raw_ty: TypeId) TypeId {
     return current;
 }
 
+/// Returns `true` if `kind` owns executable expressions or bodies carrying `BodySemanticSideTables`.
+inline fn hasBodySideTablesItemKind(kind: query_db.ItemKind) bool {
+    return switch (kind) {
+        .fn_decl,
+        .impl_decl,
+        .const_decl,
+        .extern_block,
+        .subscript_decl,
+        .test_decl,
+        .bench_decl,
+        => true,
+        .mod_decl,
+        .use_decl,
+        .struct_decl,
+        .enum_decl,
+        .union_decl,
+        .trait_decl,
+        .type_alias_decl,
+        .ffi_extern_block,
+        .extern_static,
+        => false,
+    };
+}
+
+/// Fetches `BodySemanticSideTables` for `def_id`, propagating `OutOfMemory` while ignoring non-fatal query errors.
+inline fn getDefSideTablesBestEffort(
+    db: *CompilerDb,
+    def_id: DefId,
+) error{OutOfMemory}!?*const type_system.BodySemanticSideTables {
+    return db.getDefSideTables(def_id) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => null,
+    };
+}
+
+/// Looks up the cached `BodySemanticSideTables` for `def_id` in $O(1)$, computing it lazily only on cache miss.
+inline fn getCachedOrComputeDefSideTables(
+    db: *CompilerDb,
+    def_id: DefId,
+) error{OutOfMemory}!?*const type_system.BodySemanticSideTables {
+    if (def_id.isNone()) return null;
+    if (db.parsed_artifacts.getPtr(def_id.fileId().asInt())) |parsed_ptr| {
+        if (db.def_side_tables.getPtr(def_id.asInt())) |cached_st| {
+            if (!query_db.Fingerprint128.eql(cached_st.ast_fingerprint, query_db.Fingerprint128.ZERO) and
+                query_db.Fingerprint128.eql(cached_st.ast_fingerprint, parsed_ptr.ast_fingerprint))
+            {
+                return cached_st;
+            }
+        }
+    }
+    return getDefSideTablesBestEffort(db, def_id);
+}
+
 /// Looks up the resolved `TypeId` of `ast_node` across file-level and per-`DefId` `BodySemanticSideTables`.
 fn lookupSemanticNodeType(
     db: *CompilerDb,
@@ -5673,7 +7678,8 @@ fn lookupSemanticNodeType(
         if (!file_ty.isError()) return file_ty;
     }
     for (item_tree.entries) |entry| {
-        if (try db.getDefSideTables(entry.def_id)) |def_st| {
+        if (!hasBodySideTablesItemKind(entry.kind)) continue;
+        if (try getCachedOrComputeDefSideTables(db, entry.def_id)) |def_st| {
             if (ast_node.asInt() >= def_st.ast_start and ast_node.asInt() < def_st.ast_end) {
                 const def_ty = def_st.getNodeType(ast_node);
                 if (!def_ty.isError()) return def_ty;
@@ -5700,7 +7706,8 @@ fn lookupSemanticNodeSymbol(
         }
     }
     for (item_tree.entries) |entry| {
-        if (try db.getDefSideTables(entry.def_id)) |def_st| {
+        if (!hasBodySideTablesItemKind(entry.kind)) continue;
+        if (try getCachedOrComputeDefSideTables(db, entry.def_id)) |def_st| {
             if (ast_node.asInt() >= def_st.ast_start and ast_node.asInt() < def_st.ast_end) {
                 const rel = ast_node.asInt() - def_st.ast_start;
                 if (rel < def_st.node_symbols.len and !def_st.node_symbols[rel].isNone()) {
@@ -5724,7 +7731,8 @@ fn lookupFixInlineRewrite(
         if (file_st.getFixInlineRewrite(ast_node)) |rw| return rw;
     }
     for (item_tree.entries) |entry| {
-        if (try db.getDefSideTables(entry.def_id)) |def_st| {
+        if (!hasBodySideTablesItemKind(entry.kind)) continue;
+        if (try getCachedOrComputeDefSideTables(db, entry.def_id)) |def_st| {
             if (def_st.getFixInlineRewrite(ast_node)) |rw| return rw;
         }
     }
@@ -5743,7 +7751,8 @@ fn lookupCallArgMapping(
         if (file_st.getCallArgMapping(call_node)) |mapping| return mapping;
     }
     for (item_tree.entries) |entry| {
-        if (try db.getDefSideTables(entry.def_id)) |def_st| {
+        if (!hasBodySideTablesItemKind(entry.kind)) continue;
+        if (try getCachedOrComputeDefSideTables(db, entry.def_id)) |def_st| {
             if (def_st.getCallArgMapping(call_node)) |mapping| return mapping;
         }
     }
@@ -5900,7 +7909,8 @@ fn isPtrAccessCoercedToMutRawPtr(
         .return_stmt => {
             // Check enclosing `DefId` signature return type for `*mut T`:
             for (item_tree.entries) |entry| {
-                if (try db.getDefSideTables(entry.def_id)) |def_st| {
+                if (!hasBodySideTablesItemKind(entry.kind)) continue;
+                if (try getCachedOrComputeDefSideTables(db, entry.def_id)) |def_st| {
                     if (expr_id.asInt() >= def_st.ast_start and expr_id.asInt() < def_st.ast_end) {
                         if (db.symbol_table.def_to_symbol.get(entry.def_id.asInt())) |fn_sym_idx| {
                             const fn_ty = db.symbol_table.getSymbol(fn_sym_idx).type_id;
@@ -6277,6 +8287,1434 @@ fn scanSinkForTier3(
     }
 }
 
+/// Parsed probe result for a single `{Expr[=][:Spec]}` candidate inside an unmarked `"…"` literal (`UR-24-01` Branch B).
+const UnmarkedHoleProbe = struct {
+    /// Byte offset after opening `{` inside the literal's `body` slice.
+    hole_body_start: usize,
+    /// Byte offset of closing `}` inside the literal's `body` slice.
+    hole_body_end: usize,
+    /// Trimmed expression slice inside `{…}`.
+    expr_slice: []const u8,
+    /// Verbatim `:Spec` suffix (`""` when absent).
+    spec_with_colon: []const u8,
+    /// `true` when `{expr=}` debug shorthand is present.
+    has_debug_eq: bool,
+    /// `true` when the parsed expression is a bare identifier (`{ident}`) rather than a compound expression.
+    is_bare_ident: bool,
+};
+
+/// Parses `expr_slice` inside `fn __p__() { let __x = <expr>; }` to verify it is a valid single expression.
+fn probeSingleHoleExprSyntax(
+    allocator: std.mem.Allocator,
+    expr_slice: []const u8,
+) !?struct { is_bare_ident: bool } {
+    const trimmed = std.mem.trim(u8, expr_slice, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, trimmed, ';') != null) return null;
+
+    const probe_src = try std.fmt.allocPrint(allocator, "fn __cx_probe__() {{\n    let __cx_v = (\n{s}\n    );\n}}\n", .{trimmed});
+    defer allocator.free(probe_src);
+
+    var probe_interner = try StringInterner.init(allocator);
+    defer probe_interner.deinit();
+    var probe_toks = TokenBuffer.init(allocator);
+    defer probe_toks.deinit();
+    var probe_cst = LosslessCstArena.init(allocator);
+    defer probe_cst.deinit();
+    var probe_ast = AstArena.init(allocator);
+    defer probe_ast.deinit();
+    var probe_sink = DiagnosticSink.init(allocator);
+    defer probe_sink.deinit();
+
+    _ = try parser.parseSource(
+        probe_src,
+        FileId.fromInt(999_991),
+        &probe_toks,
+        &probe_cst,
+        &probe_ast,
+        &probe_sink,
+        &probe_interner,
+    );
+    if (probe_sink.error_count > 0) return null;
+
+    // Reject top-level comma tuples caused by our `( … )` wrapper when `trimmed` itself wasn't parenthesized:
+    if (trimmed[0] != '(') {
+        var depth: u32 = 0;
+        var ti: usize = 0;
+        while (ti < probe_toks.countTokens()) : (ti += 1) {
+            const tr = probe_toks.getToken(TokenIndex.fromInt(@intCast(ti)));
+            if (tr.flags.is_synthesized) continue;
+            if (tr.byte_offset < 33 or tr.byte_offset >= 33 + trimmed.len) continue;
+            if (depth == 0 and tr.kind == .comma) return null;
+            switch (tr.kind) {
+                .lparen, .lbracket, .lbrace => depth += 1,
+                .rparen, .rbracket, .rbrace => depth -|= 1,
+                else => {},
+            }
+        }
+    }
+
+    // Count real tokens inside `trimmed` to classify bare identifier `{ident}` vs compound expression:
+    var inner_tok_count: usize = 0;
+    var sole_tok_kind: TokenKind = .eof;
+    var scan_i: usize = 0;
+    while (scan_i < probe_toks.countTokens()) : (scan_i += 1) {
+        const tr = probe_toks.getToken(TokenIndex.fromInt(@intCast(scan_i)));
+        if (tr.flags.is_synthesized or tr.kind == .eof) continue;
+        if (tr.byte_offset < 33 or tr.byte_offset >= 33 + trimmed.len) continue;
+        inner_tok_count += 1;
+        sole_tok_kind = tr.kind;
+    }
+    if (inner_tok_count == 0) return null;
+    const is_bare_id = inner_tok_count == 1 and
+        (sole_tok_kind == .ident or sole_tok_kind == .const_ident or sole_tok_kind == .type_ident);
+    return .{ .is_bare_ident = is_bare_id };
+}
+
+/// Returns `true` if `cst_kind` forms a lexical binding boundary for local variables (`UR-24-01` Branch B).
+inline fn isLexicalScopeCstKind(cst_kind: CstNodeKind) bool {
+    return switch (cst_kind) {
+        .block,
+        .for_stmt,
+        .while_stmt,
+        .loop_expr,
+        .match_arm,
+        .closure_expr,
+        .fn_item,
+        .impl_member,
+        .trait_member,
+        .subscript_item,
+        .test_item,
+        .bench_item,
+        => true,
+        else => false,
+    };
+}
+
+/// Checks whether a bare `{ident}` inside an unmarked string at `str_tok_idx` resolves in `db` or CST `param_list`.
+fn isBareIdentResolvedAtStringSite(
+    db: *CompilerDb,
+    file_id: FileId,
+    source: []const u8,
+    cst_arena: *const LosslessCstArena,
+    cst_parents: []const CstNodeIndex,
+    tok_buf: *const TokenBuffer,
+    item_tree: *const query_db.ItemTree,
+    leaf_cst_for_tok: CstNodeIndex,
+    str_start_byte: u32,
+    ident_name: []const u8,
+) bool {
+    const cst_count = cst_arena.countNodes();
+
+    // [1] Check enclosing CST `.fn_item` / `.impl_member` / `.closure_expr` / `.for_expr` parameter & loop bindings:
+    var cur_cst = leaf_cst_for_tok;
+    var walk_steps: usize = 0;
+    while (!cur_cst.isNone() and cur_cst.asInt() < cst_count and walk_steps < 256) : (walk_steps += 1) {
+        const cur_rec = cst_arena.getNode(cur_cst);
+        if (cur_rec.kind == .fn_item or cur_rec.kind == .impl_member or
+            cur_rec.kind == .trait_member or cur_rec.kind == .subscript_item)
+        {
+            const fn_end = @min(@as(usize, cur_cst.asInt()) + @max(@as(usize, cur_rec.subtree_size), 1), cst_count);
+            var sub_i: usize = cur_cst.asInt() + 1;
+            while (sub_i < fn_end) : (sub_i += 1) {
+                const sub_id = CstNodeIndex.fromInt(@intCast(sub_i));
+                const sub_rec = cst_arena.getNode(sub_id);
+                if (sub_rec.kind == .block) break;
+                if (sub_rec.kind == .fn_param) {
+                    if (extractCstTokenSpan(cst_arena, tok_buf, sub_id)) |p_sp| {
+                        var pt: u32 = p_sp.first_tok.asInt();
+                        while (pt <= p_sp.last_tok.asInt()) : (pt += 1) {
+                            const pk = tok_buf.getToken(TokenIndex.fromInt(pt)).kind;
+                            if (pk == .colon or pk == .eq) break;
+                            if (pk == .ident or pk == .kw_self_val) {
+                                const p_lex = symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(pt));
+                                if (std.mem.eql(u8, p_lex, ident_name)) return true;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (cur_rec.kind == .closure_expr) {
+            if (extractCstTokenSpan(cst_arena, tok_buf, cur_cst)) |cl_sp| {
+                const first_k = tok_buf.getToken(cl_sp.first_tok).kind;
+                if (first_k == .pipe) {
+                    var ct: u32 = cl_sp.first_tok.asInt() + 1;
+                    var in_type = false;
+                    while (ct <= cl_sp.last_tok.asInt()) : (ct += 1) {
+                        const ck = tok_buf.getToken(TokenIndex.fromInt(ct)).kind;
+                        if (ck == .pipe) break;
+                        if (ck == .colon) in_type = true else if (ck == .comma) in_type = false;
+                        if (!in_type and ck == .ident) {
+                            const c_lex = symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(ct));
+                            if (std.mem.eql(u8, c_lex, ident_name)) return true;
+                        }
+                    }
+                }
+            }
+        }
+        cur_cst = if (cur_cst.asInt() < cst_parents.len) cst_parents[cur_cst.asInt()] else .none;
+    }
+
+    // [2] Find enclosing `DefId` in `item_tree` and check `CompilerDb` local/param/const/static symbols:
+    var enclosing_def: DefId = .NONE;
+    for (item_tree.entries) |entry| {
+        if (entry.ast_node.isNone()) continue;
+        const entry_cst = db.parsed_artifacts.getPtr(file_id.asInt()).?.ast_arena.getCstOrigin(entry.ast_node);
+        if (extractCstTokenSpan(cst_arena, tok_buf, entry_cst)) |e_sp| {
+            if (e_sp.start_byte <= str_start_byte and str_start_byte <= e_sp.end_byte) {
+                enclosing_def = entry.def_id;
+            }
+        }
+    }
+
+    for (db.symbol_table.symbols.items, 0..) |sym, sym_raw| {
+        const unwrapped = if (sym.kind == .use_alias_sym)
+            db.symbol_table.getSymbol(db.symbol_table.unwrapAliasSymbolIdx(SymbolIndex.fromInt(@intCast(sym_raw)))).*
+        else
+            sym;
+        const is_allowed_kind = switch (unwrapped.kind) {
+            .local_let_sym,
+            .local_var_sym,
+            .param_sym,
+            .const_param_sym,
+            .const_sym,
+            .extern_static_sym,
+            => true,
+            else => false,
+        };
+        if (!is_allowed_kind) continue;
+        if (!std.mem.eql(u8, sym.name_text, ident_name)) continue;
+
+        if (unwrapped.kind == .local_let_sym or unwrapped.kind == .local_var_sym or unwrapped.kind == .param_sym) {
+            if (sym.decl_span.file_id != file_id) continue;
+            if (!enclosing_def.isNone() and sym.owner_def_id != enclosing_def and sym.def_id != enclosing_def) continue;
+            if (sym.decl_span.start_byte >= str_start_byte) continue;
+
+            // Verify that the innermost lexical CST block containing `sym.decl_span.start_byte` also encloses `str_start_byte`:
+            var best_scope_cst: CstNodeIndex = .none;
+            var ci: usize = 0;
+            while (ci < cst_count) : (ci += 1) {
+                const cid = CstNodeIndex.fromInt(@intCast(ci));
+                if (!isLexicalScopeCstKind(cst_arena.getNode(cid).kind)) continue;
+                if (extractCstTokenSpan(cst_arena, tok_buf, cid)) |b_sp| {
+                    if (b_sp.start_byte <= sym.decl_span.start_byte and sym.decl_span.start_byte <= b_sp.end_byte) {
+                        best_scope_cst = cid;
+                    }
+                }
+            }
+            if (!best_scope_cst.isNone()) {
+                if (extractCstTokenSpan(cst_arena, tok_buf, best_scope_cst)) |b_sp| {
+                    if (str_start_byte < b_sp.start_byte or str_start_byte > b_sp.end_byte) continue;
+                }
+            }
+            return true;
+        }
+
+        // Module/file-visible `const_sym`, `const_param_sym`, or `extern_static_sym`:
+        if (sym.decl_span.file_id == file_id or sym.flags.is_imported or sym.flags.is_builtin) {
+            if (sym.decl_span.file_id == file_id and !sym.scope_id.isNone() and
+                sym.scope_id.asInt() < db.symbol_table.scope_arena.countScopes())
+            {
+                const sc_rec = db.symbol_table.scope_arena.getScope(sym.scope_id);
+                if (sc_rec.kind == .nominal_type_scope or sc_rec.kind == .trait_scope) continue;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Collects Tier 3 `UR-24-01` Branch B fixes upgrading unmarked `"…{expr}…"` literals with verified semantic/AST holes.
+fn collectUnmarkedFmtStringTier3Fixes(
+    allocator: std.mem.Allocator,
+    db: *CompilerDb,
+    file_id: FileId,
+    source: []const u8,
+    cst_arena: *const LosslessCstArena,
+    cst_parents: []const CstNodeIndex,
+    tok_buf: *const TokenBuffer,
+    item_tree: *const query_db.ItemTree,
+    options: UpgradeOptions,
+    collector: *FixCollector,
+) !void {
+    const cst_count = cst_arena.countNodes();
+    const tok_count = tok_buf.countTokens();
+    if (tok_count == 0) return;
+
+    // Build $O(1)$ map of leaf CST node per token and mark tokens inside `.attribute` / `.use_item` / `extern "ABI"`:
+    const tok_leaf_cst = try allocator.alloc(CstNodeIndex, tok_count);
+    defer allocator.free(tok_leaf_cst);
+    @memset(tok_leaf_cst, .none);
+    const is_non_expr_str_tok = try allocator.alloc(bool, tok_count);
+    defer allocator.free(is_non_expr_str_tok);
+    @memset(is_non_expr_str_tok, false);
+
+    var cst_i: usize = 0;
+    while (cst_i < cst_count) : (cst_i += 1) {
+        const cid = CstNodeIndex.fromInt(@intCast(cst_i));
+        const crec = cst_arena.getNode(cid);
+        if (crec.subtree_size <= 1 and !crec.flags.is_missing_or_injected and
+            !crec.token.isNone() and crec.token.asInt() < tok_count)
+        {
+            tok_leaf_cst[crec.token.asInt()] = cid;
+        }
+        if (crec.kind == .attribute or crec.kind == .use_item) {
+            if (extractCstTokenSpan(cst_arena, tok_buf, cid)) |sp| {
+                var ti: u32 = sp.first_tok.asInt();
+                while (ti <= sp.last_tok.asInt() and ti < tok_count) : (ti += 1) {
+                    is_non_expr_str_tok[ti] = true;
+                }
+            }
+        }
+    }
+
+    var tok_i: usize = 0;
+    while (tok_i < tok_count) : (tok_i += 1) {
+        const rec = tok_buf.getToken(TokenIndex.fromInt(@intCast(tok_i)));
+        if (rec.flags.is_synthesized or rec.kind != .string_lit or is_non_expr_str_tok[tok_i]) continue;
+        if (tok_i > 0) {
+            const prev_tok_id = TokenIndex.fromInt(@intCast(tok_i - 1));
+            const prev_k = tok_buf.getToken(prev_tok_id).kind;
+            if (prev_k == .kw_extern) continue;
+            if (prev_k == .ident) {
+                const prev_lex = symbol_resolver.extractTokenSlice(source, tok_buf, prev_tok_id);
+                if (std.mem.eql(u8, prev_lex, "test") or std.mem.eql(u8, prev_lex, "bench")) continue;
+            }
+        }
+
+        const start_b: usize = rec.byte_offset;
+        const end_b: usize = @min(start_b + @as(usize, rec.byte_len), source.len);
+        if (start_b >= end_b) continue;
+        const raw_lit = source[start_b..end_b];
+        const info = lexer.extractStringBodyInfo(.string_lit, raw_lit);
+        if (info.is_raw or info.is_bytes or info.is_fmt or info.is_retired_triple) continue;
+
+        const close_quote_pos = raw_lit.len -| (1 + @as(usize, info.hash_count));
+        const open_body_pos = @as(usize, info.prefix_len) + @as(usize, info.hash_count) + 1;
+        if (open_body_pos >= close_quote_pos) continue;
+        const body = raw_lit[open_body_pos..close_quote_pos];
+        if (std.mem.indexOfScalar(u8, body, '{') == null) continue;
+
+        // Scan `body` with exact backslash parity; reject if any `{{`, `}}`, `\{`, `\}`, or unmatched brace exists:
+        var holes: std.ArrayListUnmanaged(UnmarkedHoleProbe) = .empty;
+        defer holes.deinit(allocator);
+        var is_branch_b_candidate = true;
+        var has_compound_or_spec = false;
+        var pos: usize = 0;
+
+        while (pos < body.len) {
+            if (body[pos] == '\\') {
+                var bs_run: usize = 0;
+                while (pos + bs_run < body.len and body[pos + bs_run] == '\\') : (bs_run += 1) {}
+                pos += bs_run;
+                if ((bs_run % 2) == 1 and pos < body.len) {
+                    if (body[pos] == '{' or body[pos] == '}') {
+                        is_branch_b_candidate = false;
+                        break;
+                    }
+                    pos += 1;
+                }
+                continue;
+            }
+            if (body[pos] == '}') {
+                is_branch_b_candidate = false;
+                break;
+            }
+            if (body[pos] == '{') {
+                if (pos + 1 < body.len and body[pos + 1] == '{') {
+                    is_branch_b_candidate = false;
+                    break;
+                }
+                const hole_start = pos + 1;
+                const after_close = scanHoleEndWithoutEdits(body, hole_start, body.len);
+                if (after_close == 0 or after_close > body.len or body[after_close - 1] != '}') {
+                    is_branch_b_candidate = false;
+                    break;
+                }
+                const hole_end = after_close - 1;
+                const split = splitUpgradeHoleParts(body[hole_start..hole_end]);
+                if (split.spec_with_colon.len > 0) {
+                    if (lexer.parseFormatSpec(split.spec_with_colon[1..], split.has_debug_eq)) |_| {} else |_| {
+                        is_branch_b_candidate = false;
+                        break;
+                    }
+                }
+                const syntax_probe = (try probeSingleHoleExprSyntax(allocator, split.expr_slice)) orelse {
+                    is_branch_b_candidate = false;
+                    break;
+                };
+                if (split.has_debug_eq or split.spec_with_colon.len > 0 or !syntax_probe.is_bare_ident) {
+                    has_compound_or_spec = true;
+                }
+                try holes.append(allocator, .{
+                    .hole_body_start = hole_start,
+                    .hole_body_end = hole_end,
+                    .expr_slice = split.expr_slice,
+                    .spec_with_colon = split.spec_with_colon,
+                    .has_debug_eq = split.has_debug_eq,
+                    .is_bare_ident = syntax_probe.is_bare_ident,
+                });
+                pos = after_close;
+                continue;
+            }
+            pos += 1;
+        }
+
+        if (!is_branch_b_candidate or holes.items.len == 0) continue;
+
+        if (!has_compound_or_spec) {
+            var all_bare_resolved = true;
+            for (holes.items) |hole_item| {
+                const ident_str = std.mem.trim(u8, hole_item.expr_slice, " \t\r\n");
+                if (!isBareIdentResolvedAtStringSite(
+                    db,
+                    file_id,
+                    source,
+                    cst_arena,
+                    cst_parents,
+                    tok_buf,
+                    item_tree,
+                    tok_leaf_cst[tok_i],
+                    rec.byte_offset,
+                    ident_str,
+                )) {
+                    all_bare_resolved = false;
+                    break;
+                }
+            }
+            if (!all_bare_resolved) continue;
+        }
+
+        // Reconstruct `f"…"` / `f#"…"#` while recursively upgrading each hole expression:
+        var out_lit: std.ArrayList(u8) = .empty;
+        defer out_lit.deinit(allocator);
+        try out_lit.append(allocator, 'f');
+        try out_lit.appendSlice(allocator, raw_lit[0..open_body_pos]);
+        var prev_body_idx: usize = 0;
+        for (holes.items) |hole_item| {
+            try out_lit.appendSlice(allocator, body[prev_body_idx..hole_item.hole_body_start]);
+            const upg_expr = try upgradeInnerHoleExprAlloc(allocator, hole_item.expr_slice, file_id, options, 1);
+            defer allocator.free(upg_expr);
+            try out_lit.appendSlice(allocator, upg_expr);
+            if (hole_item.has_debug_eq) try out_lit.append(allocator, '=');
+            try out_lit.appendSlice(allocator, hole_item.spec_with_colon);
+            try out_lit.append(allocator, '}');
+            prev_body_idx = hole_item.hole_body_end + 1;
+        }
+        try out_lit.appendSlice(allocator, body[prev_body_idx..]);
+        try out_lit.appendSlice(allocator, raw_lit[close_quote_pos..]);
+
+        try collector.appendSingleEdit(
+            .syntax_canonicalization,
+            rec.byte_offset,
+            @intCast(end_b),
+            out_lit.items,
+            "UR-24-01: add explicit `f` prefix to interpolated string literal",
+        );
+    }
+}
+
+/// Returns `true` if `cst_id` or any CST ancestor carries `@allow(W0333)` / `@allow(redundant_private_contract)`.
+fn hasAllowW0333InCstChain(
+    source: []const u8,
+    cst_arena: *const LosslessCstArena,
+    cst_parents: []const CstNodeIndex,
+    tok_buf: *const TokenBuffer,
+    cst_id: CstNodeIndex,
+) bool {
+    const cst_count = cst_arena.countNodes();
+    var cur = cst_id;
+    var steps: usize = 0;
+    while (!cur.isNone() and cur.asInt() < cst_count and steps < 128) : (steps += 1) {
+        const rec = cst_arena.getNode(cur);
+        const sub_end = @min(@as(usize, cur.asInt()) + @max(@as(usize, rec.subtree_size), 1), cst_count);
+        var child_cur: usize = cur.asInt() + 1;
+        while (child_cur < sub_end) {
+            const child_id = CstNodeIndex.fromInt(@intCast(child_cur));
+            const child_rec = cst_arena.getNode(child_id);
+            if (child_rec.kind == .attribute) {
+                if (extractCstTokenSpan(cst_arena, tok_buf, child_id)) |a_sp| {
+                    if (a_sp.first_tok.asInt() + 3 <= a_sp.last_tok.asInt() and
+                        tok_buf.getToken(a_sp.first_tok).kind == .at and
+                        std.mem.eql(
+                            u8,
+                            symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(a_sp.first_tok.asInt() + 1)),
+                            "allow",
+                        ))
+                    {
+                        var ti: u32 = a_sp.first_tok.asInt() + 2;
+                        while (ti <= a_sp.last_tok.asInt()) : (ti += 1) {
+                            const arg_lex = symbol_resolver.extractTokenSlice(source, tok_buf, TokenIndex.fromInt(ti));
+                            if (DR24_ALLOW_W0333_SET.has(arg_lex)) return true;
+                        }
+                    }
+                }
+            }
+            child_cur += @max(@as(usize, child_rec.subtree_size), 1);
+        }
+        cur = if (cur.asInt() < cst_parents.len) cst_parents[cur.asInt()] else .none;
+    }
+    return false;
+}
+
+/// Checks whether a CST item has unrestricted `pub` visibility (not `pub(pkg)` / `pub(super)` or private).
+fn hasUnrestrictedPubModifierCst(
+    cst_arena: *const LosslessCstArena,
+    tok_buf: *const TokenBuffer,
+    item_cst: CstNodeIndex,
+) bool {
+    const cst_count = cst_arena.countNodes();
+    if (item_cst.isNone() or item_cst.asInt() >= cst_count) return false;
+    const item_rec = cst_arena.getNode(item_cst);
+    const sub_end = @min(@as(usize, item_cst.asInt()) + @max(@as(usize, item_rec.subtree_size), 1), cst_count);
+    var child_cur: usize = item_cst.asInt() + 1;
+    while (child_cur < sub_end) {
+        const child_id = CstNodeIndex.fromInt(@intCast(child_cur));
+        const child_rec = cst_arena.getNode(child_id);
+        if (child_rec.kind == .visibility_modifier) {
+            if (extractCstTokenSpan(cst_arena, tok_buf, child_id)) |v_sp| {
+                return v_sp.first_tok == v_sp.last_tok and
+                    tok_buf.getToken(v_sp.first_tok).kind == .kw_pub;
+            }
+        }
+        if (child_rec.kind != .attribute) break;
+        child_cur += @max(@as(usize, child_rec.subtree_size), 1);
+    }
+    return false;
+}
+
+/// Collects `UR-24-05` fixes stripping redundant bare `@inline` and private `@no_alloc`/`@no_panic`/`@no_block` (`W0333`).
+fn collectStripRedundantPrivateContractsFixes(
+    allocator: std.mem.Allocator,
+    db: *CompilerDb,
+    file_id: FileId,
+    source: []const u8,
+    cst_arena: *const LosslessCstArena,
+    cst_parents: []const CstNodeIndex,
+    tok_buf: *const TokenBuffer,
+    item_tree: *const query_db.ItemTree,
+    collector: *FixCollector,
+) !void {
+    const cst_count = cst_arena.countNodes();
+    if (cst_count == 0) return;
+
+    var idx: usize = 0;
+    while (idx < cst_count) : (idx += 1) {
+        const fn_cst = CstNodeIndex.fromInt(@intCast(idx));
+        const fn_rec = cst_arena.getNode(fn_cst);
+        if (fn_rec.kind != .fn_item and fn_rec.kind != .impl_member) continue;
+        const fn_sp = extractCstTokenSpan(cst_arena, tok_buf, fn_cst) orelse continue;
+        const sub_end = @min(idx + @max(@as(usize, fn_rec.subtree_size), 1), cst_count);
+
+        // Skip functions inside `.trait_item` or `.extern_block_item`, and detect enclosing `.impl_item` traits/generics:
+        var is_excluded_parent = false;
+        var is_in_generic_impl = false;
+        var is_in_trait_impl = false;
+        var is_in_private_mod = false;
+        var anc_cst = if (idx < cst_parents.len) cst_parents[idx] else .none;
+        var anc_steps: usize = 0;
+        while (!anc_cst.isNone() and anc_cst.asInt() < cst_count and anc_steps < 128) : (anc_steps += 1) {
+            const anc_rec = cst_arena.getNode(anc_cst);
+            if (anc_rec.kind == .trait_item or anc_rec.kind == .trait_member or anc_rec.kind == .extern_block_item) {
+                is_excluded_parent = true;
+                break;
+            }
+            if (anc_rec.kind == .mod_item and !hasUnrestrictedPubModifierCst(cst_arena, tok_buf, anc_cst)) {
+                is_in_private_mod = true;
+            }
+            if (anc_rec.kind == .impl_item) {
+                const impl_end = @min(
+                    @as(usize, anc_cst.asInt()) + @max(@as(usize, anc_rec.subtree_size), 1),
+                    cst_count,
+                );
+                var ic: usize = anc_cst.asInt() + 1;
+                while (ic < impl_end) {
+                    const ic_id = CstNodeIndex.fromInt(@intCast(ic));
+                    const ic_rec = cst_arena.getNode(ic_id);
+                    if (ic_rec.kind == .type_params) is_in_generic_impl = true;
+                    if (ic_rec.subtree_size <= 1 and !ic_rec.token.isNone() and
+                        ic_rec.token.asInt() < tok_buf.countTokens())
+                    {
+                        const tk = tok_buf.getToken(ic_rec.token).kind;
+                        if (tk == .kw_for) is_in_trait_impl = true;
+                        if (tk == .lbrace) break;
+                    }
+                    ic += @max(@as(usize, ic_rec.subtree_size), 1);
+                }
+            }
+            anc_cst = if (anc_cst.asInt() < cst_parents.len) cst_parents[anc_cst.asInt()] else .none;
+        }
+        if (is_excluded_parent) continue;
+        if (hasAllowW0333InCstChain(source, cst_arena, cst_parents, tok_buf, fn_cst)) continue;
+
+        // Inspect function header CST for `extern`, `fn main`, generics, `= expr;` body, and attributes:
+        var is_extern_or_proto = false;
+        var has_own_generics = false;
+        var has_expr_body = false;
+        var has_abi_boundary_attr = false;
+        var has_contract_candidate = false;
+        var fn_name_lex: []const u8 = "";
+        var seen_fn_kw = false;
+
+        const CandidateStripAttr = struct {
+            name: []const u8,
+            span: Span,
+            is_bare_inline: bool,
+        };
+        var candidates: std.ArrayListUnmanaged(CandidateStripAttr) = .empty;
+        defer candidates.deinit(allocator);
+
+        var child_cur = idx + 1;
+        while (child_cur < sub_end) {
+            const child_id = CstNodeIndex.fromInt(@intCast(child_cur));
+            const child_rec = cst_arena.getNode(child_id);
+            if (child_rec.kind == .attribute) {
+                if (extractCstTokenSpan(cst_arena, tok_buf, child_id)) |a_sp| {
+                    if (a_sp.first_tok.asInt() + 1 <= a_sp.last_tok.asInt() and
+                        tok_buf.getToken(a_sp.first_tok).kind == .at)
+                    {
+                        const a_name = symbol_resolver.extractTokenSlice(
+                            source,
+                            tok_buf,
+                            TokenIndex.fromInt(a_sp.first_tok.asInt() + 1),
+                        );
+                        if (DR24_ABI_BOUNDARY_ATTR_SET.has(a_name)) {
+                            has_abi_boundary_attr = true;
+                        } else if (std.mem.eql(u8, a_name, "link")) {
+                            has_abi_boundary_attr = true;
+                        } else if (std.mem.eql(u8, a_name, "inline") and
+                            a_sp.first_tok.asInt() + 1 == a_sp.last_tok.asInt())
+                        {
+                            try candidates.append(allocator, .{
+                                .name = a_name,
+                                .span = Span.init(file_id, a_sp.start_byte, a_sp.end_byte),
+                                .is_bare_inline = true,
+                            });
+                        } else if (DR24_PRIVATE_CONTRACT_ATTR_SET.has(a_name) and
+                            a_sp.first_tok.asInt() + 1 == a_sp.last_tok.asInt())
+                        {
+                            has_contract_candidate = true;
+                            try candidates.append(allocator, .{
+                                .name = a_name,
+                                .span = Span.init(file_id, a_sp.start_byte, a_sp.end_byte),
+                                .is_bare_inline = false,
+                            });
+                        }
+                    }
+                }
+            } else if (child_rec.kind == .fn_sig) {
+                const sig_end = @min(child_cur + @max(@as(usize, child_rec.subtree_size), 1), sub_end);
+                var sc = child_cur + 1;
+                while (sc < sig_end) {
+                    const s_id = CstNodeIndex.fromInt(@intCast(sc));
+                    const s_rec = cst_arena.getNode(s_id);
+                    if (s_rec.kind == .type_params) has_own_generics = true;
+                    if (s_rec.subtree_size <= 1 and !s_rec.token.isNone() and s_rec.token.asInt() < tok_buf.countTokens()) {
+                        const sk = tok_buf.getToken(s_rec.token).kind;
+                        if (sk == .kw_extern) is_extern_or_proto = true;
+                        if (sk == .kw_fn) {
+                            seen_fn_kw = true;
+                        } else if (seen_fn_kw and fn_name_lex.len == 0 and symbol_resolver.isIdentifierToken(sk)) {
+                            fn_name_lex = symbol_resolver.extractTokenSlice(source, tok_buf, s_rec.token);
+                        }
+                    }
+                    sc += @max(@as(usize, s_rec.subtree_size), 1);
+                }
+            } else if (child_rec.kind == .type_params) {
+                has_own_generics = true;
+            } else if (child_rec.subtree_size <= 1 and !child_rec.token.isNone() and
+                child_rec.token.asInt() < tok_buf.countTokens())
+            {
+                const lk = tok_buf.getToken(child_rec.token).kind;
+                if (lk == .kw_extern) is_extern_or_proto = true;
+                if (lk == .kw_fn) {
+                    seen_fn_kw = true;
+                } else if (seen_fn_kw and fn_name_lex.len == 0 and symbol_resolver.isIdentifierToken(lk)) {
+                    fn_name_lex = symbol_resolver.extractTokenSlice(source, tok_buf, child_rec.token);
+                } else if (lk == .eq) {
+                    has_expr_body = true;
+                } else if (lk == .semi and !has_expr_body) {
+                    is_extern_or_proto = true;
+                }
+            }
+            child_cur += @max(@as(usize, child_rec.subtree_size), 1);
+        }
+
+        if (candidates.items.len == 0 or is_extern_or_proto or has_abi_boundary_attr) continue;
+        if (std.mem.eql(u8, fn_name_lex, "main")) continue;
+
+        // Locate matching semantic `SymbolIndex` (if active under `@cfg`) in `db.symbol_table`:
+        var matched_sym_idx: SymbolIndex = .none;
+        for (db.symbol_table.symbols.items, 0..) |sym, sym_i| {
+            if (sym.kind == .fn_sym and sym.decl_span.file_id == file_id and sym.cst_node == fn_cst) {
+                matched_sym_idx = SymbolIndex.fromInt(@intCast(sym_i));
+                break;
+            }
+        }
+
+        const is_syntactic_pub = hasUnrestrictedPubModifierCst(cst_arena, tok_buf, fn_cst) and !is_in_private_mod;
+        const is_effective_pub = if (!matched_sym_idx.isNone())
+            db.symbol_table.isEffectivePubBoundary(matched_sym_idx)
+        else
+            is_syntactic_pub;
+
+        if (!matched_sym_idx.isNone()) {
+            const sym_rec = db.symbol_table.getSymbol(matched_sym_idx);
+            if (db.symbol_table.getScopeAllowMask(sym_rec.scope_id).has_allow_redundant_contract_w0333) continue;
+            if (db.symbol_table.getSymbolAllowMask(matched_sym_idx).has_allow_redundant_contract_w0333) continue;
+        }
+
+        const can_strip_bare_inline = !is_effective_pub or has_own_generics or is_in_generic_impl or has_expr_body;
+
+        var can_strip_private_contracts = false;
+        if (has_contract_candidate and !is_effective_pub and !is_in_trait_impl and !matched_sym_idx.isNone()) {
+            const sym_rec = db.symbol_table.getSymbol(matched_sym_idx);
+            if (!sym_rec.layout_inline_flags.is_fn_value_reified and
+                !db.symbol_table.impl_method_trait.contains(matched_sym_idx.asInt()))
+            {
+                const check_def = if (!sym_rec.def_id.isNone()) sym_rec.def_id else sym_rec.owner_def_id;
+                if (!check_def.isNone()) {
+                    var has_any_fn_error = false;
+                    if (db.typecheckBody(check_def)) |tc_res| {
+                        if (tc_res.error_count > 0) has_any_fn_error = true;
+                    } else |_| {
+                        has_any_fn_error = true;
+                    }
+                    if (!has_any_fn_error) {
+                        if (db.verifySastMir(check_def)) |sast_res| {
+                            if (!sast_res.is_verified_sound or sast_res.error_count > 0) {
+                                if (db.sast_diagnostics.getPtr(check_def.asInt())) |sast_sink| {
+                                    for (sast_sink.diagnostics.items) |sd| {
+                                        if (sd.severity == .err and
+                                            sd.primary_span.start_byte <= fn_sp.end_byte and
+                                            fn_sp.start_byte <= sd.primary_span.end_byte)
+                                        {
+                                            has_any_fn_error = true;
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    has_any_fn_error = true;
+                                }
+                            }
+                        } else |_| {
+                            has_any_fn_error = true;
+                        }
+                    }
+                    if (!has_any_fn_error) can_strip_private_contracts = true;
+                }
+            }
+        }
+        _ = item_tree;
+
+        var min_del_start: u32 = 0;
+        var strip_edits: std.ArrayList(PendingByteEdit) = .empty;
+        defer strip_edits.deinit(allocator);
+        for (candidates.items) |cand| {
+            const should_strip = if (cand.is_bare_inline) can_strip_bare_inline else can_strip_private_contracts;
+            if (!should_strip) continue;
+            const rem = computeSafeAttrRemovalRange(source, file_id, tok_buf, cand.span, min_del_start);
+            if (rem.end > rem.start) {
+                try strip_edits.append(allocator, .{
+                    .start_byte = @intCast(rem.start),
+                    .end_byte = @intCast(rem.end),
+                    .replacement = "",
+                });
+                min_del_start = @intCast(rem.end);
+            }
+        }
+        if (strip_edits.items.len > 0) {
+            try collector.appendMultiEdits(
+                .lint_idiom,
+                strip_edits.items,
+                "UR-24-05: strip redundant `@inline` / private `@no_alloc` / `@no_panic` / `@no_block` (`W0333`)",
+            );
+        }
+    }
+}
+
+/// Checks whether `expr_id` is a pure side-effect-free scrutinee expression (`ident`, `self`, field, index, deref).
+fn isPureScrutineeAst(ast_arena: *const AstArena, expr_id: NodeIndex, depth: u32) bool {
+    if (expr_id.isNone() or expr_id.asInt() >= ast_arena.countNodes() or depth > 16) return false;
+    const node = ast_arena.getNode(expr_id);
+    return switch (node.tag) {
+        .ident_expr, .self_val => true,
+        .field_access => node.lhs.tag == .node and
+            isPureScrutineeAst(ast_arena, NodeIndex.fromInt(node.lhs.payload), depth + 1),
+        .deref_expr => node.lhs.tag == .node and
+            isPureScrutineeAst(ast_arena, NodeIndex.fromInt(node.lhs.payload), depth + 1),
+        .index_expr => node.lhs.tag == .node and node.rhs.tag == .node and
+            isPureScrutineeAst(ast_arena, NodeIndex.fromInt(node.lhs.payload), depth + 1) and
+            isPureScrutineeAst(ast_arena, NodeIndex.fromInt(node.rhs.payload), depth + 1),
+        else => false,
+    };
+}
+
+/// Checks whether `expr_id` is a constant literal, enum variant, or `CONST_IDENT` usable as a `match` pattern.
+fn isMatchPatternConstAst(
+    ast_arena: *const AstArena,
+    tok_buf: *const TokenBuffer,
+    expr_id: NodeIndex,
+) bool {
+    if (expr_id.isNone() or expr_id.asInt() >= ast_arena.countNodes()) return false;
+    const node = ast_arena.getNode(expr_id);
+    return switch (node.tag) {
+        .int_lit, .char_lit, .byte_lit, .string_lit, .byte_string_lit, .contextual_variant, .path_expr => true,
+        .unary_expr => !node.main_token.isNone() and
+            tok_buf.getToken(node.main_token).kind == .minus and
+            node.lhs.tag == .node and
+            ast_arena.getNode(NodeIndex.fromInt(node.lhs.payload)).tag == .int_lit,
+        .ident_expr => !node.main_token.isNone() and
+            tok_buf.getToken(node.main_token).kind == .const_ident,
+        .field_access => !node.main_token.isNone() and
+            node.rhs.tag == .token and
+            tok_buf.getToken(TokenIndex.fromInt(node.rhs.payload)).kind == .type_ident,
+        else => false,
+    };
+}
+
+/// Extracts the single pure scrutinee slice tested by `cond_id` (`==` / `or` / guard-free `is`), or `null`.
+fn extractSingleMatchScrutineeSlice(
+    source: []const u8,
+    cst_arena: *const LosslessCstArena,
+    ast_arena: *const AstArena,
+    tok_buf: *const TokenBuffer,
+    cond_id: NodeIndex,
+    depth: u32,
+) ?struct { scrut_node: NodeIndex, scrut_slice: []const u8 } {
+    if (cond_id.isNone() or cond_id.asInt() >= ast_arena.countNodes() or depth > 16) return null;
+    const node = ast_arena.getNode(cond_id);
+    if (node.tag == .is_expr and !node.main_token.isNone() and
+        tok_buf.getToken(node.main_token).kind == .kw_is and node.lhs.tag == .node)
+    {
+        const scrut = NodeIndex.fromInt(node.lhs.payload);
+        if (!isPureScrutineeAst(ast_arena, scrut, 0)) return null;
+        const cst_id = ast_arena.getCstOrigin(scrut);
+        const sp = extractCstTokenSpan(cst_arena, tok_buf, cst_id) orelse return null;
+        return .{
+            .scrut_node = scrut,
+            .scrut_slice = std.mem.trim(u8, source[sp.start_byte..sp.end_byte], " \t\r\n"),
+        };
+    }
+    if (node.tag == .binary_expr and !node.main_token.isNone() and
+        node.lhs.tag == .node and node.rhs.tag == .node)
+    {
+        const op_kind = tok_buf.getToken(node.main_token).kind;
+        const lhs_id = NodeIndex.fromInt(node.lhs.payload);
+        const rhs_id = NodeIndex.fromInt(node.rhs.payload);
+        if (op_kind == .kw_or) {
+            const left_res = extractSingleMatchScrutineeSlice(source, cst_arena, ast_arena, tok_buf, lhs_id, depth + 1) orelse return null;
+            const right_res = extractSingleMatchScrutineeSlice(source, cst_arena, ast_arena, tok_buf, rhs_id, depth + 1) orelse return null;
+            if (!std.mem.eql(u8, left_res.scrut_slice, right_res.scrut_slice)) return null;
+            return left_res;
+        }
+        if (op_kind == .eqeq) {
+            if (isPureScrutineeAst(ast_arena, lhs_id, 0) and isMatchPatternConstAst(ast_arena, tok_buf, rhs_id)) {
+                const sp = extractCstTokenSpan(cst_arena, tok_buf, ast_arena.getCstOrigin(lhs_id)) orelse return null;
+                return .{
+                    .scrut_node = lhs_id,
+                    .scrut_slice = std.mem.trim(u8, source[sp.start_byte..sp.end_byte], " \t\r\n"),
+                };
+            }
+            if (isPureScrutineeAst(ast_arena, rhs_id, 0) and isMatchPatternConstAst(ast_arena, tok_buf, lhs_id)) {
+                const sp = extractCstTokenSpan(cst_arena, tok_buf, ast_arena.getCstOrigin(rhs_id)) orelse return null;
+                return .{
+                    .scrut_node = rhs_id,
+                    .scrut_slice = std.mem.trim(u8, source[sp.start_byte..sp.end_byte], " \t\r\n"),
+                };
+            }
+        }
+    }
+    return null;
+}
+
+/// Returns `true` when `cond_nodes` (`len >= 3`) is a Priority-1 single-scrutinee `W0202` `match` candidate.
+fn isPriority1MatchChainCandidate(
+    db: *CompilerDb,
+    file_id: FileId,
+    source: []const u8,
+    cst_arena: *const LosslessCstArena,
+    ast_arena: *const AstArena,
+    tok_buf: *const TokenBuffer,
+    item_tree: *const query_db.ItemTree,
+    cond_nodes: []const NodeIndex,
+) !bool {
+    if (cond_nodes.len < 3) return false;
+    const first = extractSingleMatchScrutineeSlice(source, cst_arena, ast_arena, tok_buf, cond_nodes[0], 0) orelse return false;
+    for (cond_nodes[1..]) |cond_id| {
+        const next_m = extractSingleMatchScrutineeSlice(source, cst_arena, ast_arena, tok_buf, cond_id, 0) orelse return false;
+        if (!std.mem.eql(u8, first.scrut_slice, next_m.scrut_slice)) return false;
+    }
+    const scrut_ty = try lookupSemanticNodeType(db, file_id, item_tree, first.scrut_node);
+    if (scrut_ty.isError() or scrut_ty == .bool_ty or
+        scrut_ty == .f32_ty or scrut_ty == .f64_ty)
+    {
+        return false;
+    }
+    return true;
+}
+
+/// Returns `true` if `arm_tag` is a multi-branch/control-flow construct excluded from `if … => …` arms (`UR-24-06`).
+inline fn isDisallowedInlineIfArmTag(arm_tag: syntax_arenas.AstTag) bool {
+    return switch (arm_tag) {
+        .if_expr,
+        .match_expr,
+        .block,
+        .with_expr,
+        .for_stmt,
+        .while_stmt,
+        .loop_expr,
+        .return_stmt,
+        .break_stmt,
+        .continue_stmt,
+        => true,
+        else => false,
+    };
+}
+
+/// Returns `true` if `subtree_idx` contains a braced expression or pattern requiring outer `(` … `)` in headers.
+fn hasStructLitOrBlockInCstSubtree(
+    cst_arena: *const LosslessCstArena,
+    tok_buf: *const TokenBuffer,
+    subtree_idx: CstNodeIndex,
+) bool {
+    if (subtree_idx.isNone() or subtree_idx.asInt() >= cst_arena.countNodes()) return false;
+    const root_node = cst_arena.getNode(subtree_idx);
+    const end_idx = @min(
+        @as(usize, subtree_idx.asInt()) + @max(@as(usize, root_node.subtree_size), 1),
+        cst_arena.countNodes(),
+    );
+    const tok_count = tok_buf.countTokens();
+    var cursor: usize = subtree_idx.asInt();
+    while (cursor < end_idx) : (cursor += 1) {
+        const node = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cursor)));
+        if (node.kind == .struct_lit_expr or
+            node.kind == .view_block_expr or
+            node.kind == .with_expr or
+            node.kind == .struct_pat or
+            node.kind == .block)
+        {
+            return true;
+        }
+        if (node.kind == .contextual_variant_expr or
+            node.kind == .variant_pat or
+            node.kind == .path_pat)
+        {
+            const sub_end = @min(end_idx, cursor + @max(@as(usize, node.subtree_size), 1));
+            var sub_cursor: usize = cursor + 1;
+            while (sub_cursor < sub_end) : (sub_cursor += 1) {
+                const sub_node = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(sub_cursor)));
+                if (sub_node.kind == .field_init or
+                    sub_node.kind == .field_pat or
+                    sub_node.kind == .struct_pat_start)
+                {
+                    return true;
+                }
+                if (sub_node.subtree_size <= 1 and !sub_node.token.isNone() and sub_node.token.asInt() < tok_count and
+                    tok_buf.getToken(sub_node.token).kind == .lbrace)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/// Returns `true` when `target_cst` sits inside a control-flow header (`allow_struct_lit == false`) without outer `(...)`.
+fn isCstInNoStructLitHeader(
+    cst_arena: *const LosslessCstArena,
+    tok_buf: *const TokenBuffer,
+    cst_parents: []const CstNodeIndex,
+    target_cst: CstNodeIndex,
+    target_start_byte: u32,
+) bool {
+    const cst_count = cst_arena.countNodes();
+    const tok_count = tok_buf.countTokens();
+    var cur_cst = target_cst;
+    var depth: usize = 0;
+    while (!cur_cst.isNone() and cur_cst.asInt() < cst_parents.len and depth < 256) : (depth += 1) {
+        const parent_cst = cst_parents[cur_cst.asInt()];
+        if (parent_cst.isNone() or parent_cst.asInt() >= cst_count) return false;
+        const parent_rec = cst_arena.getNode(parent_cst);
+        switch (parent_rec.kind) {
+            .if_cond, .while_header, .for_header, .context_binding => return true,
+            .tuple_or_paren_expr,
+            .block,
+            .array_expr,
+            .call_arg,
+            .struct_lit_expr,
+            .field_init,
+            .view_block_expr,
+            .match_arm,
+            .local_decl_stmt,
+            .return_stmt,
+            .assign_stmt,
+            .expr_stmt,
+            .const_item,
+            .fn_item,
+            .fn_expr_body,
+            .test_item,
+            .bench_item,
+            .subscript_arm,
+            .file_end,
+            .mod_item,
+            => return false,
+            .match_expr, .while_stmt, .for_stmt, .with_expr => {
+                const parent_start: usize = parent_cst.asInt();
+                const parent_end = @min(parent_start + @max(@as(usize, parent_rec.subtree_size), 1), cst_count);
+                var child_idx = parent_start + 1;
+                while (child_idx < parent_end) {
+                    const child_cst = CstNodeIndex.fromInt(@intCast(child_idx));
+                    const child_rec = cst_arena.getNode(child_cst);
+                    if (parent_rec.kind == .match_expr and child_rec.subtree_size <= 1 and
+                        !child_rec.token.isNone() and child_rec.token.asInt() < tok_count and
+                        tok_buf.getToken(child_rec.token).kind == .lbrace)
+                    {
+                        return target_start_byte < tok_buf.getToken(child_rec.token).byte_offset;
+                    }
+                    if (parent_rec.kind != .match_expr and child_rec.kind == .block) {
+                        if (extractCstTokenSpan(cst_arena, tok_buf, child_cst)) |blk_sp| {
+                            return target_start_byte < blk_sp.start_byte;
+                        }
+                        return false;
+                    }
+                    child_idx += @max(@as(usize, child_rec.subtree_size), 1);
+                }
+                return true;
+            },
+            .index_expr => {
+                const parent_start: usize = parent_cst.asInt();
+                const parent_end = @min(parent_start + @max(@as(usize, parent_rec.subtree_size), 1), cst_count);
+                var child_idx = parent_start + 1;
+                while (child_idx < parent_end) {
+                    const child_rec = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(child_idx)));
+                    if (child_rec.subtree_size <= 1 and !child_rec.token.isNone() and
+                        child_rec.token.asInt() < tok_count and
+                        tok_buf.getToken(child_rec.token).kind == .lbracket)
+                    {
+                        if (target_start_byte > tok_buf.getToken(child_rec.token).byte_offset) return false;
+                        break;
+                    }
+                    child_idx += @max(@as(usize, child_rec.subtree_size), 1);
+                }
+            },
+            else => {},
+        }
+        cur_cst = parent_cst;
+    }
+    return false;
+}
+
+/// Climbs from `inner_cst` up through any enclosing single-expression `( … )` `.tuple_or_paren_expr` wrappers.
+fn climbEnclosingGroupingParens(
+    cst_arena: *const LosslessCstArena,
+    tok_buf: *const TokenBuffer,
+    cst_parents: []const CstNodeIndex,
+    inner_cst: CstNodeIndex,
+) CstNodeIndex {
+    if (inner_cst.isNone() or inner_cst.asInt() >= cst_arena.countNodes()) return inner_cst;
+    const tok_count = tok_buf.countTokens();
+    var cur_cst = inner_cst;
+    var depth: usize = 0;
+    while (!cur_cst.isNone() and cur_cst.asInt() < cst_parents.len and depth < 64) : (depth += 1) {
+        const parent_cst = cst_parents[cur_cst.asInt()];
+        if (parent_cst.isNone() or parent_cst.asInt() >= cst_arena.countNodes()) break;
+        if (cst_arena.getNode(parent_cst).kind != .tuple_or_paren_expr) break;
+        const cur_sp = extractCstTokenSpan(cst_arena, tok_buf, cur_cst) orelse break;
+        const par_sp = extractCstTokenSpan(cst_arena, tok_buf, parent_cst) orelse break;
+        if (par_sp.first_tok.asInt() + 1 != cur_sp.first_tok.asInt() or
+            cur_sp.last_tok.asInt() + 1 != par_sp.last_tok.asInt() or
+            par_sp.last_tok.asInt() >= tok_count)
+        {
+            break;
+        }
+        const open_tok = tok_buf.getToken(par_sp.first_tok);
+        const close_tok = tok_buf.getToken(par_sp.last_tok);
+        if (open_tok.kind != .lparen or close_tok.kind != .rparen or
+            open_tok.flags.is_synthesized or close_tok.flags.is_synthesized)
+        {
+            break;
+        }
+        cur_cst = parent_cst;
+    }
+    return cur_cst;
+}
+
+/// Returns `true` when `cst_idx` is a fat-arrow `if cond => a else b` `.if_expr` node.
+fn isFatArrowIfCstInArena(
+    cst_arena: *const LosslessCstArena,
+    tok_buf: *const TokenBuffer,
+    cst_idx: CstNodeIndex,
+) bool {
+    if (cst_idx.isNone() or cst_idx.asInt() >= cst_arena.countNodes()) return false;
+    const node = cst_arena.getNode(cst_idx);
+    if (node.kind != .if_expr) return false;
+    const end_idx = @min(
+        @as(usize, cst_idx.asInt()) + @max(@as(usize, node.subtree_size), 1),
+        cst_arena.countNodes(),
+    );
+    const tok_count = tok_buf.countTokens();
+    var child_idx: usize = cst_idx.asInt() + 1;
+    while (child_idx < end_idx) {
+        const child = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(child_idx)));
+        if (child.subtree_size <= 1 and !child.token.isNone() and child.token.asInt() < tok_count and
+            tok_buf.getToken(child.token).kind == .fat_arrow)
+        {
+            return true;
+        }
+        child_idx += @max(@as(usize, child.subtree_size), 1);
+    }
+    return false;
+}
+
+/// Unwraps redundant outer `( … )` around an `if` header condition while preserving required grouping parens.
+fn unwrapRedundantHeaderParensInArena(
+    source: []const u8,
+    cst_arena: *const LosslessCstArena,
+    tok_buf: *const TokenBuffer,
+    outer_cst: CstNodeIndex,
+    inner_base_cst: CstNodeIndex,
+) CstNodeIndex {
+    if (outer_cst == inner_base_cst) return outer_cst;
+    if (hasStructLitOrBlockInCstSubtree(cst_arena, tok_buf, inner_base_cst) or
+        isFatArrowIfCstInArena(cst_arena, tok_buf, inner_base_cst))
+    {
+        return outer_cst;
+    }
+    if (extractCstTokenSpan(cst_arena, tok_buf, outer_cst)) |out_sp| {
+        if (hasCommentsInByteRange(source, tok_buf, out_sp.start_byte, out_sp.end_byte)) {
+            return outer_cst;
+        }
+        var tok_i = out_sp.first_tok.asInt();
+        while (tok_i <= out_sp.last_tok.asInt() and tok_i < tok_buf.countTokens()) : (tok_i += 1) {
+            if (tok_buf.getToken(TokenIndex.fromInt(tok_i)).kind == .colon_eq) {
+                return outer_cst;
+            }
+        }
+    }
+    return inner_base_cst;
+}
+
+/// Collects `UR-24-06` fixes rewriting `1 <= K <= 4` pure value `if { a } else { b }` chains to `if cond => a else b`.
+fn collectInlineFatArrowIfExprFixes(
+    allocator: std.mem.Allocator,
+    db: *CompilerDb,
+    file_id: FileId,
+    source: []const u8,
+    cst_arena: *const LosslessCstArena,
+    cst_parents: []const CstNodeIndex,
+    ast_arena: *const AstArena,
+    ast_parents: []const NodeIndex,
+    extra_ends: []const u32,
+    tok_buf: *const TokenBuffer,
+    item_tree: *const query_db.ItemTree,
+    collector: *FixCollector,
+) !void {
+    const ast_count = ast_arena.countNodes();
+    const cst_count = cst_arena.countNodes();
+
+    var node_i: usize = 0;
+    while (node_i < ast_count) : (node_i += 1) {
+        const root_if = NodeIndex.fromInt(@intCast(node_i));
+        const root_node = ast_arena.getNode(root_if);
+        if (root_node.tag != .if_expr) continue;
+
+        const parent_ast = if (node_i < ast_parents.len) ast_parents[node_i] else .none;
+        if (!parent_ast.isNone() and parent_ast.asInt() < ast_count) {
+            const parent_rec = ast_arena.getNode(parent_ast);
+            if (parent_rec.tag == .if_expr) {
+                // Skip `else if` tail links; only inspect outermost `if` roots:
+                if (parent_rec.rhs.tag == .extra) {
+                    const p_extra = ast_arena.getExtraSlice(ExtraIndex.fromInt(parent_rec.rhs.payload), 2);
+                    if (p_extra.len == 2 and p_extra[1] == node_i) continue;
+                }
+            }
+            // Skip statement-position `if` inside `.block` (only value tail expression `block.rhs` produces a value):
+            if (parent_rec.tag == .block) {
+                if (!(parent_rec.rhs.tag == .node and parent_rec.rhs.payload == node_i)) continue;
+            }
+        }
+
+        const if_cst = ast_arena.getCstOrigin(root_if);
+        if (if_cst.isNone() or if_cst.asInt() >= cst_count) continue;
+        if (cst_arena.getNode(if_cst).flags.has_error) continue;
+        const if_sp = extractCstTokenSpan(cst_arena, tok_buf, if_cst) orelse continue;
+        if (hasCommentsInByteRange(source, tok_buf, if_sp.start_byte, if_sp.end_byte)) continue;
+
+        const if_ty = try lookupSemanticNodeType(db, file_id, item_tree, root_if);
+        if (if_ty.isError() or if_ty == .unit_ty or if_ty == .never_ty) continue;
+
+        // Walk `if` / `else if` / `else` chain (`1 <= K <= 4`), requiring braced `{ expr }` blocks throughout:
+        var cond_nodes: [4]NodeIndex = undefined;
+        var arm_exprs: [5]NodeIndex = undefined;
+        var cond_count: usize = 0;
+        var cur_if = root_if;
+        var is_valid_chain = true;
+
+        while (true) {
+            if (cond_count >= 4 or cur_if.isNone() or cur_if.asInt() >= ast_count) {
+                is_valid_chain = false;
+                break;
+            }
+            const cur_node = ast_arena.getNode(cur_if);
+            if (cur_node.tag != .if_expr or cur_node.lhs.tag != .node or cur_node.rhs.tag != .extra) {
+                is_valid_chain = false;
+                break;
+            }
+            const branches = ast_arena.getExtraSlice(ExtraIndex.fromInt(cur_node.rhs.payload), 2);
+            if (branches.len != 2) {
+                is_valid_chain = false;
+                break;
+            }
+            const cond_id = NodeIndex.fromInt(cur_node.lhs.payload);
+            const then_blk_id = NodeIndex.fromInt(branches[0]);
+            const else_id = NodeIndex.fromInt(branches[1]);
+            if (then_blk_id.isNone() or then_blk_id.asInt() >= ast_count or
+                else_id.isNone() or else_id.asInt() >= ast_count)
+            {
+                is_valid_chain = false;
+                break;
+            }
+            const then_blk = ast_arena.getNode(then_blk_id);
+            if (then_blk.tag != .block or then_blk.rhs.tag != .node) {
+                is_valid_chain = false;
+                break;
+            }
+            if (then_blk.lhs.tag == .extra and
+                then_blk_id.asInt() < extra_ends.len and
+                then_blk.lhs.payload < extra_ends[then_blk_id.asInt()])
+            {
+                is_valid_chain = false;
+                break;
+            }
+            const then_tail = NodeIndex.fromInt(then_blk.rhs.payload);
+            if (then_tail.isNone() or isDisallowedInlineIfArmTag(ast_arena.getNode(then_tail).tag)) {
+                is_valid_chain = false;
+                break;
+            }
+
+            cond_nodes[cond_count] = cond_id;
+            arm_exprs[cond_count] = then_tail;
+            cond_count += 1;
+
+            const else_node = ast_arena.getNode(else_id);
+            if (else_node.tag == .if_expr) {
+                cur_if = else_id;
+                continue;
+            }
+            if (else_node.tag != .block or else_node.rhs.tag != .node) {
+                is_valid_chain = false;
+                break;
+            }
+            if (else_node.lhs.tag == .extra and
+                else_id.asInt() < extra_ends.len and
+                else_node.lhs.payload < extra_ends[else_id.asInt()])
+            {
+                is_valid_chain = false;
+                break;
+            }
+            const else_tail = NodeIndex.fromInt(else_node.rhs.payload);
+            if (else_tail.isNone() or isDisallowedInlineIfArmTag(ast_arena.getNode(else_tail).tag)) {
+                is_valid_chain = false;
+                break;
+            }
+            arm_exprs[cond_count] = else_tail;
+            break;
+        }
+        if (!is_valid_chain or cond_count == 0) continue;
+
+        // Skip redundant `if cond { true } else { false }` (`W0202` boolean-simplification domain):
+        if (cond_count == 1 and
+            ast_arena.getNode(arm_exprs[0]).tag == .bool_lit and
+            ast_arena.getNode(arm_exprs[1]).tag == .bool_lit)
+        {
+            continue;
+        }
+
+        // Skip Priority-1 `>= 3`-arm single-scrutinee `match` candidates so `UR-24-06` and `W0202` never conflict:
+        if (try isPriority1MatchChainCandidate(
+            db,
+            file_id,
+            source,
+            cst_arena,
+            ast_arena,
+            tok_buf,
+            item_tree,
+            cond_nodes[0..cond_count],
+        )) {
+            continue;
+        }
+
+        // Extract single-line condition and arm slices:
+        var cond_slices: [4][]const u8 = undefined;
+        var arm_slices: [5][]const u8 = undefined;
+        var all_single_line = true;
+        var has_brace_ambig_subexpr = false;
+        for (0..cond_count) |ci| {
+            const base_cond_cst = ast_arena.getCstOrigin(cond_nodes[ci]);
+            const outer_cond_cst = climbEnclosingGroupingParens(cst_arena, tok_buf, cst_parents, base_cond_cst);
+            const cond_cst = unwrapRedundantHeaderParensInArena(
+                source,
+                cst_arena,
+                tok_buf,
+                outer_cond_cst,
+                base_cond_cst,
+            );
+            if (cond_cst == base_cond_cst and
+                (ast_arena.getNode(cond_nodes[ci]).tag == .struct_lit or
+                    hasStructLitOrBlockInCstSubtree(cst_arena, tok_buf, cond_cst)))
+            {
+                has_brace_ambig_subexpr = true;
+            }
+            const csp = extractCstTokenSpan(cst_arena, tok_buf, cond_cst) orelse {
+                all_single_line = false;
+                break;
+            };
+            const c_str = std.mem.trim(u8, source[csp.start_byte..csp.end_byte], " \t\r\n");
+            if (c_str.len == 0 or std.mem.indexOfScalar(u8, c_str, '\n') != null) {
+                all_single_line = false;
+                break;
+            }
+            cond_slices[ci] = c_str;
+        }
+        if (!all_single_line) continue;
+
+        for (0..cond_count + 1) |ai| {
+            const base_arm_cst = ast_arena.getCstOrigin(arm_exprs[ai]);
+            const arm_cst = if (ast_arena.getNode(arm_exprs[ai]).tag == .tuple_lit)
+                base_arm_cst
+            else
+                climbEnclosingGroupingParens(cst_arena, tok_buf, cst_parents, base_arm_cst);
+            if (arm_cst == base_arm_cst and
+                (ast_arena.getNode(arm_exprs[ai]).tag == .struct_lit or
+                    hasStructLitOrBlockInCstSubtree(cst_arena, tok_buf, arm_cst)))
+            {
+                has_brace_ambig_subexpr = true;
+            }
+            const asp = extractCstTokenSpan(cst_arena, tok_buf, arm_cst) orelse {
+                all_single_line = false;
+                break;
+            };
+            const a_str = std.mem.trim(u8, source[asp.start_byte..asp.end_byte], " \t\r\n");
+            if (a_str.len == 0 or a_str[0] == '{' or std.mem.indexOfScalar(u8, a_str, '\n') != null) {
+                all_single_line = false;
+                break;
+            }
+            arm_slices[ai] = a_str;
+        }
+        if (!all_single_line) continue;
+
+        const parent_cst = if (if_cst.asInt() < cst_parents.len) cst_parents[if_cst.asInt()] else CstNodeIndex.none;
+        const parent_cst_kind: ?syntax_arenas.CstNodeKind = if (!parent_cst.isNone() and parent_cst.asInt() < cst_count)
+            cst_arena.getNode(parent_cst).kind
+        else
+            null;
+
+        // Determine if `(if …)` parentheses are needed due to operator precedence or header `{` ambiguity:
+        var needs_parens = false;
+        if (!parent_ast.isNone() and parent_ast.asInt() < ast_count) {
+            const p_tag = ast_arena.getNode(parent_ast).tag;
+            needs_parens = switch (p_tag) {
+                .field_access,
+                .method_call,
+                .try_expr,
+                .deref_expr,
+                .unary_expr,
+                .binary_expr,
+                .pipe_expr,
+                .cast_expr,
+                .range_expr,
+                .is_expr,
+                => true,
+                .call_expr, .generic_call => parent_cst_kind != .call_arg,
+                .index_expr => parent_cst_kind == .index_expr and blk_before_lbracket: {
+                    const p_start: usize = parent_cst.asInt();
+                    const p_end = @min(
+                        p_start + @max(@as(usize, cst_arena.getNode(parent_cst).subtree_size), 1),
+                        cst_count,
+                    );
+                    var sub_i = p_start + 1;
+                    while (sub_i < p_end) {
+                        const sub_rec = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(sub_i)));
+                        if (sub_rec.subtree_size <= 1 and !sub_rec.token.isNone() and
+                            sub_rec.token.asInt() < tok_buf.countTokens() and
+                            tok_buf.getToken(sub_rec.token).kind == .lbracket)
+                        {
+                            break :blk_before_lbracket if_sp.start_byte < tok_buf.getToken(sub_rec.token).byte_offset;
+                        }
+                        sub_i += @max(@as(usize, sub_rec.subtree_size), 1);
+                    }
+                    break :blk_before_lbracket true;
+                },
+                else => false,
+            };
+        }
+        if (!needs_parens and if_sp.last_tok.asInt() + 1 < tok_buf.countTokens()) {
+            const next_k = tok_buf.getToken(TokenIndex.fromInt(if_sp.last_tok.asInt() + 1)).kind;
+            if (next_k == .dot or next_k == .question or next_k == .lbracket or next_k == .lparen or
+                next_k == .pipe_gt or next_k == .kw_orelse or next_k == .kw_catch or next_k == .kw_as)
+            {
+                needs_parens = true;
+            }
+        }
+        if (!needs_parens and has_brace_ambig_subexpr and
+            isCstInNoStructLitHeader(cst_arena, tok_buf, cst_parents, if_cst, if_sp.start_byte))
+        {
+            needs_parens = true;
+        }
+        // Avoid double-wrapping if already inside `( … )`:
+        if (needs_parens and parent_cst_kind == .tuple_or_paren_expr) {
+            needs_parens = false;
+        } else if (needs_parens and if_sp.first_tok.asInt() > 0 and if_sp.last_tok.asInt() + 1 < tok_buf.countTokens()) {
+            if (tok_buf.getToken(TokenIndex.fromInt(if_sp.first_tok.asInt() - 1)).kind == .lparen and
+                tok_buf.getToken(TokenIndex.fromInt(if_sp.last_tok.asInt() + 1)).kind == .rparen)
+            {
+                needs_parens = false;
+            }
+        }
+
+        const is_direct_fn_expr_body = (parent_cst_kind == .fn_expr_body);
+        if (!(try fmt_engine.fitsInlineFatArrowIfLineBudget(
+            allocator,
+            source,
+            if_sp.start_byte,
+            if_sp.end_byte,
+            cond_slices[0..cond_count],
+            arm_slices[0 .. cond_count + 1],
+            needs_parens,
+            is_direct_fn_expr_body,
+        ))) {
+            continue;
+        }
+
+        var repl_buf: std.ArrayList(u8) = .empty;
+        defer repl_buf.deinit(allocator);
+        if (needs_parens) try repl_buf.append(allocator, '(');
+        for (0..cond_count) |ci| {
+            if (ci == 0) {
+                try repl_buf.appendSlice(allocator, "if ");
+            } else {
+                try repl_buf.appendSlice(allocator, " else if ");
+            }
+            try repl_buf.appendSlice(allocator, cond_slices[ci]);
+            try repl_buf.appendSlice(allocator, " => ");
+            try repl_buf.appendSlice(allocator, arm_slices[ci]);
+        }
+        try repl_buf.appendSlice(allocator, " else ");
+        try repl_buf.appendSlice(allocator, arm_slices[cond_count]);
+        if (needs_parens) try repl_buf.append(allocator, ')');
+
+        try collector.appendSingleEdit(
+            .lint_idiom,
+            if_sp.start_byte,
+            if_sp.end_byte,
+            repl_buf.items,
+            "UR-24-06: rewrite pure single-expression `if { a } else { b }` to `if cond => a else b` (`W0202`)",
+        );
+    }
+}
+
 /// Collects Sub-stage C Tier 3 `CompilerDb` semantic modernizer fixes for `file_id` into `collector`.
 fn collectSubstageCTier3FixesForFile(
     allocator: std.mem.Allocator,
@@ -6293,20 +9731,28 @@ fn collectSubstageCTier3FixesForFile(
     const is_ur22_06 = isRuleEnabled(options.rule_mask, .ur_22_06_semantic_unary_deref_and_slice_methods);
     const is_ur23_04 = isRuleEnabled(options.rule_mask, .ur_23_04_canonical_wildcard_discard_stmt);
     const is_ur23_05 = isRuleEnabled(options.rule_mask, .ur_23_05_foreign_scalar_type_names);
+    const is_ur24_01 = isRuleEnabled(options.rule_mask, .ur_24_01_f_strings_and_multiline_dedent);
+    const is_ur24_05 = isRuleEnabled(options.rule_mask, .ur_24_05_strip_redundant_private_contracts);
+    const is_ur24_06 = isRuleEnabled(options.rule_mask, .ur_24_06_inline_fat_arrow_if_expr);
     const is_harvesting_general = !options.has_explicit_rule_filter;
 
     if (!is_ur21_04 and !is_ur21_05 and !is_ur21_06 and !is_ur21_07 and
-        !is_ur22_02 and !is_ur22_06 and !is_ur23_04 and !is_ur23_05 and !is_harvesting_general)
+        !is_ur22_02 and !is_ur22_06 and !is_ur23_04 and !is_ur23_05 and
+        !is_ur24_01 and !is_ur24_05 and !is_ur24_06 and !is_harvesting_general)
     {
         return;
     }
 
     const source = try db.getSourceText(file_id);
     const parsed = try db.parseCst(file_id);
-    _ = try db.resolveSignatures(file_id);
+    _ = db.resolveSignatures(file_id) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {},
+    };
     const item_tree = try db.extractItemTree(file_id);
     for (item_tree.entries) |entry| {
-        _ = try db.getDefSideTables(entry.def_id);
+        if (!hasBodySideTablesItemKind(entry.kind)) continue;
+        _ = try getDefSideTablesBestEffort(db, entry.def_id);
     }
 
     const tok_buf = &parsed.token_buffer;
@@ -6318,7 +9764,7 @@ fn collectSubstageCTier3FixesForFile(
     defer allocator.free(ast_parents);
     const extra_ends = try syntax_arenas.computeAstNodeExtraEnds(allocator, ast_arena);
     defer allocator.free(extra_ends);
-    const cst_parents = if (is_ur23_05)
+    const cst_parents = if (is_ur23_05 or is_ur24_01 or is_ur24_05 or is_ur24_06)
         try computeCstParentMap(allocator, cst_arena)
     else
         try allocator.alloc(CstNodeIndex, 0);
@@ -7230,6 +10676,55 @@ fn collectSubstageCTier3FixesForFile(
             }
         }
     }
+
+    // [8] `UR-24-01` Branch B; upgrade unmarked `"…{expr}…"` strings with verified semantic/compound holes:
+    if (is_ur24_01) {
+        try collectUnmarkedFmtStringTier3Fixes(
+            allocator,
+            db,
+            file_id,
+            source,
+            cst_arena,
+            cst_parents,
+            tok_buf,
+            item_tree,
+            options,
+            collector,
+        );
+    }
+
+    // [9] `UR-24-05`; strip redundant bare `@inline` and private `@no_alloc` / `@no_panic` / `@no_block` (`W0333`):
+    if (is_ur24_05) {
+        try collectStripRedundantPrivateContractsFixes(
+            allocator,
+            db,
+            file_id,
+            source,
+            cst_arena,
+            cst_parents,
+            tok_buf,
+            item_tree,
+            collector,
+        );
+    }
+
+    // [10] `UR-24-06`; rewrite `1 <= K <= 4` pure value `if { a } else { b }` chains to `if cond => a else b`:
+    if (is_ur24_06) {
+        try collectInlineFatArrowIfExprFixes(
+            allocator,
+            db,
+            file_id,
+            source,
+            cst_arena,
+            cst_parents,
+            ast_arena,
+            ast_parents,
+            extra_ends,
+            tok_buf,
+            item_tree,
+            collector,
+        );
+    }
 }
 
 // ---------------- Manifest & Lockfile Helpers -----------------
@@ -7601,10 +11096,15 @@ fn discoverExternalSubmodulesInDb(
     if (depth >= MAX_UPGRADE_MOD_DISCOVERY_DEPTH or visited_fids.contains(parent_fid.asInt())) return;
     try visited_fids.put(allocator, parent_fid.asInt(), {});
 
-    if (!db.source_inputs.contains(parent_fid.asInt())) {
+    const was_already_loaded = db.source_inputs.contains(parent_fid.asInt());
+    if (!was_already_loaded) {
         _ = source_map.getLineIndex(parent_fid) catch {};
         const disk_src = source_map.getFileSource(parent_fid) orelse "";
         _ = try db.setInput(parent_fid, disk_src, durability);
+        try db.setFilePath(parent_fid, parent_path);
+        if (pkg_id != .root) {
+            try db.setFilePackageId(parent_fid, pkg_id);
+        }
     }
     const parent_src = try db.getSourceText(parent_fid);
     if (!has_core_mention_out.* and
@@ -7613,10 +11113,6 @@ fn discoverExternalSubmodulesInDb(
             std.mem.indexOf(u8, parent_src, "std") != null))
     {
         has_core_mention_out.* = true;
-    }
-    try db.setFilePath(parent_fid, parent_path);
-    if (pkg_id != .root) {
-        try db.setFilePackageId(parent_fid, pkg_id);
     }
 
     var ext_mod_names: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -8507,6 +12003,26 @@ pub fn upgradeWorkspaceFilesInDb(
         }
         try rebindWorkspaceSubmodulesInDb(allocator, db, options);
 
+        // Pre-warm signatures and body side-tables across all workspace files so cross-file `is_fn_value_reified`
+        // flags (`UR-24-05` / `W0333`) are populated before per-file Tier 3 stripping runs:
+        if (isRuleEnabled(options.rule_mask, .ur_24_05_strip_redundant_private_contracts) and file_ids.len > 1) {
+            for (file_ids, 0..) |fid, i| {
+                if (states[i].is_generated) continue;
+                _ = try db.parseCst(fid);
+                _ = db.resolveSignatures(fid) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {},
+                };
+            }
+            for (file_ids, 0..) |fid, i| {
+                if (states[i].is_generated) continue;
+                for ((try db.extractItemTree(fid)).entries) |entry| {
+                    if (!hasBodySideTablesItemKind(entry.kind)) continue;
+                    _ = try getDefSideTablesBestEffort(db, entry.def_id);
+                }
+            }
+        }
+
         // Sub-stage C (Tier 3 Type-Directed Semantic Modernizers across `CompilerDb`):
         for (file_ids, 0..) |fid, i| {
             if (states[i].is_generated) continue;
@@ -8530,7 +12046,8 @@ pub fn upgradeWorkspaceFilesInDb(
     }
 
     // [3] Re-attach canonicalized frontmatter, run `fmt_engine.formatSource` when appropriate, and enforce rollback guard:
-    const is_running_full_fmt = !options.has_explicit_rule_filter or options.rule_mask == ALL_UPGRADE_RULES_MASK;
+    const is_running_full_fmt = !options.skip_post_format and
+        (!options.has_explicit_rule_filter or options.rule_mask == ALL_UPGRADE_RULES_MASK);
     for (file_ids, 0..) |fid, i| {
         const st = &states[i];
         if (st.is_generated) {
@@ -9115,81 +12632,85 @@ pub fn executeUpgradePaths(
     stdout_writer: *std.Io.Writer,
     stderr_writer: *std.Io.Writer,
 ) !u8 {
-    var interner = try StringInterner.init(allocator);
-    defer interner.deinit();
-    var source_map = vfs_sourcemap.VfsSourceMap.init(allocator, &interner);
-    defer source_map.deinit(io);
-    source_map.setIo(io);
-
-    var db = try CompilerDb.init(allocator);
-    defer db.deinit();
-    db.setVfsSourceMap(&source_map);
-    db.setEmbedIo(io);
-    if (options.is_internal_core) {
-        try db.setInternalCore(true);
-    }
-
     var pending_list: std.ArrayListUnmanaged(PendingUpgradeItem) = .empty;
     defer pending_list.deinit(allocator);
     var upgraded_cx_count: usize = 0;
     var upgraded_manifest_count: usize = 0;
 
     // [1] Load `.cx` workspace/file targets, bind `mod <name>;` submodules, stdlib `cx`, and offline dependencies:
-    var loaded_fids: std.ArrayListUnmanaged(FileId) = .empty;
-    defer loaded_fids.deinit(allocator);
-    var loaded_paths: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer loaded_paths.deinit(allocator);
+    if (cx_paths.len > 0) {
+        const cx_results = blk_upgrade_cx: {
+            var interner = try StringInterner.init(allocator);
+            defer interner.deinit();
+            var source_map = vfs_sourcemap.VfsSourceMap.init(allocator, &interner);
+            defer source_map.deinit(io);
+            source_map.setIo(io);
 
-    var has_core_mention = false;
-    for (cx_paths) |cx_path| {
-        const raw_bytes = try std.Io.Dir.cwd().readFileAlloc(io, cx_path, allocator, .limited(64 * 1024 * 1024));
-        defer allocator.free(raw_bytes);
-        if (!has_core_mention and
-            (std.mem.indexOf(u8, raw_bytes, "cx") != null or
-                std.mem.indexOf(u8, raw_bytes, "core") != null or
-                std.mem.indexOf(u8, raw_bytes, "std") != null))
-        {
-            has_core_mention = true;
-        }
-        const fid = try source_map.setOverlay(cx_path, raw_bytes, .root);
-        _ = try db.setInput(fid, raw_bytes, .low);
-        try db.setFilePath(fid, cx_path);
-        try loaded_fids.append(allocator, fid);
-        try loaded_paths.append(allocator, cx_path);
-    }
+            var db = try CompilerDb.init(allocator);
+            defer db.deinit();
+            db.setVfsSourceMap(&source_map);
+            db.setEmbedIo(io);
+            if (options.is_internal_core) {
+                try db.setInternalCore(true);
+            }
 
-    if (loaded_fids.items.len > 0) {
-        var visited_fids: std.AutoHashMapUnmanaged(u32, void) = .empty;
-        defer visited_fids.deinit(allocator);
+            var loaded_fids: std.ArrayListUnmanaged(FileId) = .empty;
+            defer loaded_fids.deinit(allocator);
+            var has_core_mention = false;
+            for (cx_paths) |cx_path| {
+                const raw_bytes = try std.Io.Dir.cwd().readFileAlloc(
+                    io,
+                    cx_path,
+                    allocator,
+                    .limited(64 * 1024 * 1024),
+                );
+                defer allocator.free(raw_bytes);
+                if (!has_core_mention and
+                    (std.mem.indexOf(u8, raw_bytes, "cx") != null or
+                        std.mem.indexOf(u8, raw_bytes, "core") != null or
+                        std.mem.indexOf(u8, raw_bytes, "std") != null))
+                {
+                    has_core_mention = true;
+                }
+                const fid = try source_map.setOverlay(cx_path, raw_bytes, .root);
+                _ = try db.setInput(fid, raw_bytes, .low);
+                try db.setFilePath(fid, cx_path);
+                try loaded_fids.append(allocator, fid);
+            }
 
-        if (manifest_path_opt) |toml_path| {
-            try mountOfflineManifestDepsInDb(
-                allocator,
-                io,
-                &source_map,
-                &db,
-                toml_path,
-                options,
-                &visited_fids,
-                &has_core_mention,
-            );
-        }
-        if (has_core_mention) {
-            try registerCoreStdlibInDb(allocator, io, &source_map, &db, &visited_fids);
-        }
+            var visited_fids: std.AutoHashMapUnmanaged(u32, void) = .empty;
+            defer visited_fids.deinit(allocator);
 
-        var ws_options = options;
-        ws_options.io = io;
-        ws_options.vfs = &source_map;
-        try rebindWorkspaceSubmodulesInDb(allocator, &db, ws_options);
+            if (manifest_path_opt) |toml_path| {
+                try mountOfflineManifestDepsInDb(
+                    allocator,
+                    io,
+                    &source_map,
+                    &db,
+                    toml_path,
+                    options,
+                    &visited_fids,
+                    &has_core_mention,
+                );
+            }
+            if (has_core_mention) {
+                try registerCoreStdlibInDb(allocator, io, &source_map, &db, &visited_fids);
+            }
 
-        const cx_results = try upgradeWorkspaceFilesInDb(allocator, &db, loaded_fids.items, ws_options);
+            var ws_options = options;
+            ws_options.io = io;
+            ws_options.vfs = &source_map;
+            try rebindWorkspaceSubmodulesInDb(allocator, &db, ws_options);
+
+            break :blk_upgrade_cx try upgradeWorkspaceFilesInDb(allocator, &db, loaded_fids.items, ws_options);
+        };
         defer {
             for (cx_results) |*res| res.deinit(allocator);
             allocator.free(cx_results);
         }
 
-        for (cx_results, loaded_paths.items) |res, path_str| {
+        // `source_map` and `db` are now deinitialized so Windows `SEC_COMMIT` `mmap` handles never block writes:
+        for (cx_results, cx_paths) |res, path_str| {
             if (!res.is_changed) continue;
             if (options.is_check_only) {
                 try pending_list.append(allocator, .{ .kind = .cx_source, .path = path_str });
@@ -9205,7 +12726,7 @@ pub fn executeUpgradePaths(
         if (!options.has_explicit_rule_filter) {
             const raw_toml = try std.Io.Dir.cwd().readFileAlloc(io, toml_path, allocator, .limited(16 * 1024 * 1024));
             defer allocator.free(raw_toml);
-            const toml_fid = try source_map.setOverlay(toml_path, raw_toml, .root);
+            const toml_fid = FileId.fromInt(1);
             const cfg_env = pkg_manifest.CfgEnv.fromTargetSpec(
                 options.target_spec orelse codegen_abi.TargetSpec.host(),
                 true,
@@ -9343,7 +12864,7 @@ test "test_render_upgrade_rule_list_and_all_explanations_zero_drift" {
     try std.testing.expect(std.mem.indexOf(u8, list_text, Glyphs.TOP_LEFT) != null);
     try std.testing.expect(std.mem.indexOf(u8, list_text, Glyphs.BOTTOM_RIGHT) != null);
     try std.testing.expect(
-        std.mem.endsWith(u8, list_text, "✓ 22 canonical Zero-Legacy upgrade rules registered\n"),
+        std.mem.endsWith(u8, list_text, "✓ 29 canonical Zero-Legacy upgrade rules registered\n"),
     );
 
     for (upgrade_rules.UPGRADE_RULE_CATALOG) |entry| {
@@ -9432,15 +12953,15 @@ test "test_tier1_and_tier2_synergy_ur21_and_ur22_rewrites" {
     try std.testing.expect(std.mem.indexOf(u8, out, "extern \"C\" fn free_raw(ptr: *opaque);") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "test \"bitfield and modes\" {") != null);
 
-    // `UR-22-04` (`enum`, `bit_field` member preservation, `@attr(k: v)`, `,` fields, omit `-> unit`):
+    // `UR-22-04` & `UR-24-03` (`enum`, `bit_field` member preservation, `@repr(align: 16)`, `,` fields, omit `-> unit`):
     try std.testing.expect(std.mem.indexOf(u8, out, "pub enum Mode: u8 {") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "bit_field RegFlags: u8 {") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "ready: bool | 1,") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "mode: u8 | 7,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "@align(bytes: 16)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "@repr(align: 16)") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "@no_alloc") != null);
 
-    // `UR-22-00`, `UR-22-01`, `UR-22-02`, `UR-22-03`, `UR-21-01`, `UR-21-03`:
+    // `UR-22-00`, `UR-22-01`, `UR-22-02`, `UR-22-03`, `UR-21-01`, `UR-21-03`, `UR-24-01`:
     try std.testing.expect(std.mem.indexOf(u8, out, "[T: Number]") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "item: &T") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "count: &mut i32") != null);
@@ -9448,7 +12969,7 @@ test "test_tier1_and_tier2_synergy_ur21_and_ur22_rewrites" {
     try std.testing.expect(std.mem.indexOf(u8, out, "opt_ref: (&u8)?") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "nested_res: (u32!i32)!i32") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "var acc = count;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"{{ok}} and \\\\{acc}\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "f\"{{ok}} and \\\\{acc}\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "r\"\\{untouched\\}\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "if acc > 0 and (acc == 1 or acc == 2)") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "let zero_clos = || acc;") != null);
@@ -9786,7 +13307,11 @@ test "test_deprecated_variadic_and_comment_guards_plus_standalone_fix_inline" {
         \\
         \\pub fn caller(fmt_ptr: *u8, num: i32) -> i32 {
         \\    let var_keep = unsafe { c_printf(fmt_ptr, num, 99) };
-        \\    let cmt_keep = legacy_add(/* preserve_arg_cmt */ num, 2);
+        \\    let cmt_keep = legacy_add(
+        \\        // preserve_arg_cmt
+        \\        num,
+        \\        2,
+        \\    );
         \\    let inlined = bump_one(num);
         \\    return var_keep +% cmt_keep +% inlined;
         \\}
@@ -9822,7 +13347,8 @@ test "test_deprecated_variadic_and_comment_guards_plus_standalone_fix_inline" {
 
     const upgraded = upg_res.upgraded_source;
     try std.testing.expect(std.mem.indexOf(u8, upgraded, "c_printf(fmt_ptr, num, 99)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, upgraded, "/* preserve_arg_cmt */") != null);
+    try std.testing.expect(std.mem.indexOf(u8, upgraded, "// preserve_arg_cmt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, upgraded, "legacy_add(") != null);
     try std.testing.expect(std.mem.indexOf(u8, upgraded, "let inlined = modern_add(num, 1);") != null);
 }
 
@@ -9900,44 +13426,62 @@ test "test_generated_script_frontmatter_guard_ref_self_type_and_cst_comment_guar
         try countSyntaxErrors(std.testing.allocator, FileId.fromInt(47), self_res.upgraded_source),
     );
 
-    // [3] CST/AST comment guards prevent silent comment deletion across `UR-21-01`/`02`/`06`/`07` & `UR-22-02`/`03`/`04`/`05`:
+    // [3] Block-comment hoisting (`UR-24-00`) & CST/AST `//` comment guards prevent silent comment deletion:
     const commented_src =
         \\use /* c_use */ cx.ffi.c_void;
         \\
-        \\bit_field Flags(/* c_bf */ u8) {
+        \\bit_field Flags(
+        \\    // c_bf
+        \\    u8
+        \\) {
         \\    ready: bool | 1,
         \\}
         \\
         \\pub fn keep_comments(
         \\    ref /* c_param */ arg: i32,
-        \\    opt: Option[/* c_opt */ i32],
+        \\    opt: Option[
+        \\        // c_opt
+        \\        i32
+        \\    ],
         \\    slice_in: &[u8],
         \\    scratch: &mut i32,
         \\) -> usize {
-        \\    if /* c_if */ let .Some(val) = opt {
+        \\    if
+        \\        // c_if
+        \\        let .Some(val) = opt
+        \\    {
         \\        _ = val;
         \\    }
-        \\    while /* c_while */ let .Some(w_val) = opt {
+        \\    while
+        \\        // c_while
+        \\        let .Some(w_val) = opt
+        \\    {
         \\        _ = w_val;
         \\        break;
         \\    }
-        \\    cx.mem.with_arena(/* c_arena */ scratch, || {
-        \\        _ = arg;
-        \\    });
-        \\    let sub = slice_in[0 /* c_rng */ .. slice_in.len() - 1];
+        \\    cx.mem.with_arena(
+        \\        // c_arena
+        \\        scratch,
+        \\        || {
+        \\            _ = arg;
+        \\        },
+        \\    );
+        \\    let sub = slice_in[0
+        \\        // c_rng
+        \\        .. slice_in.len() - 1];
         \\    return sub.len();
         \\}
     ++ "\n";
     var cmt_res = try upgradeSource(std.testing.allocator, commented_src, FileId.fromInt(48), .{});
     defer cmt_res.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.indexOf(u8, cmt_res.upgraded_source, "/* c_use */") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cmt_res.upgraded_source, "/* c_bf */") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cmt_res.upgraded_source, "/* c_param */") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cmt_res.upgraded_source, "/* c_opt */") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cmt_res.upgraded_source, "/* c_if */") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cmt_res.upgraded_source, "/* c_while */") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cmt_res.upgraded_source, "/* c_arena */") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cmt_res.upgraded_source, "/* c_rng */") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmt_res.upgraded_source, "// c_use") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmt_res.upgraded_source, "// c_bf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmt_res.upgraded_source, "// c_param") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmt_res.upgraded_source, "// c_opt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmt_res.upgraded_source, "// c_if") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmt_res.upgraded_source, "// c_while") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmt_res.upgraded_source, "// c_arena") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmt_res.upgraded_source, "// c_rng") != null);
 }
 
 test "test_dr23_ur23_00_through_ur23_06_multi_stage_synergy" {
@@ -9947,7 +13491,7 @@ test "test_dr23_ur23_00_through_ur23_06_multi_stage_synergy" {
         \\ */
         \\
         \\pub mod helpers {
-        \\    //! Inline module doc hoisted to outer `///`.
+        \\    //! Inline module doc hoisted to outer `/|`.
         \\    /// Detached helper doc.
         \\
         \\    pub fn ping() {}
@@ -10007,10 +13551,10 @@ test "test_dr23_ur23_00_through_ur23_06_multi_stage_synergy" {
     try std.testing.expect(!res.is_rolled_back);
 
     const out = res.upgraded_source;
-    // `UR-23-00` & `UR-23-01`:
-    try std.testing.expect(std.mem.startsWith(u8, out, "//! Ring Slab Header (`ring_slab`).\n\n"));
-    try std.testing.expect(std.mem.indexOf(u8, out, "/// Inline module doc hoisted to outer `///`.\npub mod helpers {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "/// Detached helper doc.\n    pub fn ping()") != null);
+    // `UR-23-00`, `UR-23-01`, & `UR-24-00`:
+    try std.testing.expect(std.mem.startsWith(u8, out, "/# Ring Slab Header (`ring_slab`).\n\n"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "/| Inline module doc hoisted to outer `/|`.\npub mod helpers {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "/| Detached helper doc.\n    pub fn ping()") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "// Misplaced inner comment downgraded to `//`.") != null);
     // `UR-23-02`:
     try std.testing.expect(std.mem.indexOf(u8, out, "} else if rhs > 0 {") != null);
@@ -10058,11 +13602,135 @@ test "test_dr23_ur23_00_through_ur23_06_multi_stage_synergy" {
     try std.testing.expect(adv_res.is_changed);
     try std.testing.expect(!adv_res.is_rolled_back);
     const adv_out = adv_res.upgraded_source;
-    try std.testing.expect(std.mem.indexOf(u8, adv_out, "//! header\n//! injected_guard\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, adv_out, "/# header\n/# injected_guard\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, adv_out, "impl[T: Copy, const CAP: usize] Box[T, CAP] {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, adv_out, "/// Hoisted above `@inline`.\n@inline\npub fn elif") != null);
+    try std.testing.expect(std.mem.indexOf(u8, adv_out, "/| Hoisted above `@inline`.\n@inline\npub fn elif") != null);
     try std.testing.expect(std.mem.indexOf(u8, adv_out, "let ((_, _), (nested_ok, _)) = ((1_u32, 2_u32), pair);") != null);
     try std.testing.expect(std.mem.indexOf(u8, adv_out, "(state.counter, _) = pair;") != null);
     try std.testing.expect(std.mem.indexOf(u8, adv_out, "elif(nested_ok)") != null);
     try std.testing.expectEqual(@as(u32, 0), try countSyntaxErrors(std.testing.allocator, FileId.fromInt(62), adv_out));
+}
+
+test "test_dr24_ur24_00_through_ur24_06_showcases_and_idempotency" {
+    const dr24_legacy_cx =
+        \\//! Ring slab module docs.
+        \\
+        \\//// Decorative banner preserved verbatim ////
+        \\
+        \\pub mod tag_mod {
+        \\    pub fn pick(label: str) -> str = label;
+        \\}
+        \\
+        \\/// Cache-line aligned wire header (`Span16`-style non-adjacent layout attrs).
+        \\@repr_c
+        \\@derive(Copy, Clone, Equatable)
+        \\@cache_aligned
+        \\@zero_pad
+        \\pub struct Span16 {
+        \\    pub lo: u64,
+        \\    pub hi: u64,
+        \\}
+        \\
+        \\@packed(2)
+        \\pub struct WireHdr {
+        \\    pub tag: u16,
+        \\}
+        \\
+        \\@link_name("__cx_ring_sym")
+        \\@link_section(".text.hot")
+        \\pub fn exported_hook() {}
+        \\
+        \\@[must_use, no_alloc, no_panic]
+        \\pub fn id(code: u32) -> u32 = code;
+        \\
+        \\@inline
+        \\@no_alloc
+        \\@no_panic
+        \\fn step_private(cur: u16) -> u16 {
+        \\    return cur +% 1_u16;
+        \\}
+        \\
+        \\@no_alloc
+        \\fn reified_cb(cur: u32) -> u32 {
+        \\    return cur;
+        \\}
+        \\
+        \\pub fn use_reified() -> u32 {
+        \\    let fn_ptr: @no_alloc fn(u32) -> u32 = reified_cb;
+        \\    return fn_ptr(7_u32);
+        \\}
+        \\
+        \\pub fn classify_and_format(port: u16, delta: i32, code: u32) -> usize {
+        \\    //! Mid-file module doc downgraded to `//`.
+        \\    let inline_cmt = /* mid-line comment */ step_private(port);
+        \\    _ = inline_cmt;
+        \\    let empty_json = "{{}}";
+        \\    let keep_route = "/users/{id}";
+        \\    let keep_pct = "{p}%";
+        \\    let live_port = "0.0.0.0:{port}";
+        \\    let live_sum = "{delta + 1}";
+        \\    let multi_msg = """
+        \\        bound={tag_mod::pick(r"""ok""")}
+        \\        """;
+        \\    _ = empty_json;
+        \\    _ = keep_route;
+        \\    _ = keep_pct;
+        \\    _ = live_port;
+        \\    _ = live_sum;
+        \\    _ = multi_msg;
+        \\    let sign_val = if delta < 0 { -1_i32 } else if delta > 0 { 1_i32 } else { 0_i32 };
+        \\    _ = sign_val;
+        \\    let match_stay = if code == 1_u32 { 10_usize } else if code == 2_u32 { 20_usize } else if code == 3_u32 { 30_usize } else { 0_usize };
+        \\    let picked_len = if port > 0_u16 { "live" } else { "idle" }.len();
+        \\    return match_stay +% picked_len;
+        \\}
+    ++ "\n";
+
+    var pass1 = try upgradeSource(std.testing.allocator, dr24_legacy_cx, FileId.fromInt(70), .{});
+    defer pass1.deinit(std.testing.allocator);
+    try std.testing.expect(pass1.is_changed);
+    try std.testing.expect(!pass1.is_rolled_back);
+
+    const out = pass1.upgraded_source;
+    // `UR-24-00`:
+    try std.testing.expect(std.mem.startsWith(u8, out, "/# Ring slab module docs.\n\n"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "//// Decorative banner preserved verbatim ////") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "/| Cache-line aligned wire header") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "// Mid-file module doc downgraded to `//`.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "// mid-line comment\n    let inline_cmt = step_private(port);") != null);
+
+    // `UR-24-03` & `UR-24-04` + horizontal `fmt_engine` attribute packing (`<= 100` cols, `.CacheLine`):
+    try std.testing.expect(
+        std.mem.indexOf(u8, out, "@repr(C, align: .CacheLine, zero_pad: true) @derive(Copy, Clone, Equatable)\npub struct Span16") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, out, "@repr(C, packed: 2)\npub struct WireHdr") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, out, "@link(name: \"__cx_ring_sym\", section: \".text.hot\")\npub fn exported_hook()") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, out, "@no_alloc @no_panic @must_use\npub fn id(") != null);
+
+    // `UR-24-05` (`step_private` stripped completely; `reified_cb` keeps `@no_alloc` due to fn-pointer reification!):
+    try std.testing.expect(std.mem.indexOf(u8, out, "\nfn step_private(cur: u16) -> u16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "@no_alloc\nfn reified_cb(cur: u32) -> u32") != null);
+
+    // `UR-24-01` & `UR-24-02` (Branch A + Branch B + nested `::` & `r"""…"""` + idempotent plain literals):
+    try std.testing.expect(std.mem.indexOf(u8, out, "let empty_json = \"{}\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "let keep_route = \"/users/{id}\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "let keep_pct = \"{p}%\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "let live_port = f\"0.0.0.0:{port}\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "let live_sum = f\"{delta + 1}\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "tag_mod.pick(r\"ok\")") != null);
+
+    // `UR-24-06` (`sign_val` & parenthesized `(if …).len()` upgrade; 3-arm single-scrutinee `match_stay` stays braced):
+    try std.testing.expect(std.mem.indexOf(u8, out, "if delta < 0 => -1_i32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "(if port > 0_u16 => \"live\" else \"idle\").len()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "if code == 1_u32 {") != null);
+    try std.testing.expectEqual(@as(u32, 0), try countSyntaxErrors(std.testing.allocator, FileId.fromInt(71), out));
+
+    // Strict idempotency check (`upgrade(upgrade(x)) == upgrade(x)` with 0 edits):
+    var pass2 = try upgradeSource(std.testing.allocator, out, FileId.fromInt(72), .{});
+    defer pass2.deinit(std.testing.allocator);
+    try std.testing.expect(!pass2.is_changed);
+    try std.testing.expectEqual(@as(u32, 0), pass2.applied_edit_count);
+    try std.testing.expectEqualStrings(out, pass2.upgraded_source);
 }

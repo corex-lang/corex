@@ -1,100 +1,94 @@
-//! Lock-Free Atomic Primitives and Memory Ordering Fences (`core.atomic`)
-//!
-//! Provides `@repr(C)` interior-mutable atomic cells (`AtomicBool`, `AtomicU32`, `AtomicU64`,
-//! `AtomicUsize`) and the `u8`-backed `MemoryOrder` (`Ordering`) lattice lowered directly to
-//! C11 / LLVM atomic instructions via `@atomic_*` compiler intrinsics (`DR-22` §4.1).
-//!
-//! Methods operate on shared `&self` borrows using `&raw self.inner` raw-address projections inside
-//! `@std_cap_boundary(clears: [unsafe_op])` boundaries so callers need neither `var` nor `unsafe`.
+/# Lock-Free Atomic Primitives and Memory Ordering Fences (`core.atomic`)
+/#
+/# Provides `@repr(C)` interior-mutable atomic cells (`AtomicBool`, `AtomicU32`, `AtomicU64`,
+/# `AtomicUsize`) and the `u8`-backed `MemoryOrder` (`Ordering`) lattice lowered directly to
+/# C11 / LLVM atomic instructions via `@atomic_*` compiler intrinsics (`DR-22` §4.1).
+/#
+/# Methods operate on shared `&self` borrows using `&raw self.inner` raw-address projections inside
+/# `@std_cap_boundary(clears: [unsafe_op])` boundaries so callers need neither `var` nor `unsafe`.
 
 // ---------------------------------------- TYPES ----------------------------------------
-/// Hardware and compiler atomic memory ordering lattice (`DR-08`, `DR-22` §4.1).
+/| Hardware and compiler atomic memory ordering lattice (`DR-08`, `DR-22` §4.1).
 pub enum MemoryOrder: u8 {
-    /// Monotonic atomicity with no cross-thread happens-before synchronization (`0`).
+    /| Monotonic atomicity with no cross-thread happens-before synchronization (`0`).
     Relaxed = 0,
-    /// Data-dependent acquire synchronization (`1`, promoted to `Acquire` on C11 and LLVM).
+    /| Data-dependent acquire synchronization (`1`, promoted to `Acquire` on C11 and LLVM).
     Consume = 1,
-    /// Acquire load/fence synchronization preventing subsequent memory reordering (`2`).
+    /| Acquire load/fence synchronization preventing subsequent memory reordering (`2`).
     Acquire = 2,
-    /// Release store/fence synchronization publishing prior writes (`3`).
+    /| Release store/fence synchronization publishing prior writes (`3`).
     Release = 3,
-    /// Acquire-release read-modify-write synchronization (`4`).
+    /| Acquire-release read-modify-write synchronization (`4`).
     AcqRel = 4,
-    /// Sequentially consistent total-order synchronization (`5`).
+    /| Sequentially consistent total-order synchronization (`5`).
     SeqCst = 5,
 }
 
-/// Ergonomic alias for `MemoryOrder` (`cx.atomic.Ordering`).
+/| Ergonomic alias for `MemoryOrder` (`cx.atomic.Ordering`).
 pub type Ordering = MemoryOrder;
 
-/// Lock-free atomic boolean cell backed by an aligned `u8` (`0` = `false`, `1` = `true`).
+/| Lock-free atomic boolean cell backed by an aligned `u8` (`0` = `false`, `1` = `true`).
 @repr(C)
 pub struct AtomicBool {
-    /// Backing atomic byte (`0` or `1`).
+    /| Backing atomic byte (`0` or `1`).
     inner: u8,
 }
 
-/// Lock-free 32-bit unsigned atomic integer cell.
-@repr(C)
-@align(4)
+/| Lock-free 32-bit unsigned atomic integer cell.
+@repr(C, align: 4)
 pub struct AtomicU32 {
-    /// Backing 32-bit unsigned cell.
+    /| Backing 32-bit unsigned cell.
     inner: u32,
 }
 
-/// Lock-free 64-bit unsigned atomic integer cell.
-@repr(C)
-@align(8)
+/| Lock-free 64-bit unsigned atomic integer cell.
+@repr(C, align: 8)
 pub struct AtomicU64 {
-    /// Backing 64-bit unsigned cell.
+    /| Backing 64-bit unsigned cell.
     inner: u64,
 }
 
-/// Lock-free pointer-width unsigned atomic integer cell.
+/| Lock-free pointer-width unsigned atomic integer cell.
 @repr(C)
 pub struct AtomicUsize {
-    /// Backing pointer-width unsigned cell.
+    /| Backing pointer-width unsigned cell.
     inner: usize,
 }
 
 // ------------------------------------- PUBLIC API --------------------------------------
 impl AtomicBool {
-    /// Constructs an `AtomicBool` initialized to `is_initial_set`.
+    /| Constructs an `AtomicBool` initialized to `is_initial_set`.
     @inline @no_alloc @no_panic
     pub fn new(is_initial_set: bool, /) -> Self {
         return Self { inner: is_initial_set as u8 };
     }
 
-    /// Atomically loads the boolean flag with `order` (`default: .SeqCst`).
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically loads the boolean flag with `order` (`default: .SeqCst`).
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn load(&self, *, order: Ordering = .SeqCst) -> bool {
         return unsafe {
             @atomic_load(&raw self.inner, order as u8) != 0
         };
     }
 
-    /// Atomically stores `is_next_set` into `self` with `order` (`default: .SeqCst`).
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically stores `is_next_set` into `self` with `order` (`default: .SeqCst`).
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn store(&self, is_next_set: bool, /, *, order: Ordering = .SeqCst) {
         unsafe {
             @atomic_store((&raw self.inner) as *mut u8, is_next_set as u8, order as u8);
         }
     }
 
-    /// Atomically swaps `is_next_set` into `self` and returns the previous boolean value.
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically swaps `is_next_set` into `self` and returns the previous boolean value.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn swap(&self, is_next_set: bool, /, *, order: Ordering = .SeqCst) -> bool {
         return unsafe {
             @atomic_rmw_xchg((&raw self.inner) as *mut u8, is_next_set as u8, order as u8) != 0
         };
     }
 
-    /// Atomically replaces `current_val` with `desired_val`, returning `.Ok` or `.Err` with the prior flag.
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically replaces `current_val` with `desired_val`, returning `.Ok` or `.Err` with the prior flag.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn compare_exchange(
         &self,
         current_val: bool,
@@ -124,60 +118,54 @@ impl AtomicBool {
 }
 
 impl AtomicU32 {
-    /// Constructs an `AtomicU32` initialized to `initial_val`.
+    /| Constructs an `AtomicU32` initialized to `initial_val`.
     @inline @no_alloc @no_panic
     pub fn new(initial_val: u32, /) -> Self {
         return Self { inner: initial_val };
     }
 
-    /// Atomically loads the `u32` value with `order` (`default: .SeqCst`).
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically loads the `u32` value with `order` (`default: .SeqCst`).
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn load(&self, *, order: Ordering = .SeqCst) -> u32 {
         return unsafe {
             @atomic_load(&raw self.inner, order as u8)
         };
     }
 
-    /// Atomically stores `next_val` into `self` with `order` (`default: .SeqCst`).
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically stores `next_val` into `self` with `order` (`default: .SeqCst`).
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn store(&self, next_val: u32, /, *, order: Ordering = .SeqCst) {
         unsafe {
             @atomic_store((&raw self.inner) as *mut u32, next_val, order as u8);
         }
     }
 
-    /// Atomically swaps `next_val` into `self` and returns the previous `u32` value.
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically swaps `next_val` into `self` and returns the previous `u32` value.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn swap(&self, next_val: u32, /, *, order: Ordering = .SeqCst) -> u32 {
         return unsafe {
             @atomic_rmw_xchg((&raw self.inner) as *mut u32, next_val, order as u8)
         };
     }
 
-    /// Atomically adds `delta` to `self` and returns the previous `u32` value.
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically adds `delta` to `self` and returns the previous `u32` value.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn fetch_add(&self, delta: u32, /, *, order: Ordering = .SeqCst) -> u32 {
         return unsafe {
             @atomic_rmw_add((&raw self.inner) as *mut u32, delta, order as u8)
         };
     }
 
-    /// Atomically subtracts `delta` from `self` and returns the previous `u32` value.
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically subtracts `delta` from `self` and returns the previous `u32` value.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn fetch_sub(&self, delta: u32, /, *, order: Ordering = .SeqCst) -> u32 {
         return unsafe {
             @atomic_rmw_sub((&raw self.inner) as *mut u32, delta, order as u8)
         };
     }
 
-    /// Atomically replaces `current_val` with `desired_val`, returning `.Ok` or `.Err` with the prior value.
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically replaces `current_val` with `desired_val`, returning `.Ok` or `.Err` with the prior value.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn compare_exchange(
         &self,
         current_val: u32,
@@ -206,60 +194,54 @@ impl AtomicU32 {
 }
 
 impl AtomicU64 {
-    /// Constructs an `AtomicU64` initialized to `initial_val`.
+    /| Constructs an `AtomicU64` initialized to `initial_val`.
     @inline @no_alloc @no_panic
     pub fn new(initial_val: u64, /) -> Self {
         return Self { inner: initial_val };
     }
 
-    /// Atomically loads the `u64` value with `order` (`default: .SeqCst`).
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically loads the `u64` value with `order` (`default: .SeqCst`).
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn load(&self, *, order: Ordering = .SeqCst) -> u64 {
         return unsafe {
             @atomic_load(&raw self.inner, order as u8)
         };
     }
 
-    /// Atomically stores `next_val` into `self` with `order` (`default: .SeqCst`).
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically stores `next_val` into `self` with `order` (`default: .SeqCst`).
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn store(&self, next_val: u64, /, *, order: Ordering = .SeqCst) {
         unsafe {
             @atomic_store((&raw self.inner) as *mut u64, next_val, order as u8);
         }
     }
 
-    /// Atomically swaps `next_val` into `self` and returns the previous `u64` value.
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically swaps `next_val` into `self` and returns the previous `u64` value.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn swap(&self, next_val: u64, /, *, order: Ordering = .SeqCst) -> u64 {
         return unsafe {
             @atomic_rmw_xchg((&raw self.inner) as *mut u64, next_val, order as u8)
         };
     }
 
-    /// Atomically adds `delta` to `self` and returns the previous `u64` value.
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically adds `delta` to `self` and returns the previous `u64` value.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn fetch_add(&self, delta: u64, /, *, order: Ordering = .SeqCst) -> u64 {
         return unsafe {
             @atomic_rmw_add((&raw self.inner) as *mut u64, delta, order as u8)
         };
     }
 
-    /// Atomically subtracts `delta` from `self` and returns the previous `u64` value.
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically subtracts `delta` from `self` and returns the previous `u64` value.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn fetch_sub(&self, delta: u64, /, *, order: Ordering = .SeqCst) -> u64 {
         return unsafe {
             @atomic_rmw_sub((&raw self.inner) as *mut u64, delta, order as u8)
         };
     }
 
-    /// Atomically replaces `current_val` with `desired_val`, returning `.Ok` or `.Err` with the prior value.
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically replaces `current_val` with `desired_val`, returning `.Ok` or `.Err` with the prior value.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn compare_exchange(
         &self,
         current_val: u64,
@@ -288,60 +270,54 @@ impl AtomicU64 {
 }
 
 impl AtomicUsize {
-    /// Constructs an `AtomicUsize` initialized to `initial_val`.
+    /| Constructs an `AtomicUsize` initialized to `initial_val`.
     @inline @no_alloc @no_panic
     pub fn new(initial_val: usize, /) -> Self {
         return Self { inner: initial_val };
     }
 
-    /// Atomically loads the `usize` value with `order` (`default: .SeqCst`).
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically loads the `usize` value with `order` (`default: .SeqCst`).
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn load(&self, *, order: Ordering = .SeqCst) -> usize {
         return unsafe {
             @atomic_load(&raw self.inner, order as u8)
         };
     }
 
-    /// Atomically stores `next_val` into `self` with `order` (`default: .SeqCst`).
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically stores `next_val` into `self` with `order` (`default: .SeqCst`).
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn store(&self, next_val: usize, /, *, order: Ordering = .SeqCst) {
         unsafe {
             @atomic_store((&raw self.inner) as *mut usize, next_val, order as u8);
         }
     }
 
-    /// Atomically swaps `next_val` into `self` and returns the previous `usize` value.
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically swaps `next_val` into `self` and returns the previous `usize` value.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn swap(&self, next_val: usize, /, *, order: Ordering = .SeqCst) -> usize {
         return unsafe {
             @atomic_rmw_xchg((&raw self.inner) as *mut usize, next_val, order as u8)
         };
     }
 
-    /// Atomically adds `delta` to `self` and returns the previous `usize` value.
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically adds `delta` to `self` and returns the previous `usize` value.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn fetch_add(&self, delta: usize, /, *, order: Ordering = .SeqCst) -> usize {
         return unsafe {
             @atomic_rmw_add((&raw self.inner) as *mut usize, delta, order as u8)
         };
     }
 
-    /// Atomically subtracts `delta` from `self` and returns the previous `usize` value.
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically subtracts `delta` from `self` and returns the previous `usize` value.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn fetch_sub(&self, delta: usize, /, *, order: Ordering = .SeqCst) -> usize {
         return unsafe {
             @atomic_rmw_sub((&raw self.inner) as *mut usize, delta, order as u8)
         };
     }
 
-    /// Atomically replaces `current_val` with `desired_val`, returning `.Ok` or `.Err` with the prior value.
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Atomically replaces `current_val` with `desired_val`, returning `.Ok` or `.Err` with the prior value.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn compare_exchange(
         &self,
         current_val: usize,
@@ -369,9 +345,8 @@ impl AtomicUsize {
     }
 }
 
-/// Emits a hardware and compiler atomic memory fence (`default: .SeqCst`).
-@std_cap_boundary(clears: [unsafe_op])
-@inline @no_alloc @no_panic
+/| Emits a hardware and compiler atomic memory fence (`default: .SeqCst`).
+@std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
 pub fn fence(*, order: Ordering = .SeqCst) {
     unsafe {
         @atomic_fence(order as u8);

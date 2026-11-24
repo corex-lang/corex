@@ -160,8 +160,12 @@ pub const AllowLintMask = packed struct(u8) {
     has_allow_unused_w0402: bool = false,
     /// Suppresses `W0403` (`deprecated`) deprecated symbol reference warnings.
     has_allow_deprecated_w0403: bool = false,
-    /// Reserved zero padding (`0`).
-    reserved: u3 = 0,
+    /// Suppresses `W0119` (`useless_format_string`) zero-hole `f"…"` warnings (`DR-24`).
+    has_allow_useless_fmt_w0119: bool = false,
+    /// Suppresses `W0120` (`uninterpolated_fmt_placeholder`) plain `"…"` placeholder warnings (`DR-24`).
+    has_allow_uninterp_fmt_w0120: bool = false,
+    /// Suppresses `W0333` (`redundant_private_contract`) private `@inline` / effect contract warnings (`DR-24`).
+    has_allow_redundant_contract_w0333: bool = false,
 
     comptime {
         std.debug.assert(@sizeOf(AllowLintMask) == 1);
@@ -185,8 +189,11 @@ pub const AllowLintMask = packed struct(u8) {
     /// Returns `true` when `self` suppresses `code`.
     pub inline fn isCodeAllowed(self: AllowLintMask, code: DiagnosticCode) bool {
         return switch (code) {
+            .w0119_useless_format_string => self.has_allow_useless_fmt_w0119,
+            .w0120_uninterpolated_fmt_placeholder => self.has_allow_uninterp_fmt_w0120,
             .w0201_non_canonical_identifier_case => self.has_allow_case_w0201,
             .w0202_non_idiomatic_construct => self.has_allow_idiom_w0202,
+            .w0333_redundant_private_contract => self.has_allow_redundant_contract_w0333,
             .w0401_unreachable_pattern_arm => self.has_allow_unreachable_w0401,
             .w0402_unused_binding => self.has_allow_unused_w0402,
             .w0403_deprecated_symbol => self.has_allow_deprecated_w0403,
@@ -439,11 +446,41 @@ pub const DeclExtraFlags = packed struct(u16) {
     is_noinline: bool = false,
     /// `true` if struct field is annotated with `@non_null` (`STD-01` pointer niche guarantee).
     is_non_null: bool = false,
-    /// Reserved zero padding bit (`0`).
-    reserved: u1 = 0,
+    /// `true` if nominal struct is annotated with `@repr(transparent)` (`ADR-24C`).
+    is_repr_transparent: bool = false,
 
     comptime {
         std.debug.assert(@sizeOf(DeclExtraFlags) == 2);
+    }
+};
+
+/// Explicit `@inline` / `@inline(always)` / `@inline(never)` directive mode (`ADR-24C`).
+pub const InlineAttrMode = enum(u2) {
+    /// No `@inline` attribute present.
+    none = 0,
+    /// Bare `@inline` cross-package `.cxi` hint.
+    hint = 1,
+    /// `@inline(always)` forced hot-path inlining.
+    always = 2,
+    /// `@inline(never)` explicit outline directive.
+    never = 3,
+};
+
+/// 1-byte bit-packed `@repr(…, packed: k)`, `@inline(…)`, and function-value reification flags (`DR-24`).
+pub const SymbolLayoutInlineFlags = packed struct(u8) {
+    /// Packed field alignment cap encoded as `log2(cap) + 1` (`0` = unpacked, `1..5` = `1|2|4|8|16`).
+    packed_align_log2_plus1: u3 = 0,
+    /// Parsed `@inline` mode (`none`, `hint`, `always`, `never`).
+    inline_mode: InlineAttrMode = .none,
+    /// `true` when a `fn_sym` is referenced as a first-class value outside direct call callee position.
+    is_fn_value_reified: bool = false,
+    /// `true` when `@cold` or `@noinline` appeared explicitly on this item header.
+    has_cold_or_noinline_attr: bool = false,
+    /// `true` when `@cold` appeared explicitly on this item header.
+    is_cold_attr: bool = false,
+
+    comptime {
+        std.debug.assert(@sizeOf(SymbolLayoutInlineFlags) == 1);
     }
 };
 
@@ -666,8 +703,42 @@ pub const SymbolRecord = struct {
     explicit_align_log2_plus1: u8 = 0,
     /// `true` if the declaration (or an enclosing `impl`) carries at least one `@cfg(…)` attribute (`SE-18`).
     has_cfg_attr: bool = false,
+    /// Packed alignment cap (`packed: 1|2|4|8|16`), `@inline` mode, and `fn` value reification flags (`DR-24`).
+    layout_inline_flags: SymbolLayoutInlineFlags = .{},
     /// Optional enclosing `impl` CST node carrying `@cfg(…)` (`CstNodeIndex.none` when absent).
     enclosing_cfg_cst: CstNodeIndex = .none,
+
+    comptime {
+        std.debug.assert(@sizeOf(SymbolRecord) <= 136);
+    }
+
+    /// Returns the packed field alignment cap in bytes (`1 | 2 | 4 | 8 | 16`), or `0` when unpacked.
+    pub inline fn packedCapBytes(self: *const SymbolRecord) u32 {
+        if (self.layout_inline_flags.packed_align_log2_plus1 > 0) {
+            return @as(u32, 1) << @intCast(self.layout_inline_flags.packed_align_log2_plus1 - 1);
+        }
+        return if (self.contract_flags.is_packed) 1 else 0;
+    }
+
+    /// Returns the explicit `@inline` mode (`none`, `hint`, `always`, `never`).
+    pub inline fn inlineMode(self: *const SymbolRecord) InlineAttrMode {
+        return self.layout_inline_flags.inline_mode;
+    }
+
+    /// Returns `true` when this function was coerced or referenced as a first-class function value.
+    pub inline fn isFnValueReified(self: *const SymbolRecord) bool {
+        return self.layout_inline_flags.is_fn_value_reified;
+    }
+
+    /// Returns `true` when annotated with `@repr(transparent)`.
+    pub inline fn isReprTransparent(self: *const SymbolRecord) bool {
+        return self.extra_flags.is_repr_transparent;
+    }
+
+    /// Returns `true` when annotated with `@cold`.
+    pub inline fn isCold(self: *const SymbolRecord) bool {
+        return self.layout_inline_flags.is_cold_attr;
+    }
 };
 
 /// Target operating-system selector evaluated inside `@cfg(target.os == .Linux)` (`SE-18`).
@@ -1025,13 +1096,17 @@ const HeaderAttrKind = enum(u8) {
     from,
     /// `@ifunc` forbidden indirect function resolver attribute (`E0327`).
     ifunc,
+    /// `@inline`, `@inline(always)`, or `@inline(never)` inlining directive (`ADR-24C`).
+    inline_attr,
     /// `@linear` Tier 3 must-consume ownership attribute (`DR-06`).
     linear,
+    /// `@link(name: "…", section: "…")` consolidated symbol linkage attribute (`ADR-24C`).
+    link,
     /// `@link_lib("…")` native library link directive attribute (`DR-10`).
     link_lib,
-    /// `@link_name(…)` custom linker symbol name attribute.
+    /// Retired `@link_name(…)` attribute (`E0239`).
     link_name,
-    /// `@link_section(…)` custom object section attribute (`E0327` checked).
+    /// Retired `@link_section(…)` attribute (`E0239`, `E0327` checked).
     link_section,
     /// `@local` non-escaping borrow attribute (`DR-06`).
     local,
@@ -1055,10 +1130,12 @@ const HeaderAttrKind = enum(u8) {
     not_sync,
     /// `@overload` explicit function overload group attribute (`DR-02`).
     overload,
-    /// `@packed` 1-byte field alignment attribute.
+    /// Retired `@packed` attribute (`E0239`).
     packed_attr,
-    /// `@repr(…)` explicit layout and discriminant width attribute.
+    /// `@repr(…)` consolidated layout, alignment, packing, and zero-padding attribute (`ADR-24C`).
     repr,
+    /// Retired `@repr_c` attribute (`E0239`).
+    repr_c,
     /// `@secret` constant-time / wire-redacted taint attribute (`DR-20`).
     secret,
     /// `@soa` Structure-of-Arrays layout attribute.
@@ -1487,7 +1564,9 @@ const HEADER_ATTR_MAP = std.StaticStringMap(HeaderAttrKind).initComptime(.{
     .{ "fix_inline", .fix_inline },
     .{ "from", .from },
     .{ "ifunc", .ifunc },
+    .{ "inline", .inline_attr },
     .{ "linear", .linear },
+    .{ "link", .link },
     .{ "link_lib", .link_lib },
     .{ "link_name", .link_name },
     .{ "link_section", .link_section },
@@ -1504,6 +1583,7 @@ const HEADER_ATTR_MAP = std.StaticStringMap(HeaderAttrKind).initComptime(.{
     .{ "overload", .overload },
     .{ "packed", .packed_attr },
     .{ "repr", .repr },
+    .{ "repr_c", .repr_c },
     .{ "secret", .secret },
     .{ "soa", .soa },
     .{ "std_cap_boundary", .std_cap_boundary },
@@ -1516,8 +1596,11 @@ const HEADER_ATTR_MAP = std.StaticStringMap(HeaderAttrKind).initComptime(.{
 
 /// Canonical scoped `@allow(…)` lint names for typo suggestions on `E0403`.
 pub const ALLOW_LINT_NAMES = [_][]const u8{
+    "W0119",
+    "W0120",
     "W0201",
     "W0202",
+    "W0333",
     "W0401",
     "W0402",
     "W0403",
@@ -1525,17 +1608,23 @@ pub const ALLOW_LINT_NAMES = [_][]const u8{
     "idiom",
     "non_canonical_case",
     "non_idiomatic",
+    "redundant_private_contract",
     "style",
+    "uninterpolated_fmt_placeholder",
     "unreachable_pattern",
     "unused",
     "unused_binding",
     "unused_variables",
+    "useless_format_string",
 };
 
 /// $O(1)$ static lookup map from scoped `@allow(…)` lint identifiers to `AllowLintMask` bits.
 pub const ALLOW_LINT_NAME_MAP = std.StaticStringMap(AllowLintMask).initComptime(.{
+    .{ "W0119", AllowLintMask{ .has_allow_useless_fmt_w0119 = true } },
+    .{ "W0120", AllowLintMask{ .has_allow_uninterp_fmt_w0120 = true } },
     .{ "W0201", AllowLintMask{ .has_allow_case_w0201 = true } },
     .{ "W0202", AllowLintMask{ .has_allow_idiom_w0202 = true } },
+    .{ "W0333", AllowLintMask{ .has_allow_redundant_contract_w0333 = true } },
     .{ "W0401", AllowLintMask{ .has_allow_unreachable_w0401 = true } },
     .{ "W0402", AllowLintMask{ .has_allow_unused_w0402 = true } },
     .{ "W0403", AllowLintMask{ .has_allow_deprecated_w0403 = true } },
@@ -1543,11 +1632,14 @@ pub const ALLOW_LINT_NAME_MAP = std.StaticStringMap(AllowLintMask).initComptime(
     .{ "idiom", AllowLintMask{ .has_allow_idiom_w0202 = true } },
     .{ "non_canonical_case", AllowLintMask{ .has_allow_case_w0201 = true } },
     .{ "non_idiomatic", AllowLintMask{ .has_allow_idiom_w0202 = true } },
+    .{ "redundant_private_contract", AllowLintMask{ .has_allow_redundant_contract_w0333 = true } },
     .{ "style", AllowLintMask{ .has_allow_idiom_w0202 = true } },
+    .{ "uninterpolated_fmt_placeholder", AllowLintMask{ .has_allow_uninterp_fmt_w0120 = true } },
     .{ "unreachable_pattern", AllowLintMask{ .has_allow_unreachable_w0401 = true } },
     .{ "unused", AllowLintMask{ .has_allow_unused_w0402 = true } },
     .{ "unused_binding", AllowLintMask{ .has_allow_unused_w0402 = true } },
     .{ "unused_variables", AllowLintMask{ .has_allow_unused_w0402 = true } },
+    .{ "useless_format_string", AllowLintMask{ .has_allow_useless_fmt_w0119 = true } },
 });
 
 /// $O(1)$ static lookup map from built-in `@derive` trait identifiers to `DeriveMask` bits.
@@ -2400,6 +2492,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     .repr_tag_bits = header_meta.repr_tag_bits,
                     .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
                     .has_cfg_attr = header_meta.has_cfg_attr,
+                    .layout_inline_flags = header_meta.layout_inline_flags,
                 }, diagnostic_sink);
                 try sym_table.applyItemHeaderLintAndDeprecation(defined_sym_idx, member_scope, &header_meta);
 
@@ -2483,6 +2576,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     .repr_tag_bits = header_meta.repr_tag_bits,
                     .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
                     .has_cfg_attr = header_meta.has_cfg_attr,
+                    .layout_inline_flags = header_meta.layout_inline_flags,
                 }, diagnostic_sink);
                 try sym_table.applyItemHeaderLintAndDeprecation(defined_sym_idx, variant_scope, &header_meta);
 
@@ -2663,6 +2757,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     .repr_tag_bits = header_meta.repr_tag_bits,
                     .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
                     .has_cfg_attr = header_meta.has_cfg_attr,
+                    .layout_inline_flags = header_meta.layout_inline_flags,
                 }, diagnostic_sink);
                 try sym_table.applyItemHeaderLintAndDeprecation(defined_sym_idx, bf_member_scope, &header_meta);
 
@@ -2711,6 +2806,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     .link_name_text = interned_link_name,
                     .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
                     .has_cfg_attr = header_meta.has_cfg_attr,
+                    .layout_inline_flags = header_meta.layout_inline_flags,
                 }, diagnostic_sink);
                 try sym_table.applyItemHeaderLintAndDeprecation(defined_sym_idx, .none, &header_meta);
             },
@@ -2758,6 +2854,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     .link_name_text = interned_link_name,
                     .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
                     .has_cfg_attr = header_meta.has_cfg_attr,
+                    .layout_inline_flags = header_meta.layout_inline_flags,
                 }, diagnostic_sink);
 
                 try sym_table.applyItemHeaderLintAndDeprecation(defined_sym_idx, .none, &header_meta);
@@ -2830,6 +2927,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     .link_name_text = interned_link_name,
                     .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
                     .has_cfg_attr = header_meta.has_cfg_attr,
+                    .layout_inline_flags = header_meta.layout_inline_flags,
                 }, diagnostic_sink);
 
                 try sym_table.applyItemHeaderLintAndDeprecation(defined_sym_idx, .none, &header_meta);
@@ -3007,6 +3105,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     .link_name_text = interned_link_name,
                     .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
                     .has_cfg_attr = header_meta.has_cfg_attr,
+                    .layout_inline_flags = header_meta.layout_inline_flags,
                 }, diagnostic_sink);
 
                 try sym_table.applyItemHeaderLintAndDeprecation(defined_sym_idx, .none, &header_meta);
@@ -3071,6 +3170,7 @@ fn collectItemSliceInScopeWithOrdinal(
                     .contract_flags = header_meta.contract_flags,
                     .max_stack_bytes = header_meta.max_stack_bytes,
                     .has_cfg_attr = header_meta.has_cfg_attr,
+                    .layout_inline_flags = header_meta.layout_inline_flags,
                 }, diagnostic_sink);
 
                 try sym_table.applyItemHeaderLintAndDeprecation(defined_sym_idx, .none, &header_meta);
@@ -3294,11 +3394,11 @@ fn internDecodedAttrStringToken(
     if (raw_str.len == 0) return .empty;
     var stack_buf: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
-    if (lexer.cookStringLiteral(fba.allocator(), raw_str)) |cooked_stack| {
+    if (decodeDr24PlainStringAlloc(fba.allocator(), raw_str)) |cooked_stack| {
         return str_interner.intern(cooked_stack);
     } else |_| {}
     const backing = str_interner.backing_allocator;
-    if (lexer.cookStringLiteral(backing, raw_str)) |cooked_heap| {
+    if (decodeDr24PlainStringAlloc(backing, raw_str)) |cooked_heap| {
         defer backing.free(cooked_heap);
         return str_interner.intern(cooked_heap);
     } else |_| {
@@ -5391,6 +5491,34 @@ pub const SymbolTable = struct {
         return .{ .found = resolved_idx };
     }
 
+    /// Returns `true` when `sym_idx` is exported at an effective external `pub` boundary (all enclosing nominals/modules `pub`).
+    pub fn isEffectivePubBoundary(self: *const SymbolTable, sym_idx: SymbolIndex) bool {
+        if (sym_idx.isNone() or sym_idx.asInt() >= self.symbols.items.len) return false;
+        const sym = self.getSymbol(sym_idx);
+        if (sym.visibility != .public) return false;
+        var cur_scope = sym.scope_id;
+        var steps: usize = 0;
+        while (!cur_scope.isNone() and cur_scope.asInt() < self.scope_arena.countScopes() and steps <= MAX_SCOPE_DEPTH) : (steps += 1) {
+            const scope_rec = self.scope_arena.getScope(cur_scope);
+            if (scope_rec.kind == .nominal_type_scope or scope_rec.kind == .module_scope) {
+                if (!scope_rec.owner_def_id.isNone()) {
+                    if (self.def_to_symbol.get(scope_rec.owner_def_id.asInt())) |owner_idx| {
+                        const owner_sym = self.getSymbol(owner_idx);
+                        if ((owner_sym.kind == .struct_sym or owner_sym.kind == .enum_sym or
+                            owner_sym.kind == .union_sym or owner_sym.kind == .bit_field_sym or
+                            owner_sym.kind == .module_sym or owner_sym.kind == .trait_sym) and
+                            owner_sym.visibility != .public)
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+            cur_scope = scope_rec.parent;
+        }
+        return true;
+    }
+
     /// Finds the closest visible candidate identifier to `query_text` using bounded Damerau-Levenshtein distance.
     pub fn suggestClosestSymbol(
         self: *const SymbolTable,
@@ -6005,6 +6133,8 @@ pub const ItemHeaderMetadata = struct {
     repr_int_token: TokenIndex = .none,
     /// `true` if `@cfg(…)` appears on this item header (`SE-18`).
     has_cfg_attr: bool = false,
+    /// Packed alignment cap (`packed: 1|2|4|8|16`), `@inline` mode, and `@cold`/`@noinline` flags (`DR-24`).
+    layout_inline_flags: SymbolLayoutInlineFlags = .{},
     /// `true` if `@trusted` appears on this item or `extern` block header (`DR-10` §2.3).
     is_trusted: bool = false,
     /// `true` if `@thread_local` appears on this `extern static` item header (`DR-10`).
@@ -6145,16 +6275,278 @@ pub fn isForbiddenExecutableSection(section_name: []const u8) bool {
     return false;
 }
 
-/// Strips outer quotes (`"…"`, `b"…"`, or `r#"…"#`) and decodes standard `\xNN` / `\u{…}` escapes into `out_buf`.
-fn unquoteAttrStringLexeme(lexeme: []const u8, out_buf: *[256]u8) []const u8 {
-    if (std.mem.startsWith(u8, lexeme, "br") or std.mem.startsWith(u8, lexeme, "r")) {
-        var hash_count: usize = 0;
-        var idx: usize = if (std.mem.startsWith(u8, lexeme, "br")) 2 else 1;
-        while (idx < lexeme.len and lexeme[idx] == '#') : (idx += 1) {
-            hash_count += 1;
+/// Parsed delimiter view of a plain, raw, or byte string literal (`ADR-24B`).
+pub const Dr24StringBodyView = struct {
+    /// Inner body slice between the opening `"` and closing `"` delimiters.
+    raw_inner: []const u8,
+    /// `true` for raw `r"…"`, `r#"…"#`, `br"…"`, or `br#"…"#` literals.
+    is_raw: bool,
+    /// `true` for byte `b"…"`, `br"…"`, or `br#"…"#` literals.
+    is_byte: bool,
+    /// `true` when `raw_inner` opens immediately with `\n` or `\r\n` (`"<newline> … "` multiline mode).
+    is_multiline: bool,
+    /// Byte length of the initial opening newline (`1` for `\n`, `2` for `\r\n`, `0` when single-line).
+    open_nl_len: u8,
+    /// Closing delimiter indentation column `C` in ASCII spaces (`0` when single-line).
+    closing_indent: u32,
+    /// Slice of multiline content lines excluding the opening newline and closing `\r?\n` + `C` spaces.
+    multiline_content: []const u8,
+};
+
+/// Extracts the inner body and `ADR-24B` `"<newline> … "` multiline indentation geometry from `lexeme`.
+pub fn extractDr24StringBodyView(lexeme: []const u8) ?Dr24StringBodyView {
+    var cursor: usize = 0;
+    var is_byte = false;
+    var is_raw = false;
+    if (std.mem.startsWith(u8, lexeme, "br")) {
+        is_byte = true;
+        is_raw = true;
+        cursor = 2;
+    } else if (std.mem.startsWith(u8, lexeme, "r")) {
+        is_raw = true;
+        cursor = 1;
+    } else if (std.mem.startsWith(u8, lexeme, "b")) {
+        is_byte = true;
+        cursor = 1;
+    } else if (std.mem.startsWith(u8, lexeme, "f")) {
+        cursor = 1;
+    }
+    var hash_count: usize = 0;
+    while (cursor < lexeme.len and lexeme[cursor] == '#') : (cursor += 1) {
+        hash_count += 1;
+    }
+    if (cursor >= lexeme.len or lexeme[cursor] != '"') return null;
+    if (lexeme.len < cursor + 2 + hash_count) return null;
+    const close_quote_idx = lexeme.len - 1 - hash_count;
+    if (lexeme[close_quote_idx] != '"') return null;
+
+    var raw_inner = lexeme[cursor + 1 .. close_quote_idx];
+    // Gracefully strip legacy `"""` fences during error recovery if encountered:
+    if (hash_count == 0 and raw_inner.len >= 4 and
+        std.mem.startsWith(u8, raw_inner, "\"\"") and std.mem.endsWith(u8, raw_inner, "\"\""))
+    {
+        raw_inner = raw_inner[2 .. raw_inner.len - 2];
+    }
+
+    var open_nl_len: u8 = 0;
+    if (raw_inner.len >= 1 and raw_inner[0] == '\n') {
+        open_nl_len = 1;
+    } else if (raw_inner.len >= 2 and raw_inner[0] == '\r' and raw_inner[1] == '\n') {
+        open_nl_len = 2;
+    }
+    if (open_nl_len == 0) {
+        return .{
+            .raw_inner = raw_inner,
+            .is_raw = is_raw,
+            .is_byte = is_byte,
+            .is_multiline = false,
+            .open_nl_len = 0,
+            .closing_indent = 0,
+            .multiline_content = raw_inner,
+        };
+    }
+
+    const after_open = raw_inner[open_nl_len..];
+    if (std.mem.lastIndexOfScalar(u8, after_open, '\n')) |last_nl| {
+        const trailing_slice = after_open[last_nl + 1 ..];
+        var all_spaces = true;
+        for (trailing_slice) |trail_ch| {
+            if (trail_ch != ' ' and trail_ch != '\t') {
+                all_spaces = false;
+                break;
+            }
         }
-        if (idx < lexeme.len and lexeme[idx] == '"' and lexeme.len >= idx + 2 + hash_count) {
-            return lexeme[idx + 1 .. lexeme.len - 1 - hash_count];
+        if (all_spaces) {
+            const content_end = if (last_nl > 0 and after_open[last_nl - 1] == '\r') last_nl - 1 else last_nl;
+            return .{
+                .raw_inner = raw_inner,
+                .is_raw = is_raw,
+                .is_byte = is_byte,
+                .is_multiline = true,
+                .open_nl_len = open_nl_len,
+                .closing_indent = @intCast(trailing_slice.len),
+                .multiline_content = after_open[0..content_end],
+            };
+        }
+    } else {
+        var only_spaces = true;
+        for (after_open) |trail_ch| {
+            if (trail_ch != ' ' and trail_ch != '\t') {
+                only_spaces = false;
+                break;
+            }
+        }
+        if (only_spaces) {
+            return .{
+                .raw_inner = raw_inner,
+                .is_raw = is_raw,
+                .is_byte = is_byte,
+                .is_multiline = true,
+                .open_nl_len = open_nl_len,
+                .closing_indent = @intCast(after_open.len),
+                .multiline_content = "",
+            };
+        }
+    }
+
+    return .{
+        .raw_inner = raw_inner,
+        .is_raw = is_raw,
+        .is_byte = is_byte,
+        .is_multiline = true,
+        .open_nl_len = open_nl_len,
+        .closing_indent = 0,
+        .multiline_content = after_open,
+    };
+}
+
+/// Dedents `multiline_content` by stripping up to `closing_indent` leading `' '` bytes per line and normalizing `\r\n` to `\n`.
+pub fn dedentMultilineContentAlloc(
+    allocator: std.mem.Allocator,
+    multiline_content: []const u8,
+    closing_indent: usize,
+) ![]u8 {
+    if (multiline_content.len == 0) return allocator.alloc(u8, 0);
+    var out_buf: std.ArrayList(u8) = .empty;
+    errdefer out_buf.deinit(allocator);
+    try out_buf.ensureTotalCapacity(allocator, multiline_content.len);
+
+    var line_iter = std.mem.splitScalar(u8, multiline_content, '\n');
+    var is_first_line = true;
+    while (line_iter.next()) |raw_line| {
+        if (!is_first_line) {
+            try out_buf.append(allocator, '\n');
+        }
+        is_first_line = false;
+        const clean_line = if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r')
+            raw_line[0 .. raw_line.len - 1]
+        else
+            raw_line;
+        if (clean_line.len == 0) continue;
+
+        var leading_spaces: usize = 0;
+        while (leading_spaces < clean_line.len and leading_spaces < closing_indent and
+            clean_line[leading_spaces] == ' ') : (leading_spaces += 1)
+        {}
+        if (leading_spaces == clean_line.len) continue;
+        try out_buf.appendSlice(allocator, clean_line[leading_spaces..]);
+    }
+    return out_buf.toOwnedSlice(allocator);
+}
+
+/// Appends decoded backslash escapes from `segment` into `out_buf` (`{` and `}` remain literal per `ADR-24B`).
+fn appendDecodedPlainEscapes(
+    allocator: std.mem.Allocator,
+    segment: []const u8,
+    is_byte: bool,
+    out_buf: *std.ArrayList(u8),
+) !void {
+    var i: usize = 0;
+    while (i < segment.len) {
+        if (segment[i] != '\\' or i + 1 >= segment.len) {
+            try out_buf.append(allocator, segment[i]);
+            i += 1;
+            continue;
+        }
+        const esc_ch = segment[i + 1];
+        i += 2;
+        switch (esc_ch) {
+            'n' => try out_buf.append(allocator, '\n'),
+            'r' => try out_buf.append(allocator, '\r'),
+            't' => try out_buf.append(allocator, '\t'),
+            '0' => try out_buf.append(allocator, 0),
+            '\\', '"', '\'' => try out_buf.append(allocator, esc_ch),
+            'x' => {
+                if (i + 2 <= segment.len) {
+                    const hi_nib = std.fmt.charToDigit(segment[i], 16) catch null;
+                    const lo_nib = std.fmt.charToDigit(segment[i + 1], 16) catch null;
+                    if (hi_nib != null and lo_nib != null) {
+                        const byte_val: u8 = (@as(u8, hi_nib.?) << 4) | @as(u8, lo_nib.?);
+                        if (!is_byte and byte_val >= 0x80) return error.InvalidStringLiteral;
+                        try out_buf.append(allocator, byte_val);
+                        i += 2;
+                        continue;
+                    }
+                }
+                return error.InvalidStringLiteral;
+            },
+            'u' => {
+                if (is_byte) return error.InvalidStringLiteral;
+                if (i < segment.len and segment[i] == '{') {
+                    if (std.mem.indexOfScalarPos(u8, segment, i + 1, '}')) |close_brace| {
+                        const hex_digits = segment[i + 1 .. close_brace];
+                        const codepoint = std.fmt.parseInt(u21, hex_digits, 16) catch return error.InvalidStringLiteral;
+                        if (!std.unicode.utf8ValidCodepoint(codepoint)) return error.InvalidStringLiteral;
+                        var utf8_seq: [4]u8 = undefined;
+                        const enc_len = std.unicode.utf8Encode(codepoint, &utf8_seq) catch return error.InvalidStringLiteral;
+                        try out_buf.appendSlice(allocator, utf8_seq[0..enc_len]);
+                        i = close_brace + 1;
+                        continue;
+                    }
+                }
+                return error.InvalidStringLiteral;
+            },
+            else => try out_buf.append(allocator, esc_ch),
+        }
+    }
+}
+
+/// Decodes any `ADR-24B` plain, raw, or byte string `lexeme` (single-line or `"<newline> … "`), keeping `{` and `}` literal.
+pub fn decodeDr24PlainStringAlloc(
+    allocator: std.mem.Allocator,
+    lexeme: []const u8,
+) error{ InvalidStringLiteral, OutOfMemory }![]u8 {
+    const view = extractDr24StringBodyView(lexeme) orelse return error.InvalidStringLiteral;
+    if (view.is_multiline) {
+        const dedented = try dedentMultilineContentAlloc(allocator, view.multiline_content, view.closing_indent);
+        if (view.is_raw) {
+            if (view.is_byte) {
+                for (dedented) |raw_byte| {
+                    if (raw_byte >= 0x80) {
+                        allocator.free(dedented);
+                        return error.InvalidStringLiteral;
+                    }
+                }
+            }
+            return dedented;
+        }
+        defer allocator.free(dedented);
+        var out_buf: std.ArrayList(u8) = .empty;
+        errdefer out_buf.deinit(allocator);
+        try out_buf.ensureTotalCapacity(allocator, dedented.len);
+        try appendDecodedPlainEscapes(allocator, dedented, view.is_byte, &out_buf);
+        return out_buf.toOwnedSlice(allocator);
+    }
+
+    if (view.is_raw) {
+        if (view.is_byte) {
+            for (view.raw_inner) |raw_byte| {
+                if (raw_byte >= 0x80) return error.InvalidStringLiteral;
+            }
+        }
+        return allocator.dupe(u8, view.raw_inner);
+    }
+    var out_buf: std.ArrayList(u8) = .empty;
+    errdefer out_buf.deinit(allocator);
+    try out_buf.ensureTotalCapacity(allocator, view.raw_inner.len);
+    try appendDecodedPlainEscapes(allocator, view.raw_inner, view.is_byte, &out_buf);
+    return out_buf.toOwnedSlice(allocator);
+}
+
+/// Strips outer quotes (`"…"`, `b"…"`, `r#"…"#`, or `"<newline> … "`) and decodes backslash escapes into `out_buf`.
+fn unquoteAttrStringLexeme(lexeme: []const u8, out_buf: *[256]u8) []const u8 {
+    var scratch_buf: [2048]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch_buf);
+    if (decodeDr24PlainStringAlloc(fba.allocator(), lexeme)) |decoded| {
+        const copy_len = @min(decoded.len, out_buf.len);
+        @memcpy(out_buf[0..copy_len], decoded[0..copy_len]);
+        return out_buf[0..copy_len];
+    } else |_| {}
+
+    if (extractDr24StringBodyView(lexeme)) |view| {
+        if (view.is_raw and !view.is_multiline) return view.raw_inner;
+        if (!view.is_multiline and std.mem.indexOfScalar(u8, view.raw_inner, '\\') == null) {
+            return view.raw_inner;
         }
     }
     const inner = if (lexeme.len >= 3 and lexeme[0] == 'b' and lexeme[1] == '"' and lexeme[lexeme.len - 1] == '"')
@@ -6163,81 +6555,68 @@ fn unquoteAttrStringLexeme(lexeme: []const u8, out_buf: *[256]u8) []const u8 {
         lexeme[1 .. lexeme.len - 1]
     else
         lexeme;
-    if (std.mem.indexOfScalar(u8, inner, '\\') == null) return inner;
+    const fallback_len = @min(inner.len, out_buf.len);
+    @memcpy(out_buf[0..fallback_len], inner[0..fallback_len]);
+    return out_buf[0..fallback_len];
+}
 
-    var out_len: usize = 0;
-    var i: usize = 0;
-    while (i < inner.len and out_len < out_buf.len) {
-        if (inner[i] != '\\' or i + 1 >= inner.len) {
-            out_buf[out_len] = inner[i];
-            out_len += 1;
-            i += 1;
-            continue;
-        }
-        const esc_ch = inner[i + 1];
-        i += 2;
-        switch (esc_ch) {
-            'n' => {
-                out_buf[out_len] = '\n';
-                out_len += 1;
-            },
-            'r' => {
-                out_buf[out_len] = '\r';
-                out_len += 1;
-            },
-            't' => {
-                out_buf[out_len] = '\t';
-                out_len += 1;
-            },
-            '0' => {
-                out_buf[out_len] = 0;
-                out_len += 1;
-            },
-            '\\', '"', '\'' => {
-                out_buf[out_len] = esc_ch;
-                out_len += 1;
-            },
-            'x' => {
-                if (i + 2 <= inner.len) {
-                    const hi_nibble = std.fmt.charToDigit(inner[i], 16) catch null;
-                    const lo_nibble = std.fmt.charToDigit(inner[i + 1], 16) catch null;
-                    if (hi_nibble != null and lo_nibble != null) {
-                        out_buf[out_len] = (@as(u8, hi_nibble.?) << 4) | @as(u8, lo_nibble.?);
-                        out_len += 1;
-                        i += 2;
-                        continue;
-                    }
-                }
-                out_buf[out_len] = 'x';
-                out_len += 1;
-            },
-            'u' => {
-                if (i < inner.len and inner[i] == '{') {
-                    if (std.mem.indexOfScalarPos(u8, inner, i + 1, '}')) |close_brace| {
-                        const hex_digits = inner[i + 1 .. close_brace];
-                        if (std.fmt.parseInt(u21, hex_digits, 16)) |codepoint| {
-                            if (std.unicode.utf8ValidCodepoint(codepoint) and out_len + 4 <= out_buf.len) {
-                                const encoded_len = std.unicode.utf8Encode(
-                                    codepoint,
-                                    out_buf[out_len .. out_len + 4],
-                                ) catch 0;
-                                out_len += encoded_len;
-                                i = close_brace + 1;
-                                continue;
-                            }
-                        } else |_| {}
-                    }
-                }
-                out_buf[out_len] = 'u';
-                out_len += 1;
-            },
-            else => {
-                out_buf[out_len] = esc_ch;
-                out_len += 1;
-            },
+/// Computes the exact deletion `Span` for removing a standalone-line or inline `@attribute` without leaving blank lines.
+pub fn computeAttributeRemovalSpan(source: []const u8, file_id: FileId, attr_span: Span) Span {
+    if (attr_span.file_id.isNone() or attr_span.start_byte > attr_span.end_byte or
+        attr_span.end_byte > source.len)
+    {
+        return attr_span;
+    }
+    const start_pos: usize = attr_span.start_byte;
+    const end_pos: usize = attr_span.end_byte;
+
+    // [1] Locate the start of the line containing `attr_span`:
+    var line_start: usize = start_pos;
+    while (line_start > 0 and source[line_start - 1] != '\n') : (line_start -= 1) {}
+    var is_first_on_line = true;
+    for (source[line_start..start_pos]) |lead_ch| {
+        if (lead_ch != ' ' and lead_ch != '\t') {
+            is_first_on_line = false;
+            break;
         }
     }
-    return out_buf[0..out_len];
+
+    // [2] Scan trailing horizontal whitespace on the same line:
+    var after_ws: usize = end_pos;
+    while (after_ws < source.len and (source[after_ws] == ' ' or source[after_ws] == '\t')) : (after_ws += 1) {}
+    const is_at_eol = after_ws == source.len or
+        source[after_ws] == '\n' or
+        (after_ws + 1 < source.len and source[after_ws] == '\r' and source[after_ws + 1] == '\n');
+
+    if (is_first_on_line and is_at_eol) {
+        const line_end: usize = if (after_ws < source.len and source[after_ws] == '\n')
+            after_ws + 1
+        else if (after_ws + 1 < source.len and source[after_ws] == '\r' and source[after_ws + 1] == '\n')
+            after_ws + 2
+        else
+            after_ws;
+        return Span.init(file_id, @intCast(line_start), @intCast(line_end));
+    }
+
+    // [3] Inline attribute followed by another attribute or item keyword on the same line:
+    if (after_ws > end_pos and !is_at_eol and !std.mem.startsWith(u8, source[after_ws..], "//")) {
+        return Span.init(file_id, @intCast(start_pos), @intCast(after_ws));
+    }
+
+    // [4] Trailing attribute at end of a shared line (consume preceding space if preceded by a kept token):
+    if (!is_first_on_line) {
+        var before_ws: usize = start_pos;
+        while (before_ws > line_start and (source[before_ws - 1] == ' ' or source[before_ws - 1] == '\t')) : (before_ws -= 1) {}
+        const lead_slice = std.mem.trim(u8, source[line_start..before_ws], " \t");
+        if (!std.mem.endsWith(u8, lead_slice, "@inline") and
+            !std.mem.endsWith(u8, lead_slice, "@no_alloc") and
+            !std.mem.endsWith(u8, lead_slice, "@no_panic") and
+            !std.mem.endsWith(u8, lead_slice, "@no_block"))
+        {
+            return Span.init(file_id, @intCast(before_ws), @intCast(end_pos));
+        }
+    }
+    return attr_span;
 }
 
 /// Extracts an unsigned 32-bit integer value from a literal lexeme (allowing `_` separators and `0x`/`0b`/`0o` prefixes).
@@ -6390,8 +6769,371 @@ fn extractStdCapBoundaryMasks(
     }
 }
 
-/// Extracts `@repr(C | c | packed | align: N)` metadata inside `[arg_start .. attr_end)`.
+/// Emits `E0440` (`e0440_invalid_repr_or_inline_attribute`) with an optional `MachineApplicable` replacement fix.
+fn emitInvalidReprOrInlineDiagnostic(
+    sink: *DiagnosticSink,
+    interner: ?*StringInterner,
+    span: Span,
+    message: []const u8,
+    label_text: []const u8,
+    fix_message: ?[]const u8,
+    fix_replacement: ?[]const u8,
+) !void {
+    if (span.file_id.isNone()) return;
+    for (sink.asSlice()) |existing| {
+        if (existing.code == .e0440_invalid_repr_or_inline_attribute and
+            existing.primary_span.file_id == span.file_id and
+            existing.primary_span.start_byte <= span.end_byte and
+            span.start_byte <= existing.primary_span.end_byte)
+        {
+            return;
+        }
+    }
+    const arena_alloc = sink.arena.asAllocator();
+    const msg_owned = try arena_alloc.dupe(u8, message);
+    const lbl_owned = try arena_alloc.dupe(u8, label_text);
+    const labels = try arena_alloc.alloc(LabeledSpan, 1);
+    labels[0] = .{ .span = span, .label = lbl_owned, .style = .primary };
+
+    if (fix_replacement) |rep_str| {
+        if (interner) |str_interner| {
+            const rep_id = try str_interner.intern(rep_str);
+            const edits = try arena_alloc.alloc(TextEdit, 1);
+            edits[0] = .{
+                .file_id = span.file_id,
+                .start_byte = span.start_byte,
+                .end_byte = span.end_byte,
+                .replacement_id = rep_id,
+            };
+            const fixes = try arena_alloc.alloc(SuggestedFix, 1);
+            fixes[0] = .{
+                .message = try arena_alloc.dupe(u8, fix_message orelse "replace with canonical `@repr` argument"),
+                .applicability = .machine_applicable,
+                .priority = .syntax_canonicalization,
+                .edits = edits,
+            };
+            _ = try sink.emit(.{
+                .code = .e0440_invalid_repr_or_inline_attribute,
+                .severity = .err,
+                .primary_span = span,
+                .message = msg_owned,
+                .labels = labels,
+                .suggestions = fixes,
+            });
+            return;
+        }
+    }
+    _ = try sink.emit(.{
+        .code = .e0440_invalid_repr_or_inline_attribute,
+        .severity = .err,
+        .primary_span = span,
+        .message = msg_owned,
+        .labels = labels,
+    });
+}
+
+/// Extracts `@repr([C | transparent,] [packed: bool | K,] [align: N | .CacheLine,] [zero_pad: bool])` metadata (`ADR-24C`).
 fn extractReprAttr(
+    source: []const u8,
+    file_id: FileId,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    interner: ?*StringInterner,
+    arg_start: usize,
+    attr_end: usize,
+    meta: *ItemHeaderMetadata,
+    diagnostic_sink: ?*DiagnosticSink,
+) !void {
+    const ReprKeyState = enum { none, packed_key, align_key, zero_pad_key, other_key };
+    var active_key: ReprKeyState = .none;
+    var has_key_sep = false;
+    var paren_depth: u32 = 0;
+    var dot_tok: TokenIndex = .none;
+    var arg_cur = arg_start;
+    while (arg_cur < attr_end) : (arg_cur += 1) {
+        const arg_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cur)));
+        if (arg_leaf.subtree_size > 1 or arg_leaf.flags.is_missing_or_injected or
+            arg_leaf.token.isNone() or arg_leaf.token.asInt() >= token_buffer.countTokens())
+        {
+            continue;
+        }
+        const arg_kind = token_buffer.getToken(arg_leaf.token).kind;
+        if (arg_kind == .lparen) {
+            paren_depth += 1;
+            continue;
+        } else if (arg_kind == .rparen) {
+            if (paren_depth <= 1) break;
+            paren_depth -= 1;
+            continue;
+        } else if (paren_depth != 1) {
+            continue;
+        } else if (arg_kind == .comma) {
+            active_key = .none;
+            has_key_sep = false;
+            dot_tok = .none;
+            continue;
+        } else if (arg_kind == .colon or arg_kind == .eq) {
+            has_key_sep = true;
+            continue;
+        } else if (arg_kind == .dot) {
+            dot_tok = arg_leaf.token;
+            continue;
+        }
+
+        const repr_lex = extractTokenSlice(source, token_buffer, arg_leaf.token);
+        if (!has_key_sep and active_key == .none) {
+            const next_tok = peekNextAttrLeafToken(token_buffer, cst_arena, arg_cur + 1, attr_end);
+            const next_kind: TokenKind = if (!next_tok.isNone()) token_buffer.getToken(next_tok).kind else .eof;
+            if (next_kind == .colon or next_kind == .eq) {
+                if (std.mem.eql(u8, repr_lex, "packed")) {
+                    active_key = .packed_key;
+                } else if (std.mem.eql(u8, repr_lex, "align")) {
+                    active_key = .align_key;
+                } else if (std.mem.eql(u8, repr_lex, "zero_pad")) {
+                    active_key = .zero_pad_key;
+                } else {
+                    active_key = .other_key;
+                }
+                continue;
+            }
+            if (arg_kind != .prim_type and !isIdentifierToken(arg_kind)) continue;
+            if (std.mem.eql(u8, repr_lex, "C")) {
+                meta.contract_flags.is_repr_c = true;
+                if (meta.repr_tag_bits == 0) meta.repr_tag_bits = 32;
+            } else if (std.mem.eql(u8, repr_lex, "c")) {
+                meta.contract_flags.is_repr_c = true;
+                if (meta.repr_tag_bits == 0) meta.repr_tag_bits = 32;
+                if (diagnostic_sink) |sink| {
+                    try emitInvalidReprOrInlineDiagnostic(
+                        sink,
+                        interner,
+                        token_buffer.getTokenSpan(file_id, arg_leaf.token),
+                        "lowercase `c` in `@repr(c)` is invalid; write `@repr(C)`",
+                        "expected uppercase `C` here",
+                        "replace `c` with `C`",
+                        "C",
+                    );
+                }
+            } else if (std.mem.eql(u8, repr_lex, "transparent")) {
+                meta.extra_flags.is_repr_transparent = true;
+            } else if (std.mem.eql(u8, repr_lex, "packed")) {
+                meta.contract_flags.is_packed = true;
+                if (meta.layout_inline_flags.packed_align_log2_plus1 == 0) {
+                    meta.layout_inline_flags.packed_align_log2_plus1 = 1;
+                }
+            } else if (REPR_TAG_BITS_MAP.get(repr_lex)) |tag_bits| {
+                meta.repr_tag_bits = tag_bits;
+                meta.extra_flags.has_repr_int = true;
+                if (meta.repr_int_token.isNone()) meta.repr_int_token = arg_leaf.token;
+            }
+            continue;
+        }
+
+        switch (active_key) {
+            .packed_key => {
+                if (arg_kind == .kw_true) {
+                    meta.contract_flags.is_packed = true;
+                    meta.layout_inline_flags.packed_align_log2_plus1 = 1;
+                } else if (arg_kind == .kw_false) {
+                    meta.contract_flags.is_packed = false;
+                    meta.layout_inline_flags.packed_align_log2_plus1 = 0;
+                } else if (arg_kind == .int_lit) {
+                    if (extractAttrUint32Lexeme(repr_lex)) |cap_bytes| {
+                        if (cap_bytes == 1 or cap_bytes == 2 or cap_bytes == 4 or cap_bytes == 8 or cap_bytes == 16) {
+                            meta.contract_flags.is_packed = true;
+                            meta.layout_inline_flags.packed_align_log2_plus1 =
+                                @as(u3, @intCast(std.math.log2_int(u32, cap_bytes))) + 1;
+                        }
+                    }
+                }
+            },
+            .align_key => {
+                if (!dot_tok.isNone() and (isIdentifierToken(arg_kind) or arg_kind == .prim_type)) {
+                    if (std.mem.eql(u8, repr_lex, "CacheLine")) {
+                        meta.contract_flags.is_cache_aligned = true;
+                    } else if (std.ascii.eqlIgnoreCase(repr_lex, "cacheline") or
+                        std.ascii.eqlIgnoreCase(repr_lex, "cache_line"))
+                    {
+                        meta.contract_flags.is_cache_aligned = true;
+                        if (diagnostic_sink) |sink| {
+                            const dot_sp = token_buffer.getTokenSpan(file_id, dot_tok);
+                            const id_sp = token_buffer.getTokenSpan(file_id, arg_leaf.token);
+                            try emitInvalidReprOrInlineDiagnostic(
+                                sink,
+                                interner,
+                                Span.init(file_id, dot_sp.start_byte, id_sp.end_byte),
+                                "invalid cache-line alignment selector; write `align: .CacheLine`",
+                                "expected `.CacheLine` here",
+                                "replace with `.CacheLine`",
+                                ".CacheLine",
+                            );
+                        }
+                    }
+                    dot_tok = .none;
+                } else if (dot_tok.isNone() and isIdentifierToken(arg_kind) and
+                    (std.ascii.eqlIgnoreCase(repr_lex, "cacheline") or
+                        std.ascii.eqlIgnoreCase(repr_lex, "cache_line")))
+                {
+                    meta.contract_flags.is_cache_aligned = true;
+                    if (diagnostic_sink) |sink| {
+                        try emitInvalidReprOrInlineDiagnostic(
+                            sink,
+                            interner,
+                            token_buffer.getTokenSpan(file_id, arg_leaf.token),
+                            "invalid cache-line alignment selector; write `align: .CacheLine`",
+                            "expected `.CacheLine` here",
+                            "replace with `.CacheLine`",
+                            ".CacheLine",
+                        );
+                    }
+                } else if (arg_kind == .int_lit) {
+                    const next_after = peekNextAttrLeafToken(token_buffer, cst_arena, arg_cur + 1, attr_end);
+                    const next_after_kind: TokenKind = if (!next_after.isNone())
+                        token_buffer.getToken(next_after).kind
+                    else
+                        .eof;
+                    if (next_after_kind == .comma or next_after_kind == .rparen or next_after_kind == .eof) {
+                        if (extractAttrUint32Lexeme(repr_lex)) |align_bytes| {
+                            if (align_bytes > 0 and std.math.isPowerOfTwo(align_bytes) and align_bytes <= (@as(u32, 1) << 29)) {
+                                const log2_plus1: u8 = @as(u8, @intCast(std.math.log2_int(u32, align_bytes))) + 1;
+                                meta.explicit_align_log2_plus1 = @max(meta.explicit_align_log2_plus1, log2_plus1);
+                            }
+                        }
+                    }
+                }
+            },
+            .zero_pad_key => {
+                if (arg_kind == .kw_true) {
+                    meta.contract_flags.is_zero_pad = true;
+                } else if (arg_kind == .kw_false) {
+                    meta.contract_flags.is_zero_pad = false;
+                }
+            },
+            .none, .other_key => {},
+        }
+    }
+}
+
+/// Extracts `@link(name: "…", section: "…")` metadata inside `[arg_start .. attr_end)` and enforces `E0327` (`ADR-24C`).
+fn extractLinkAttr(
+    source: []const u8,
+    file_id: FileId,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    arg_start: usize,
+    attr_end: usize,
+    meta: *ItemHeaderMetadata,
+    diagnostic_sink: ?*DiagnosticSink,
+) !void {
+    const LinkKeyState = enum { none, name_key, section_key, other_key };
+    var active_key: LinkKeyState = .none;
+    var has_key_sep = false;
+    var paren_depth: u32 = 0;
+    var cur = arg_start;
+    while (cur < attr_end) : (cur += 1) {
+        const leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+        if (leaf.subtree_size > 1 or leaf.flags.is_missing_or_injected or
+            leaf.token.isNone() or leaf.token.asInt() >= token_buffer.countTokens())
+        {
+            continue;
+        }
+        const tok_kind = token_buffer.getToken(leaf.token).kind;
+        if (tok_kind == .lparen) {
+            paren_depth += 1;
+            continue;
+        } else if (tok_kind == .rparen) {
+            if (paren_depth <= 1) break;
+            paren_depth -= 1;
+            continue;
+        } else if (paren_depth != 1) {
+            continue;
+        } else if (tok_kind == .comma) {
+            active_key = .none;
+            has_key_sep = false;
+            continue;
+        } else if (tok_kind == .colon or tok_kind == .eq) {
+            has_key_sep = true;
+            continue;
+        }
+
+        if (!has_key_sep and active_key == .none and isIdentifierToken(tok_kind)) {
+            const next_tok = peekNextAttrLeafToken(token_buffer, cst_arena, cur + 1, attr_end);
+            const next_kind: TokenKind = if (!next_tok.isNone()) token_buffer.getToken(next_tok).kind else .eof;
+            if (next_kind == .colon or next_kind == .eq) {
+                const key_lex = extractTokenSlice(source, token_buffer, leaf.token);
+                if (std.mem.eql(u8, key_lex, "name")) {
+                    active_key = .name_key;
+                } else if (std.mem.eql(u8, key_lex, "section")) {
+                    active_key = .section_key;
+                } else {
+                    active_key = .other_key;
+                }
+                continue;
+            }
+        }
+
+        if (has_key_sep and (tok_kind == .string_lit or tok_kind == .byte_string_lit)) {
+            const raw_str = extractTokenSlice(source, token_buffer, leaf.token);
+            var unesc_buf: [256]u8 = undefined;
+            const decoded_str = unquoteAttrStringLexeme(raw_str, &unesc_buf);
+            switch (active_key) {
+                .name_key => {
+                    var has_ctrl_byte = false;
+                    for (decoded_str) |byte_val| {
+                        if (byte_val == 0 or byte_val == '\n' or byte_val == '\r' or
+                            (byte_val < 0x20 and byte_val != 0x01))
+                        {
+                            has_ctrl_byte = true;
+                            break;
+                        }
+                    }
+                    if (!has_ctrl_byte and decoded_str.len > 0) {
+                        const copy_len = @min(decoded_str.len, meta.link_name_buf.len);
+                        @memcpy(meta.link_name_buf[0..copy_len], decoded_str[0..copy_len]);
+                        meta.link_name_len = @intCast(copy_len);
+                        meta.contract_flags.has_link_name = true;
+                    }
+                },
+                .section_key => {
+                    meta.contract_flags.has_link_section = true;
+                    const copy_len = @min(decoded_str.len, meta.link_section_buf.len);
+                    @memcpy(meta.link_section_buf[0..copy_len], decoded_str[0..copy_len]);
+                    meta.link_section_len = @intCast(copy_len);
+                    if (isForbiddenExecutableSection(decoded_str)) {
+                        if (diagnostic_sink) |sink| {
+                            const sec_span = token_buffer.getTokenSpan(file_id, leaf.token);
+                            if (!hasDiagnosticAtSpan(sink, .e0327_forbidden_sandbox_bypass_attribute, sec_span)) {
+                                const msg = try std.fmt.allocPrint(
+                                    sink.arena.asAllocator(),
+                                    "forbidden executable/constructor section `{s}` in `@link(section: …)`",
+                                    .{decoded_str},
+                                );
+                                const labels = [1]LabeledSpan{.{
+                                    .span = sec_span,
+                                    .label = "constructor/destructor/TLS section bypasses `main(ctx)` capability root",
+                                    .style = .primary,
+                                }};
+                                _ = try sink.emit(.{
+                                    .code = .e0327_forbidden_sandbox_bypass_attribute,
+                                    .severity = .err,
+                                    .primary_span = sec_span,
+                                    .message = msg,
+                                    .labels = &labels,
+                                });
+                            }
+                        }
+                    }
+                },
+                .none, .other_key => {},
+            }
+            active_key = .none;
+            has_key_sep = false;
+        }
+    }
+}
+
+/// Extracts `@inline`, `@inline(always)`, or `@inline(never)` mode inside `[arg_start .. attr_end)` (`ADR-24C`).
+fn extractInlineAttr(
     source: []const u8,
     token_buffer: *const TokenBuffer,
     cst_arena: *const LosslessCstArena,
@@ -6399,45 +7141,37 @@ fn extractReprAttr(
     attr_end: usize,
     meta: *ItemHeaderMetadata,
 ) void {
-    var is_expecting_align = false;
-    var arg_cur = arg_start;
-    while (arg_cur < attr_end) : (arg_cur += 1) {
-        const arg_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cur)));
-        if (arg_leaf.subtree_size > 1 or arg_leaf.token.isNone() or
-            arg_leaf.token.asInt() >= token_buffer.countTokens())
+    const first_tok = peekNextAttrLeafToken(token_buffer, cst_arena, arg_start, attr_end);
+    if (first_tok.isNone() or token_buffer.getToken(first_tok).kind != .lparen) {
+        if (meta.layout_inline_flags.inline_mode == .none) {
+            meta.layout_inline_flags.inline_mode = .hint;
+        }
+        return;
+    }
+    var paren_depth: u32 = 0;
+    var cur = arg_start;
+    while (cur < attr_end) : (cur += 1) {
+        const leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+        if (leaf.subtree_size > 1 or leaf.flags.is_missing_or_injected or
+            leaf.token.isNone() or leaf.token.asInt() >= token_buffer.countTokens())
         {
             continue;
         }
-        const arg_kind = token_buffer.getToken(arg_leaf.token).kind;
-        if (arg_kind == .int_lit and is_expecting_align) {
-            const align_lex = extractTokenSlice(source, token_buffer, arg_leaf.token);
-            if (extractAttrUint32Lexeme(align_lex)) |align_bytes| {
-                if (align_bytes > 0 and std.math.isPowerOfTwo(align_bytes) and align_bytes <= (@as(u32, 1) << 29)) {
-                    const log2_plus1: u8 = @as(u8, @intCast(std.math.log2_int(u32, align_bytes))) + 1;
-                    meta.explicit_align_log2_plus1 = @max(meta.explicit_align_log2_plus1, log2_plus1);
-                }
+        const tok_kind = token_buffer.getToken(leaf.token).kind;
+        if (tok_kind == .lparen) {
+            paren_depth += 1;
+        } else if (tok_kind == .rparen) {
+            if (paren_depth <= 1) break;
+            paren_depth -= 1;
+        } else if (paren_depth == 1 and (isIdentifierToken(tok_kind) or tok_kind == .prim_type)) {
+            const mode_lex = extractTokenSlice(source, token_buffer, leaf.token);
+            if (std.mem.eql(u8, mode_lex, "always")) {
+                meta.layout_inline_flags.inline_mode = .always;
+            } else if (std.mem.eql(u8, mode_lex, "never")) {
+                meta.layout_inline_flags.inline_mode = .never;
+                meta.extra_flags.is_noinline = true;
             }
-            is_expecting_align = false;
-            continue;
-        }
-        if (arg_kind == .eq or arg_kind == .colon or arg_kind == .lparen or arg_kind == .rparen) continue;
-        if (arg_kind == .comma) {
-            is_expecting_align = false;
-            continue;
-        }
-        if (arg_kind != .prim_type and !isIdentifierToken(arg_kind)) continue;
-        const repr_lex = extractTokenSlice(source, token_buffer, arg_leaf.token);
-        if (std.mem.eql(u8, repr_lex, "C") or std.mem.eql(u8, repr_lex, "c")) {
-            meta.contract_flags.is_repr_c = true;
-            if (meta.repr_tag_bits == 0) meta.repr_tag_bits = 32;
-        } else if (std.mem.eql(u8, repr_lex, "packed")) {
-            meta.contract_flags.is_packed = true;
-        } else if (std.mem.eql(u8, repr_lex, "align")) {
-            is_expecting_align = true;
-        } else if (REPR_TAG_BITS_MAP.get(repr_lex)) |tag_bits| {
-            meta.repr_tag_bits = tag_bits;
-            meta.extra_flags.has_repr_int = true;
-            if (meta.repr_int_token.isNone()) meta.repr_int_token = arg_leaf.token;
+            break;
         }
     }
 }
@@ -6935,6 +7669,409 @@ pub fn extractItemHeaderMetadataValidated(
     );
 }
 
+/// Collected CST attribute span and argument range for coalesced `E0239` migration fixes (`ADR-24C`).
+const HeaderAttrSpanRecord = struct {
+    /// Parsed `HeaderAttrKind` of this attribute node.
+    kind: HeaderAttrKind,
+    /// Full source span of `@name` or `@name(…)`.
+    attr_span: Span,
+    /// Source slice inside `( … )`, or `""` when unparenthesized.
+    inner_args_slice: []const u8,
+    /// `true` when this attribute is a retired standalone form (`@align`, `@packed`, `@link_name`, etc.).
+    is_retired: bool,
+};
+
+/// Extracts the full `@attr(…)` source `Span` and inner `( … )` slice for `[attr_start .. attr_end)`.
+fn extractHeaderAttrSpanAndArgs(
+    source: []const u8,
+    file_id: FileId,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    attr_start: usize,
+    attr_end: usize,
+) struct { attr_span: Span, inner_args: []const u8 } {
+    var first_tok: TokenIndex = .none;
+    var last_tok: TokenIndex = .none;
+    var lparen_tok: TokenIndex = .none;
+    var rparen_tok: TokenIndex = .none;
+    var paren_depth: u32 = 0;
+    var cur = attr_start + 1;
+    while (cur < attr_end) : (cur += 1) {
+        const leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+        if (leaf.subtree_size > 1 or leaf.flags.is_missing_or_injected or
+            leaf.token.isNone() or leaf.token.asInt() >= token_buffer.countTokens())
+        {
+            continue;
+        }
+        const tok_rec = token_buffer.getToken(leaf.token);
+        if (tok_rec.flags.is_synthesized or tok_rec.kind == .eof) continue;
+        if (first_tok.isNone()) first_tok = leaf.token;
+        last_tok = leaf.token;
+        if (tok_rec.kind == .lparen) {
+            if (paren_depth == 0) lparen_tok = leaf.token;
+            paren_depth += 1;
+        } else if (tok_rec.kind == .rparen and paren_depth > 0) {
+            paren_depth -= 1;
+            if (paren_depth == 0) rparen_tok = leaf.token;
+        }
+    }
+    if (first_tok.isNone() or file_id.isNone()) {
+        return .{ .attr_span = Span.ZERO, .inner_args = "" };
+    }
+    const start_sp = token_buffer.getTokenSpan(file_id, first_tok);
+    const end_sp = token_buffer.getTokenSpan(file_id, last_tok);
+    const full_span = Span.init(file_id, start_sp.start_byte, @max(start_sp.end_byte, end_sp.end_byte));
+    var inner_args: []const u8 = "";
+    if (!lparen_tok.isNone() and !rparen_tok.isNone()) {
+        const lp_sp = token_buffer.getTokenSpan(file_id, lparen_tok);
+        const rp_sp = token_buffer.getTokenSpan(file_id, rparen_tok);
+        if (lp_sp.end_byte <= rp_sp.start_byte and rp_sp.start_byte <= source.len) {
+            inner_args = std.mem.trim(u8, source[lp_sp.end_byte..rp_sp.start_byte], " \t\r\n");
+        }
+    }
+    return .{ .attr_span = full_span, .inner_args = inner_args };
+}
+
+/// Emits a single coalesced `E0239` (`e0239_retired_layout_or_link_attribute`) diagnostic with non-overlapping `TextEdit`s.
+fn emitCoalescedRetiredGroupDiagnostic(
+    sink: *DiagnosticSink,
+    interner: ?*StringInterner,
+    source: []const u8,
+    file_id: FileId,
+    group_records: []const HeaderAttrSpanRecord,
+    merged_replacement: []const u8,
+    message: []const u8,
+    label_text: []const u8,
+    fix_message: []const u8,
+) !void {
+    if (group_records.len == 0 or file_id.isNone()) return;
+    var primary_span = group_records[0].attr_span;
+    for (group_records) |rec| {
+        if (rec.is_retired) {
+            primary_span = rec.attr_span;
+            break;
+        }
+    }
+    if (primary_span.file_id.isNone()) return;
+    for (sink.asSlice()) |existing| {
+        if (existing.code == .e0239_retired_layout_or_link_attribute and
+            existing.primary_span.file_id == primary_span.file_id and
+            existing.primary_span.start_byte <= primary_span.end_byte and
+            primary_span.start_byte <= existing.primary_span.end_byte)
+        {
+            return;
+        }
+    }
+
+    const arena_alloc = sink.arena.asAllocator();
+    const labels = try arena_alloc.alloc(LabeledSpan, 1);
+    labels[0] = .{
+        .span = primary_span,
+        .label = try arena_alloc.dupe(u8, label_text),
+        .style = .primary,
+    };
+
+    if (interner) |str_interner| {
+        const merged_id = try str_interner.intern(merged_replacement);
+        const empty_id = try str_interner.intern("");
+        var edits_list: std.ArrayListUnmanaged(TextEdit) = .empty;
+        try edits_list.ensureTotalCapacity(arena_alloc, group_records.len);
+
+        const first_sp = group_records[0].attr_span;
+        try edits_list.append(arena_alloc, .{
+            .file_id = file_id,
+            .start_byte = first_sp.start_byte,
+            .end_byte = first_sp.end_byte,
+            .replacement_id = merged_id,
+        });
+        var last_end = first_sp.end_byte;
+        var idx: usize = 1;
+        while (idx < group_records.len) : (idx += 1) {
+            const raw_rem = computeAttributeRemovalSpan(source, file_id, group_records[idx].attr_span);
+            const clamped_start = @max(raw_rem.start_byte, last_end);
+            const clamped_end = @max(raw_rem.end_byte, clamped_start);
+            try edits_list.append(arena_alloc, .{
+                .file_id = file_id,
+                .start_byte = clamped_start,
+                .end_byte = clamped_end,
+                .replacement_id = empty_id,
+            });
+            last_end = clamped_end;
+        }
+
+        const fixes = try arena_alloc.alloc(SuggestedFix, 1);
+        fixes[0] = .{
+            .message = try arena_alloc.dupe(u8, fix_message),
+            .applicability = .machine_applicable,
+            .priority = .syntax_canonicalization,
+            .edits = edits_list.items,
+        };
+        _ = try sink.emit(.{
+            .code = .e0239_retired_layout_or_link_attribute,
+            .severity = .err,
+            .primary_span = primary_span,
+            .message = try arena_alloc.dupe(u8, message),
+            .labels = labels,
+            .suggestions = fixes,
+        });
+        return;
+    }
+
+    _ = try sink.emit(.{
+        .code = .e0239_retired_layout_or_link_attribute,
+        .severity = .err,
+        .primary_span = primary_span,
+        .message = try arena_alloc.dupe(u8, message),
+        .labels = labels,
+    });
+}
+
+/// Scans header attributes on `item_cst` to emit coalesced `E0239` diagnostics for retired layout/link attributes (`ADR-24C`).
+fn emitCoalescedRetiredHeaderAttrs(
+    sink: *DiagnosticSink,
+    interner: ?*StringInterner,
+    source: []const u8,
+    file_id: FileId,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    start_idx: usize,
+    end_idx: usize,
+    main_token: TokenIndex,
+    has_retired_layout: bool,
+    has_retired_link: bool,
+) !void {
+    var layout_recs: [16]HeaderAttrSpanRecord = undefined;
+    var layout_count: usize = 0;
+    var link_recs: [16]HeaderAttrSpanRecord = undefined;
+    var link_count: usize = 0;
+
+    var cursor: usize = start_idx + 1;
+    while (cursor < end_idx) : (cursor += 1) {
+        const node = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cursor)));
+        if (!node.token.isNone() and !main_token.isNone() and node.token.asInt() >= main_token.asInt()) {
+            break;
+        }
+        if (node.kind == .visibility_modifier and node.subtree_size > 1) {
+            cursor += @as(usize, node.subtree_size) - 1;
+            continue;
+        }
+        if (node.kind == .attribute) {
+            const attr_end = @min(cursor + @max(@as(usize, node.subtree_size), 1), end_idx);
+            var attr_cur = cursor + 1;
+            while (attr_cur < attr_end) : (attr_cur += 1) {
+                const leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(attr_cur)));
+                if (leaf.subtree_size <= 1 and !leaf.token.isNone() and
+                    leaf.token.asInt() < token_buffer.countTokens())
+                {
+                    const tok_kind = token_buffer.getToken(leaf.token).kind;
+                    if (tok_kind == .at) continue;
+                    if (isIdentifierToken(tok_kind)) {
+                        const attr_name = extractTokenSlice(source, token_buffer, leaf.token);
+                        if (HEADER_ATTR_MAP.get(attr_name)) |attr_kind| {
+                            const span_info = extractHeaderAttrSpanAndArgs(
+                                source,
+                                file_id,
+                                token_buffer,
+                                cst_arena,
+                                cursor,
+                                attr_end,
+                            );
+                            switch (attr_kind) {
+                                .repr, .repr_c, .packed_attr, .align_attr, .cache_aligned, .zero_pad => {
+                                    if (has_retired_layout and layout_count < layout_recs.len) {
+                                        layout_recs[layout_count] = .{
+                                            .kind = attr_kind,
+                                            .attr_span = span_info.attr_span,
+                                            .inner_args_slice = span_info.inner_args,
+                                            .is_retired = (attr_kind != .repr),
+                                        };
+                                        layout_count += 1;
+                                    }
+                                },
+                                .link, .link_name, .link_section => {
+                                    if (has_retired_link and link_count < link_recs.len) {
+                                        link_recs[link_count] = .{
+                                            .kind = attr_kind,
+                                            .attr_span = span_info.attr_span,
+                                            .inner_args_slice = span_info.inner_args,
+                                            .is_retired = (attr_kind != .link),
+                                        };
+                                        link_count += 1;
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            if (node.subtree_size > 1) {
+                cursor += @as(usize, node.subtree_size) - 1;
+            }
+        }
+    }
+
+    const arena_alloc = sink.arena.asAllocator();
+    if (has_retired_layout and layout_count > 0) {
+        var has_c_base = false;
+        var has_transparent_base = false;
+        var packed_arg: ?[]const u8 = null;
+        var align_arg: ?[]const u8 = null;
+        var has_zero_pad = false;
+        var extra_repr_parts: std.ArrayListUnmanaged([]const u8) = .empty;
+
+        for (layout_recs[0..layout_count]) |rec| {
+            switch (rec.kind) {
+                .repr_c => has_c_base = true,
+                .packed_attr => {
+                    has_c_base = true;
+                    packed_arg = if (rec.inner_args_slice.len > 0) rec.inner_args_slice else "true";
+                },
+                .align_attr => {
+                    if (rec.inner_args_slice.len > 0) align_arg = rec.inner_args_slice;
+                },
+                .cache_aligned => align_arg = ".CacheLine",
+                .zero_pad => has_zero_pad = true,
+                .repr => {
+                    var part_iter = std.mem.splitScalar(u8, rec.inner_args_slice, ',');
+                    while (part_iter.next()) |raw_part| {
+                        const part = std.mem.trim(u8, raw_part, " \t\r\n");
+                        if (part.len == 0) continue;
+                        if (std.mem.eql(u8, part, "C") or std.mem.eql(u8, part, "c")) {
+                            has_c_base = true;
+                        } else if (std.mem.eql(u8, part, "transparent")) {
+                            has_transparent_base = true;
+                        } else if (std.mem.eql(u8, part, "packed")) {
+                            has_c_base = true;
+                            packed_arg = "true";
+                        } else if (std.mem.startsWith(u8, part, "packed")) {
+                            if (std.mem.indexOfAny(u8, part, ":=")) |sep_pos| {
+                                packed_arg = std.mem.trim(u8, part[sep_pos + 1 ..], " \t");
+                            }
+                        } else if (std.mem.startsWith(u8, part, "align")) {
+                            if (std.mem.indexOfAny(u8, part, ":=")) |sep_pos| {
+                                align_arg = std.mem.trim(u8, part[sep_pos + 1 ..], " \t");
+                            }
+                        } else if (std.mem.startsWith(u8, part, "zero_pad")) {
+                            has_zero_pad = true;
+                        } else {
+                            try extra_repr_parts.append(arena_alloc, part);
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        var repr_buf: std.ArrayListUnmanaged(u8) = .empty;
+        try repr_buf.appendSlice(arena_alloc, "@repr(");
+        var has_any_part = false;
+        if (has_c_base) {
+            try repr_buf.appendSlice(arena_alloc, "C");
+            has_any_part = true;
+        } else if (has_transparent_base) {
+            try repr_buf.appendSlice(arena_alloc, "transparent");
+            has_any_part = true;
+        }
+        for (extra_repr_parts.items) |extra_p| {
+            if (has_any_part) try repr_buf.appendSlice(arena_alloc, ", ");
+            try repr_buf.appendSlice(arena_alloc, extra_p);
+            has_any_part = true;
+        }
+        if (packed_arg) |pk_val| {
+            if (has_any_part) try repr_buf.appendSlice(arena_alloc, ", ");
+            try repr_buf.appendSlice(arena_alloc, "packed: ");
+            try repr_buf.appendSlice(arena_alloc, pk_val);
+            has_any_part = true;
+        }
+        if (align_arg) |al_val| {
+            if (has_any_part) try repr_buf.appendSlice(arena_alloc, ", ");
+            try repr_buf.appendSlice(arena_alloc, "align: ");
+            try repr_buf.appendSlice(arena_alloc, al_val);
+            has_any_part = true;
+        }
+        if (has_zero_pad) {
+            if (has_any_part) try repr_buf.appendSlice(arena_alloc, ", ");
+            try repr_buf.appendSlice(arena_alloc, "zero_pad: true");
+            has_any_part = true;
+        }
+        try repr_buf.append(arena_alloc, ')');
+
+        try emitCoalescedRetiredGroupDiagnostic(
+            sink,
+            interner,
+            source,
+            file_id,
+            layout_recs[0..layout_count],
+            repr_buf.items,
+            "standalone layout attributes (`@repr_c`, `@align`, `@packed`, `@cache_aligned`, `@zero_pad`) " ++
+                "are retired; consolidate into `@repr(…)`",
+            "retired standalone layout attribute; consolidate into `@repr(…)`",
+            "consolidate layout attributes into `@repr(…)`",
+        );
+    }
+
+    if (has_retired_link and link_count > 0) {
+        var name_arg: ?[]const u8 = null;
+        var section_arg: ?[]const u8 = null;
+        for (link_recs[0..link_count]) |rec| {
+            switch (rec.kind) {
+                .link_name => {
+                    if (rec.inner_args_slice.len > 0) name_arg = rec.inner_args_slice;
+                },
+                .link_section => {
+                    if (rec.inner_args_slice.len > 0) section_arg = rec.inner_args_slice;
+                },
+                .link => {
+                    var part_iter = std.mem.splitScalar(u8, rec.inner_args_slice, ',');
+                    while (part_iter.next()) |raw_part| {
+                        const part = std.mem.trim(u8, raw_part, " \t\r\n");
+                        if (std.mem.startsWith(u8, part, "name")) {
+                            if (std.mem.indexOfAny(u8, part, ":=")) |sep_pos| {
+                                name_arg = std.mem.trim(u8, part[sep_pos + 1 ..], " \t");
+                            }
+                        } else if (std.mem.startsWith(u8, part, "section")) {
+                            if (std.mem.indexOfAny(u8, part, ":=")) |sep_pos| {
+                                section_arg = std.mem.trim(u8, part[sep_pos + 1 ..], " \t");
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        var link_buf: std.ArrayListUnmanaged(u8) = .empty;
+        try link_buf.appendSlice(arena_alloc, "@link(");
+        var has_any_link = false;
+        if (name_arg) |nm_val| {
+            try link_buf.appendSlice(arena_alloc, "name: ");
+            try link_buf.appendSlice(arena_alloc, nm_val);
+            has_any_link = true;
+        }
+        if (section_arg) |sec_val| {
+            if (has_any_link) try link_buf.appendSlice(arena_alloc, ", ");
+            try link_buf.appendSlice(arena_alloc, "section: ");
+            try link_buf.appendSlice(arena_alloc, sec_val);
+            has_any_link = true;
+        }
+        try link_buf.append(arena_alloc, ')');
+
+        try emitCoalescedRetiredGroupDiagnostic(
+            sink,
+            interner,
+            source,
+            file_id,
+            link_recs[0..link_count],
+            link_buf.items,
+            "standalone `@link_name` and `@link_section` attributes are retired; consolidate into `@link(name: …, section: …)`",
+            "retired standalone link attribute; consolidate into `@link(…)`",
+            "consolidate link attributes into `@link(…)`",
+        );
+    }
+}
+
 /// Extracts item header metadata with optional `StringInterner` for machine-applicable attribute migration fixes.
 fn extractItemHeaderMetadataWithInterner(
     source: []const u8,
@@ -6955,6 +8092,9 @@ fn extractItemHeaderMetadataWithInterner(
         start_idx + @max(@as(usize, root_rec.subtree_size), 1),
         cst_arena.countNodes(),
     );
+
+    var has_retired_layout = false;
+    var has_retired_link = false;
 
     var cursor: usize = start_idx + 1;
     while (cursor < end_idx) : (cursor += 1) {
@@ -7033,16 +8173,50 @@ fn extractItemHeaderMetadataWithInterner(
                                 },
                                 .no_panic => meta.contract_flags.is_no_panic = true,
                                 .no_block => meta.contract_flags.is_no_block = true,
-                                .cold, .noinline_attr => meta.extra_flags.is_noinline = true,
+                                .cold => {
+                                    meta.extra_flags.is_noinline = true;
+                                    meta.layout_inline_flags.has_cold_or_noinline_attr = true;
+                                    meta.layout_inline_flags.is_cold_attr = true;
+                                },
+                                .noinline_attr => {
+                                    meta.extra_flags.is_noinline = true;
+                                    meta.layout_inline_flags.has_cold_or_noinline_attr = true;
+                                },
+                                .inline_attr => extractInlineAttr(
+                                    source,
+                                    token_buffer,
+                                    cst_arena,
+                                    attr_cur + 1,
+                                    attr_end,
+                                    &meta,
+                                ),
                                 .not_send => meta.extra_flags.is_not_send = true,
                                 .not_sync => meta.extra_flags.is_not_sync = true,
                                 .linear => meta.contract_flags.is_linear = true,
-                                .zero_pad => meta.contract_flags.is_zero_pad = true,
+                                .zero_pad => {
+                                    meta.contract_flags.is_zero_pad = true;
+                                    has_retired_layout = true;
+                                },
                                 .secret => meta.contract_flags.is_secret = true,
                                 .export_attr => meta.contract_flags.is_export = true,
                                 .local => meta.contract_flags.is_local_only = true,
-                                .cache_aligned => meta.contract_flags.is_cache_aligned = true,
-                                .packed_attr => meta.contract_flags.is_packed = true,
+                                .cache_aligned => {
+                                    meta.contract_flags.is_cache_aligned = true;
+                                    has_retired_layout = true;
+                                },
+                                .packed_attr => {
+                                    meta.contract_flags.is_repr_c = true;
+                                    meta.contract_flags.is_packed = true;
+                                    if (meta.layout_inline_flags.packed_align_log2_plus1 == 0) {
+                                        meta.layout_inline_flags.packed_align_log2_plus1 = 1;
+                                    }
+                                    has_retired_layout = true;
+                                },
+                                .repr_c => {
+                                    meta.contract_flags.is_repr_c = true;
+                                    if (meta.repr_tag_bits == 0) meta.repr_tag_bits = 32;
+                                    has_retired_layout = true;
+                                },
                                 .trusted => {
                                     meta.is_trusted = true;
                                     meta.extra_flags.is_trusted_ffi = true;
@@ -7051,6 +8225,16 @@ fn extractItemHeaderMetadataWithInterner(
                                     meta.is_thread_local = true;
                                     meta.extra_flags.is_thread_local = true;
                                 },
+                                .link => try extractLinkAttr(
+                                    source,
+                                    file_id,
+                                    token_buffer,
+                                    cst_arena,
+                                    attr_cur + 1,
+                                    attr_end,
+                                    &meta,
+                                    diagnostic_sink,
+                                ),
                                 .link_lib => extractSingleStringAttrIntoBuf(
                                     source,
                                     token_buffer,
@@ -7077,14 +8261,17 @@ fn extractItemHeaderMetadataWithInterner(
                                     attr_end,
                                     &meta,
                                 ),
-                                .align_attr => extractAlignAttr(
-                                    source,
-                                    token_buffer,
-                                    cst_arena,
-                                    attr_cur + 1,
-                                    attr_end,
-                                    &meta,
-                                ),
+                                .align_attr => {
+                                    has_retired_layout = true;
+                                    extractAlignAttr(
+                                        source,
+                                        token_buffer,
+                                        cst_arena,
+                                        attr_cur + 1,
+                                        attr_end,
+                                        &meta,
+                                    );
+                                },
                                 .allow_attr => {
                                     const parsed_allow = try extractAndValidateAllowAttrRange(
                                         source,
@@ -7132,14 +8319,17 @@ fn extractItemHeaderMetadataWithInterner(
                                         &meta.has_deprecated_meta,
                                     );
                                 },
-                                .link_name => extractLinkNameAttr(
-                                    source,
-                                    token_buffer,
-                                    cst_arena,
-                                    attr_cur + 1,
-                                    attr_end,
-                                    &meta,
-                                ),
+                                .link_name => {
+                                    has_retired_link = true;
+                                    extractLinkNameAttr(
+                                        source,
+                                        token_buffer,
+                                        cst_arena,
+                                        attr_cur + 1,
+                                        attr_end,
+                                        &meta,
+                                    );
+                                },
                                 .ifunc => {
                                     meta.contract_flags.is_ifunc = true;
                                     if (diagnostic_sink) |sink| {
@@ -7160,16 +8350,19 @@ fn extractItemHeaderMetadataWithInterner(
                                         });
                                     }
                                 },
-                                .link_section => try extractLinkSectionAttr(
-                                    source,
-                                    file_id,
-                                    token_buffer,
-                                    cst_arena,
-                                    attr_cur + 1,
-                                    attr_end,
-                                    &meta,
-                                    diagnostic_sink,
-                                ),
+                                .link_section => {
+                                    has_retired_link = true;
+                                    try extractLinkSectionAttr(
+                                        source,
+                                        file_id,
+                                        token_buffer,
+                                        cst_arena,
+                                        attr_cur + 1,
+                                        attr_end,
+                                        &meta,
+                                        diagnostic_sink,
+                                    );
+                                },
                                 .max_stack => try extractMaxStackAttr(
                                     source,
                                     file_id,
@@ -7196,13 +8389,16 @@ fn extractItemHeaderMetadataWithInterner(
                                         diagnostic_sink,
                                     );
                                 },
-                                .repr => extractReprAttr(
+                                .repr => try extractReprAttr(
                                     source,
+                                    file_id,
                                     token_buffer,
                                     cst_arena,
+                                    interner,
                                     attr_cur + 1,
                                     attr_end,
                                     &meta,
+                                    diagnostic_sink,
                                 ),
                                 .derive => {
                                     var arg_cur = attr_cur + 1;
@@ -7245,6 +8441,24 @@ fn extractItemHeaderMetadataWithInterner(
             if (node.subtree_size > 1) {
                 cursor += @as(usize, node.subtree_size) - 1;
             }
+        }
+    }
+
+    if (has_retired_layout or has_retired_link) {
+        if (diagnostic_sink) |sink| {
+            try emitCoalescedRetiredHeaderAttrs(
+                sink,
+                interner,
+                source,
+                file_id,
+                token_buffer,
+                cst_arena,
+                start_idx,
+                end_idx,
+                main_token,
+                has_retired_layout,
+                has_retired_link,
+            );
         }
     }
     return meta;
@@ -8643,6 +9857,90 @@ pub fn enforceExternalPackageCstHygiene(
                                 .labels = &labels,
                             });
                         }
+                    } else if (std.mem.eql(u8, attr_name, "link") or std.mem.eql(u8, attr_name, "link_section")) {
+                        // Enforce `E0327` on `@link(section: …)` in external packages AND forbidden loader/TLS sections everywhere:
+                        const is_standalone_sec = std.mem.eql(u8, attr_name, "link_section");
+                        var link_depth: u32 = 0;
+                        var is_in_sec_val = is_standalone_sec;
+                        var link_scan = attr_cur + 1;
+                        while (link_scan < attr_end) : (link_scan += 1) {
+                            const sub_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(link_scan)));
+                            if (sub_leaf.subtree_size > 1 or sub_leaf.flags.is_missing_or_injected or
+                                sub_leaf.token.isNone() or sub_leaf.token.asInt() >= total_tokens)
+                            {
+                                continue;
+                            }
+                            const sub_kind = token_buffer.getToken(sub_leaf.token).kind;
+                            if (sub_kind == .lparen) {
+                                link_depth += 1;
+                                continue;
+                            } else if (sub_kind == .rparen) {
+                                if (link_depth <= 1) break;
+                                link_depth -= 1;
+                                continue;
+                            } else if (link_depth != 1) {
+                                continue;
+                            } else if (sub_kind == .comma) {
+                                is_in_sec_val = false;
+                                continue;
+                            }
+                            if (!is_standalone_sec and !is_in_sec_val and isIdentifierToken(sub_kind)) {
+                                const key_lex = extractTokenSlice(source, token_buffer, sub_leaf.token);
+                                const next_tok = peekNextAttrLeafToken(token_buffer, cst_arena, link_scan + 1, attr_end);
+                                const next_kind: TokenKind = if (!next_tok.isNone()) token_buffer.getToken(next_tok).kind else .eof;
+                                if (std.mem.eql(u8, key_lex, "section") and (next_kind == .colon or next_kind == .eq)) {
+                                    is_in_sec_val = true;
+                                    if (is_external_pkg) {
+                                        const sec_key_span = token_buffer.getTokenSpan(file_id, sub_leaf.token);
+                                        if (!hasDiagnosticAtSpan(sink, .e0327_forbidden_sandbox_bypass_attribute, sec_key_span)) {
+                                            const labels = [1]LabeledSpan{.{
+                                                .span = sec_key_span,
+                                                .label = "privileged custom object section is forbidden in external dependencies",
+                                                .style = .primary,
+                                            }};
+                                            _ = try sink.emit(.{
+                                                .code = .e0327_forbidden_sandbox_bypass_attribute,
+                                                .severity = .err,
+                                                .primary_span = sec_key_span,
+                                                .message = "forbidden sandbox-bypass `@link(section: …)` attribute inside external package",
+                                                .labels = &labels,
+                                            });
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            if (is_in_sec_val and (sub_kind == .string_lit or sub_kind == .byte_string_lit)) {
+                                var sec_unesc: [256]u8 = undefined;
+                                const sec_val = unquoteAttrStringLexeme(
+                                    extractTokenSlice(source, token_buffer, sub_leaf.token),
+                                    &sec_unesc,
+                                );
+                                if (isForbiddenExecutableSection(sec_val)) {
+                                    const val_span = token_buffer.getTokenSpan(file_id, sub_leaf.token);
+                                    if (!hasDiagnosticAtSpan(sink, .e0327_forbidden_sandbox_bypass_attribute, val_span)) {
+                                        const msg = try std.fmt.allocPrint(
+                                            sink.arena.asAllocator(),
+                                            "forbidden executable/constructor section `{s}` in `@{s}`",
+                                            .{ sec_val, attr_name },
+                                        );
+                                        const labels = [1]LabeledSpan{.{
+                                            .span = val_span,
+                                            .label = "constructor/destructor/TLS section bypasses `main(ctx)` capability root",
+                                            .style = .primary,
+                                        }};
+                                        _ = try sink.emit(.{
+                                            .code = .e0327_forbidden_sandbox_bypass_attribute,
+                                            .severity = .err,
+                                            .primary_span = val_span,
+                                            .message = msg,
+                                            .labels = &labels,
+                                        });
+                                    }
+                                }
+                                is_in_sec_val = false;
+                            }
+                        }
                     } else if (!is_stdlib_privileged and std.mem.eql(u8, attr_name, "std_cap_boundary")) {
                         const attr_span = token_buffer.getTokenSpan(file_id, leaf.token);
                         if (!hasDiagnosticAtSpan(sink, .e0327_forbidden_sandbox_bypass_attribute, attr_span)) {
@@ -8896,7 +10194,7 @@ pub fn extractAndValidateAllowAttrRange(
             var msg_buf: [200]u8 = undefined;
             const msg = std.fmt.bufPrint(
                 &msg_buf,
-                "unknown `@allow` lint `{s}`; expected `W0201`–`W0202` or `W0401`–`W0403`",
+                "unknown `@allow` lint `{s}`; expected `W0119`–`W0120`, `W0201`–`W0202`, `W0333`, or `W0401`–`W0403`",
                 .{raw_lex},
             ) catch "unknown lint identifier in `@allow(…)`";
             try emitInvalidAllowAttrDiagnostic(
@@ -11430,6 +12728,7 @@ pub fn scanFileInactiveCfgCapabilities(
                         token_caps |= CapabilityBits.FFI;
                     } else if (std.mem.eql(u8, lexeme, "export") or
                         std.mem.eql(u8, lexeme, "wasm_export") or
+                        std.mem.eql(u8, lexeme, "link") or
                         std.mem.eql(u8, lexeme, "link_name") or
                         std.mem.eql(u8, lexeme, "link_section"))
                     {
@@ -11450,7 +12749,9 @@ pub fn scanFileInactiveCfgCapabilities(
                         const next_tok = peekNextAttrLeafToken(token_buffer, cst_arena, scan_cur + 1, subtree_end);
                         if (!next_tok.isNone()) {
                             const next_kind = token_buffer.getToken(next_tok).kind;
-                            if (next_kind == .lparen or next_kind == .lbrace or next_kind == .string_lit) {
+                            if (next_kind == .lparen or next_kind == .lbrace or
+                                next_kind == .string_lit or next_kind == .fmt_string_lit)
+                            {
                                 token_caps |= CapabilityBits.FFI_UNSAFE;
                                 if (!is_outer_in_body and nested_body_end == 0) {
                                     has_link_export = true;
@@ -12106,4 +13407,82 @@ test "test_multi_package_scope_isolation_hygiene_and_inactive_cfg_caps" {
     try std.testing.expect((scan_b.pub_inactive_caps_bits & CapabilityBits.NET) != 0);
     try std.testing.expect((scan_b.link_ambient_inactive_caps_bits & CapabilityBits.FFI) != 0);
     try std.testing.expect((scan_b.link_ambient_inactive_caps_bits & CapabilityBits.UNSAFE_OP) != 0);
+}
+
+test "test_dr24_allow_lint_mask_consolidated_repr_link_and_retired_e0239" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(@as(usize, 1), @sizeOf(AllowLintMask));
+    try std.testing.expect(@sizeOf(SymbolRecord) <= 136);
+    try std.testing.expect(AllowLintMask.fromLintName("W0119").?.isCodeAllowed(.w0119_useless_format_string));
+    try std.testing.expect(AllowLintMask.fromLintName("useless_format_string").?.isCodeAllowed(.w0119_useless_format_string));
+    try std.testing.expect(AllowLintMask.fromLintName("W0120").?.isCodeAllowed(.w0120_uninterpolated_fmt_placeholder));
+    try std.testing.expect(AllowLintMask.fromLintName("W0333").?.isCodeAllowed(.w0333_redundant_private_contract));
+
+    const dr24_src =
+        \\@repr(C, packed: 4, align: .CacheLine, zero_pad: true)
+        \\pub struct SlabDesc { pub addr: u64 }
+        \\@repr(transparent)
+        \\pub struct Wrapper { pub raw: u32 }
+        \\@inline(always) @link(name: "cx_fast_hook", section: ".text.hot")
+        \\pub fn fast_hook() -> i32 { return 1; }
+        \\@repr(C)
+        \\@packed
+        \\@align(16)
+        \\@zero_pad
+        \\pub struct LegacyPacked { pub tag: u8 }
+    ;
+    var interner = try StringInterner.init(allocator);
+    defer interner.deinit();
+    var tokens = TokenBuffer.init(allocator);
+    defer tokens.deinit();
+    var cst = LosslessCstArena.init(allocator);
+    defer cst.deinit();
+    var ast = AstArena.init(allocator);
+    defer ast.deinit();
+    var sink = DiagnosticSink.init(allocator);
+    defer sink.deinit();
+
+    _ = try parser.parseSource(dr24_src, FileId.fromInt(98), &tokens, &cst, &ast, &sink, &interner);
+    var sym_table = try SymbolTable.init(allocator, &interner);
+    defer sym_table.deinit();
+    const mod_scope = try collectFileModuleItems(
+        &sym_table,
+        &interner,
+        FileId.fromInt(98),
+        dr24_src,
+        &tokens,
+        &cst,
+        &ast,
+        &sink,
+    );
+
+    const slab_idx = sym_table.lookupInScopeDirect(mod_scope, try interner.intern("SlabDesc"), NamespaceMask.TYPE_ONLY);
+    const slab_sym = sym_table.getSymbol(slab_idx);
+    try std.testing.expect(slab_sym.contract_flags.is_repr_c);
+    try std.testing.expect(slab_sym.contract_flags.is_packed);
+    try std.testing.expectEqual(@as(u32, 4), slab_sym.packedCapBytes());
+    try std.testing.expect(slab_sym.contract_flags.is_cache_aligned);
+    try std.testing.expect(slab_sym.contract_flags.is_zero_pad);
+
+    const wrap_idx = sym_table.lookupInScopeDirect(mod_scope, try interner.intern("Wrapper"), NamespaceMask.TYPE_ONLY);
+    try std.testing.expect(sym_table.getSymbol(wrap_idx).isReprTransparent());
+
+    const hook_idx = sym_table.lookupInScopeDirect(mod_scope, try interner.intern("fast_hook"), NamespaceMask.VALUE_ONLY);
+    const hook_sym = sym_table.getSymbol(hook_idx);
+    try std.testing.expectEqual(InlineAttrMode.always, hook_sym.inlineMode());
+    try std.testing.expectEqualStrings("cx_fast_hook", hook_sym.link_name_text);
+    try std.testing.expectEqualStrings(".text.hot", hook_sym.link_section_name);
+
+    var e0239_count: usize = 0;
+    for (sink.asSlice()) |diag_item| {
+        if (diag_item.code == .e0239_retired_layout_or_link_attribute) {
+            e0239_count += 1;
+            try std.testing.expect(diag_item.suggestions.len == 1);
+            try std.testing.expectEqualStrings(
+                "@repr(C, packed: true, align: 16, zero_pad: true)",
+                interner.get(diag_item.suggestions[0].edits[0].replacement_id),
+            );
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), e0239_count);
 }

@@ -191,7 +191,7 @@ test "test_nominal_field_hash64_detects_semantic_swaps_and_terminates_on_cycles"
 
     const file_id = FileId.fromInt(10);
     const cache_src =
-        \\@cache_aligned
+        \\@repr(align: .CacheLine)
         \\pub struct HotSlot {
         \\    pub counter: u64,
         \\}

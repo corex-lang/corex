@@ -1,80 +1,106 @@
   lead  shebang [0..20]
   lead  newline_lf [20..21]
-  lead  module_doc_comment [21..46]
-  lead  newline_lf [46..47]
-#00 kw_const [47..52] nl=1 err=0 `const`
-  lead  spaces [52..53]
-#01 const_ident [53..62] nl=0 err=0 `MAX_STEPS`
-#02 colon [62..63] nl=0 err=0 `:`
-  lead  spaces [63..64]
-#03 prim_type [64..69] nl=0 err=0 `usize`
-  lead  spaces [69..70]
-#04 eq [70..71] nl=0 err=0 `=`
-  lead  spaces [71..72]
-#05 int_lit [72..79] nl=0 err=0 `0x10_00`
-#06 semi [79..80] nl=0 err=0 `;`
-  lead  newline_lf [80..81]
-#07 kw_pub [81..84] nl=1 err=0 `pub`
-  lead  spaces [84..85]
-#08 kw_fn [85..87] nl=0 err=0 `fn`
-  lead  spaces [87..88]
-#09 ident [88..98] nl=0 err=0 `step_count`
-#10 lparen [98..99] nl=0 err=0 `(`
-#11 ident [99..102] nl=0 err=0 `val`
-#12 colon [102..103] nl=0 err=0 `:`
-  lead  spaces [103..104]
-#13 prim_type [104..107] nl=0 err=0 `i32`
-#14 rparen [107..108] nl=0 err=0 `)`
-  lead  spaces [108..109]
-#15 arrow [109..111] nl=0 err=0 `->`
-  lead  spaces [111..112]
-#16 prim_type [112..115] nl=0 err=0 `i32`
-#17 bang [115..116] nl=0 err=0 `!`
-#18 type_ident [116..123] nl=0 err=0 `IoError`
-  lead  spaces [123..124]
-#19 lbrace [124..125] nl=0 err=0 `{`
-  lead  newline_lf [125..126]
-  lead  spaces [126..130]
-#20 kw_for [130..133] nl=1 err=0 `for`
-  lead  spaces [133..134]
-#21 ident [134..135] nl=0 err=0 `i`
-  lead  spaces [135..136]
-#22 kw_in [136..138] nl=0 err=0 `in`
-  lead  spaces [138..139]
-#23 int_lit [139..140] nl=0 err=0 `0`
-#24 dotdot [140..142] nl=0 err=0 `..`
-#25 int_lit [142..144] nl=0 err=0 `10`
-  lead  spaces [144..145]
-#26 lbrace [145..146] nl=0 err=0 `{`
-  lead  newline_lf [146..147]
-  lead  spaces [147..155]
-#27 kw_let [155..158] nl=1 err=0 `let`
-  lead  spaces [158..159]
-#28 ident [159..162] nl=0 err=0 `msg`
-  lead  spaces [162..163]
-#29 eq [163..164] nl=0 err=0 `=`
+  lead  module_doc_comment [21..45]
+  lead  newline_lf [45..46]
+#00 kw_const [46..51] nl=1 err=0 `const`
+  lead  spaces [51..52]
+#01 const_ident [52..61] nl=0 err=0 `MAX_STEPS`
+#02 colon [61..62] nl=0 err=0 `:`
+  lead  spaces [62..63]
+#03 prim_type [63..68] nl=0 err=0 `usize`
+  lead  spaces [68..69]
+#04 eq [69..70] nl=0 err=0 `=`
+  lead  spaces [70..71]
+#05 int_lit [71..78] nl=0 err=0 `0x10_00`
+#06 semi [78..79] nl=0 err=0 `;`
+  lead  newline_lf [79..80]
+  lead  doc_comment [80..106]
+  lead  newline_lf [106..107]
+#07 kw_pub [107..110] nl=1 err=0 `pub`
+  lead  spaces [110..111]
+#08 kw_fn [111..113] nl=0 err=0 `fn`
+  lead  spaces [113..114]
+#09 ident [114..124] nl=0 err=0 `step_count`
+#10 lparen [124..125] nl=0 err=0 `(`
+#11 ident [125..128] nl=0 err=0 `val`
+#12 colon [128..129] nl=0 err=0 `:`
+  lead  spaces [129..130]
+#13 prim_type [130..133] nl=0 err=0 `i32`
+#14 rparen [133..134] nl=0 err=0 `)`
+  lead  spaces [134..135]
+#15 arrow [135..137] nl=0 err=0 `->`
+  lead  spaces [137..138]
+#16 prim_type [138..141] nl=0 err=0 `i32`
+#17 bang [141..142] nl=0 err=0 `!`
+#18 type_ident [142..149] nl=0 err=0 `IoError`
+  lead  spaces [149..150]
+#19 lbrace [150..151] nl=0 err=0 `{`
+  lead  newline_lf [151..152]
+  lead  spaces [152..156]
+#20 kw_for [156..159] nl=1 err=0 `for`
+  lead  spaces [159..160]
+#21 ident [160..161] nl=0 err=0 `i`
+  lead  spaces [161..162]
+#22 kw_in [162..164] nl=0 err=0 `in`
   lead  spaces [164..165]
-#30 string_lit [165..196] nl=0 err=0 `"step={val.max(1)} {r#"ok"#}\n"`
-#31 semi [196..197] nl=0 err=0 `;`
-  lead  newline_lf [197..198]
-  lead  spaces [198..202]
-#32 rbrace [202..203] nl=1 err=0 `}`
-  lead  newline_lf [203..204]
-  lead  spaces [204..208]
-#33 kw_return [208..214] nl=1 err=0 `return`
-  lead  spaces [214..215]
-#34 dot [215..216] nl=0 err=0 `.`
-#35 type_ident [216..218] nl=0 err=0 `Ok`
-#36 lparen [218..219] nl=0 err=0 `(`
-#37 ident [219..222] nl=0 err=0 `val`
-  lead  spaces [222..223]
-#38 plus_percent [223..225] nl=0 err=0 `+%`
-  lead  spaces [225..226]
-#39 int_lit [226..227] nl=0 err=0 `1`
-#40 rparen [227..228] nl=0 err=0 `)`
-#41 semi [228..229] nl=0 err=0 `;`
-  lead  newline_lf [229..230]
-#42 rbrace [230..231] nl=1 err=0 `}`
-  lead  newline_lf [231..232]
-#43 eof [232..232] nl=1 err=0 ``
+#23 int_lit [165..166] nl=0 err=0 `0`
+#24 dotdot [166..168] nl=0 err=0 `..`
+#25 int_lit [168..170] nl=0 err=0 `10`
+  lead  spaces [170..171]
+#26 lbrace [171..172] nl=0 err=0 `{`
+  lead  newline_lf [172..173]
+  lead  spaces [173..181]
+#27 kw_let [181..184] nl=1 err=0 `let`
+  lead  spaces [184..185]
+#28 ident [185..192] nl=0 err=0 `raw_tag`
+  lead  spaces [192..193]
+#29 eq [193..194] nl=0 err=0 `=`
+  lead  spaces [194..195]
+#30 kw_if [195..197] nl=0 err=0 `if`
+  lead  spaces [197..198]
+#31 ident [198..199] nl=0 err=0 `i`
+  lead  spaces [199..200]
+#32 gt [200..201] nl=0 err=0 `>`
+  lead  spaces [201..202]
+#33 int_lit [202..203] nl=0 err=0 `0`
+  lead  spaces [203..204]
+#34 fat_arrow [204..206] nl=0 err=0 `=>`
+  lead  spaces [206..207]
+#35 string_lit [207..213] nl=0 err=0 `"{ok}"`
+  lead  spaces [213..214]
+#36 kw_else [214..218] nl=0 err=0 `else`
+  lead  spaces [218..219]
+#37 string_lit [219..225] nl=0 err=0 `"idle"`
+#38 semi [225..226] nl=0 err=0 `;`
+  lead  newline_lf [226..227]
+  lead  spaces [227..235]
+#39 kw_let [235..238] nl=1 err=0 `let`
+  lead  spaces [238..239]
+#40 ident [239..242] nl=0 err=0 `msg`
+  lead  spaces [242..243]
+#41 eq [243..244] nl=0 err=0 `=`
+  lead  spaces [244..245]
+#42 fmt_string_lit [245..287] nl=0 err=0 `f"step={val.max(1)} {raw_tag} {r#"ok"#}\n"`
+#43 semi [287..288] nl=0 err=0 `;`
+  lead  newline_lf [288..289]
+  lead  spaces [289..293]
+#44 rbrace [293..294] nl=1 err=0 `}`
+  lead  newline_lf [294..295]
+  lead  spaces [295..299]
+#45 kw_return [299..305] nl=1 err=0 `return`
+  lead  spaces [305..306]
+#46 dot [306..307] nl=0 err=0 `.`
+#47 type_ident [307..309] nl=0 err=0 `Ok`
+#48 lparen [309..310] nl=0 err=0 `(`
+#49 ident [310..313] nl=0 err=0 `val`
+  lead  spaces [313..314]
+#50 plus_percent [314..316] nl=0 err=0 `+%`
+  lead  spaces [316..317]
+#51 int_lit [317..318] nl=0 err=0 `1`
+#52 rparen [318..319] nl=0 err=0 `)`
+#53 semi [319..320] nl=0 err=0 `;`
+  lead  newline_lf [320..321]
+#54 rbrace [321..322] nl=1 err=0 `}`
+  lead  newline_lf [322..323]
+#55 eof [323..323] nl=1 err=0 ``
 lossless_roundtrip: true

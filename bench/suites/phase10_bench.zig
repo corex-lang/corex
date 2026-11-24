@@ -225,13 +225,17 @@ const PIPE_WRITER_VTABLE = std.Io.Writer.VTable{
     .flush = flushPipeWriter,
 };
 
-/// Representative multi-item legacy `DR-21` + `DR-22` `.cx` module for Case 3 (`upgradeSource`).
+/// Representative multi-item legacy `DR-21`..`DR-24` `.cx` module for Case 3 (`upgradeSource`).
 const LEGACY_SYNERGY_MODULE_CX: []const u8 =
+    \\//! Legacy packet synergy module for 3-tier upgrade benchmarking.
+    \\
     \\use std::io;
     \\use cx.ffi.c_void;
     \\
+    \\@link_name("free_legacy")
     \\extern "c" fn free_legacy(ptr: *const c_void) -> unit;
     \\
+    \\/// Packet wire scheduling tier.
     \\@repr(u8)
     \\pub enum PacketMode {
     \\    Fast = 0;
@@ -243,6 +247,14 @@ const LEGACY_SYNERGY_MODULE_CX: []const u8 =
     \\    lane: u8 | 7;
     \\};
     \\
+    \\@repr(C)
+    \\@align(bytes = 16)
+    \\@zero_pad
+    \\pub struct WireHeader {
+    \\    pub tag: u32;
+    \\    pub flags: u32;
+    \\}
+    \\
     \\pub struct Envelope[T] {
     \\    pub payload: T;
     \\}
@@ -253,8 +265,15 @@ const LEGACY_SYNERGY_MODULE_CX: []const u8 =
     \\    }
     \\}
     \\
+    \\/* Redundant private contract helper migrated by UR-24-00 & UR-24-05 */
+    \\@inline
+    \\@no_alloc
+    \\@no_panic
+    \\fn bias_step(cur_val: i32) -> i32 {
+    \\    if cur_val > 0 { cur_val + 1 } else { 1 }
+    \\}
+    \\
     \\@noalloc
-    \\@align(bytes = 16)
     \\pub fn transform_packet[T: Numeric](
     \\    ref item: T,
     \\    inout counter: i32,
@@ -268,13 +287,17 @@ const LEGACY_SYNERGY_MODULE_CX: []const u8 =
     \\) -> usize {
     \\    let _keep_item = item;
     \\    let _keep_res = nested_res catch 0;
-    \\    let mut local_acc = counter;
+    \\    let mut local_acc = bias_step(counter);
     \\    let _escaped = "\{tag\}";
+    \\    let _interp_note = "acc={local_acc}";
+    \\    let _banner = """
+    \\        packet {local_acc=}
+    \\        """;
     \\    if local_acc > 0 && (local_acc == 1 || local_acc == 2) {
     \\        local_acc += 1;
     \\    }
     \\    let wrapped = Envelope.wrap[i32](7);
-    \\    let fallback_v = maybe_opt.unwrap_or(0) + wrapped.payload;
+    \\    let fallback_v = maybe_opt.unwrap_or(0) + wrapped.payload + if is_active { 1 } else { 0 };
     \\    let _ptr_ro: *u8 = bytes_view.ptr;
     \\    let tail_slice = bytes_view[0 .. bytes_view.len - 2];
     \\    let deref_num = unsafe { *raw_slot };
@@ -494,16 +517,16 @@ fn writeSynthetic400LocModule(
 
     // Item 0 (`16` lines; `0..15`):
     try writer.print(
-        "/// Module {d:0>3} state vector for incremental LSP scaling benchmark.\n" ++
+        "/| Module {d:0>3} state vector for incremental LSP scaling benchmark.\n" ++
             "pub struct SamplePair {{\n" ++
-            "    /// Primary horizontal metric value.\n" ++
+            "    /| Primary horizontal metric value.\n" ++
             "    pub x_metric: i32,\n" ++
-            "    /// Secondary vertical metric value.\n" ++
+            "    /| Secondary vertical metric value.\n" ++
             "    pub y_metric: i32,\n" ++
             "}}\n\n" ++
-            "/// Constructs a `SamplePair` and computes scaled delta for `func_00`.\n" ++
-            "@no_alloc\n" ++
-            "@no_panic\n" ++
+            "/| Constructs a `SamplePair` and computes scaled delta for `func_00`.\n" ++
+            "/| Enforces zero-allocation and panic-free modular arithmetic contracts.\n" ++
+            "@no_alloc @no_panic\n" ++
             "pub fn func_00(seed_val: i32) -> i32 {{\n" ++
             "    let pair = SamplePair {{ x_metric: seed_val, y_metric: {d} }};\n" ++
             "    let sum_val = pair.x_metric +% pair.y_metric;\n" ++
@@ -516,9 +539,9 @@ fn writeSynthetic400LocModule(
     var fn_idx: usize = 1;
     while (fn_idx < 25) : (fn_idx += 1) {
         try writer.print(
-            "\n/// Computes deterministic modular step for `func_{d:0>2}`.\n" ++
-                "@no_alloc\n" ++
-                "@no_panic\n" ++
+            "\n/| Computes deterministic modular step for `func_{d:0>2}`.\n" ++
+                "/| Enforces zero-allocation and panic-free modular step invariants.\n" ++
+                "@no_alloc @no_panic\n" ++
                 "pub fn func_{d:0>2}(input_val: i32, bias_val: i32) -> i32 {{\n" ++
                 "    let pair = SamplePair {{ x_metric: input_val, y_metric: bias_val }};\n" ++
                 "    var acc_val: i32 = pair.x_metric +% 10;\n" ++
@@ -566,7 +589,7 @@ fn writeSynthetic400LocRootModule(
 
     // `7` lines (`249 + 7 = 256` lines):
     try writer.writeAll(
-        "\n/// Root workspace summary record for the 100,000-LOC LSP benchmark corpus.\n" ++
+        "\n/| Root workspace summary record for the 100,000-LOC LSP benchmark corpus.\n" ++
             "pub struct RootSummary {\n" ++
             "    pub checksum: i32,\n" ++
             "    pub sample_count: i32,\n" ++
@@ -579,9 +602,9 @@ fn writeSynthetic400LocRootModule(
     while (fn_idx < 9) : (fn_idx += 1) {
         const target_mod = fn_idx * 25 + 1;
         try writer.print(
-            "\n/// Aggregates cross-module sample `{d}` from `mod_{d:0>3}`.\n" ++
-                "@no_alloc\n" ++
-                "@no_panic\n" ++
+            "\n/| Aggregates cross-module sample `{d}` from `mod_{d:0>3}`.\n" ++
+                "/| Preserves panic-free cross-module probe invariants.\n" ++
+                "@no_alloc @no_panic\n" ++
                 "pub fn root_probe_{d:0>2}(seed_val: i32) -> i32 {{\n" ++
                 "    let remote_val = mod_{d:0>3}.func_00(seed_val);\n" ++
                 "    let summary = RootSummary {{ checksum: remote_val, sample_count: 1, flags: {d} }};\n" ++
@@ -903,7 +926,7 @@ fn benchLsp100kCompletionHoverDefTokens(_: std.mem.Allocator) !usize {
     return resp_bytes.len;
 }
 
-/// Case 3 (`upgrade_3tier_synergy_module`): 3-tier `DR-21` + `DR-22` `upgradeSource` fixed-point migration.
+/// Case 3 (`upgrade_3tier_synergy_module`): 3-tier `DR-21`..`DR-24` `upgradeSource` fixed-point migration.
 fn benchUpgrade3TierSynergyModule(allocator: std.mem.Allocator) !usize {
     var upg_res = try upgrade_engine.upgradeSource(
         allocator,
@@ -957,7 +980,7 @@ pub fn main(init: std.process.Init) !void {
             },
         },
         .{
-            .name = "upgrade_3tier_synergy_module (DR-21 + DR-22)",
+            .name = "upgrade_3tier_synergy_module (DR-21..DR-24)",
             .run_fn = benchUpgrade3TierSynergyModule,
             .config = BenchConfig{
                 .warmup_iterations = BENCH_WARMUP_COUNT,

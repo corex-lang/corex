@@ -190,15 +190,15 @@ pub const DiagnosticCode = enum(u16) {
     e0112_retired_path_separator = 20,
     /// Retired `&&` logical AND operator (`E0113`).
     e0113_retired_logical_and = 21,
-    /// Invalid `\{` or `\}` brace escape in interpolated string (`E0114`).
+    /// Unmatched `}` or invalid brace escape in interpolated `f"…"` string (`E0114`).
     e0114_invalid_brace_escape = 22,
-    /// Multiline `"""` delimiter not immediately followed by newline (`E0115`).
+    /// Retired `"""` delimiter or non-whitespace before closing `"` on multiline string (`E0115`).
     e0115_multiline_string_opening = 23,
-    /// Multiline `"""` content line under-indented or mixes leading tabs and spaces (`E0116`).
+    /// Under-indented multiline string content line or forbidden hard `\t` tab (`E0116`).
     e0116_multiline_string_indent = 24,
     /// Non-ASCII byte (`> 0x7F`) in `b'…'` or `b"…"` byte literal (`E0117`).
     e0117_non_ascii_byte_literal = 25,
-    /// Block documentation comment (`/** … */` or `/*! … */`) is forbidden (`E0118`).
+    /// Retired block comment (`/* … */`) or 3-character doc prefix (`//!`, `///`) (`E0118`).
     e0118_block_doc_comment_forbidden = 26,
 
     // E02xx; Syntax Parsing, Recovery & Casing:
@@ -236,9 +236,9 @@ pub const DiagnosticCode = enum(u16) {
     e0227_retired_prefix_deref = 42,
     /// Invalid `/` positional-only or `*` keyword-only parameter zone separator (`E0228`).
     e0228_invalid_param_zone_separator = 43,
-    /// Misplaced `//!` module doc comment outside top-of-file header (`E0229`).
+    /// Misplaced `/#` module docstring outside top-of-file header (`E0229`).
     e0229_misplaced_module_doc_comment = 44,
-    /// Unattached `///` outer doc comment not preceding a documentable declaration (`E0230`).
+    /// Unattached `/|` outer docstring not preceding a documentable declaration (`E0230`).
     e0230_unattached_doc_comment = 45,
     /// Redundant visibility modifier on `impl` block (`E0231`).
     e0231_visibility_on_impl_block = 46,
@@ -252,186 +252,202 @@ pub const DiagnosticCode = enum(u16) {
     e0235_all_wildcard_destructuring_assign = 50,
     /// Missing `:` separator before type annotation (`E0236`).
     e0236_missing_colon_before_type = 51,
+    /// Inline `if cond => expr` missing mandatory `else expr` branch (`E0237`).
+    e0237_inline_if_missing_else = 52,
+    /// Mixed `=>` and `{ … }` block branches in `if` expression (`E0238`).
+    e0238_mixed_if_arrow_and_block = 53,
+    /// Retired standalone layout/linkage attribute or `@[…]`/`@(…)` wrapper (`E0239`).
+    e0239_retired_layout_or_link_attribute = 54,
 
     // E03xx; MIR SAST Memory, Ownership, Capabilities & Exclusivity:
     /// Use of deallocated or freed value (`E0301`).
-    e0301_use_after_free = 52,
+    e0301_use_after_free = 55,
     /// Use of moved value after ownership transfer (`E0302`).
-    e0302_use_after_move = 53,
+    e0302_use_after_move = 56,
     /// Read of possibly uninitialized memory or binding (`E0303`).
-    e0303_uninitialized_memory_read = 54,
+    e0303_uninitialized_memory_read = 57,
     /// Unconsumed `@linear` resource or memory leak (`E0304`).
-    e0304_resource_or_memory_leak = 55,
+    e0304_resource_or_memory_leak = 58,
     /// Mutable aliasing or MVS loan exclusivity violation (`E0305`).
-    e0305_exclusivity_violation = 56,
+    e0305_exclusivity_violation = 59,
     /// Value escapes lexical arena or stack region (`E0306`).
-    e0306_region_escape_violation = 57,
+    e0306_region_escape_violation = 60,
     /// Compile-time proven out-of-bounds buffer access (`E0307`).
-    e0307_static_buffer_overflow = 58,
+    e0307_static_buffer_overflow = 61,
     /// Non-NUL-terminated `str` or slice passed to `@null_terminated` C FFI parameter (`E0308`).
-    e0308_unterminated_cstr_ffi = 59,
+    e0308_unterminated_cstr_ffi = 62,
     /// Concurrent mutable aliasing, `@thread_local` capture, or borrow escape across `TaskGroup`/`async` (`E0309`).
-    e0309_concurrent_exclusivity_or_escape = 60,
+    e0309_concurrent_exclusivity_or_escape = 63,
     /// `@owned_by_caller @free_with(fn)` FFI pointer released with mismatched deallocator (`E0310`).
-    e0310_mismatched_ffi_deallocator = 61,
+    e0310_mismatched_ffi_deallocator = 64,
     /// Unchecked dereference or `@non_null` use of `@may_be_null` FFI pointer (`E0311`).
-    e0311_unchecked_nullable_ffi_ptr = 62,
+    e0311_unchecked_nullable_ffi_ptr = 65,
     /// Raw pointer and length passed to `@slice_len` / `@byte_len` FFI without proven capacity (`E0312`).
-    e0312_unproven_ffi_slice_len = 63,
+    e0312_unproven_ffi_slice_len = 66,
     /// Double free or duplicate `@linear` resource consumption (`E0313`).
-    e0313_double_free_or_close = 64,
+    e0313_double_free_or_close = 67,
     /// `FromBytes` / `IntoBytes` wire layout contract violation (`E0315`).
-    e0315_wire_layout_contract_violation = 65,
+    e0315_wire_layout_contract_violation = 68,
     /// Worst-case call stack exceeds `@max_stack` budget (`E0316`).
-    e0316_max_stack_budget_exceeded = 66,
+    e0316_max_stack_budget_exceeded = 69,
     /// Inline `async` state-machine frame subtree exceeds `16 KiB` cap or recurses unboxed (`E0317`).
-    e0317_async_inline_frame_exceeded = 67,
+    e0317_async_inline_frame_exceeded = 70,
     /// `@no_alloc` contract violated by heap allocation (`E0320`).
-    e0320_no_alloc_contract_violation = 68,
+    e0320_no_alloc_contract_violation = 71,
     /// `@no_panic` contract violated by residual trap path (`E0321`).
-    e0321_no_panic_contract_violation = 69,
+    e0321_no_panic_contract_violation = 72,
     /// `@no_block` contract violated by blocking operation (`E0322`).
-    e0322_no_block_contract_violation = 70,
+    e0322_no_block_contract_violation = 73,
     /// Trait `impl` method escalates signature contract (`E0323`).
-    e0323_trait_impl_effect_escalation = 71,
+    e0323_trait_impl_effect_escalation = 74,
     /// Package exceeds authorized capability policy (`E0324`).
-    e0324_package_capability_violation = 72,
+    e0324_package_capability_violation = 75,
     /// Forbidden capability in hermetic `comptime` context (`E0325`).
-    e0325_comptime_sandbox_violation = 73,
+    e0325_comptime_sandbox_violation = 76,
     /// `@embed_bytes` path escapes package sandbox root (`E0326`).
-    e0326_embed_path_escape = 74,
+    e0326_embed_path_escape = 77,
     /// Forbidden linker section or sandbox bypass attribute (`E0327`).
-    e0327_forbidden_sandbox_bypass_attribute = 75,
+    e0327_forbidden_sandbox_bypass_attribute = 78,
     /// Scratch arena rewind aliases caller output arena (`E0328`).
-    e0328_scratch_arena_ping_pong_conflict = 76,
+    e0328_scratch_arena_ping_pong_conflict = 79,
 
     // E04xx; Type System, Inference, Traits, Bounds & Error Semantics:
     /// Ambiguous overload call in explicit overload group (`E0400`).
-    e0400_ambiguous_overload = 77,
+    e0400_ambiguous_overload = 80,
     /// Mismatched types between expected and found expressions (`E0401`).
-    e0401_type_mismatch = 78,
+    e0401_type_mismatch = 81,
     /// Type does not satisfy constrained trait or type group bound (`E0402`).
-    e0402_unsatisfied_trait_bound = 79,
+    e0402_unsatisfied_trait_bound = 82,
     /// Unresolved identifier or symbol in scope (`E0403`).
-    e0403_unresolved_symbol = 80,
+    e0403_unresolved_symbol = 83,
     /// Conflicting concrete types for a Bind-Once Constrained Type Group (`E0404`).
-    e0404_bind_once_group_conflict = 81,
+    e0404_bind_once_group_conflict = 84,
     /// Distinct nominal type mixed with underlying representation without `as` or `~T` (`E0405`).
-    e0405_distinct_type_mixing = 82,
+    e0405_distinct_type_mixing = 85,
     /// Compile-time value or width violates range refinement or bit-field bounds (`E0406`).
-    e0406_range_refinement_violation = 83,
+    e0406_range_refinement_violation = 86,
     /// Contextual `.Variant` syntax cannot be resolved against expected type (`E0407`).
-    e0407_invalid_contextual_variant = 84,
+    e0407_invalid_contextual_variant = 87,
     /// Duplicate symbol definition in the same namespace and lexical scope (`E0408`).
-    e0408_duplicate_definition = 85,
+    e0408_duplicate_definition = 88,
     /// Access to a private item, field, or method outside its defining module (`E0409`).
-    e0409_private_symbol_access = 86,
+    e0409_private_symbol_access = 89,
     /// Postfix `?` operator used outside a fallible `T!E` or `T?` function (`E0410`).
-    e0410_try_outside_fallible_fn = 87,
+    e0410_try_outside_fallible_fn = 90,
     /// Propagated error type cannot be converted via `FromError` or `@from` (`E0411`).
-    e0411_missing_from_error_conversion = 88,
+    e0411_missing_from_error_conversion = 91,
     /// `let … else` guard block does not unconditionally diverge (`never`) (`E0412`).
-    e0412_let_else_not_diverging = 89,
+    e0412_let_else_not_diverging = 92,
     /// Unhandled `T!E` or `@must_use` value in expression statement (`E0413`).
-    e0413_unhandled_must_use_or_result = 90,
+    e0413_unhandled_must_use_or_result = 93,
     /// Forbidden bare `_ = fallible()` discard of a `T!E` without `catch` or `.ok()` (`E0414`).
-    e0414_bare_wildcard_result_discard = 91,
+    e0414_bare_wildcard_result_discard = 94,
     /// Non-exhaustive pattern arms in `match` expression (`E0415`).
-    e0415_non_exhaustive_match = 92,
+    e0415_non_exhaustive_match = 95,
     /// `$` length sentinel used outside indexable `[…]` brackets (`E0416`).
-    e0416_invalid_dollar_length_expr = 93,
+    e0416_invalid_dollar_length_expr = 96,
     /// Irrefutable bare identifier pattern in an `is` test (`E0418`).
-    e0418_irrefutable_is_binding = 94,
+    e0418_irrefutable_is_binding = 97,
     /// Invalid named or default call arguments at a call site (`E0419`).
-    e0419_invalid_call_arguments = 95,
+    e0419_invalid_call_arguments = 98,
     /// Missing active `own` marker at call site on named non-`Copy` binding (`E0420`).
-    e0420_missing_call_site_own = 96,
+    e0420_missing_call_site_own = 99,
     /// Bare by-value parameter `x: T` where `T` is non-`Copy` (`E0421`).
-    e0421_non_copy_value_parameter = 97,
+    e0421_non_copy_value_parameter = 100,
     /// `&out T` parameter contract violation at call site or function exit (`E0422`).
-    e0422_out_param_contract_violation = 98,
+    e0422_out_param_contract_violation = 101,
     /// `bit_field` width mismatch or invalid backed-enum, `bit_field`, or `bool` `as` cast (`E0423`).
-    e0423_invalid_bitfield_or_enum_cast = 99,
+    e0423_invalid_bitfield_or_enum_cast = 102,
     /// Retired `.len` or `.ptr` field access on slice, array, or `str` (`E0424`).
-    e0424_retired_slice_field_access = 100,
+    e0424_retired_slice_field_access = 103,
     /// Invalid `opaque` value usage or direct `*opaque` dereference (`E0425`).
-    e0425_invalid_opaque_type_usage = 101,
+    e0425_invalid_opaque_type_usage = 104,
     /// Non-defaulted generic parameter follows a defaulted generic parameter (`E0426`).
-    e0426_non_trailing_generic_default = 102,
+    e0426_non_trailing_generic_default = 105,
     /// Invalid `@derive(From)` enum layout or Type Group on error side of `T!Group` (`E0427`).
-    e0427_invalid_error_composition = 103,
+    e0427_invalid_error_composition = 106,
     /// Named argument passed to a `/` positional-only parameter (`E0428`).
-    e0428_named_arg_for_positional_only = 104,
+    e0428_named_arg_for_positional_only = 107,
     /// Positional argument passed to a `*` keyword-only parameter (`E0429`).
-    e0429_positional_arg_for_keyword_only = 105,
+    e0429_positional_arg_for_keyword_only = 108,
     /// Non-defaulted parameter follows a defaulted parameter before `*` (`E0430`).
-    e0430_non_default_after_default_param = 106,
+    e0430_non_default_after_default_param = 109,
     /// Invalid `FormatSpec` syntax or incompatible specifier for interpolated type or `@secret` (`E0431`).
-    e0431_invalid_format_specifier = 107,
+    e0431_invalid_format_specifier = 110,
     /// Missing non-defaulted struct field initializer without `..` or `..base` (`E0432`).
-    e0432_missing_struct_field_initializer = 108,
+    e0432_missing_struct_field_initializer = 111,
     /// Inaccessible private, `pub(super)`, or `pub(pkg)` symbol or struct field (`E0433`).
-    e0433_inaccessible_field_or_visibility = 109,
+    e0433_inaccessible_field_or_visibility = 112,
     /// Invalid non-place or immutable target in parallel destructuring assignment (`E0434`).
-    e0434_invalid_parallel_assign_target = 110,
+    e0434_invalid_parallel_assign_target = 113,
     /// Invalid, non-boolean, or undeclared feature predicate in `@cfg(…)` (`E0435`).
-    e0435_invalid_cfg_predicate = 111,
+    e0435_invalid_cfg_predicate = 114,
     /// `@builder_item` invoked outside an active `@builder` trailing block scope (`E0436`).
-    e0436_builder_item_outside_scope = 112,
+    e0436_builder_item_outside_scope = 115,
     /// Invalid labeled `match` `continue :label` target or state payload (`E0437`).
-    e0437_invalid_labeled_match_continue = 113,
+    e0437_invalid_labeled_match_continue = 116,
     /// Postfix `.await` used outside an `async fn`, `async` closure, or `async` block (`E0438`).
-    e0438_await_outside_async_context = 114,
+    e0438_await_outside_async_context = 117,
     /// Pointless `_ = expr;` discard of `unit` or already-used local/parameter (`E0439`).
-    e0439_pointless_unit_or_used_discard = 115,
+    e0439_pointless_unit_or_used_discard = 118,
+    /// Invalid or conflicting `@repr`, `@link`, or `@inline` schema arguments (`E0440`).
+    e0440_invalid_repr_or_inline_attribute = 119,
+    /// Safe `&` / `&mut` / `&out` borrow of misaligned packed struct field (`E0441`).
+    e0441_unaligned_packed_field_borrow = 120,
 
     // E05xx; Comptime Virtual Machine & MIR Lowering:
     /// Compile-time execution exceeded step fuel budget (`E0501`).
-    e0501_comptime_step_limit_exceeded = 116,
+    e0501_comptime_step_limit_exceeded = 121,
     /// Compile-time integer arithmetic overflow (`E0502`).
-    e0502_integer_constant_overflow = 117,
+    e0502_integer_constant_overflow = 122,
     /// Forbidden non-deterministic, FFI, I/O, or raw pointer-to-integer operation in `comptime` (`E0503`).
-    e0503_forbidden_comptime_operation = 118,
+    e0503_forbidden_comptime_operation = 123,
     /// Out-of-bounds array, slice, or virtual allocation access in `comptime` (`E0504`).
-    e0504_comptime_out_of_bounds = 119,
+    e0504_comptime_out_of_bounds = 124,
     /// Read from uninitialized virtual memory bytes in `comptime` (`E0505`).
-    e0505_comptime_uninitialized_read = 120,
+    e0505_comptime_uninitialized_read = 125,
     /// Null, misaligned, or dangling virtual pointer dereference in `comptime` (`E0506`).
-    e0506_comptime_invalid_pointer = 121,
+    e0506_comptime_invalid_pointer = 126,
     /// Division by zero, remainder by zero, or invalid shift count in `comptime` (`E0507`).
-    e0507_comptime_arithmetic_trap = 122,
+    e0507_comptime_arithmetic_trap = 127,
     /// Virtual heap, call depth, loop unroll, or `@embed_bytes` cap exceeded in `comptime` (`E0508`).
-    e0508_comptime_resource_limit_exceeded = 123,
+    e0508_comptime_resource_limit_exceeded = 128,
     /// Cyclic dependency across `const` or `comptime` evaluations (`E0509`).
-    e0509_comptime_evaluation_cycle = 124,
+    e0509_comptime_evaluation_cycle = 129,
     /// Failed `@compile_assert` or reached `@compile_error` intrinsic (`E0510`).
-    e0510_compile_assertion_failed = 125,
+    e0510_compile_assertion_failed = 130,
 
     // W00xx to W05xx; Subsystem Compiler Warnings:
     /// Deprecated CLI invocation or option (`W0001`).
-    w0001_deprecated_cli_option = 126,
+    w0001_deprecated_cli_option = 131,
     /// Redundant character escape sequence in literal (`W0101`).
-    w0101_redundant_escape_sequence = 127,
+    w0101_redundant_escape_sequence = 132,
+    /// Interpolated `f"…"` / `f#"…"#` string contains zero `{…}` holes (`W0119`).
+    w0119_useless_format_string = 133,
+    /// Plain `"…"` passed to `FmtArgs` sink contains `{ident}` matching an in-scope binding (`W0120`).
+    w0120_uninterpolated_fmt_placeholder = 134,
     /// Identifier does not follow canonical CoreX casing (`W0201`).
-    w0201_non_canonical_identifier_case = 128,
+    w0201_non_canonical_identifier_case = 135,
     /// Non-idiomatic syntax or redundant expression construct (`W0202`).
-    w0202_non_idiomatic_construct = 129,
+    w0202_non_idiomatic_construct = 136,
     /// Unused region capability or linear binding (`W0308`).
-    w0308_unused_region_allocation = 130,
+    w0308_unused_region_allocation = 137,
     /// Slice or array bounds not statically proven under `--sast-strict` (`W0314`).
-    w0314_unproven_bounds_access = 131,
+    w0314_unproven_bounds_access = 138,
     /// Panic inside vacated non-`Copy` projection inserts abort guard (`W0329`).
-    w0329_vacated_projection_panic_abort = 132,
+    w0329_vacated_projection_panic_abort = 139,
     /// Unreachable high-risk capability exported by dependency (`W0330`).
-    w0330_ambient_dead_capability_in_dep = 133,
+    w0330_ambient_dead_capability_in_dep = 140,
+    /// Redundant `@inline`, `@no_alloc`, `@no_panic`, or `@no_block` on private/generic/`= expr;` fn (`W0333`).
+    w0333_redundant_private_contract = 141,
     /// Unreachable pattern arm in `match` expression (`W0401`).
-    w0401_unreachable_pattern_arm = 134,
+    w0401_unreachable_pattern_arm = 142,
     /// Unused local variable binding or function parameter (`W0402`).
-    w0402_unused_binding = 135,
+    w0402_unused_binding = 143,
     /// Reference to symbol marked `@deprecated` (`W0403`).
-    w0403_deprecated_symbol = 136,
+    w0403_deprecated_symbol = 144,
     /// Function exceeds MIR inlining cost threshold (`W0501`).
-    w0501_inlining_budget_exceeded = 137,
+    w0501_inlining_budget_exceeded = 145,
 
     /// Ergonomic alias for undeclared `@cfg(cfg.feature.<name>)` predicates (`E0435`).
     pub const e0435_unknown_cfg_feature: DiagnosticCode = .e0435_invalid_cfg_predicate;
@@ -681,22 +697,24 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .code = .e0114_invalid_brace_escape,
         .code_str = "E0114",
         .default_severity = .err,
-        .title = "invalid '\\{' or '\\}' brace escape in string",
-        .explanation = "Interpolated strings use `{{` and `}}` for literal braces; `\\{` and `\\}` have been retired.",
+        .title = "unmatched '}' or invalid brace escape in interpolated string",
+        .explanation = "Interpolated `f\"…\"` strings use `{{` and `}}` for literal braces; unmatched `}` and `\\{` / `\\}` are invalid.",
     },
     .{
         .code = .e0115_multiline_string_opening,
         .code_str = "E0115",
         .default_severity = .err,
-        .title = "missing newline after opening '\"\"\"' delimiter",
-        .explanation = "Multiline `\"\"\"` string literals must begin with an immediate `\\n` or `\\r\\n` after opening `\"\"\"`.",
+        .title = "retired '\"\"\"' delimiter or invalid multiline closing quote",
+        .explanation = "Triple-quoted `\"\"\"` is retired; open multiline strings with `\"<newline>` " ++
+            "and place closing `\"` on its own indented line.",
     },
     .{
         .code = .e0116_multiline_string_indent,
         .code_str = "E0116",
         .default_severity = .err,
-        .title = "invalid multiline '\"\"\"' string indentation",
-        .explanation = "Closing `\"\"\"` must sit on its own indented line, and non-empty lines must match its prefix without tab/space mixing.",
+        .title = "under-indented multiline string line or forbidden '\\t' tab",
+        .explanation = "Multiline content lines must match closing `\"` indentation using ASCII spaces " ++
+            "(`4`-space indent; `\\t` tabs are forbidden).",
     },
     .{
         .code = .e0117_non_ascii_byte_literal,
@@ -709,9 +727,9 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .code = .e0118_block_doc_comment_forbidden,
         .code_str = "E0118",
         .default_severity = .err,
-        .title = "block doc comment ('/** … */' / '/*! … */') is forbidden",
-        .explanation = "CoreX uses line-only doc comments (`///` for declarations and top-of-file `//!` for modules); " ++
-            "`/** … */` and `/*! … */` are forbidden.",
+        .title = "retired block comment ('/* … */') or 3-character doc prefix ('///' / '//!')",
+        .explanation = "Block comments and 3-character doc prefixes are retired; use `//` for comments, " ++
+            "`/|` for item docs, and `/#` for module docs.",
     },
     .{
         .code = .e0201_unexpected_token,
@@ -836,15 +854,15 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .code = .e0229_misplaced_module_doc_comment,
         .code_str = "E0229",
         .default_severity = .err,
-        .title = "misplaced module doc comment ('//!')",
-        .explanation = "Module doc comments (`//!`) may only appear at the top of a `.cx` file before any `///`, non-doc comment, or item.",
+        .title = "misplaced module docstring ('/#')",
+        .explanation = "Module docstrings (`/#`) may only appear at the top of a `.cx` file before any `/|`, non-doc comment, or item.",
     },
     .{
         .code = .e0230_unattached_doc_comment,
         .code_str = "E0230",
         .default_severity = .err,
-        .title = "unattached outer doc comment ('///')",
-        .explanation = "Outer doc comments (`///`) must immediately precede a documentable item with no blank line or non-doc comment.",
+        .title = "unattached outer docstring ('/|')",
+        .explanation = "Outer docstrings (`/|`) must immediately precede a documentable item with no blank line or `//` comment.",
     },
     .{
         .code = .e0231_visibility_on_impl_block,
@@ -887,6 +905,29 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .default_severity = .err,
         .title = "missing ':' before type annotation",
         .explanation = "Type annotations require a postfix `:` separator between the identifier and its type (`name: Type`).",
+    },
+    .{
+        .code = .e0237_inline_if_missing_else,
+        .code_str = "E0237",
+        .default_severity = .err,
+        .title = "inline 'if cond => expr' missing 'else' branch",
+        .explanation = "Inline `if cond => expr` must produce a value on all paths and requires `else expr`; use `if cond { … }` for statements.",
+    },
+    .{
+        .code = .e0238_mixed_if_arrow_and_block,
+        .code_str = "E0238",
+        .default_severity = .err,
+        .title = "mixed '=>' and '{ … }' branches in 'if' expression",
+        .explanation = "Do not mix `=>` and `{ … }` in `if`; use `if cond => a else b` for single expressions " ++
+            "or `if cond { … } else { … }` for blocks.",
+    },
+    .{
+        .code = .e0239_retired_layout_or_link_attribute,
+        .code_str = "E0239",
+        .default_severity = .err,
+        .title = "retired standalone layout/linkage attribute or '@[…]'/'@(…)' wrapper",
+        .explanation = "Layout and symbol attributes consolidate into `@repr(…)` and `@link(…)`, " ++
+            "and attributes use `@attr` without outer brackets.",
     },
     .{
         .code = .e0301_use_after_free,
@@ -1337,6 +1378,21 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .explanation = "Discarding a `unit` expression or an already-used binding via `_ = …;` is redundant; remove `_ =` or the statement.",
     },
     .{
+        .code = .e0440_invalid_repr_or_inline_attribute,
+        .code_str = "E0440",
+        .default_severity = .err,
+        .title = "invalid or conflicting '@repr', '@link', or '@inline' arguments",
+        .explanation = "Validate `@repr` (`C | transparent`, `packed: bool | 1|2|4|8|16` with `C`, " ++
+            "`align: N | .CacheLine`, `zero_pad: bool`) and `@inline`.",
+    },
+    .{
+        .code = .e0441_unaligned_packed_field_borrow,
+        .code_str = "E0441",
+        .default_severity = .err,
+        .title = "safe borrow of misaligned '@repr(C, packed: …)' field",
+        .explanation = "Borrowing an unaligned packed field via `&` or `&mut` is undefined; copy `s.field` by value or use `&raw s.field`.",
+    },
+    .{
         .code = .e0501_comptime_step_limit_exceeded,
         .code_str = "E0501",
         .default_severity = .err,
@@ -1421,6 +1477,21 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .explanation = "A string or character literal used an unnecessary backslash escape.",
     },
     .{
+        .code = .w0119_useless_format_string,
+        .code_str = "W0119",
+        .default_severity = .warning,
+        .title = "interpolated string contains zero '{…}' holes",
+        .explanation = "Interpolated `f\"…\"` or `f#\"…\"#` has no `{…}` holes; remove `f` prefix " ++
+            "to use plain `\"…\"` / `r#\"…\"#` `str`.",
+    },
+    .{
+        .code = .w0120_uninterpolated_fmt_placeholder,
+        .code_str = "W0120",
+        .default_severity = .warning,
+        .title = "plain string in format sink contains uninterpolated '{ident}'",
+        .explanation = "Plain `\"…\"` does not interpolate `{ident}`; prepend `f` if formatting the in-scope binding was intended.",
+    },
+    .{
         .code = .w0201_non_canonical_identifier_case,
         .code_str = "W0201",
         .default_severity = .warning,
@@ -1463,6 +1534,14 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .explanation = "Dependency exports dead/unreachable functions carrying `net`, `process`, or `ffi` capabilities.",
     },
     .{
+        .code = .w0333_redundant_private_contract,
+        .code_str = "W0333",
+        .default_severity = .warning,
+        .title = "redundant '@inline', '@no_alloc', '@no_panic', or '@no_block' attribute",
+        .explanation = "Inlining and effect contracts are inferred automatically on private, generic, " ++
+            "and `= expr;` functions; reserve for `pub` boundaries.",
+    },
+    .{
         .code = .w0401_unreachable_pattern_arm,
         .code_str = "W0401",
         .default_severity = .warning,
@@ -1503,7 +1582,7 @@ pub const DIAGNOSTIC_CODE_STR_MAP = blk: {
 };
 
 comptime {
-    std.debug.assert(DIAGNOSTIC_CATALOG.len == 138);
+    std.debug.assert(DIAGNOSTIC_CATALOG.len == 146);
     std.debug.assert(DIAGNOSTIC_CODE_STR_MAP.keys().len == DIAGNOSTIC_CATALOG.len);
     std.debug.assert(@typeInfo(DiagnosticCode).@"enum".field_names.len == DIAGNOSTIC_CATALOG.len);
     for (DIAGNOSTIC_CATALOG, 0..) |entry, i| {
@@ -1894,10 +1973,42 @@ test "test_diagnostic_sink_error_cap_and_patcher" {
     try std.testing.expectEqual(@as(u32, 1), outcome.applied_count);
     try std.testing.expectEqualStrings("call(&socket);", outcome.patched_source);
 
-    try std.testing.expectEqual(@as(usize, 138), DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 146), DIAGNOSTIC_CATALOG.len);
     try std.testing.expectEqual(
         DiagnosticCode.e0118_block_doc_comment_forbidden,
         DiagnosticCode.fromCodeStr("E0118").?,
+    );
+    try std.testing.expectEqual(
+        DiagnosticCode.e0237_inline_if_missing_else,
+        DiagnosticCode.fromCodeStr("E0237").?,
+    );
+    try std.testing.expectEqual(
+        DiagnosticCode.e0238_mixed_if_arrow_and_block,
+        DiagnosticCode.fromCodeStr("E0238").?,
+    );
+    try std.testing.expectEqual(
+        DiagnosticCode.e0239_retired_layout_or_link_attribute,
+        DiagnosticCode.fromCodeStr("E0239").?,
+    );
+    try std.testing.expectEqual(
+        DiagnosticCode.e0440_invalid_repr_or_inline_attribute,
+        DiagnosticCode.fromCodeStr("E0440").?,
+    );
+    try std.testing.expectEqual(
+        DiagnosticCode.e0441_unaligned_packed_field_borrow,
+        DiagnosticCode.fromCodeStr("E0441").?,
+    );
+    try std.testing.expectEqual(
+        DiagnosticCode.w0119_useless_format_string,
+        DiagnosticCode.fromCodeStr("W0119").?,
+    );
+    try std.testing.expectEqual(
+        DiagnosticCode.w0120_uninterpolated_fmt_placeholder,
+        DiagnosticCode.fromCodeStr("W0120").?,
+    );
+    try std.testing.expectEqual(
+        DiagnosticCode.w0333_redundant_private_contract,
+        DiagnosticCode.fromCodeStr("W0333").?,
     );
     try std.testing.expectEqual(
         DiagnosticCode.e0229_misplaced_module_doc_comment,

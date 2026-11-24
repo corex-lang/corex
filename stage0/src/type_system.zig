@@ -1124,7 +1124,29 @@ pub const CfgEndian = symbol_resolver.CfgEndian;
 /// Re-exported compile-time `@cfg(expr)` evaluation context (`DR-22` `SE-18`).
 pub const CfgEnv = symbol_resolver.CfgEnv;
 
-/// Validated per-hole interpolation descriptor recorded for `HirLowerer` (`DR-22` `SE-12`).
+/// Resolved token entry inside an `f"…"` / `f#"…"#` interpolation hole (`ADR-24B`).
+pub const InterpHoleTokenInfo = struct {
+    /// Byte offset relative to the enclosing `.fmt_string_lit` token's `byte_offset`.
+    rel_byte: u32,
+    /// UTF-8 byte length of the token.
+    byte_len: u16,
+    /// Lexical `TokenKind` of the token.
+    kind: TokenKind,
+    /// Resolved `SymbolIndex` for identifier, member, variant, or type tokens (`.none` when unmapped).
+    symbol_index: SymbolIndex = .none,
+    /// Resolved `TypeId` at the token's AST node (`TypeId.err_ty` when unmapped).
+    type_id: TypeId = .err_ty,
+};
+
+/// Incomplete `.` member-access trigger recorded inside an `f"…"` / `f#"…"#` interpolation hole (`ADR-24B`).
+pub const InterpHoleDotInfo = struct {
+    /// Exclusive end byte of the `.` trigger token relative to the `.fmt_string_lit` token's `byte_offset`.
+    rel_trigger_end_byte: u32,
+    /// Resolved receiver `TypeId` preceding `.`.
+    receiver_type_id: TypeId,
+};
+
+/// Validated per-hole interpolation descriptor recorded for `HirLowerer` and `corex lsp` (`DR-24` `ADR-24B`).
 pub const InterpHoleSpec = struct {
     /// Zero-based hole index inside the interpolated string literal.
     hole_index: u16,
@@ -1134,19 +1156,72 @@ pub const InterpHoleSpec = struct {
     spec: lexer.FmtSpec,
     /// Synthesized `TypeId` of the interpolated hole expression.
     expr_type_id: TypeId,
-    /// Rebased source `Span` of the sub-expression inside `file_id`.
-    expr_span: Span,
+    /// Byte offset of `{` relative to the `.fmt_string_lit` token's `byte_offset`.
+    rel_brace_open_byte: u32 = 0,
+    /// Byte offset of matching `}` relative to the `.fmt_string_lit` token's `byte_offset`.
+    rel_brace_close_byte: u32 = 0,
+    /// Start byte of `expr` relative to the `.fmt_string_lit` token's `byte_offset`.
+    rel_expr_start_byte: u32 = 0,
+    /// Exclusive end byte of `expr` relative to the `.fmt_string_lit` token's `byte_offset`.
+    rel_expr_end_byte: u32 = 0,
     /// Interned trimmed source text of `expr` (used to emit `"expr = "` prefix for `{expr=}`).
     raw_expr_text: SymbolId = .none,
+    /// Owned slice of resolved sub-AST tokens inside this hole (`&.{}` when empty).
+    tokens: []InterpHoleTokenInfo = &.{},
+    /// Owned slice of incomplete `.` completion triggers inside this hole (`&.{}` when empty).
+    incomplete_dots: []InterpHoleDotInfo = &.{},
 };
 
-/// Validated string interpolation side-table metadata keyed by `.string_lit` AST offset (`SE-12`).
+/// Releases `holes` and every nested `tokens` / `incomplete_dots` slice using `allocator`.
+pub fn freeInterpHoleSpecs(allocator: std.mem.Allocator, holes: []InterpHoleSpec) void {
+    for (holes) |hole| {
+        if (hole.tokens.len > 0) allocator.free(hole.tokens);
+        if (hole.incomplete_dots.len > 0) allocator.free(hole.incomplete_dots);
+    }
+    if (holes.len > 0) allocator.free(holes);
+}
+
+/// Deep-clones `src_holes` (including nested `tokens` and `incomplete_dots` slices) into `allocator`.
+pub fn cloneInterpHoleSpecsAlloc(
+    allocator: std.mem.Allocator,
+    src_holes: []const InterpHoleSpec,
+) ![]InterpHoleSpec {
+    if (src_holes.len == 0) return &.{};
+    const cloned = try allocator.alloc(InterpHoleSpec, src_holes.len);
+    var initialized_count: usize = 0;
+    errdefer {
+        for (cloned[0..initialized_count]) |partial_hole| {
+            if (partial_hole.tokens.len > 0) allocator.free(partial_hole.tokens);
+            if (partial_hole.incomplete_dots.len > 0) allocator.free(partial_hole.incomplete_dots);
+        }
+        allocator.free(cloned);
+    }
+    for (src_holes, 0..) |src_hole, i| {
+        const duped_tokens: []InterpHoleTokenInfo = if (src_hole.tokens.len > 0)
+            try allocator.dupe(InterpHoleTokenInfo, src_hole.tokens)
+        else
+            &.{};
+        errdefer if (duped_tokens.len > 0) allocator.free(duped_tokens);
+        const duped_dots: []InterpHoleDotInfo = if (src_hole.incomplete_dots.len > 0)
+            try allocator.dupe(InterpHoleDotInfo, src_hole.incomplete_dots)
+        else
+            &.{};
+        var dst_hole = src_hole;
+        dst_hole.tokens = duped_tokens;
+        dst_hole.incomplete_dots = duped_dots;
+        cloned[i] = dst_hole;
+        initialized_count += 1;
+    }
+    return cloned;
+}
+
+/// Validated string interpolation side-table metadata keyed by `.fmt_string_lit` / `.string_lit` AST offset (`ADR-24B`).
 pub const StringInterpMeta = struct {
     /// `true` when checked top-down against `FmtArgs` (zero-allocation borrowed view mode).
     is_fmt_args_mode: bool = false,
-    /// `true` when the literal uses triple-quote `"""…"""` multiline delimiters.
+    /// `true` when the literal uses `"<newline> … "` multiline delimiters.
     is_multiline: bool = false,
-    /// Opening quote delimiter byte width (`3` for `"""`, `1` for `"`).
+    /// Opening delimiter byte offset up to and including opening `"` (`2` for `f"`, `2 + k` for `f#"`, `1` for `"`).
     delimiter_width: u8 = 1,
     /// Owned slice of validated `{expr[=][:spec]}` hole descriptors.
     holes: []InterpHoleSpec = &.{},
@@ -1246,7 +1321,7 @@ pub const BodySemanticSideTables = struct {
         self.call_arg_mappings.deinit(self.allocator);
         var interp_iter = self.string_interps.valueIterator();
         while (interp_iter.next()) |interp_ptr| {
-            if (interp_ptr.holes.len > 0) self.allocator.free(interp_ptr.holes);
+            freeInterpHoleSpecs(self.allocator, interp_ptr.holes);
         }
         self.string_interps.deinit(self.allocator);
         self.builder_block_calls.deinit(self.allocator);
@@ -2128,9 +2203,11 @@ pub const BUILTIN_ATTRIBUTE_MAP = std.StaticStringMap(void).initComptime(.{
     .{ "fix_inline", {} },
     .{ "free_with", {} },
     .{ "from", {} },
+    .{ "gpu_kernel", {} },
     .{ "ifunc", {} },
     .{ "inline", {} },
     .{ "linear", {} },
+    .{ "link", {} },
     .{ "link_lib", {} },
     .{ "link_name", {} },
     .{ "link_section", {} },
@@ -2152,6 +2229,7 @@ pub const BUILTIN_ATTRIBUTE_MAP = std.StaticStringMap(void).initComptime(.{
     .{ "owned_by_caller", {} },
     .{ "packed", {} },
     .{ "repr", {} },
+    .{ "repr_c", {} },
     .{ "secret", {} },
     .{ "simd", {} },
     .{ "slice_len", {} },
@@ -2163,6 +2241,17 @@ pub const BUILTIN_ATTRIBUTE_MAP = std.StaticStringMap(void).initComptime(.{
     .{ "vectorize_width", {} },
     .{ "wasm_export", {} },
     .{ "wasm_import", {} },
+    .{ "zero_pad", {} },
+});
+
+/// $O(1)$ set of retired standalone layout/linkage attributes consolidated into `@repr` and `@link` (`E0239`).
+const RETIRED_LAYOUT_OR_LINK_ATTR_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "align", {} },
+    .{ "cache_aligned", {} },
+    .{ "link_name", {} },
+    .{ "link_section", {} },
+    .{ "packed", {} },
+    .{ "repr_c", {} },
     .{ "zero_pad", {} },
 });
 
@@ -2865,13 +2954,6 @@ pub fn decodeStandardStringSegment(allocator: std.mem.Allocator, raw_seg: []cons
             }
             continue;
         }
-        if ((raw_seg[cursor] == '{' or raw_seg[cursor] == '}') and
-            cursor + 1 < raw_seg.len and raw_seg[cursor + 1] == raw_seg[cursor])
-        {
-            try out_buf.append(allocator, raw_seg[cursor]);
-            cursor += 2;
-            continue;
-        }
         try out_buf.append(allocator, raw_seg[cursor]);
         cursor += 1;
     }
@@ -2909,56 +2991,49 @@ fn skipRawStringInsideHole(slice: []const u8, after_r_pos: usize) usize {
         raw_hashes += 1;
     }
     if (cursor >= slice.len or slice[cursor] != '"') return cursor;
-    var quote_run: usize = 0;
-    while (cursor + quote_run < slice.len and slice[cursor + quote_run] == '"') : (quote_run += 1) {}
-    const is_triple = quote_run >= 3 and
-        !(raw_hashes > 0 and hasAtLeastHashes(slice, cursor + quote_run, raw_hashes));
-    cursor += if (is_triple) 3 else 1;
-
-    while (cursor < slice.len) {
-        if (slice[cursor] == '"') {
-            if (is_triple) {
-                if (cursor + 2 < slice.len and
-                    slice[cursor + 1] == '"' and
-                    slice[cursor + 2] == '"' and
-                    hasAtLeastHashes(slice, cursor + 3, raw_hashes))
-                {
-                    return cursor + 3 + raw_hashes;
-                }
-                cursor += 1;
-                continue;
-            }
-            if (hasAtLeastHashes(slice, cursor + 1, raw_hashes)) {
-                return cursor + 1 + raw_hashes;
-            }
+    cursor += 1;
+    while (cursor < slice.len) : (cursor += 1) {
+        if (slice[cursor] == '"' and hasAtLeastHashes(slice, cursor + 1, raw_hashes)) {
+            return cursor + 1 + raw_hashes;
         }
-        cursor += 1;
     }
     return slice.len;
 }
 
-/// Skips a standard or byte string (`"…"` / `"""…"""`) starting at opening `"` inside an `{expr}` hole.
-fn skipQuotedStringInsideHole(slice: []const u8, open_quote_pos: usize, is_interp_allowed: bool) usize {
-    const is_triple = open_quote_pos + 2 < slice.len and
-        slice[open_quote_pos + 1] == '"' and
-        slice[open_quote_pos + 2] == '"';
-    var cursor = open_quote_pos + (if (is_triple) @as(usize, 3) else 1);
+/// Skips a plain or byte string (`"…"` / `b"…"`) starting at opening `"` inside an `{expr}` hole.
+fn skipQuotedStringInsideHole(slice: []const u8, open_quote_pos: usize) usize {
+    var cursor = open_quote_pos + 1;
     while (cursor < slice.len) {
         if (slice[cursor] == '\\') {
             cursor = advancePastStringEscape(slice, cursor);
             continue;
         }
         if (slice[cursor] == '"') {
-            if (is_triple) {
-                if (cursor + 2 < slice.len and slice[cursor + 1] == '"' and slice[cursor + 2] == '"') {
-                    return cursor + 3;
-                }
-                cursor += 1;
-                continue;
-            }
             return cursor + 1;
         }
-        if (is_interp_allowed and slice[cursor] == '{') {
+        cursor += 1;
+    }
+    return slice.len;
+}
+
+/// Skips a nested `f"…"` or `f#"…"#` format string starting after `'f'` (`after_f_pos`) inside an `{expr}` hole.
+fn skipFmtStringInsideHole(slice: []const u8, after_f_pos: usize) usize {
+    var cursor = after_f_pos;
+    var fmt_hashes: usize = 0;
+    while (cursor < slice.len and slice[cursor] == '#') : (cursor += 1) {
+        fmt_hashes += 1;
+    }
+    if (cursor >= slice.len or slice[cursor] != '"') return cursor;
+    cursor += 1;
+    while (cursor < slice.len) {
+        if (slice[cursor] == '\\') {
+            cursor = advancePastStringEscape(slice, cursor);
+            continue;
+        }
+        if (slice[cursor] == '"' and hasAtLeastHashes(slice, cursor + 1, fmt_hashes)) {
+            return cursor + 1 + fmt_hashes;
+        }
+        if (slice[cursor] == '{') {
             if (cursor + 1 < slice.len and slice[cursor + 1] == '{') {
                 cursor += 2;
                 continue;
@@ -2974,13 +3049,18 @@ fn skipQuotedStringInsideHole(slice: []const u8, open_quote_pos: usize, is_inter
     return slice.len;
 }
 
-/// Skips a nested string, byte-string, char/byte literal, or comment starting at `cursor` inside `{expr}`, or returns `null`.
+/// Skips a nested string, byte-string, char/byte literal, or line comment starting at `cursor` inside `{expr}`.
 fn trySkipLiteralOrCommentInHole(slice: []const u8, cursor: usize, expr_floor: usize) ?usize {
     const cur_byte = slice[cursor];
     const is_word_start = cursor <= expr_floor or
         (!std.ascii.isAlphanumeric(slice[cursor - 1]) and slice[cursor - 1] != '_');
     if (cur_byte == '"') {
-        return skipQuotedStringInsideHole(slice, cursor, true);
+        return skipQuotedStringInsideHole(slice, cursor);
+    }
+    if (cur_byte == 'f' and is_word_start and cursor + 1 < slice.len and
+        (slice[cursor + 1] == '"' or slice[cursor + 1] == '#'))
+    {
+        return skipFmtStringInsideHole(slice, cursor + 1);
     }
     if (cur_byte == 'r' and is_word_start and cursor + 1 < slice.len and
         (slice[cursor + 1] == '"' or slice[cursor + 1] == '#'))
@@ -2989,7 +3069,7 @@ fn trySkipLiteralOrCommentInHole(slice: []const u8, cursor: usize, expr_floor: u
     }
     if (cur_byte == 'b' and is_word_start and cursor + 1 < slice.len) {
         if (slice[cursor + 1] == '"') {
-            return skipQuotedStringInsideHole(slice, cursor + 1, false);
+            return skipQuotedStringInsideHole(slice, cursor + 1);
         }
         if (slice[cursor + 1] == '\'') {
             var char_cur = cursor + 2;
@@ -3016,30 +3096,19 @@ fn trySkipLiteralOrCommentInHole(slice: []const u8, cursor: usize, expr_floor: u
         while (line_cur < slice.len and slice[line_cur] != '\n') : (line_cur += 1) {}
         return line_cur;
     }
-    if (cur_byte == '/' and cursor + 1 < slice.len and slice[cursor + 1] == '*') {
-        var blk_cur = cursor + 2;
-        var comment_depth: u32 = 1;
-        while (blk_cur + 1 < slice.len and comment_depth > 0) {
-            if (slice[blk_cur] == '/' and slice[blk_cur + 1] == '*') {
-                comment_depth += 1;
-                blk_cur += 2;
-            } else if (slice[blk_cur] == '*' and slice[blk_cur + 1] == '/') {
-                comment_depth -= 1;
-                blk_cur += 2;
-            } else {
-                blk_cur += 1;
-            }
-        }
-        return if (comment_depth == 0) blk_cur else slice.len;
-    }
     return null;
 }
 
 /// Scans `body[start_pos..]` (inside `"…"`) for the next unescaped `{expr}` segment, respecting nested quotes/comments.
 pub fn scanNextInterpolationSegment(body: []const u8, start_pos: usize) ?InterpolationSegment {
+    return scanNextInterpolationSegmentMode(body, start_pos, false);
+}
+
+/// Scans `body[start_pos..]` inside `f"…"` (`is_raw == false`) or `f#"…"#` (`is_raw == true`) for the next `{expr}` hole.
+pub fn scanNextInterpolationSegmentMode(body: []const u8, start_pos: usize, is_raw: bool) ?InterpolationSegment {
     var cursor = start_pos;
     while (cursor < body.len) {
-        if (body[cursor] == '\\') {
+        if (!is_raw and body[cursor] == '\\') {
             cursor = advancePastStringEscape(body, cursor);
             continue;
         }
@@ -3699,8 +3768,9 @@ fn computeTypeLayoutBoundedMemo(
             }
             const child_subst = NominalTypeSubst.fromNominal(pool, sym_table, type_id, struct_sym, subst);
             const active_subst = if (child_subst.len > 0) &child_subst else subst;
-            const is_packed = struct_sym.contract_flags.is_packed;
-            const is_decl_order = is_packed or struct_sym.contract_flags.is_repr_c;
+            const packed_cap = struct_sym.packedCapBytes();
+            const is_decl_order = (packed_cap > 0) or struct_sym.contract_flags.is_repr_c or
+                struct_sym.isReprTransparent();
             const members = sym_table.getScopeMembers(struct_sym.target_scope);
             var cur_offset: u64 = 0;
             var max_align_log2: u8 = 0;
@@ -3719,10 +3789,14 @@ fn computeTypeLayoutBoundedMemo(
                         memo,
                     );
                     if (!field_layout.is_sized) is_all_sized = false;
-                    if (!is_packed and field_layout.align_log2 > max_align_log2) {
-                        max_align_log2 = field_layout.align_log2;
+                    const eff_align: u32 = if (packed_cap > 0)
+                        @min(field_layout.align_bytes, packed_cap)
+                    else
+                        field_layout.align_bytes;
+                    const eff_log2: u8 = @intCast(std.math.log2_int(u32, @max(eff_align, 1)));
+                    if (eff_log2 > max_align_log2) {
+                        max_align_log2 = eff_log2;
                     }
-                    const eff_align: u32 = if (is_packed) 1 else field_layout.align_bytes;
                     cur_offset = alignUpU64(cur_offset, eff_align) +| field_layout.byte_size;
                 }
             } else {
@@ -4130,12 +4204,12 @@ fn computeLeafNicheBoundedMemo(
                     }
                 }
             }
-            if (st_sym.target_scope.isNone() or st_sym.contract_flags.is_packed) break :blk .{};
+            if (st_sym.target_scope.isNone() or st_sym.packedCapBytes() > 0) break :blk .{};
             const child_subst = NominalTypeSubst.fromNominal(pool, sym_table, ty, st_sym, subst);
             const active_subst = if (child_subst.len > 0) &child_subst else subst;
             const members = sym_table.getScopeMembers(st_sym.target_scope);
             var cur_offset: u64 = 0;
-            if (st_sym.contract_flags.is_repr_c) {
+            if (st_sym.contract_flags.is_repr_c or st_sym.isReprTransparent()) {
                 for (members) |mem_idx| {
                     const mem_sym = sym_table.getSymbol(mem_idx).*;
                     if (mem_sym.kind != .field_sym) continue;
@@ -6657,8 +6731,9 @@ pub const InternPool = struct {
                 if (st_sym.target_scope.isNone()) return null;
                 const child_subst = NominalTypeSubst.fromNominal(self, sym_table, ty, st_sym, subst);
                 const active_subst = if (child_subst.len > 0) &child_subst else subst;
-                const is_packed = st_sym.contract_flags.is_packed;
-                const is_decl_order = is_packed or st_sym.contract_flags.is_repr_c;
+                const packed_cap = st_sym.packedCapBytes();
+                const is_decl_order = (packed_cap > 0) or st_sym.contract_flags.is_repr_c or
+                    st_sym.isReprTransparent();
                 const members = sym_table.getScopeMembers(st_sym.target_scope);
                 var cur_offset: u64 = 0;
                 if (is_decl_order) {
@@ -6673,7 +6748,11 @@ pub const InternPool = struct {
                             active_subst,
                             depth + 1,
                         );
-                        const aligned_off = if (is_packed) cur_offset else alignUpU64(cur_offset, f_layout.align_bytes);
+                        const eff_align: u32 = if (packed_cap > 0)
+                            @min(f_layout.align_bytes, packed_cap)
+                        else
+                            f_layout.align_bytes;
+                        const aligned_off = alignUpU64(cur_offset, eff_align);
                         if (self.explainFromBytesViolationBounded(
                             mem_sym.type_id,
                             sym_table,
@@ -7120,8 +7199,9 @@ pub const InternPool = struct {
                 const child_subst = NominalTypeSubst.fromNominal(self, sym_table, ty, st_sym, subst);
                 const active_subst = if (child_subst.len > 0) &child_subst else subst;
                 const is_zero_padded = st_sym.contract_flags.is_zero_pad;
-                const is_packed = st_sym.contract_flags.is_packed;
-                const is_decl_order = is_packed or st_sym.contract_flags.is_repr_c;
+                const packed_cap = st_sym.packedCapBytes();
+                const is_decl_order = (packed_cap > 0) or st_sym.contract_flags.is_repr_c or
+                    st_sym.isReprTransparent();
                 const members = sym_table.getScopeMembers(st_sym.target_scope);
                 var cur_offset: u64 = 0;
                 var max_align_log2: u8 = 0;
@@ -7137,8 +7217,13 @@ pub const InternPool = struct {
                             active_subst,
                             depth + 1,
                         );
-                        if (!is_packed and f_layout.align_log2 > max_align_log2) max_align_log2 = f_layout.align_log2;
-                        const aligned_off = if (is_packed) cur_offset else alignUpU64(cur_offset, f_layout.align_bytes);
+                        const eff_align: u32 = if (packed_cap > 0)
+                            @min(f_layout.align_bytes, packed_cap)
+                        else
+                            f_layout.align_bytes;
+                        const eff_log2: u8 = @intCast(std.math.log2_int(u32, @max(eff_align, 1)));
+                        if (eff_log2 > max_align_log2) max_align_log2 = eff_log2;
+                        const aligned_off = alignUpU64(cur_offset, eff_align);
                         if (self.explainIntoBytesViolationBounded(
                             mem_sym.type_id,
                             sym_table,
@@ -7748,8 +7833,9 @@ pub fn computeStructFieldOffset(
     if (struct_sym.target_scope.isNone()) return null;
 
     const subst = NominalTypeSubst.fromNominal(pool, sym_table, unwrapped, struct_sym, &NominalTypeSubst.EMPTY);
-    const is_packed = struct_sym.contract_flags.is_packed;
-    const is_decl_order = is_packed or struct_sym.contract_flags.is_repr_c;
+    const packed_cap = struct_sym.packedCapBytes();
+    const is_decl_order = (packed_cap > 0) or struct_sym.contract_flags.is_repr_c or
+        struct_sym.isReprTransparent();
     const members = sym_table.getScopeMembers(struct_sym.target_scope);
     var memo: LayoutNicheMemo = .{};
     var cur_offset: u64 = 0;
@@ -7767,7 +7853,10 @@ pub fn computeStructFieldOffset(
                 1,
                 &memo,
             );
-            const eff_align: u32 = if (is_packed) 1 else field_layout.align_bytes;
+            const eff_align: u32 = if (packed_cap > 0)
+                @min(field_layout.align_bytes, packed_cap)
+            else
+                field_layout.align_bytes;
             const aligned_offset = alignUpU64(cur_offset, eff_align);
             if (cur_ordinal == field_ordinal) return aligned_offset;
             cur_offset = aligned_offset +| field_layout.byte_size;
@@ -9761,7 +9850,7 @@ pub const TypeChecker = struct {
         self.call_arg_mappings.deinit(self.allocator);
         var interp_iter = self.string_interps.valueIterator();
         while (interp_iter.next()) |interp_ptr| {
-            if (interp_ptr.holes.len > 0) self.allocator.free(interp_ptr.holes);
+            freeInterpHoleSpecs(self.allocator, interp_ptr.holes);
         }
         self.string_interps.deinit(self.allocator);
         self.builder_block_calls.deinit(self.allocator);
@@ -10125,8 +10214,8 @@ pub const TypeChecker = struct {
         while (interp_iter.next()) |entry| {
             const raw_node = entry.key_ptr.*;
             if (raw_node >= result.ast_start and raw_node < result.ast_end) {
-                const duped_holes = try allocator.dupe(InterpHoleSpec, entry.value_ptr.holes);
-                errdefer if (duped_holes.len > 0) allocator.free(duped_holes);
+                const duped_holes = try cloneInterpHoleSpecsAlloc(allocator, entry.value_ptr.holes);
+                errdefer freeInterpHoleSpecs(allocator, duped_holes);
                 try result.string_interps.put(allocator, raw_node - result.ast_start, .{
                     .is_fmt_args_mode = entry.value_ptr.is_fmt_args_mode,
                     .is_multiline = entry.value_ptr.is_multiline,
@@ -12510,6 +12599,39 @@ pub const TypeChecker = struct {
                 std.mem.eql(u8, attr_name, "deprecated"),
             );
             return;
+        } else if (RETIRED_LAYOUT_OR_LINK_ATTR_SET.has(attr_name)) {
+            const dedup_cst = if (!target_sym_idx.isNone() and
+                !self.sym_table.getSymbol(target_sym_idx).cst_node.isNone())
+                self.sym_table.getSymbol(target_sym_idx).cst_node
+            else
+                CstNodeIndex.fromInt(@intCast(attr_start));
+            if (!self.hasDiagnosticInCstSubtree(
+                .e0239_retired_layout_or_link_attribute,
+                dedup_cst,
+            )) {
+                const attr_span = symbol_resolver.computeCstSubtreeSpan(
+                    self.file_id,
+                    self.token_buffer,
+                    self.cst_arena,
+                    CstNodeIndex.fromInt(@intCast(attr_start)),
+                ) orelse self.token_buffer.getTokenSpan(self.file_id, name_tok);
+                try self.emitDiagnosticSimple(
+                    .e0239_retired_layout_or_link_attribute,
+                    attr_span,
+                    "retired standalone layout or linkage attribute; consolidate into `@repr(…)` or `@link(…)` (`ADR-24C`)",
+                    "retired standalone attribute",
+                );
+            }
+            return;
+        } else if (std.mem.eql(u8, attr_name, "repr")) {
+            try self.validateReprAttrCst(target_sym_idx, attr_start, name_tok, name_leaf_pos, attr_end);
+            return;
+        } else if (std.mem.eql(u8, attr_name, "link")) {
+            try self.validateLinkAttrCst(target_sym_idx, attr_start, name_tok, name_leaf_pos, attr_end);
+            return;
+        } else if (std.mem.eql(u8, attr_name, "inline")) {
+            try self.validateInlineAttrAndW0333Cst(target_sym_idx, attr_start, name_tok, name_leaf_pos, attr_end);
+            return;
         } else if (BUILTIN_ATTRIBUTE_MAP.has(attr_name)) {
             return;
         }
@@ -12803,8 +12925,985 @@ pub const TypeChecker = struct {
         return directives;
     }
 
+    /// Returns `true` if `sym_idx` (or its enclosing nominal `impl` owner) declares generic parameters.
+    fn isSymbolOrOwnerGeneric(self: *const TypeChecker, sym_idx: SymbolIndex) bool {
+        if (sym_idx.isNone()) return false;
+        if (self.sym_table.getGenericParamSpecs(sym_idx).len > 0) return true;
+        const sym = self.sym_table.getSymbol(sym_idx).*;
+        if (!sym.target_scope.isNone()) {
+            for (self.sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
+                const mem_kind = self.sym_table.getSymbol(mem_idx).kind;
+                if (mem_kind == .type_param_sym or mem_kind == .const_param_sym) return true;
+            }
+        }
+        if (!sym.scope_id.isNone()) {
+            const parent_scope = self.sym_table.scope_arena.getScope(sym.scope_id);
+            if (parent_scope.kind == .nominal_type_scope) {
+                for (self.sym_table.getScopeMembers(sym.scope_id)) |mem_idx| {
+                    const mem_kind = self.sym_table.getSymbol(mem_idx).kind;
+                    if (mem_kind == .type_param_sym or mem_kind == .const_param_sym) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Returns `true` if `fn_ast_id` is an inline `= expr;` expression-bodied function (`fn foo() -> T = expr;`).
+    fn hasFnExprBodyAst(self: *const TypeChecker, fn_ast_id: NodeIndex) bool {
+        if (fn_ast_id.isNone() or fn_ast_id.asInt() >= self.ast_arena.countNodes()) return false;
+        const fn_node = self.ast_arena.getNode(fn_ast_id);
+        if (fn_node.tag != .fn_decl or fn_node.rhs.tag != .node) return false;
+        const body_id = NodeIndex.fromInt(fn_node.rhs.payload);
+        if (body_id.isNone() or body_id.asInt() >= self.ast_arena.countNodes()) return false;
+        return self.ast_arena.getNode(body_id).tag != .block;
+    }
+
+    /// Classification of generic struct fields for `@repr(transparent)` zero-sized layout verification (`E0440`).
+    const GenericZstClass = enum {
+        /// Non-zero-sized or instantiation-dependent field size (`T`, `[T; 4]`, `Option[T]`, etc.).
+        non_zst,
+        /// Guaranteed `size == 0` and `align == 1` across all instantiations (`Phantom[T]`, `()`, etc.).
+        zst_align_1,
+        /// Guaranteed `size == 0` with `align > 1` or unknown `alignof(T)` (`[T; 0]`, `@repr(align: 8) struct Z[T] {}`).
+        zst_overaligned,
+    };
+
+    /// Classifies whether a `has_type_vars` field type `raw_ty` is a guaranteed 1-aligned ZST (`depth <= 16`).
+    fn classifyGenericZstField(
+        self: *TypeChecker,
+        raw_ty: TypeId,
+        depth: u32,
+    ) anyerror!GenericZstClass {
+        if (depth > 16) return .non_zst;
+        const unwrapped_ty = self.pool.unwrapUnderlyingType(raw_ty);
+        if (unwrapped_ty.isError()) return .non_zst;
+        if (!self.pool.getFlags(unwrapped_ty).has_type_vars) {
+            const concrete_lay = self.computeTypeLayout(unwrapped_ty, self.target_layout);
+            if (concrete_lay.byte_size > 0) return .non_zst;
+            return if (concrete_lay.align_bytes > 1) .zst_overaligned else .zst_align_1;
+        }
+
+        const ty_node = self.pool.getNode(unwrapped_ty);
+        switch (ty_node.tag) {
+            .array_ty, .soa_array_ty => {
+                if ((ty_node.rhs & SYMBOLIC_ARRAY_LEN_FLAG) != 0) return .non_zst;
+                const elem_class = try self.classifyGenericZstField(TypeId.fromInt(ty_node.lhs), depth + 1);
+                if (ty_node.rhs == 0) {
+                    if (ty_node.tag == .array_ty and elem_class == .zst_align_1) return .zst_align_1;
+                    return .zst_overaligned;
+                }
+                return if (ty_node.tag == .array_ty) elem_class else .non_zst;
+            },
+            .tuple_ty => {
+                var has_overaligned = false;
+                for (self.pool.getTupleElements(unwrapped_ty)) |raw_elem| {
+                    switch (try self.classifyGenericZstField(TypeId.fromInt(raw_elem), depth + 1)) {
+                        .non_zst => return .non_zst,
+                        .zst_overaligned => has_overaligned = true,
+                        .zst_align_1 => {},
+                    }
+                }
+                return if (has_overaligned) .zst_overaligned else .zst_align_1;
+            },
+            .struct_ty => {
+                const struct_sym = self.sym_table.getSymbol(SymbolIndex.fromInt(ty_node.rhs)).*;
+                var has_overaligned = struct_sym.contract_flags.is_cache_aligned or
+                    struct_sym.explicit_align_log2_plus1 > 1;
+                if (!struct_sym.target_scope.isNone()) {
+                    for (self.sym_table.getScopeMembers(struct_sym.target_scope)) |mem_idx| {
+                        const mem_sym = self.sym_table.getSymbol(mem_idx).*;
+                        if (mem_sym.kind != .field_sym) continue;
+                        const subst_field_ty = try self.substituteNominalMemberType(unwrapped_ty, mem_sym.type_id);
+                        switch (try self.classifyGenericZstField(subst_field_ty, depth + 1)) {
+                            .non_zst => return .non_zst,
+                            .zst_overaligned => has_overaligned = true,
+                            .zst_align_1 => {},
+                        }
+                    }
+                }
+                return if (has_overaligned) .zst_overaligned else .zst_align_1;
+            },
+            else => return .non_zst,
+        }
+    }
+
+    /// Validates `@repr(…)` schema arguments, const `align:` expressions, and `@repr(transparent)` layout (`E0440`).
+    fn validateReprAttrCst(
+        self: *TypeChecker,
+        target_sym_idx: SymbolIndex,
+        attr_start: usize,
+        name_tok: TokenIndex,
+        name_pos: usize,
+        attr_end: usize,
+    ) !void {
+        const attr_cst = CstNodeIndex.fromInt(@intCast(attr_start));
+        const attr_span = symbol_resolver.computeCstSubtreeSpan(
+            self.file_id,
+            self.token_buffer,
+            self.cst_arena,
+            attr_cst,
+        ) orelse self.token_buffer.getTokenSpan(self.file_id, name_tok);
+        const target_kind: symbol_resolver.SymbolKind = if (!target_sym_idx.isNone())
+            self.sym_table.getSymbol(target_sym_idx).kind
+        else
+            .local_let_sym;
+
+        const is_allowed_target = target_kind == .struct_sym or
+            target_kind == .union_sym or
+            target_kind == .enum_sym or
+            target_kind == .extern_static_sym;
+        if (!is_allowed_target) {
+            try self.emitDiagnosticSimple(
+                .e0440_invalid_repr_or_inline_attribute,
+                attr_span,
+                "`@repr` is only valid on `struct`, `union`, `enum`, or `static` (`align:` only) declarations",
+                "invalid `@repr` target",
+            );
+            return;
+        }
+
+        var arg_cursor = name_pos + 1;
+        var has_open_paren = false;
+        while (arg_cursor < attr_end) : (arg_cursor += 1) {
+            const leaf = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cursor)));
+            if (leaf.subtree_size <= 1 and !leaf.flags.is_missing_or_injected and !leaf.token.isNone() and
+                leaf.token.asInt() < self.token_buffer.countTokens() and
+                self.token_buffer.getToken(leaf.token).kind == .lparen)
+            {
+                has_open_paren = true;
+                arg_cursor += 1;
+                break;
+            }
+        }
+        if (!has_open_paren) {
+            try self.emitDiagnosticSimple(
+                .e0440_invalid_repr_or_inline_attribute,
+                self.token_buffer.getTokenSpan(self.file_id, name_tok),
+                "`@repr` requires arguments such as `@repr(C)`, `@repr(transparent)`, or `@repr(align: 16)`",
+                "missing `@repr(…)` arguments",
+            );
+            return;
+        }
+
+        const BaseMode = enum { none, repr_c, transparent, int_prim };
+        var base_mode: BaseMode = .none;
+        var has_seen_named = false;
+        var has_packed_key = false;
+        var has_align_key = false;
+        var has_zero_pad_key = false;
+        var arg_count: usize = 0;
+        var packed_cap: u32 = 0;
+        var explicit_align_val: ?u64 = null;
+
+        while (arg_cursor < attr_end) {
+            var seg_end = arg_cursor;
+            var paren_depth: u32 = 0;
+            while (seg_end < attr_end) : (seg_end += 1) {
+                const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(seg_end)));
+                if (sub.subtree_size <= 1 and !sub.token.isNone() and
+                    sub.token.asInt() < self.token_buffer.countTokens())
+                {
+                    const tok_kind = self.token_buffer.getToken(sub.token).kind;
+                    if (tok_kind == .lparen or tok_kind == .lbracket or tok_kind == .lbrace) {
+                        paren_depth += 1;
+                    } else if (tok_kind == .rparen or tok_kind == .rbracket or tok_kind == .rbrace) {
+                        if (paren_depth == 0) break;
+                        paren_depth -= 1;
+                    } else if (tok_kind == .comma and paren_depth == 0) {
+                        break;
+                    }
+                }
+            }
+
+            if (seg_end > arg_cursor) {
+                var leaf_toks: [8]TokenIndex = undefined;
+                var leaf_pos_arr: [8]usize = undefined;
+                var leaf_count: usize = 0;
+                var scan_pos = arg_cursor;
+                while (scan_pos < seg_end) : (scan_pos += 1) {
+                    const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(scan_pos)));
+                    if (sub.subtree_size <= 1 and !sub.flags.is_missing_or_injected and !sub.token.isNone() and
+                        sub.token.asInt() < self.token_buffer.countTokens())
+                    {
+                        if (leaf_count < leaf_toks.len) {
+                            leaf_toks[leaf_count] = sub.token;
+                            leaf_pos_arr[leaf_count] = scan_pos;
+                        }
+                        leaf_count += 1;
+                    }
+                }
+
+                if (leaf_count > 0) {
+                    arg_count += 1;
+                    const first_kind = self.token_buffer.getToken(leaf_toks[0]).kind;
+                    const is_key_val = leaf_count >= 2 and
+                        symbol_resolver.isIdentifierToken(first_kind) and
+                        (self.token_buffer.getToken(leaf_toks[1]).kind == .colon or
+                            self.token_buffer.getToken(leaf_toks[1]).kind == .eq);
+
+                    if (is_key_val) {
+                        has_seen_named = true;
+                        const key_tok = leaf_toks[0];
+                        const sep_tok = leaf_toks[1];
+                        const key_lex = symbol_resolver.extractTokenSlice(self.source, self.token_buffer, key_tok);
+                        const key_span = self.token_buffer.getTokenSpan(self.file_id, key_tok);
+                        if (self.token_buffer.getToken(sep_tok).kind == .eq) {
+                            try self.emitDiagnosticWithSingleFix(
+                                .e0440_invalid_repr_or_inline_attribute,
+                                self.token_buffer.getTokenSpan(self.file_id, sep_tok),
+                                "`@repr` named arguments use `:` rather than `=`",
+                                "expected `:` here",
+                                "replace `=` with `:`",
+                                self.token_buffer.getTokenSpan(self.file_id, sep_tok),
+                                ":",
+                            );
+                        }
+                        if (std.mem.eql(u8, key_lex, "packed")) {
+                            if (has_packed_key) {
+                                try self.emitDiagnosticSimple(
+                                    .e0440_invalid_repr_or_inline_attribute,
+                                    key_span,
+                                    "duplicate `packed` key in `@repr` attribute",
+                                    "duplicate `packed` argument",
+                                );
+                            }
+                            has_packed_key = true;
+                            if (target_kind != .struct_sym) {
+                                try self.emitDiagnosticSimple(
+                                    .e0440_invalid_repr_or_inline_attribute,
+                                    key_span,
+                                    "`packed` in `@repr` is only valid on `@repr(C, …)` `struct` declarations",
+                                    "`packed` requires a `struct` target",
+                                );
+                            }
+                            if (leaf_count != 3) {
+                                try self.emitDiagnosticSimple(
+                                    .e0440_invalid_repr_or_inline_attribute,
+                                    key_span,
+                                    "`packed:` expects `true`, `false`, or alignment cap `1 | 2 | 4 | 8 | 16`",
+                                    "invalid `packed` value",
+                                );
+                            } else {
+                                const val_tok = leaf_toks[2];
+                                const val_kind = self.token_buffer.getToken(val_tok).kind;
+                                const val_lex = symbol_resolver.extractTokenSlice(
+                                    self.source,
+                                    self.token_buffer,
+                                    val_tok,
+                                );
+                                if (val_kind == .kw_true) {
+                                    packed_cap = 1;
+                                } else if (val_kind == .kw_false) {
+                                    packed_cap = 0;
+                                } else if (val_kind == .int_lit) {
+                                    const parsed_cap = std.fmt.parseInt(u32, val_lex, 10) catch 0;
+                                    if (parsed_cap == 1 or parsed_cap == 2 or parsed_cap == 4 or
+                                        parsed_cap == 8 or parsed_cap == 16)
+                                    {
+                                        packed_cap = parsed_cap;
+                                    } else {
+                                        try self.emitDiagnosticSimple(
+                                            .e0440_invalid_repr_or_inline_attribute,
+                                            self.token_buffer.getTokenSpan(self.file_id, val_tok),
+                                            "`packed:` integer cap must be `1`, `2`, `4`, `8`, or `16`",
+                                            "unsupported `packed` alignment cap",
+                                        );
+                                    }
+                                } else {
+                                    try self.emitDiagnosticSimple(
+                                        .e0440_invalid_repr_or_inline_attribute,
+                                        self.token_buffer.getTokenSpan(self.file_id, val_tok),
+                                        "`packed:` expects `true`, `false`, or `1 | 2 | 4 | 8 | 16`",
+                                        "invalid `packed` value",
+                                    );
+                                }
+                            }
+                        } else if (std.mem.eql(u8, key_lex, "align")) {
+                            if (has_align_key) {
+                                try self.emitDiagnosticSimple(
+                                    .e0440_invalid_repr_or_inline_attribute,
+                                    key_span,
+                                    "duplicate `align` key in `@repr` attribute",
+                                    "duplicate `align` argument",
+                                );
+                            }
+                            has_align_key = true;
+                            const is_dot_cache_line = leaf_count == 4 and
+                                self.token_buffer.getToken(leaf_toks[2]).kind == .dot and
+                                std.mem.eql(
+                                    u8,
+                                    symbol_resolver.extractTokenSlice(self.source, self.token_buffer, leaf_toks[3]),
+                                    "CacheLine",
+                                );
+                            const is_typo_cache_line = (leaf_count == 4 and
+                                self.token_buffer.getToken(leaf_toks[2]).kind == .dot and
+                                std.mem.eql(
+                                    u8,
+                                    symbol_resolver.extractTokenSlice(self.source, self.token_buffer, leaf_toks[3]),
+                                    "cache_line",
+                                )) or (leaf_count == 3 and
+                                std.mem.eql(
+                                    u8,
+                                    symbol_resolver.extractTokenSlice(self.source, self.token_buffer, leaf_toks[2]),
+                                    "cache_line",
+                                ));
+                            if (is_dot_cache_line) {
+                                if (!target_sym_idx.isNone()) {
+                                    self.sym_table.getSymbolMut(target_sym_idx).contract_flags.is_cache_aligned = true;
+                                }
+                            } else if (is_typo_cache_line) {
+                                if (!self.hasDiagnosticInCstSubtree(
+                                    .e0440_invalid_repr_or_inline_attribute,
+                                    attr_cst,
+                                )) {
+                                    const typo_span = if (leaf_count == 4)
+                                        Span.init(
+                                            self.file_id,
+                                            self.token_buffer.getTokenSpan(self.file_id, leaf_toks[2]).start_byte,
+                                            self.token_buffer.getTokenSpan(self.file_id, leaf_toks[3]).end_byte,
+                                        )
+                                    else
+                                        self.token_buffer.getTokenSpan(self.file_id, leaf_toks[2]);
+                                    try self.emitDiagnosticWithSingleFix(
+                                        .e0440_invalid_repr_or_inline_attribute,
+                                        typo_span,
+                                        "cache-line alignment in `@repr` is spelled `.CacheLine`",
+                                        "expected `.CacheLine`",
+                                        "replace with `.CacheLine`",
+                                        typo_span,
+                                        ".CacheLine",
+                                    );
+                                }
+                            } else {
+                                const val_search_start = leaf_pos_arr[1] + 1;
+                                const align_ast = self.findFirstAstInCstRange(val_search_start, seg_end);
+                                var align_eval_opt: ?i128 = null;
+                                if (!align_ast.isNone()) {
+                                    self.pure_comptime_depth += 1;
+                                    defer self.pure_comptime_depth -= 1;
+                                    _ = try self.checkExpr(align_ast, .usize_ty);
+                                    align_eval_opt = try self.evalConstIntExpr(align_ast, true);
+                                } else if (leaf_count == 3 and
+                                    self.token_buffer.getToken(leaf_toks[2]).kind == .int_lit)
+                                {
+                                    const lit_lex = symbol_resolver.extractTokenSlice(
+                                        self.source,
+                                        self.token_buffer,
+                                        leaf_toks[2],
+                                    );
+                                    if (extractIntLiteralValue(lit_lex)) |parsed_lit| {
+                                        if (!parsed_lit.is_above_i128_max) align_eval_opt = parsed_lit.value;
+                                    }
+                                }
+                                const err_span = if (!align_ast.isNone())
+                                    self.getAstNodeSpan(align_ast)
+                                else if (leaf_count >= 3)
+                                    self.token_buffer.getTokenSpan(self.file_id, leaf_toks[2])
+                                else
+                                    key_span;
+                                if (align_eval_opt) |align_i128| {
+                                    const max_align_i128: i128 = @as(i128, 1) << 29;
+                                    if (align_i128 >= 1 and align_i128 <= max_align_i128 and
+                                        std.math.isPowerOfTwo(@as(u64, @intCast(align_i128))))
+                                    {
+                                        const align_u64: u64 = @intCast(align_i128);
+                                        explicit_align_val = align_u64;
+                                        if (!target_sym_idx.isNone()) {
+                                            self.sym_table.getSymbolMut(target_sym_idx).explicit_align_log2_plus1 =
+                                                @intCast(std.math.log2_int(u64, align_u64) + 1);
+                                        }
+                                    } else {
+                                        try self.emitDiagnosticSimple(
+                                            .e0440_invalid_repr_or_inline_attribute,
+                                            err_span,
+                                            "`@repr(align: …)` value must be a power of two in `1 ..= 536870912` (`1 << 29`) or `.CacheLine`",
+                                            "alignment is not a valid power of two",
+                                        );
+                                    }
+                                } else {
+                                    try self.emitDiagnosticSimple(
+                                        .e0440_invalid_repr_or_inline_attribute,
+                                        err_span,
+                                        "`@repr(align: …)` requires a compile-time power-of-two integer expression or `.CacheLine`",
+                                        "expected const power-of-two alignment or `.CacheLine`",
+                                    );
+                                }
+                            }
+                        } else if (std.mem.eql(u8, key_lex, "zero_pad")) {
+                            if (has_zero_pad_key) {
+                                try self.emitDiagnosticSimple(
+                                    .e0440_invalid_repr_or_inline_attribute,
+                                    key_span,
+                                    "duplicate `zero_pad` key in `@repr` attribute",
+                                    "duplicate `zero_pad` argument",
+                                );
+                            }
+                            has_zero_pad_key = true;
+                            if (target_kind == .extern_static_sym) {
+                                try self.emitDiagnosticSimple(
+                                    .e0440_invalid_repr_or_inline_attribute,
+                                    key_span,
+                                    "`zero_pad` is only valid on `struct`, `union`, or `enum` declarations",
+                                    "invalid `zero_pad` target",
+                                );
+                            }
+                            if (leaf_count != 3 or
+                                (self.token_buffer.getToken(leaf_toks[2]).kind != .kw_true and
+                                    self.token_buffer.getToken(leaf_toks[2]).kind != .kw_false))
+                            {
+                                try self.emitDiagnosticSimple(
+                                    .e0440_invalid_repr_or_inline_attribute,
+                                    if (leaf_count >= 3)
+                                        self.token_buffer.getTokenSpan(self.file_id, leaf_toks[2])
+                                    else
+                                        key_span,
+                                    "`zero_pad:` expects `true` or `false`",
+                                    "expected boolean literal",
+                                );
+                            }
+                        } else {
+                            var unk_buf: [192]u8 = undefined;
+                            const unk_msg = std.fmt.bufPrint(
+                                &unk_buf,
+                                "unknown `@repr` key `{s}`; expected `packed`, `align`, or `zero_pad`",
+                                .{key_lex},
+                            ) catch "unknown key in `@repr` attribute";
+                            try self.emitDiagnosticSimple(
+                                .e0440_invalid_repr_or_inline_attribute,
+                                key_span,
+                                unk_msg,
+                                "valid `@repr` keys are `packed`, `align`, and `zero_pad`",
+                            );
+                        }
+                    } else {
+                        const pos_tok = leaf_toks[0];
+                        const pos_span = self.token_buffer.getTokenSpan(self.file_id, pos_tok);
+                        const pos_lex = symbol_resolver.extractTokenSlice(self.source, self.token_buffer, pos_tok);
+                        if (has_seen_named or base_mode != .none or leaf_count != 1) {
+                            try self.emitDiagnosticSimple(
+                                .e0440_invalid_repr_or_inline_attribute,
+                                pos_span,
+                                "`@repr` accepts at most one positional representation base (`C` or `transparent`) before named keys",
+                                "unexpected positional `@repr` argument",
+                            );
+                        } else if (std.mem.eql(u8, pos_lex, "C")) {
+                            if (target_kind == .extern_static_sym) {
+                                try self.emitDiagnosticSimple(
+                                    .e0440_invalid_repr_or_inline_attribute,
+                                    pos_span,
+                                    "`@repr(C)` is not valid on `static` items; use `extern \"C\"` for foreign linkage",
+                                    "`@repr(C)` requires `struct`, `union`, or `enum`",
+                                );
+                            }
+                            base_mode = .repr_c;
+                        } else if (std.mem.eql(u8, pos_lex, "c")) {
+                            base_mode = .repr_c;
+                            if (!self.hasDiagnosticInCstSubtree(
+                                .e0440_invalid_repr_or_inline_attribute,
+                                attr_cst,
+                            )) {
+                                try self.emitDiagnosticWithSingleFix(
+                                    .e0440_invalid_repr_or_inline_attribute,
+                                    pos_span,
+                                    "C ABI representation base in `@repr` is spelled uppercase `C`",
+                                    "expected uppercase `C`",
+                                    "replace `c` with `C`",
+                                    pos_span,
+                                    "C",
+                                );
+                            }
+                        } else if (std.mem.eql(u8, pos_lex, "transparent")) {
+                            base_mode = .transparent;
+                            if (target_kind != .struct_sym) {
+                                try self.emitDiagnosticSimple(
+                                    .e0440_invalid_repr_or_inline_attribute,
+                                    pos_span,
+                                    "`@repr(transparent)` is only valid on single-field `struct` declarations",
+                                    "`@repr(transparent)` requires a `struct`",
+                                );
+                            }
+                        } else if (symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.get(pos_lex)) |prim_ty| {
+                            if (prim_ty.isIntegerPrimitive()) {
+                                base_mode = .int_prim;
+                                if (target_kind != .enum_sym) {
+                                    try self.emitDiagnosticSimple(
+                                        .e0440_invalid_repr_or_inline_attribute,
+                                        pos_span,
+                                        "integer representation type is only valid on `enum Name: Int` declarations",
+                                        "invalid integer `@repr` on non-`enum` declaration",
+                                    );
+                                }
+                            } else {
+                                try self.emitDiagnosticSimple(
+                                    .e0440_invalid_repr_or_inline_attribute,
+                                    pos_span,
+                                    "invalid `@repr` base; expected `C`, `transparent`, or named `packed:` / `align:` / `zero_pad:`",
+                                    "invalid `@repr` argument",
+                                );
+                            }
+                        } else {
+                            try self.emitDiagnosticSimple(
+                                .e0440_invalid_repr_or_inline_attribute,
+                                pos_span,
+                                "unknown `@repr` argument; expected `C`, `transparent`, `packed: …`, `align: …`, or `zero_pad: …`",
+                                "unrecognized `@repr` argument",
+                            );
+                        }
+                    }
+                }
+            }
+
+            if (seg_end >= attr_end) break;
+            const delim_sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(seg_end)));
+            if (delim_sub.subtree_size <= 1 and !delim_sub.token.isNone() and
+                delim_sub.token.asInt() < self.token_buffer.countTokens() and
+                self.token_buffer.getToken(delim_sub.token).kind == .rparen) break;
+            arg_cursor = seg_end + 1;
+        }
+
+        if (arg_count == 0) {
+            try self.emitDiagnosticSimple(
+                .e0440_invalid_repr_or_inline_attribute,
+                attr_span,
+                "`@repr()` cannot be empty; specify `C`, `transparent`, `packed: …`, `align: …`, or `zero_pad: …`",
+                "empty `@repr()` attribute",
+            );
+            return;
+        }
+        if (packed_cap > 0 and base_mode != .repr_c) {
+            try self.emitDiagnosticSimple(
+                .e0440_invalid_repr_or_inline_attribute,
+                attr_span,
+                "`@repr(packed: …)` requires explicit `C` layout base (`@repr(C, packed: …)`)",
+                "add `C` as the first argument to `@repr`",
+            );
+        }
+        if (packed_cap > 0) {
+            if (explicit_align_val) |align_bytes| {
+                if (align_bytes < packed_cap) {
+                    try self.emitDiagnosticSimple(
+                        .e0440_invalid_repr_or_inline_attribute,
+                        attr_span,
+                        "`@repr` container `align` cannot be smaller than `packed` field alignment cap",
+                        "`align` is smaller than `packed` cap",
+                    );
+                }
+            }
+        }
+        if (base_mode == .transparent) {
+            if (has_packed_key or has_align_key or has_zero_pad_key) {
+                try self.emitDiagnosticSimple(
+                    .e0440_invalid_repr_or_inline_attribute,
+                    attr_span,
+                    "`@repr(transparent)` cannot be combined with `packed`, `align`, or `zero_pad`",
+                    "conflicting keys on `@repr(transparent)`",
+                );
+            }
+            if (target_kind == .struct_sym and !target_sym_idx.isNone()) {
+                const st_sym = self.sym_table.getSymbol(target_sym_idx).*;
+                var non_zst_count: usize = 0;
+                var has_overaligned_zst = false;
+                if (!st_sym.target_scope.isNone()) {
+                    for (self.sym_table.getScopeMembers(st_sym.target_scope)) |mem_idx| {
+                        const mem_sym = self.sym_table.getSymbol(mem_idx).*;
+                        if (mem_sym.kind != .field_sym) continue;
+                        if (mem_sym.type_id.isError()) {
+                            non_zst_count += 1;
+                            continue;
+                        }
+                        if (self.pool.getFlags(mem_sym.type_id).has_type_vars) {
+                            switch (try self.classifyGenericZstField(mem_sym.type_id, 0)) {
+                                .non_zst => non_zst_count += 1,
+                                .zst_overaligned => has_overaligned_zst = true,
+                                .zst_align_1 => {},
+                            }
+                            continue;
+                        }
+                        const f_lay = self.computeTypeLayout(mem_sym.type_id, self.target_layout);
+                        if (f_lay.byte_size > 0) {
+                            non_zst_count += 1;
+                        } else if (f_lay.align_bytes > 1) {
+                            has_overaligned_zst = true;
+                        }
+                    }
+                }
+                if (non_zst_count != 1 or has_overaligned_zst) {
+                    try self.emitDiagnosticSimple(
+                        .e0440_invalid_repr_or_inline_attribute,
+                        attr_span,
+                        "`@repr(transparent)` struct must contain exactly 1 non-zero-sized field (and only 1-aligned zero-sized fields)",
+                        "invalid field layout for `@repr(transparent)`",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Validates `@link(name: "…", section: "…")` target and argument schema (`E0440`).
+    fn validateLinkAttrCst(
+        self: *TypeChecker,
+        target_sym_idx: SymbolIndex,
+        attr_start: usize,
+        name_tok: TokenIndex,
+        name_pos: usize,
+        attr_end: usize,
+    ) !void {
+        const attr_span = symbol_resolver.computeCstSubtreeSpan(
+            self.file_id,
+            self.token_buffer,
+            self.cst_arena,
+            CstNodeIndex.fromInt(@intCast(attr_start)),
+        ) orelse self.token_buffer.getTokenSpan(self.file_id, name_tok);
+        const target_kind: symbol_resolver.SymbolKind = if (!target_sym_idx.isNone())
+            self.sym_table.getSymbol(target_sym_idx).kind
+        else
+            .local_let_sym;
+
+        if (target_kind != .fn_sym and target_kind != .extern_static_sym and target_kind != .const_sym) {
+            try self.emitDiagnosticSimple(
+                .e0440_invalid_repr_or_inline_attribute,
+                attr_span,
+                "`@link` is only valid on `fn`, `extern`, `static`, or `const` declarations",
+                "invalid `@link` target",
+            );
+            return;
+        }
+
+        var arg_cursor = name_pos + 1;
+        var has_open_paren = false;
+        while (arg_cursor < attr_end) : (arg_cursor += 1) {
+            const leaf = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cursor)));
+            if (leaf.subtree_size <= 1 and !leaf.flags.is_missing_or_injected and !leaf.token.isNone() and
+                leaf.token.asInt() < self.token_buffer.countTokens() and
+                self.token_buffer.getToken(leaf.token).kind == .lparen)
+            {
+                has_open_paren = true;
+                arg_cursor += 1;
+                break;
+            }
+        }
+        if (!has_open_paren) {
+            try self.emitDiagnosticSimple(
+                .e0440_invalid_repr_or_inline_attribute,
+                self.token_buffer.getTokenSpan(self.file_id, name_tok),
+                "`@link` requires `name: \"…\"` and/or `section: \"…\"`",
+                "missing `@link(…)` arguments",
+            );
+            return;
+        }
+
+        var has_name = false;
+        var has_section = false;
+        while (arg_cursor < attr_end) {
+            var seg_end = arg_cursor;
+            var paren_depth: u32 = 0;
+            while (seg_end < attr_end) : (seg_end += 1) {
+                const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(seg_end)));
+                if (sub.subtree_size <= 1 and !sub.token.isNone() and
+                    sub.token.asInt() < self.token_buffer.countTokens())
+                {
+                    const tok_kind = self.token_buffer.getToken(sub.token).kind;
+                    if (tok_kind == .lparen or tok_kind == .lbracket or tok_kind == .lbrace) {
+                        paren_depth += 1;
+                    } else if (tok_kind == .rparen or tok_kind == .rbracket or tok_kind == .rbrace) {
+                        if (paren_depth == 0) break;
+                        paren_depth -= 1;
+                    } else if (tok_kind == .comma and paren_depth == 0) {
+                        break;
+                    }
+                }
+            }
+            if (seg_end > arg_cursor) {
+                var leaf_toks: [6]TokenIndex = undefined;
+                var leaf_count: usize = 0;
+                var scan_pos = arg_cursor;
+                while (scan_pos < seg_end) : (scan_pos += 1) {
+                    const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(scan_pos)));
+                    if (sub.subtree_size <= 1 and !sub.flags.is_missing_or_injected and !sub.token.isNone() and
+                        sub.token.asInt() < self.token_buffer.countTokens())
+                    {
+                        if (leaf_count < leaf_toks.len) leaf_toks[leaf_count] = sub.token;
+                        leaf_count += 1;
+                    }
+                }
+                if (leaf_count > 0) {
+                    if (leaf_count != 3 or
+                        !symbol_resolver.isIdentifierToken(self.token_buffer.getToken(leaf_toks[0]).kind) or
+                        (self.token_buffer.getToken(leaf_toks[1]).kind != .colon and
+                            self.token_buffer.getToken(leaf_toks[1]).kind != .eq))
+                    {
+                        try self.emitDiagnosticSimple(
+                            .e0440_invalid_repr_or_inline_attribute,
+                            self.token_buffer.getTokenSpan(self.file_id, leaf_toks[0]),
+                            "`@link` arguments must be named `name: \"…\"` or `section: \"…\"`",
+                            "expected `name: \"…\"` or `section: \"…\"`",
+                        );
+                    } else {
+                        if (self.token_buffer.getToken(leaf_toks[1]).kind == .eq) {
+                            try self.emitDiagnosticWithSingleFix(
+                                .e0440_invalid_repr_or_inline_attribute,
+                                self.token_buffer.getTokenSpan(self.file_id, leaf_toks[1]),
+                                "`@link` named arguments use `:` rather than `=`",
+                                "expected `:` here",
+                                "replace `=` with `:`",
+                                self.token_buffer.getTokenSpan(self.file_id, leaf_toks[1]),
+                                ":",
+                            );
+                        }
+                        const key_lex = symbol_resolver.extractTokenSlice(self.source, self.token_buffer, leaf_toks[0]);
+                        const key_span = self.token_buffer.getTokenSpan(self.file_id, leaf_toks[0]);
+                        const val_tok = leaf_toks[2];
+                        const val_span = self.token_buffer.getTokenSpan(self.file_id, val_tok);
+                        if (std.mem.eql(u8, key_lex, "name")) {
+                            if (has_name) {
+                                try self.emitDiagnosticSimple(
+                                    .e0440_invalid_repr_or_inline_attribute,
+                                    key_span,
+                                    "duplicate `name` key in `@link` attribute",
+                                    "duplicate `name` argument",
+                                );
+                            }
+                            has_name = true;
+                        } else if (std.mem.eql(u8, key_lex, "section")) {
+                            if (has_section) {
+                                try self.emitDiagnosticSimple(
+                                    .e0440_invalid_repr_or_inline_attribute,
+                                    key_span,
+                                    "duplicate `section` key in `@link` attribute",
+                                    "duplicate `section` argument",
+                                );
+                            }
+                            has_section = true;
+                        } else {
+                            try self.emitDiagnosticSimple(
+                                .e0440_invalid_repr_or_inline_attribute,
+                                key_span,
+                                "unknown `@link` key; expected `name` or `section`",
+                                "valid `@link` keys are `name` and `section`",
+                            );
+                        }
+
+                        if (self.token_buffer.getToken(val_tok).kind != .string_lit) {
+                            try self.emitDiagnosticSimple(
+                                .e0440_invalid_repr_or_inline_attribute,
+                                val_span,
+                                "`@link` argument value must be an uninterpolated string literal",
+                                "expected plain string literal",
+                            );
+                        } else {
+                            const raw_str = symbol_resolver.extractTokenSlice(self.source, self.token_buffer, val_tok);
+                            const decoded_opt = symbol_resolver.decodeDr24PlainStringAlloc(self.allocator, raw_str) catch null;
+                            defer if (decoded_opt) |bytes| self.allocator.free(bytes);
+                            const val_bytes = decoded_opt orelse "";
+                            var has_bad_ctl = false;
+                            for (val_bytes) |ch_byte| {
+                                if (ch_byte == 0 or (ch_byte < 0x20 and ch_byte != 0x01) or ch_byte == 0x7F) {
+                                    has_bad_ctl = true;
+                                    break;
+                                }
+                            }
+                            if (val_bytes.len == 0 or has_bad_ctl) {
+                                try self.emitDiagnosticSimple(
+                                    .e0440_invalid_repr_or_inline_attribute,
+                                    val_span,
+                                    "`@link` symbol or section name must be a non-empty string without NUL or control characters",
+                                    "invalid `@link` string value",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            if (seg_end >= attr_end) break;
+            const delim_sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(seg_end)));
+            if (delim_sub.subtree_size <= 1 and !delim_sub.token.isNone() and
+                delim_sub.token.asInt() < self.token_buffer.countTokens() and
+                self.token_buffer.getToken(delim_sub.token).kind == .rparen) break;
+            arg_cursor = seg_end + 1;
+        }
+        if (!has_name and !has_section) {
+            try self.emitDiagnosticSimple(
+                .e0440_invalid_repr_or_inline_attribute,
+                attr_span,
+                "`@link` requires at least one of `name: \"…\"` or `section: \"…\"`",
+                "empty `@link()` attribute",
+            );
+        }
+    }
+
+    /// Validates `@inline` / `@inline(always | never)` (`E0440`) and emits `W0333` on redundant bare `@inline`.
+    fn validateInlineAttrAndW0333Cst(
+        self: *TypeChecker,
+        target_sym_idx: SymbolIndex,
+        attr_start: usize,
+        name_tok: TokenIndex,
+        name_pos: usize,
+        attr_end: usize,
+    ) !void {
+        const attr_cst = CstNodeIndex.fromInt(@intCast(attr_start));
+        const full_attr_span = symbol_resolver.computeCstSubtreeSpan(
+            self.file_id,
+            self.token_buffer,
+            self.cst_arena,
+            attr_cst,
+        ) orelse self.token_buffer.getTokenSpan(self.file_id, name_tok);
+        if (target_sym_idx.isNone() or self.sym_table.getSymbol(target_sym_idx).kind != .fn_sym) {
+            try self.emitDiagnosticSimple(
+                .e0440_invalid_repr_or_inline_attribute,
+                full_attr_span,
+                "`@inline` is only valid on `fn` declarations",
+                "invalid `@inline` target",
+            );
+            return;
+        }
+
+        const target_sym = self.sym_table.getSymbol(target_sym_idx).*;
+        var leaf_toks: [6]TokenIndex = undefined;
+        var leaf_count: usize = 0;
+        var scan_pos = name_pos + 1;
+        while (scan_pos < attr_end) : (scan_pos += 1) {
+            const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(scan_pos)));
+            if (sub.subtree_size <= 1 and !sub.flags.is_missing_or_injected and !sub.token.isNone() and
+                sub.token.asInt() < self.token_buffer.countTokens())
+            {
+                if (leaf_count < leaf_toks.len) leaf_toks[leaf_count] = sub.token;
+                leaf_count += 1;
+            }
+        }
+
+        var mode: symbol_resolver.InlineAttrMode = .hint;
+        var has_err = false;
+        if (leaf_count > 0) {
+            if (leaf_count == 3 and
+                self.token_buffer.getToken(leaf_toks[0]).kind == .lparen and
+                self.token_buffer.getToken(leaf_toks[2]).kind == .rparen)
+            {
+                const mode_lex = symbol_resolver.extractTokenSlice(self.source, self.token_buffer, leaf_toks[1]);
+                if (std.mem.eql(u8, mode_lex, "always")) {
+                    mode = .always;
+                } else if (std.mem.eql(u8, mode_lex, "never")) {
+                    mode = .never;
+                } else {
+                    has_err = true;
+                    try self.emitDiagnosticSimple(
+                        .e0440_invalid_repr_or_inline_attribute,
+                        self.token_buffer.getTokenSpan(self.file_id, leaf_toks[1]),
+                        "invalid `@inline` mode; expected bare `@inline`, `@inline(always)`, or `@inline(never)`",
+                        "expected `always` or `never`",
+                    );
+                }
+            } else {
+                has_err = true;
+                try self.emitDiagnosticSimple(
+                    .e0440_invalid_repr_or_inline_attribute,
+                    self.token_buffer.getTokenSpan(self.file_id, name_tok),
+                    "invalid `@inline` syntax; expected bare `@inline`, `@inline(always)`, or `@inline(never)`",
+                    "invalid `@inline(…)` arguments",
+                );
+            }
+        }
+
+        if (mode == .always and target_sym.flags.is_prototype_only) {
+            has_err = true;
+            try self.emitDiagnosticSimple(
+                .e0440_invalid_repr_or_inline_attribute,
+                full_attr_span,
+                "`@inline(always)` cannot be applied to a bodiless `trait` or `extern` function prototype",
+                "function has no body to inline",
+            );
+        }
+        if ((mode == .hint or mode == .always) and
+            (target_sym.layout_inline_flags.has_cold_or_noinline_attr or target_sym.inlineMode() == .never))
+        {
+            has_err = true;
+            if (!self.hasDiagnosticInCstSubtree(.e0440_invalid_repr_or_inline_attribute, target_sym.cst_node)) {
+                try self.emitDiagnosticSimple(
+                    .e0440_invalid_repr_or_inline_attribute,
+                    full_attr_span,
+                    "conflicting inline attributes: `@inline` / `@inline(always)` cannot be combined with `@cold`, `@inline(never)`, or `@noinline`",
+                    "conflicting inlining directive",
+                );
+            }
+        }
+        if (has_err or mode != .hint) return;
+
+        // Emit `W0333` (`redundant_private_contract`) for redundant bare `@inline` in `PackageId.root`:
+        if (self.sym_table.getFilePackageId(self.file_id) != .root) return;
+        if (self.getEffectiveAllowMask(full_attr_span).has_allow_redundant_contract_w0333) return;
+        const is_gpu_kernel_sym = if (@hasField(@TypeOf(target_sym.extra_flags), "is_gpu_kernel"))
+            target_sym.extra_flags.is_gpu_kernel
+        else
+            false;
+        if (target_sym.flags.is_prototype_only or
+            target_sym.flags.is_extern or
+            std.mem.eql(u8, target_sym.name_text, "main") or
+            target_sym.contract_flags.is_export or
+            target_sym.contract_flags.has_link_section or
+            target_sym.contract_flags.has_link_name or
+            target_sym.contract_flags.is_std_cap_boundary or
+            is_gpu_kernel_sym or
+            self.sym_table.impl_method_trait.contains(target_sym_idx.asInt()) or
+            self.hasAttrNameOnSymbolCst(target_sym, "wasm_export") or
+            self.hasAttrNameOnSymbolCst(target_sym, "gpu_kernel"))
+        {
+            return;
+        }
+
+        const is_pub_boundary = self.sym_table.isEffectivePubBoundary(target_sym_idx);
+        const is_generic = self.isSymbolOrOwnerGeneric(target_sym_idx);
+        const is_expr_body = self.hasFnExprBodyAst(target_sym.ast_node);
+        if (is_pub_boundary and !is_generic and !is_expr_body) return;
+
+        if (self.diagnostic_sink) |sink| {
+            const removal_span = symbol_resolver.computeAttributeRemovalSpan(
+                self.source,
+                self.file_id,
+                full_attr_span,
+            );
+            const empty_id = try self.interner.intern("");
+            const arena_alloc = sink.arena.asAllocator();
+            const labels = try arena_alloc.alloc(LabeledSpan, 1);
+            labels[0] = .{
+                .span = full_attr_span,
+                .label = if (!is_pub_boundary)
+                    "non-`pub` function is already intra-package inlineable by the optimizer"
+                else if (is_generic)
+                    "generic function body is already exported across `.cxi` boundaries"
+                else
+                    "`= expr;` function body is already exported across `.cxi` boundaries",
+                .style = .primary,
+            };
+            const edits = try arena_alloc.alloc(TextEdit, 1);
+            edits[0] = .{
+                .file_id = removal_span.file_id,
+                .start_byte = removal_span.start_byte,
+                .end_byte = removal_span.end_byte,
+                .replacement_id = empty_id,
+            };
+            const fixes = try arena_alloc.alloc(SuggestedFix, 1);
+            fixes[0] = .{
+                .message = "remove redundant `@inline` attribute",
+                .applicability = .machine_applicable,
+                .priority = .lint_idiom,
+                .edits = edits,
+            };
+            _ = try sink.emit(.{
+                .code = .w0333_redundant_private_contract,
+                .severity = .warning,
+                .primary_span = full_attr_span,
+                .message = "redundant `@inline` hint on non-`pub`, generic, or `= expr;` function (`ADR-24C`)",
+                .labels = labels,
+                .suggestions = fixes,
+            });
+        }
+    }
+
     /// Decodes a CoreX string literal `lexeme` and interns its UTF-8 content in `self.interner`.
     fn decodeAttrStringLexeme(self: *TypeChecker, lexeme: []const u8) !SymbolId {
+        if (symbol_resolver.decodeDr24PlainStringAlloc(self.allocator, lexeme)) |decoded_dr24| {
+            defer self.allocator.free(decoded_dr24);
+            return self.interner.intern(decoded_dr24);
+        } else |_| {}
         if (lexer.cookStringLiteral(self.allocator, lexeme)) |cooked| {
             defer self.allocator.free(cooked);
             return self.interner.intern(cooked);
@@ -13347,24 +14446,7 @@ pub const TypeChecker = struct {
             .ident_expr => node.main_token.isNone() or
                 node.main_token.asInt() >= self.token_buffer.countTokens() or
                 self.token_buffer.getToken(node.main_token).kind != .at,
-            .string_lit => blk_str: {
-                const lex = symbol_resolver.extractTokenSlice(self.source, self.token_buffer, node.main_token);
-                if (std.mem.startsWith(u8, lex, "r\"") or std.mem.startsWith(u8, lex, "r#")) break :blk_str true;
-                var idx: usize = 0;
-                while (idx < lex.len) : (idx += 1) {
-                    if (lex[idx] == '\\') {
-                        idx += 1;
-                        continue;
-                    } else if (lex[idx] == '{') {
-                        if (idx + 1 < lex.len and lex[idx + 1] == '{') {
-                            idx += 1;
-                            continue;
-                        }
-                        break :blk_str false;
-                    }
-                }
-                break :blk_str true;
-            },
+            .string_lit => true,
             .field_access => node.lhs.tag == .node and
                 self.isPureUpgradeArgAst(NodeIndex.fromInt(node.lhs.payload), depth + 1),
             .tuple_lit, .array_lit => blk_seq: {
@@ -13508,7 +14590,7 @@ pub const TypeChecker = struct {
             const piece_end = piece.byte_offset +| @as(u32, piece.byte_len);
             if (piece_end <= replace_span.start_byte or piece_start >= replace_span.end_byte) continue;
             switch (piece.kind) {
-                .line_comment, .doc_comment, .module_doc_comment, .block_comment => {
+                .line_comment, .doc_comment, .module_doc_comment => {
                     if (!isCommentPreservedByUsedSlot(
                         eval_slots,
                         use_counts,
@@ -13526,38 +14608,14 @@ pub const TypeChecker = struct {
                 const scan_hi: usize = @min(@as(usize, piece_end), self.source.len);
                 var cursor: usize = scan_lo;
                 while (cursor + 1 < scan_hi) {
-                    if (self.source[cursor] == '/' and self.source[cursor + 1] == '/') {
+                    if (self.source[cursor] == '/' and
+                        (self.source[cursor + 1] == '/' or
+                            self.source[cursor + 1] == '|' or
+                            self.source[cursor + 1] == '#'))
+                    {
                         const cmt_lo: u32 = @intCast(cursor);
                         cursor += 2;
                         while (cursor < scan_hi and self.source[cursor] != '\n') : (cursor += 1) {}
-                        const cmt_hi: u32 = @intCast(cursor);
-                        if (cmt_hi > replace_span.start_byte and cmt_lo < replace_span.end_byte) {
-                            if (!isCommentPreservedByUsedSlot(
-                                eval_slots,
-                                use_counts,
-                                @max(cmt_lo, replace_span.start_byte),
-                                @min(cmt_hi, replace_span.end_byte),
-                            )) {
-                                return true;
-                            }
-                        }
-                        continue;
-                    } else if (self.source[cursor] == '/' and self.source[cursor + 1] == '*') {
-                        const cmt_lo: u32 = @intCast(cursor);
-                        cursor += 2;
-                        var block_depth: usize = 1;
-                        while (cursor + 1 < scan_hi and block_depth > 0) {
-                            if (self.source[cursor] == '/' and self.source[cursor + 1] == '*') {
-                                block_depth += 1;
-                                cursor += 2;
-                            } else if (self.source[cursor] == '*' and self.source[cursor + 1] == '/') {
-                                block_depth -= 1;
-                                cursor += 2;
-                            } else {
-                                cursor += 1;
-                            }
-                        }
-                        if (block_depth > 0) cursor = scan_hi;
                         const cmt_hi: u32 = @intCast(cursor);
                         if (cmt_hi > replace_span.start_byte and cmt_lo < replace_span.end_byte) {
                             if (!isCommentPreservedByUsedSlot(
@@ -14439,6 +15497,10 @@ pub const TypeChecker = struct {
             },
             .string_lit => {
                 const lex = symbol_resolver.extractTokenSlice(self.source, self.token_buffer, expr_node.main_token);
+                if (symbol_resolver.decodeDr24PlainStringAlloc(self.allocator, lex)) |decoded_dr24| {
+                    defer self.allocator.free(decoded_dr24);
+                    return .{ .str_val = try self.interner.intern(decoded_dr24) };
+                } else |_| {}
                 if (lexer.cookStringLiteral(self.allocator, lex)) |cooked| {
                     defer self.allocator.free(cooked);
                     return .{ .str_val = try self.interner.intern(cooked) };
@@ -18453,6 +19515,23 @@ pub const TypeChecker = struct {
                     else => return null,
                 }
             },
+            .block => {
+                if (self.getNodeExtraSlice(expr_id, false).len == 0 and ast_node.rhs.tag == .node) {
+                    return self.evalConstIntExpr(NodeIndex.fromInt(ast_node.rhs.payload), is_emitting_diags);
+                }
+                return null;
+            },
+            .if_expr => {
+                if (ast_node.lhs.tag != .node or ast_node.rhs.tag != .extra) return null;
+                const branches = self.getNodeExtraSlice(expr_id, true);
+                if (branches.len < 2) return null;
+                const cond_val = (try self.evalConstIntExpr(
+                    NodeIndex.fromInt(ast_node.lhs.payload),
+                    is_emitting_diags,
+                )) orelse return null;
+                const chosen_branch = NodeIndex.fromInt(if (cond_val != 0) branches[0] else branches[1]);
+                return self.evalConstIntExpr(chosen_branch, is_emitting_diags);
+            },
             else => return null,
         }
     }
@@ -20019,6 +21098,10 @@ pub const TypeChecker = struct {
                 const lex = symbol_resolver.extractTokenSlice(src, toks, node.main_token);
                 return if (lexer.extractByteLiteralValue(lex)) |byte_val| @as(i128, byte_val) else null;
             },
+            .bool_lit => {
+                if (node.main_token.isNone() or node.main_token.asInt() >= toks.countTokens()) return null;
+                return if (toks.getToken(node.main_token).kind == .kw_true) 1 else 0;
+            },
             .unary_expr => {
                 if (node.lhs.tag != .node or node.main_token.isNone() or
                     node.main_token.asInt() >= toks.countTokens()) return null;
@@ -20028,6 +21111,11 @@ pub const TypeChecker = struct {
                     const inner_val = self.evalReadOnlyConstExprInt(src, toks, ast, scope_id, inner_id, depth + 1) orelse
                         return null;
                     return ~inner_val;
+                }
+                if (op_kind == .kw_not) {
+                    const inner_val = self.evalReadOnlyConstExprInt(src, toks, ast, scope_id, inner_id, depth + 1) orelse
+                        return null;
+                    return if (inner_val == 0) 1 else 0;
                 }
                 if (op_kind == .minus) {
                     const inner_node = ast.getNode(inner_id);
@@ -20051,6 +21139,47 @@ pub const TypeChecker = struct {
             .binary_expr => {
                 if (node.lhs.tag != .node or node.rhs.tag != .node or node.main_token.isNone() or
                     node.main_token.asInt() >= toks.countTokens()) return null;
+                const op_kind = toks.getToken(node.main_token).kind;
+                if (op_kind == .kw_and) {
+                    const lhs_val = self.evalReadOnlyConstExprInt(
+                        src,
+                        toks,
+                        ast,
+                        scope_id,
+                        NodeIndex.fromInt(node.lhs.payload),
+                        depth + 1,
+                    ) orelse return null;
+                    if (lhs_val == 0) return 0;
+                    const rhs_val = self.evalReadOnlyConstExprInt(
+                        src,
+                        toks,
+                        ast,
+                        scope_id,
+                        NodeIndex.fromInt(node.rhs.payload),
+                        depth + 1,
+                    ) orelse return null;
+                    return if (rhs_val != 0) 1 else 0;
+                }
+                if (op_kind == .kw_or) {
+                    const lhs_val = self.evalReadOnlyConstExprInt(
+                        src,
+                        toks,
+                        ast,
+                        scope_id,
+                        NodeIndex.fromInt(node.lhs.payload),
+                        depth + 1,
+                    ) orelse return null;
+                    if (lhs_val != 0) return 1;
+                    const rhs_val = self.evalReadOnlyConstExprInt(
+                        src,
+                        toks,
+                        ast,
+                        scope_id,
+                        NodeIndex.fromInt(node.rhs.payload),
+                        depth + 1,
+                    ) orelse return null;
+                    return if (rhs_val != 0) 1 else 0;
+                }
                 const lhs_val = self.evalReadOnlyConstExprInt(
                     src,
                     toks,
@@ -20067,10 +21196,16 @@ pub const TypeChecker = struct {
                     NodeIndex.fromInt(node.rhs.payload),
                     depth + 1,
                 ) orelse return null;
-                return switch (toks.getToken(node.main_token).kind) {
+                return switch (op_kind) {
                     .plus => std.math.add(i128, lhs_val, rhs_val) catch null,
+                    .plus_percent => lhs_val +% rhs_val,
+                    .plus_pipe => lhs_val +| rhs_val,
                     .minus => std.math.sub(i128, lhs_val, rhs_val) catch null,
+                    .minus_percent => lhs_val -% rhs_val,
+                    .minus_pipe => lhs_val -| rhs_val,
                     .star => std.math.mul(i128, lhs_val, rhs_val) catch null,
+                    .star_percent => lhs_val *% rhs_val,
+                    .star_pipe => lhs_val *| rhs_val,
                     .slash => if (rhs_val != 0) std.math.divTrunc(i128, lhs_val, rhs_val) catch null else null,
                     .percent => if (rhs_val != 0) std.math.rem(i128, lhs_val, rhs_val) catch null else null,
                     .shl => if (rhs_val >= 0 and rhs_val < 128)
@@ -20081,6 +21216,12 @@ pub const TypeChecker = struct {
                     .amp => lhs_val & rhs_val,
                     .pipe => lhs_val | rhs_val,
                     .caret => lhs_val ^ rhs_val,
+                    .eqeq => if (lhs_val == rhs_val) 1 else 0,
+                    .bang_eq => if (lhs_val != rhs_val) 1 else 0,
+                    .lt => if (lhs_val < rhs_val) 1 else 0,
+                    .le => if (lhs_val <= rhs_val) 1 else 0,
+                    .gt => if (lhs_val > rhs_val) 1 else 0,
+                    .ge => if (lhs_val >= rhs_val) 1 else 0,
                     else => null,
                 };
             },
@@ -20123,6 +21264,44 @@ pub const TypeChecker = struct {
                     }
                 }
                 return null;
+            },
+            .block => {
+                if (node.lhs.tag == .none and node.rhs.tag == .node) {
+                    return self.evalReadOnlyConstExprInt(
+                        src,
+                        toks,
+                        ast,
+                        scope_id,
+                        NodeIndex.fromInt(node.rhs.payload),
+                        depth + 1,
+                    );
+                }
+                return null;
+            },
+            .if_expr => {
+                if (node.lhs.tag != .node or node.rhs.tag != .extra) return null;
+                const branch_start: usize = node.rhs.payload;
+                if (branch_start + 1 >= ast.extra_data.items.len) return null;
+                const cond_val = self.evalReadOnlyConstExprInt(
+                    src,
+                    toks,
+                    ast,
+                    scope_id,
+                    NodeIndex.fromInt(node.lhs.payload),
+                    depth + 1,
+                ) orelse return null;
+                const chosen_raw = if (cond_val != 0)
+                    ast.extra_data.items[branch_start]
+                else
+                    ast.extra_data.items[branch_start + 1];
+                return self.evalReadOnlyConstExprInt(
+                    src,
+                    toks,
+                    ast,
+                    scope_id,
+                    NodeIndex.fromInt(chosen_raw),
+                    depth + 1,
+                );
             },
             else => null,
         };
@@ -20525,6 +21704,7 @@ pub const TypeChecker = struct {
                 .cap_clears_mask = header_meta.cap_clears_mask,
                 .explicit_align_log2_plus1 = header_meta.explicit_align_log2_plus1,
                 .has_cfg_attr = header_meta.has_cfg_attr,
+                .layout_inline_flags = header_meta.layout_inline_flags,
             }, self.diagnostic_sink);
             if (header_meta.allow_mask.merge(self.active_allow_mask).hasAny()) {
                 try self.sym_table.mergeSymbolAllowMask(
@@ -20821,10 +22001,46 @@ pub const TypeChecker = struct {
         const block_node = self.ast_arena.getNode(block_id);
         if (block_node.tag == .expr_hole) return self.recordNodeType(block_id, .err_ty);
         if (block_node.tag != .block) {
-            return if (expected_ty.isError())
-                self.synthExpr(block_id)
+            const saved_arm_scope = self.current_scope;
+            const saved_arm_pos = self.is_direct_positive_cond;
+            const saved_arm_walrus = self.is_dominating_walrus_pos;
+            const saved_arm_neg = self.is_negated_is_context;
+            const arm_scope = if (is_fn_body)
+                self.current_scope
             else
-                self.checkExpr(block_id, expected_ty);
+                try self.sym_table.scope_arena.allocScope(
+                    .block_scope,
+                    self.current_scope,
+                    .NONE,
+                    self.file_id,
+                    .{ .is_inside_deprecated = self.is_in_deprecated_context },
+                );
+            if (!is_fn_body and self.active_allow_mask.hasAny()) {
+                self.sym_table.scope_arena.addAllowMask(arm_scope, self.active_allow_mask);
+            }
+            self.current_scope = arm_scope;
+            self.is_direct_positive_cond = false;
+            self.is_dominating_walrus_pos = false;
+            self.is_negated_is_context = false;
+            defer {
+                self.current_scope = saved_arm_scope;
+                self.is_direct_positive_cond = saved_arm_pos;
+                self.is_dominating_walrus_pos = saved_arm_walrus;
+                self.is_negated_is_context = saved_arm_neg;
+            }
+            const arm_ty = if (expected_ty.isError())
+                try self.synthExpr(block_id)
+            else
+                try self.checkExpr(block_id, expected_ty);
+            if (!is_fn_body) {
+                try symbol_resolver.checkUnusedBindingsInScope(
+                    self.sym_table,
+                    arm_scope,
+                    self.interner,
+                    self.diagnostic_sink,
+                );
+            }
+            return self.recordNodeType(block_id, arm_ty);
         }
 
         const block_cst = self.ast_arena.getCstOrigin(block_id);
@@ -23776,10 +24992,47 @@ pub const TypeChecker = struct {
                             )) {
                                 .found => |f_sym_idx| {
                                     self.sym_table.markSymbolUsed(f_sym_idx);
+                                    const f_sym = self.sym_table.getSymbol(f_sym_idx).*;
                                     field_ty = try self.substituteNominalMemberType(
                                         unwrapped,
-                                        self.sym_table.getSymbol(f_sym_idx).type_id,
+                                        f_sym.type_id,
                                     );
+                                    if (struct_node.tag == .struct_ty and !field_ty.isError()) {
+                                        const st_sym = self.sym_table.getSymbol(SymbolIndex.fromInt(struct_node.rhs)).*;
+                                        if (st_sym.packedCapBytes() > 0 and self.hasRefBindingInSubPatternCst(sub_pat_id)) {
+                                            const st_align: u64 = @max(
+                                                @as(u64, self.computeTypeLayout(unwrapped, self.target_layout).align_bytes),
+                                                1,
+                                            );
+                                            const f_off: u64 = computeStructFieldOffset(
+                                                self.pool,
+                                                self.sym_table,
+                                                unwrapped,
+                                                f_sym.member_ordinal,
+                                                self.target_layout,
+                                            ) orelse 0;
+                                            const eff_align = if (f_off == 0) st_align else std.math.gcd(st_align, f_off);
+                                            const req_align: u64 = @max(
+                                                @as(u64, self.computeTypeLayout(field_ty, self.target_layout).align_bytes),
+                                                1,
+                                            );
+                                            if (eff_align < req_align) {
+                                                var msg_buf: [240]u8 = undefined;
+                                                const msg = std.fmt.bufPrint(
+                                                    &msg_buf,
+                                                    "cannot borrow misaligned field `{s}` (aligned to {d} B, " ++
+                                                        "requires {d} B) of packed struct `{s}` in pattern",
+                                                    .{ f_sym.name_text, eff_align, req_align, st_sym.name_text },
+                                                ) catch "cannot borrow misaligned field of packed struct in pattern";
+                                                try self.emitDiagnosticSimple(
+                                                    .e0441_unaligned_packed_field_borrow,
+                                                    self.getAstNodeSpan(sub_pat_id),
+                                                    msg,
+                                                    "bind field by value instead of `&` / `&mut`",
+                                                );
+                                            }
+                                        }
+                                    }
                                 },
                                 .private_error => |priv_idx| {
                                     if (self.diagnostic_sink) |sink| {
@@ -24195,8 +25448,19 @@ pub const TypeChecker = struct {
             },
             .string_lit => {
                 if (self.pool.unwrapUnderlyingType(expected_ty) == .fmt_args_ty) {
-                    const fmt_ty = try self.synthOrCheckStringLit(expr_id, true);
+                    const fmt_ty = try self.checkPlainStringForFmtArgs(expr_id);
                     return self.recordNodeType(expr_id, fmt_ty);
+                }
+            },
+            .fmt_string_lit => {
+                const unwrapped_exp = self.pool.unwrapUnderlyingType(expected_ty);
+                if (unwrapped_exp == .fmt_args_ty) {
+                    const fmt_ty = try self.synthOrCheckFmtStringLit(expr_id, .fmt_args_ty);
+                    return self.recordNodeType(expr_id, fmt_ty);
+                }
+                if (unwrapped_exp == .str_ty) {
+                    const str_ty = try self.synthOrCheckFmtStringLit(expr_id, .str_ty);
+                    return self.recordNodeType(expr_id, str_ty);
                 }
             },
             .unary_expr => {
@@ -24455,13 +25719,21 @@ pub const TypeChecker = struct {
             .byte_lit => .u8_ty,
             .byte_string_lit => blk: {
                 const lexeme = symbol_resolver.extractTokenSlice(self.source, self.token_buffer, ast_node.main_token);
-                const cooked = lexer.cookStringLiteral(self.allocator, lexeme) catch null;
+                const dr24_decoded = symbol_resolver.decodeDr24PlainStringAlloc(self.allocator, lexeme) catch null;
+                defer if (dr24_decoded) |bytes| self.allocator.free(bytes);
+                const cooked = if (dr24_decoded == null) (lexer.cookStringLiteral(self.allocator, lexeme) catch null) else null;
                 defer if (cooked) |bytes| self.allocator.free(bytes);
-                const byte_len: u32 = if (cooked) |bytes| @intCast(bytes.len) else 0;
+                const byte_len: u32 = if (dr24_decoded) |bytes|
+                    @intCast(bytes.len)
+                else if (cooked) |bytes|
+                    @intCast(bytes.len)
+                else
+                    0;
                 const arr_ty = try self.pool.internArray(.u8_ty, byte_len, false);
                 break :blk try self.pool.internRef(arr_ty, false);
             },
-            .string_lit => try self.synthOrCheckStringLit(expr_id, false),
+            .string_lit => .str_ty,
+            .fmt_string_lit => try self.synthOrCheckFmtStringLit(expr_id, try self.resolveDefaultFmtStringType(expr_id)),
             .int_lit => try self.synthIntLiteral(expr_id, false),
             .float_lit => self.synthFloatLiteral(expr_id),
             .self_val => blk: {
@@ -26475,40 +27747,302 @@ pub const TypeChecker = struct {
         return self.recordNodeType(expr_id, arr_ty);
     }
 
-    /// Type-checks any `{expr[=][:spec]}` interpolation segments inside a `.string_lit` (`SE-12` & `SE-13`).
-    fn synthOrCheckStringLit(self: *TypeChecker, expr_id: NodeIndex, is_fmt_args_target: bool) !TypeId {
+    /// Resolves the synthesized `TypeId` of a standalone `f"…"` / `f#"…"#` (`cx.str.String` when mounted, else `str`).
+    fn resolveDefaultFmtStringType(self: *TypeChecker, expr_id: NodeIndex) !TypeId {
+        if (self.sym_table.lookupCxSubmoduleType(self.interner, "str", "String")) |cx_str_ty| {
+            const unwrapped = self.pool.unwrapUnderlyingType(cx_str_ty);
+            const str_node = self.pool.getNode(unwrapped);
+            if (str_node.tag == .struct_ty) {
+                const str_sym_idx = SymbolIndex.fromInt(str_node.rhs);
+                if (!str_sym_idx.isNone() and str_sym_idx.asInt() < self.sym_table.symbols.items.len) {
+                    const str_sym = self.sym_table.getSymbol(str_sym_idx).*;
+                    if (!str_sym.target_scope.isNone()) {
+                        for (self.sym_table.getScopeMembers(str_sym.target_scope)) |mem_idx| {
+                            if (self.isSymbolCfgDisabled(mem_idx)) continue;
+                            const mem_sym = self.sym_table.getSymbol(mem_idx).*;
+                            if (mem_sym.kind == .fn_sym and std.mem.eql(u8, mem_sym.name_text, "fmt")) {
+                                try self.resolveFnSignatureSymbol(mem_idx);
+                                const fn_ty = self.sym_table.getSymbol(mem_idx).type_id;
+                                if (self.pool.getFnSignatureView(fn_ty)) |sig| {
+                                    if (sig.paramCount() == 1 and
+                                        self.pool.unwrapUnderlyingType(sig.getParamType(0)) == .fmt_args_ty)
+                                    {
+                                        self.sym_table.markSymbolUsed(mem_idx);
+                                        self.recordNodeSymbol(expr_id, mem_idx);
+                                        return cx_str_ty;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return .str_ty;
+    }
+
+    /// Returns `true` if `candidate` is a valid non-empty ASCII CoreX value identifier.
+    fn isValidValueIdentSlice(candidate: []const u8) bool {
+        if (candidate.len == 0 or std.mem.eql(u8, candidate, "_")) return false;
+        const first_ch = candidate[0];
+        if (!std.ascii.isAlphabetic(first_ch) and first_ch != '_') return false;
+        for (candidate[1..]) |ch_byte| {
+            if (!std.ascii.isAlphanumeric(ch_byte) and ch_byte != '_') return false;
+        }
+        return true;
+    }
+
+    /// Checks a plain `.string_lit` coerced to `FmtArgs`, recording `0`-hole `StringInterpMeta` and emitting `W0120` if `{ident}` resolves.
+    fn checkPlainStringForFmtArgs(self: *TypeChecker, expr_id: NodeIndex) !TypeId {
         const str_node = self.ast_arena.getNode(expr_id);
-        const ret_ty: TypeId = if (is_fmt_args_target) .fmt_args_ty else .str_ty;
         if (str_node.main_token.isNone() or str_node.main_token.asInt() >= self.token_buffer.countTokens()) {
-            return ret_ty;
+            return .fmt_args_ty;
+        }
+        const already_recorded = self.string_interps.contains(expr_id.asInt());
+        const tok_span = self.token_buffer.getTokenSpan(self.file_id, str_node.main_token);
+        const lexeme = symbol_resolver.extractTokenSlice(self.source, self.token_buffer, str_node.main_token);
+        const view_opt = symbol_resolver.extractDr24StringBodyView(lexeme);
+        const is_multiline = if (view_opt) |body_view| body_view.is_multiline else false;
+        try self.recordStringInterpMeta(expr_id, &.{}, true, is_multiline, 1);
+
+        if (already_recorded or lexeme.len < 4 or lexeme[0] != '"') return .fmt_args_ty;
+        if (self.getEffectiveAllowMask(tok_span).has_allow_uninterp_fmt_w0120) return .fmt_args_ty;
+
+        const inner = lexeme[1 .. lexeme.len - 1];
+        const MatchedSpan = struct { open_idx: usize, close_idx: usize };
+        var matched_holes: [16]MatchedSpan = undefined;
+        var matched_count: usize = 0;
+        var first_ident: []const u8 = "";
+
+        var cursor: usize = 0;
+        while (cursor < inner.len) {
+            if (inner[cursor] == '\\') {
+                cursor = advancePastStringEscape(inner, cursor);
+                continue;
+            }
+            if (inner[cursor] == '{') {
+                if (std.mem.indexOfScalarPos(u8, inner, cursor + 1, '}')) |close_idx| {
+                    const raw_hole = inner[cursor + 1 .. close_idx];
+                    if (std.mem.indexOfAny(u8, raw_hole, "{}\"\r\n") == null) {
+                        const split = splitInterpolationHole(raw_hole);
+                        const ident_trimmed = std.mem.trim(u8, split.expr_slice, " \t");
+                        const is_spec_valid = if (split.spec_slice) |sp_raw|
+                            (if (lexer.parseFormatSpec(sp_raw, split.has_debug_eq)) |_| true else |_| false)
+                        else
+                            true;
+                        if (is_spec_valid and isValidValueIdentSlice(ident_trimmed)) {
+                            if (self.interner.lookup(ident_trimmed)) |ident_sym| {
+                                // Read-only lexical lookup so `W0402` unused-binding state is never mutated!
+                                switch (self.sym_table.lookupLexical(
+                                    self.current_scope,
+                                    ident_sym,
+                                    NamespaceMask.VALUE_OR_CONST,
+                                )) {
+                                    .found => |found_idx| {
+                                        const canon_idx = self.unwrapAliasSymbolIdx(found_idx);
+                                        if (!canon_idx.isNone() and canon_idx.asInt() < self.sym_table.symbols.items.len) {
+                                            const sym_kind = self.sym_table.getSymbol(canon_idx).kind;
+                                            if (sym_kind == .local_let_sym or
+                                                sym_kind == .local_var_sym or
+                                                sym_kind == .param_sym or
+                                                sym_kind == .const_sym or
+                                                sym_kind == .extern_static_sym)
+                                            {
+                                                if (matched_count == 0) first_ident = ident_trimmed;
+                                                if (matched_count < matched_holes.len) {
+                                                    matched_holes[matched_count] = .{
+                                                        .open_idx = cursor,
+                                                        .close_idx = close_idx,
+                                                    };
+                                                    matched_count += 1;
+                                                }
+                                                cursor = close_idx + 1;
+                                                continue;
+                                            }
+                                        }
+                                    },
+                                    else => {},
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            cursor += 1;
+        }
+
+        if (matched_count == 0) return .fmt_args_ty;
+        if (self.diagnostic_sink) |sink| {
+            // Check whether any stray unmatched `{` or `}` exists outside `matched_holes`:
+            var has_stray_brace = false;
+            var check_cur: usize = 0;
+            var hole_ord: usize = 0;
+            while (check_cur < inner.len) {
+                if (hole_ord < matched_count and check_cur == matched_holes[hole_ord].open_idx) {
+                    check_cur = matched_holes[hole_ord].close_idx + 1;
+                    hole_ord += 1;
+                    continue;
+                }
+                if (inner[check_cur] == '\\') {
+                    if (check_cur + 1 < inner.len and
+                        (inner[check_cur + 1] == '{' or inner[check_cur + 1] == '}'))
+                    {
+                        has_stray_brace = true;
+                        break;
+                    }
+                    check_cur = advancePastStringEscape(inner, check_cur);
+                    continue;
+                }
+                if (inner[check_cur] == '{' or inner[check_cur] == '}') {
+                    has_stray_brace = true;
+                    break;
+                }
+                check_cur += 1;
+            }
+
+            const arena_alloc = sink.arena.asAllocator();
+            const edits = try arena_alloc.alloc(TextEdit, 1);
+            if (!has_stray_brace) {
+                edits[0] = .{
+                    .file_id = tok_span.file_id,
+                    .start_byte = tok_span.start_byte,
+                    .end_byte = tok_span.start_byte,
+                    .replacement_id = try self.interner.intern("f"),
+                };
+            } else {
+                var repl_buf: std.ArrayList(u8) = .empty;
+                defer repl_buf.deinit(self.allocator);
+                try repl_buf.appendSlice(self.allocator, "f\"");
+                var rw_cur: usize = 0;
+                var rw_hole_ord: usize = 0;
+                while (rw_cur < inner.len) {
+                    if (rw_hole_ord < matched_count and rw_cur == matched_holes[rw_hole_ord].open_idx) {
+                        const h_end = matched_holes[rw_hole_ord].close_idx + 1;
+                        try repl_buf.appendSlice(self.allocator, inner[rw_cur..h_end]);
+                        rw_cur = h_end;
+                        rw_hole_ord += 1;
+                        continue;
+                    }
+                    if (inner[rw_cur] == '\\') {
+                        const next_cur = advancePastStringEscape(inner, rw_cur);
+                        if (rw_cur + 1 < inner.len and (inner[rw_cur + 1] == '{' or inner[rw_cur + 1] == '}')) {
+                            const brace_ch = inner[rw_cur + 1];
+                            try repl_buf.append(self.allocator, brace_ch);
+                            try repl_buf.append(self.allocator, brace_ch);
+                        } else {
+                            try repl_buf.appendSlice(self.allocator, inner[rw_cur..next_cur]);
+                        }
+                        rw_cur = next_cur;
+                        continue;
+                    }
+                    if (inner[rw_cur] == '{' or inner[rw_cur] == '}') {
+                        try repl_buf.append(self.allocator, inner[rw_cur]);
+                        try repl_buf.append(self.allocator, inner[rw_cur]);
+                        rw_cur += 1;
+                        continue;
+                    }
+                    try repl_buf.append(self.allocator, inner[rw_cur]);
+                    rw_cur += 1;
+                }
+                try repl_buf.append(self.allocator, '"');
+                edits[0] = .{
+                    .file_id = tok_span.file_id,
+                    .start_byte = tok_span.start_byte,
+                    .end_byte = tok_span.end_byte,
+                    .replacement_id = try self.interner.intern(repl_buf.items),
+                };
+            }
+
+            var msg_buf: [240]u8 = undefined;
+            const msg = std.fmt.bufPrint(
+                &msg_buf,
+                "plain string literal passed to `FmtArgs` contains `{{{s}}}` matching an in-scope binding " ++
+                    "(`ADR-24B`); prefix with `f` to interpolate",
+                .{first_ident},
+            ) catch "plain string literal passed to `FmtArgs` contains `{ident}` matching an in-scope binding; prefix with `f`";
+            const labels = try arena_alloc.alloc(LabeledSpan, 1);
+            labels[0] = .{
+                .span = tok_span,
+                .label = "plain `\"…\"` treats `{` and `}` literally; write `f\"…\"` to interpolate",
+                .style = .primary,
+            };
+            const fixes = try arena_alloc.alloc(SuggestedFix, 1);
+            fixes[0] = .{
+                .message = "prepend `f` to interpolate format placeholder",
+                .applicability = .maybe_incorrect,
+                .priority = .lint_idiom,
+                .edits = edits,
+            };
+            _ = try sink.emit(.{
+                .code = .w0120_uninterpolated_fmt_placeholder,
+                .severity = .warning,
+                .primary_span = tok_span,
+                .message = msg,
+                .labels = labels,
+                .suggestions = fixes,
+            });
+        }
+        return .fmt_args_ty;
+    }
+
+    /// Type-checks `{expr[=][:spec]}` holes inside `f"…"` / `f#"…"#` (`AstTag.fmt_string_lit`, `ADR-24B`).
+    fn synthOrCheckFmtStringLit(self: *TypeChecker, expr_id: NodeIndex, target_ret_ty: TypeId) !TypeId {
+        const str_node = self.ast_arena.getNode(expr_id);
+        const is_fmt_args_target = (target_ret_ty == .fmt_args_ty);
+        if (str_node.main_token.isNone() or str_node.main_token.asInt() >= self.token_buffer.countTokens()) {
+            return target_ret_ty;
         }
         const tok_span = self.token_buffer.getTokenSpan(self.file_id, str_node.main_token);
         const lexeme = symbol_resolver.extractTokenSlice(self.source, self.token_buffer, str_node.main_token);
-        if (isRawStringLexeme(lexeme)) {
+
+        // Extract opening delimiter offset (`f"` = 2, `f#"` = 2 + hash_count) and body slice:
+        var prefix_cur: usize = 0;
+        if (prefix_cur < lexeme.len and lexeme[prefix_cur] == 'f') prefix_cur += 1;
+        var hash_count: usize = 0;
+        while (prefix_cur < lexeme.len and lexeme[prefix_cur] == '#') : (prefix_cur += 1) {
+            hash_count += 1;
+        }
+        if (prefix_cur >= lexeme.len or lexeme[prefix_cur] != '"') {
             if (is_fmt_args_target) {
                 try self.recordStringInterpMeta(expr_id, &.{}, true, false, 1);
             }
-            return ret_ty;
+            return target_ret_ty;
         }
-
-        const delim_width: usize = if (lexeme.len >= 6 and
-            std.mem.startsWith(u8, lexeme, "\"\"\"") and
-            std.mem.endsWith(u8, lexeme, "\"\"\""))
-            3
-        else if (lexeme.len >= 2 and lexeme[0] == '"' and lexeme[lexeme.len - 1] == '"')
-            1
+        var open_offset: usize = prefix_cur + 1;
+        var close_quote_idx: usize = if (lexeme.len >= open_offset + 1 + hash_count and
+            lexeme[lexeme.len - 1 - hash_count] == '"')
+            lexeme.len - 1 - hash_count
         else
-            0;
-        if (delim_width == 0) {
-            if (is_fmt_args_target) {
-                try self.recordStringInterpMeta(expr_id, &.{}, true, false, 1);
-            }
-            return ret_ty;
+            lexeme.len;
+        if (hash_count == 0 and close_quote_idx >= open_offset + 4 and
+            std.mem.startsWith(u8, lexeme[open_offset..close_quote_idx], "\"\"") and
+            std.mem.endsWith(u8, lexeme[open_offset..close_quote_idx], "\"\""))
+        {
+            open_offset += 2;
+            close_quote_idx -= 2;
         }
+        if (close_quote_idx < open_offset) close_quote_idx = open_offset;
 
-        const body = lexeme[delim_width .. lexeme.len - delim_width];
+        const body = lexeme[open_offset..close_quote_idx];
+        const is_multiline = (body.len >= 1 and body[0] == '\n') or
+            (body.len >= 2 and body[0] == '\r' and body[1] == '\n');
+
         var holes_list: std.ArrayListUnmanaged(InterpHoleSpec) = .empty;
-        defer holes_list.deinit(self.allocator);
+        defer {
+            for (holes_list.items) |hole_item| {
+                if (hole_item.tokens.len > 0) self.allocator.free(hole_item.tokens);
+                if (hole_item.incomplete_dots.len > 0) self.allocator.free(hole_item.incomplete_dots);
+            }
+            holes_list.deinit(self.allocator);
+        }
+        var nested_holes_list: std.ArrayListUnmanaged(InterpHoleSpec) = .empty;
+        defer {
+            for (nested_holes_list.items) |nested_item| {
+                if (nested_item.tokens.len > 0) self.allocator.free(nested_item.tokens);
+                if (nested_item.incomplete_dots.len > 0) self.allocator.free(nested_item.incomplete_dots);
+            }
+            nested_holes_list.deinit(self.allocator);
+        }
 
         var scan_pos: usize = 0;
         while (scanNextInterpolationSegment(body, scan_pos)) |seg| {
@@ -26521,7 +28055,7 @@ pub const TypeChecker = struct {
                     break :blk_spec parsed_spec;
                 } else |_| {
                     const spec_start_byte: u32 = tok_span.start_byte +
-                        @as(u32, @intCast(delim_width + seg.expr_start + split.spec_offset));
+                        @as(u32, @intCast(open_offset + seg.expr_start + split.spec_offset));
                     const spec_span = Span.init(
                         self.file_id,
                         @min(spec_start_byte, tok_span.end_byte),
@@ -26558,7 +28092,36 @@ pub const TypeChecker = struct {
             );
 
             const expr_trimmed = std.mem.trim(u8, split.expr_slice, " \t\r\n");
-            if (expr_trimmed.len == 0) continue;
+            if (expr_trimmed.len == 0) {
+                if (self.diagnostic_sink) |sink| {
+                    const hole_open_byte: u32 = tok_span.start_byte +
+                        @as(u32, @intCast(open_offset + seg.open_brace));
+                    const hole_close_end_byte: u32 = tok_span.start_byte +
+                        @as(u32, @intCast(open_offset + seg.after_close));
+                    const empty_hole_span = Span.init(
+                        self.file_id,
+                        @min(hole_open_byte, tok_span.end_byte),
+                        @min(@max(hole_close_end_byte, hole_open_byte + 1), tok_span.end_byte),
+                    );
+                    const labels = [1]LabeledSpan{.{
+                        .span = empty_hole_span,
+                        .label = "expected an expression inside `{…}`",
+                        .style = .primary,
+                    }};
+                    const notes = [1][]const u8{
+                        "help: provide an expression inside `{…}`, or escape literal braces as `{{` and `}}`",
+                    };
+                    _ = try sink.emit(.{
+                        .code = .e0201_unexpected_token,
+                        .severity = .err,
+                        .primary_span = empty_hole_span,
+                        .message = "empty interpolation hole in format string",
+                        .labels = &labels,
+                        .notes = &notes,
+                    });
+                }
+                continue;
+            }
 
             const wrapper_prefix = "fn __cx_interp__() {\n";
             const wrapper_suffix = "\n}\n";
@@ -26588,7 +28151,16 @@ pub const TypeChecker = struct {
                 self.interner,
             );
 
+            const prefix_u32: u32 = @intCast(wrapper_prefix.len);
+            const expr_end_in_wrapped: u32 = prefix_u32 + @as(u32, @intCast(split.expr_slice.len));
+            const hole_expr_rel_base: u32 = @intCast(open_offset + seg.expr_start);
+
             var hole_ty: TypeId = .err_ty;
+            var hole_tokens_list: std.ArrayListUnmanaged(InterpHoleTokenInfo) = .empty;
+            defer hole_tokens_list.deinit(self.allocator);
+            var hole_dots_list: std.ArrayListUnmanaged(InterpHoleDotInfo) = .empty;
+            defer hole_dots_list.deinit(self.allocator);
+
             if (sub_ast.countNodes() > 1) {
                 var sub_checker = try TypeChecker.init(
                     self.allocator,
@@ -26634,11 +28206,240 @@ pub const TypeChecker = struct {
                 while (read_it.next()) |sym_k| {
                     try self.non_discard_read_syms.put(self.allocator, sym_k.*, {});
                 }
+
+                // Project sub-AST symbol & type bindings onto hole tokens (`InterpHoleTokenInfo`):
+                const sub_tok_count = sub_tokens.countTokens();
+                const tok_syms = try self.allocator.alloc(SymbolIndex, sub_tok_count);
+                defer if (tok_syms.len > 0) self.allocator.free(tok_syms);
+                @memset(tok_syms, .none);
+                const tok_tys = try self.allocator.alloc(TypeId, sub_tok_count);
+                defer if (tok_tys.len > 0) self.allocator.free(tok_tys);
+                @memset(tok_tys, .err_ty);
+
+                var ast_i: u32 = 1;
+                while (ast_i < sub_ast.countNodes()) : (ast_i += 1) {
+                    const sub_id = NodeIndex.fromInt(ast_i);
+                    const sub_node = sub_ast.getNode(sub_id);
+                    const sym_idx = if (ast_i < sub_checker.node_symbols.len)
+                        sub_checker.node_symbols[ast_i]
+                    else
+                        SymbolIndex.none;
+                    const ty_id = if (ast_i < sub_checker.node_types.len)
+                        sub_checker.node_types[ast_i]
+                    else
+                        TypeId.err_ty;
+
+                    if (sub_node.tag == .struct_lit and !ty_id.isError()) {
+                        const unwrapped_st = self.pool.unwrapUnderlyingType(ty_id);
+                        const st_node = self.pool.getNode(unwrapped_st);
+                        const st_scope: ScopeId = if (st_node.tag == .struct_ty or
+                            st_node.tag == .union_ty or st_node.tag == .bit_field_ty)
+                            self.sym_table.getSymbol(SymbolIndex.fromInt(st_node.rhs)).target_scope
+                        else
+                            .none;
+                        const lit_cst = sub_ast.getCstOrigin(sub_id);
+                        if (!st_scope.isNone() and !lit_cst.isNone() and lit_cst.asInt() < sub_cst.countNodes()) {
+                            const lit_start: usize = lit_cst.asInt();
+                            const lit_rec = sub_cst.getNode(lit_cst);
+                            const lit_end: usize = @min(
+                                lit_start + @max(@as(usize, lit_rec.subtree_size), 1),
+                                sub_cst.countNodes(),
+                            );
+                            var cst_cur = lit_start + 1;
+                            while (cst_cur < lit_end) {
+                                const cst_sub = sub_cst.getNode(CstNodeIndex.fromInt(@intCast(cst_cur)));
+                                if (cst_sub.kind == .field_init) {
+                                    const fld_end = @min(
+                                        cst_cur + @max(@as(usize, cst_sub.subtree_size), 1),
+                                        lit_end,
+                                    );
+                                    var fld_tok: TokenIndex = .none;
+                                    var has_colon = false;
+                                    var fld_cur = cst_cur + 1;
+                                    while (fld_cur < fld_end) : (fld_cur += 1) {
+                                        const leaf = sub_cst.getNode(CstNodeIndex.fromInt(@intCast(fld_cur)));
+                                        const is_leaf = leaf.subtree_size <= 1 and !leaf.flags.is_bracketed;
+                                        if (!is_leaf or leaf.flags.is_missing_or_injected or
+                                            leaf.token.isNone() or leaf.token.asInt() >= sub_tok_count) continue;
+                                        const leaf_kind = sub_tokens.getToken(leaf.token).kind;
+                                        if (fld_tok.isNone()) {
+                                            if (leaf_kind == .dotdot) break;
+                                            if (symbol_resolver.isIdentifierToken(leaf_kind)) {
+                                                fld_tok = leaf.token;
+                                            }
+                                        } else {
+                                            if (leaf_kind == .colon) has_colon = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!fld_tok.isNone() and fld_tok.asInt() < sub_tok_count) {
+                                        const fld_name = symbol_resolver.extractTokenSlice(
+                                            wrapped_src,
+                                            &sub_tokens,
+                                            fld_tok,
+                                        );
+                                        if (self.interner.lookup(fld_name)) |fld_sym_id| {
+                                            const fld_sym_idx = self.sym_table.lookupInScopeDirect(
+                                                st_scope,
+                                                fld_sym_id,
+                                                NamespaceMask.VALUE_ONLY,
+                                            );
+                                            if (!fld_sym_idx.isNone() and
+                                                (has_colon or tok_syms[fld_tok.asInt()].isNone()))
+                                            {
+                                                tok_syms[fld_tok.asInt()] = fld_sym_idx;
+                                                const fld_ty = try sub_checker.substituteNominalMemberType(
+                                                    unwrapped_st,
+                                                    self.sym_table.getSymbol(fld_sym_idx).type_id,
+                                                );
+                                                if (!fld_ty.isError()) tok_tys[fld_tok.asInt()] = fld_ty;
+                                            }
+                                        }
+                                    }
+                                    cst_cur = fld_end;
+                                    continue;
+                                }
+                                cst_cur += 1;
+                            }
+                        }
+                    }
+
+                    const target_tok: TokenIndex = switch (sub_node.tag) {
+                        .field_access => if (sub_node.rhs.tag == .token)
+                            TokenIndex.fromInt(sub_node.rhs.payload)
+                        else
+                            .none,
+                        .method_call => blk_mc: {
+                            const mc_items = sub_checker.getNodeExtraSlice(sub_id, true);
+                            break :blk_mc if (mc_items.len > 0) TokenIndex.fromInt(mc_items[0]) else .none;
+                        },
+                        .incomplete_call => blk_ic: {
+                            if (sub_checker.classifyIncompleteCallShape(sub_id) == .method_call) {
+                                const ic_items = sub_checker.getNodeExtraSlice(sub_id, true);
+                                break :blk_ic if (ic_items.len > 0) TokenIndex.fromInt(ic_items[0]) else .none;
+                            }
+                            break :blk_ic .none;
+                        },
+                        .contextual_variant => if (sub_node.lhs.tag == .token)
+                            TokenIndex.fromInt(sub_node.lhs.payload)
+                        else
+                            sub_node.main_token,
+                        .path_expr => blk_pe: {
+                            const segs = sub_checker.getNodeExtraSlice(sub_id, false);
+                            break :blk_pe if (segs.len > 0) TokenIndex.fromInt(segs[segs.len - 1]) else .none;
+                        },
+                        .ident_expr,
+                        .self_val,
+                        .named_type,
+                        .prim_type,
+                        .int_lit,
+                        .float_lit,
+                        .bool_lit,
+                        .char_lit,
+                        .byte_lit,
+                        .string_lit,
+                        .byte_string_lit,
+                        .fmt_string_lit,
+                        => sub_node.main_token,
+                        else => .none,
+                    };
+                    if (!target_tok.isNone() and target_tok.asInt() < sub_tok_count) {
+                        if (!sym_idx.isNone()) tok_syms[target_tok.asInt()] = sym_idx;
+                        if (!ty_id.isError()) tok_tys[target_tok.asInt()] = ty_id;
+                    }
+                }
+
+                var tok_i: u32 = 0;
+                while (tok_i < sub_tok_count) : (tok_i += 1) {
+                    const tok_rec = sub_tokens.getToken(TokenIndex.fromInt(tok_i));
+                    if (tok_rec.flags.is_synthesized or tok_rec.kind == .eof) continue;
+                    if (tok_rec.byte_offset < prefix_u32 or tok_rec.byte_offset >= expr_end_in_wrapped) continue;
+                    try hole_tokens_list.append(self.allocator, .{
+                        .rel_byte = hole_expr_rel_base + (tok_rec.byte_offset - prefix_u32),
+                        .byte_len = tok_rec.byte_len,
+                        .kind = tok_rec.kind,
+                        .symbol_index = tok_syms[tok_i],
+                        .type_id = tok_tys[tok_i],
+                    });
+                }
+
+                var dot_it = sub_checker.incomplete_dot_targets.iterator();
+                while (dot_it.next()) |dot_entry| {
+                    const recv_ty: TypeId = switch (dot_entry.value_ptr.*) {
+                        .value_expr => |v_ty| v_ty,
+                        .type_ns => |t_ty| t_ty,
+                        .module_ns => .err_ty,
+                    };
+                    if (recv_ty.isError()) continue;
+                    const inc_ast_id = NodeIndex.fromInt(dot_entry.key_ptr.*);
+                    if (inc_ast_id.isNone() or inc_ast_id.asInt() >= sub_ast.countNodes()) continue;
+                    const dot_tok = sub_ast.getNode(inc_ast_id).main_token;
+                    if (dot_tok.isNone() or dot_tok.asInt() >= sub_tok_count) continue;
+                    const dot_rec = sub_tokens.getToken(dot_tok);
+                    if (dot_rec.byte_offset < prefix_u32 or dot_rec.byte_offset >= expr_end_in_wrapped) continue;
+                    const dot_end_in_wrapped = dot_rec.byte_offset + @as(u32, dot_rec.byte_len);
+                    try hole_dots_list.append(self.allocator, .{
+                        .rel_trigger_end_byte = hole_expr_rel_base + (dot_end_in_wrapped - prefix_u32),
+                        .receiver_type_id = recv_ty,
+                    });
+                }
+
+                // Rebase nested `f"…"` / `f#"…"#` interpolation holes from `sub_checker.string_interps`:
+                if (sub_checker.string_interps.count() > 0) {
+                    var nested_keys = try self.allocator.alloc(u32, sub_checker.string_interps.count());
+                    defer self.allocator.free(nested_keys);
+                    var key_count: usize = 0;
+                    var key_it = sub_checker.string_interps.keyIterator();
+                    while (key_it.next()) |sub_key_ptr| {
+                        nested_keys[key_count] = sub_key_ptr.*;
+                        key_count += 1;
+                    }
+                    std.mem.sort(u32, nested_keys[0..key_count], {}, std.sort.asc(u32));
+                    for (nested_keys[0..key_count]) |sub_ast_raw| {
+                        if (sub_ast_raw == 0 or sub_ast_raw >= sub_ast.countNodes()) continue;
+                        const sub_meta = sub_checker.string_interps.get(sub_ast_raw) orelse continue;
+                        if (sub_meta.holes.len == 0) continue;
+                        const inner_lit_tok = sub_ast.getNode(NodeIndex.fromInt(sub_ast_raw)).main_token;
+                        if (inner_lit_tok.isNone() or inner_lit_tok.asInt() >= sub_tok_count) continue;
+                        const inner_lit_rec = sub_tokens.getToken(inner_lit_tok);
+                        if (inner_lit_rec.byte_offset < prefix_u32 or
+                            inner_lit_rec.byte_offset >= expr_end_in_wrapped) continue;
+                        const inner_rel_in_outer: u32 = hole_expr_rel_base +
+                            (inner_lit_rec.byte_offset - prefix_u32);
+                        for (sub_meta.holes) |sub_hole| {
+                            const rebased_tokens: []InterpHoleTokenInfo = if (sub_hole.tokens.len > 0) blk_rt: {
+                                const duped_toks = try self.allocator.dupe(InterpHoleTokenInfo, sub_hole.tokens);
+                                for (duped_toks) |*tok_info| {
+                                    tok_info.rel_byte += inner_rel_in_outer;
+                                }
+                                break :blk_rt duped_toks;
+                            } else &.{};
+                            errdefer if (rebased_tokens.len > 0) self.allocator.free(rebased_tokens);
+
+                            const rebased_dots: []InterpHoleDotInfo = if (sub_hole.incomplete_dots.len > 0) blk_rd: {
+                                const duped_dots = try self.allocator.dupe(InterpHoleDotInfo, sub_hole.incomplete_dots);
+                                for (duped_dots) |*dot_info| {
+                                    dot_info.rel_trigger_end_byte += inner_rel_in_outer;
+                                }
+                                break :blk_rd duped_dots;
+                            } else &.{};
+                            errdefer if (rebased_dots.len > 0) self.allocator.free(rebased_dots);
+
+                            var rebased_hole = sub_hole;
+                            rebased_hole.rel_brace_open_byte += inner_rel_in_outer;
+                            rebased_hole.rel_brace_close_byte += inner_rel_in_outer;
+                            rebased_hole.rel_expr_start_byte += inner_rel_in_outer;
+                            rebased_hole.rel_expr_end_byte += inner_rel_in_outer;
+                            rebased_hole.tokens = rebased_tokens;
+                            rebased_hole.incomplete_dots = rebased_dots;
+                            try nested_holes_list.append(self.allocator, rebased_hole);
+                        }
+                    }
+                }
             }
 
-            const base_in_file: u32 = tok_span.start_byte + @as(u32, @intCast(delim_width + seg.expr_start));
+            const base_in_file: u32 = tok_span.start_byte + hole_expr_rel_base;
             if (self.diagnostic_sink) |main_sink| {
-                const prefix_u32: u32 = @intCast(wrapper_prefix.len);
                 for (sub_diags.asSlice()) |sub_diag| {
                     if (sub_diag.severity != .err) continue;
                     if (sub_diag.code == .e0118_block_doc_comment_forbidden) continue;
@@ -26683,22 +28484,34 @@ pub const TypeChecker = struct {
                 try self.interner.intern(split.debug_prefix_slice)
             else
                 .none;
-            const sub_expr_span = Span.init(
-                self.file_id,
-                @min(base_in_file, tok_span.end_byte),
-                @min(
-                    base_in_file + @max(@as(u32, @intCast(split.expr_slice.len)), 1),
-                    tok_span.end_byte,
-                ),
-            );
+
+            const owned_hole_tokens = try hole_tokens_list.toOwnedSlice(self.allocator);
+            errdefer if (owned_hole_tokens.len > 0) self.allocator.free(owned_hole_tokens);
+            const owned_hole_dots = try hole_dots_list.toOwnedSlice(self.allocator);
+            errdefer if (owned_hole_dots.len > 0) self.allocator.free(owned_hole_dots);
+
             try holes_list.append(self.allocator, .{
                 .hole_index = @intCast(holes_list.items.len),
                 .has_debug_eq = split.has_debug_eq,
                 .spec = fmt_spec,
                 .expr_type_id = hole_ty,
-                .expr_span = sub_expr_span,
+                .rel_brace_open_byte = @intCast(open_offset + seg.open_brace),
+                .rel_brace_close_byte = @intCast(open_offset + seg.expr_end),
+                .rel_expr_start_byte = hole_expr_rel_base,
+                .rel_expr_end_byte = hole_expr_rel_base + @as(u32, @intCast(split.expr_slice.len)),
                 .raw_expr_text = debug_prefix_sym,
+                .tokens = owned_hole_tokens,
+                .incomplete_dots = owned_hole_dots,
             });
+        }
+
+        if (nested_holes_list.items.len > 0) {
+            try holes_list.ensureUnusedCapacity(self.allocator, nested_holes_list.items.len);
+            for (nested_holes_list.items) |*nested_hole| {
+                nested_hole.hole_index = @intCast(holes_list.items.len);
+                holes_list.appendAssumeCapacity(nested_hole.*);
+            }
+            nested_holes_list.clearRetainingCapacity();
         }
 
         if (holes_list.items.len > 0 or is_fmt_args_target) {
@@ -26706,14 +28519,14 @@ pub const TypeChecker = struct {
                 expr_id,
                 holes_list.items,
                 is_fmt_args_target,
-                delim_width == 3,
-                @intCast(delim_width),
+                is_multiline,
+                @intCast(@min(open_offset, 255)),
             );
         }
-        return ret_ty;
+        return target_ret_ty;
     }
 
-    /// Stores `StringInterpMeta` for `expr_id` in `self.string_interps`, freeing any overwritten slice.
+    /// Stores `StringInterpMeta` for `expr_id` in `self.string_interps`, deep-cloning holes and freeing any overwritten slice.
     fn recordStringInterpMeta(
         self: *TypeChecker,
         expr_id: NodeIndex,
@@ -26722,20 +28535,15 @@ pub const TypeChecker = struct {
         is_multiline: bool,
         delimiter_width: u8,
     ) !void {
-        const owned_holes: []InterpHoleSpec = if (holes.len > 0)
-            try self.allocator.dupe(InterpHoleSpec, holes)
-        else
-            &.{};
-        errdefer if (owned_holes.len > 0) self.allocator.free(owned_holes);
+        const owned_holes = try cloneInterpHoleSpecsAlloc(self.allocator, holes);
+        errdefer freeInterpHoleSpecs(self.allocator, owned_holes);
         if (try self.string_interps.fetchPut(self.allocator, expr_id.asInt(), .{
             .is_fmt_args_mode = is_fmt_args_mode,
             .is_multiline = is_multiline,
             .delimiter_width = delimiter_width,
             .holes = owned_holes,
         })) |prev_kv| {
-            if (prev_kv.value.holes.len > 0) {
-                self.allocator.free(prev_kv.value.holes);
-            }
+            freeInterpHoleSpecs(self.allocator, prev_kv.value.holes);
         }
     }
 
@@ -27215,6 +29023,9 @@ pub const TypeChecker = struct {
                         try self.resolveFnSignatureSymbol(target_idx);
                     }
                     if (expr_id != self.suppress_ident_deprecated_node) {
+                        if (sym.kind == .fn_sym) {
+                            self.sym_table.getSymbolMut(target_idx).layout_inline_flags.is_fn_value_reified = true;
+                        }
                         const is_in_compound = self.isAstNodeInsideCompoundExpr(expr_id);
                         try self.checkDeprecatedSimpleSymbolRef(
                             sym_idx,
@@ -27331,6 +29142,9 @@ pub const TypeChecker = struct {
                 }
                 const target_idx = self.unwrapAliasSymbolIdx(sym_idx);
                 const sym = self.sym_table.getSymbol(target_idx).*;
+                if (sym.kind == .fn_sym and expr_id != self.suppress_ident_deprecated_node) {
+                    self.sym_table.getSymbolMut(target_idx).layout_inline_flags.is_fn_value_reified = true;
+                }
                 if (sym.kind == .fn_sym and sym.type_id.isError()) {
                     try self.resolveFnSignatureSymbol(target_idx);
                 } else if (sym.kind == .enum_variant_sym) {
@@ -28432,6 +30246,9 @@ pub const TypeChecker = struct {
                                 "cannot pass immutable binding or temporary rvalue as `&out`",
                             );
                         }
+                        if (!operand_ty.isError()) {
+                            try self.checkAlignedPlaceBorrow(inner_id, self.getAstNodeSpan(expr_id));
+                        }
                         return self.pool.internOutRef(operand_ty);
                     },
                     .normal_ref => {
@@ -28445,6 +30262,9 @@ pub const TypeChecker = struct {
                                 "cannot take mutable `&mut` borrow of an immutable binding, `&T`, or read-only `*T` place",
                                 "place is immutable; declare with `var` or borrow via `&`",
                             );
+                        }
+                        if (!operand_ty.isError()) {
+                            try self.checkAlignedPlaceBorrow(inner_id, self.getAstNodeSpan(expr_id));
                         }
                         return self.pool.internRef(operand_ty, is_mut);
                     },
@@ -28464,6 +30284,238 @@ pub const TypeChecker = struct {
             },
             else => return self.synthExpr(inner_id),
         }
+    }
+
+    /// Returns `true` if `sub_pat_id`'s CST subtree contains a safe `&` / `&mut` binding modifier.
+    fn hasRefBindingInSubPatternCst(self: *const TypeChecker, sub_pat_id: NodeIndex) bool {
+        if (sub_pat_id.isNone() or sub_pat_id.asInt() >= self.ast_arena.countNodes()) return false;
+        const cst_id = self.ast_arena.getCstOrigin(sub_pat_id);
+        if (cst_id.isNone() or cst_id.asInt() >= self.cst_arena.countNodes()) return false;
+        const start_idx: usize = cst_id.asInt();
+        const rec = self.cst_arena.getNode(cst_id);
+        const end_idx: usize = @min(
+            start_idx + @max(@as(usize, rec.subtree_size), 1),
+            self.cst_arena.countNodes(),
+        );
+        var cur: usize = start_idx;
+        while (cur < end_idx) : (cur += 1) {
+            const sub = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+            if (sub.subtree_size <= 1 and !sub.flags.is_missing_or_injected and !sub.token.isNone() and
+                sub.token.asInt() < self.token_buffer.countTokens() and
+                self.token_buffer.getToken(sub.token).kind == .amp)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Effective alignment state traced across a place projection chain for `E0441` (`ADR-24C`).
+    const PlaceAlignTrace = struct {
+        cur_align: u64,
+        crossed_packed: bool,
+        packed_container_name: []const u8,
+        last_field_name: []const u8,
+    };
+
+    /// Computes effective byte alignment of `place_id` from its root base across `.field`, `[i]`, and `.*` projections.
+    fn tracePlaceAlignment(self: *const TypeChecker, place_id: NodeIndex, depth: u32) PlaceAlignTrace {
+        if (depth >= 32 or place_id.isNone() or place_id.asInt() >= self.ast_arena.countNodes()) {
+            return .{ .cur_align = 1, .crossed_packed = false, .packed_container_name = "", .last_field_name = "" };
+        }
+        const place_ty = if (place_id.asInt() < self.node_types.len)
+            self.node_types[place_id.asInt()]
+        else
+            TypeId.err_ty;
+        const node = self.ast_arena.getNode(place_id);
+        switch (node.tag) {
+            .deref_expr => {
+                const pointee_align: u64 = if (place_ty.isError())
+                    1
+                else
+                    @max(@as(u64, self.computeTypeLayout(place_ty, self.target_layout).align_bytes), 1);
+                return .{
+                    .cur_align = pointee_align,
+                    .crossed_packed = false,
+                    .packed_container_name = "",
+                    .last_field_name = "",
+                };
+            },
+            .index_expr => {
+                if (node.lhs.tag != .node) {
+                    const elem_align: u64 = if (place_ty.isError())
+                        1
+                    else
+                        @max(@as(u64, self.computeTypeLayout(place_ty, self.target_layout).align_bytes), 1);
+                    return .{
+                        .cur_align = elem_align,
+                        .crossed_packed = false,
+                        .packed_container_name = "",
+                        .last_field_name = "",
+                    };
+                }
+                const base_id = NodeIndex.fromInt(node.lhs.payload);
+                const raw_base_ty = if (base_id.asInt() < self.node_types.len)
+                    self.node_types[base_id.asInt()]
+                else
+                    TypeId.err_ty;
+                const unwrapped_raw_base = self.pool.unwrapUnderlyingType(raw_base_ty);
+                const raw_base_tag = self.pool.getTag(unwrapped_raw_base);
+                const base_ty = self.pool.unwrapUnderlyingType(self.unwrapRefType(raw_base_ty));
+                const base_node = self.pool.getNode(base_ty);
+                const elem_layout = self.computeTypeLayout(place_ty, self.target_layout);
+                if (base_node.tag == .slice_ty or base_node.tag == .soa_slice_ty or
+                    raw_base_tag == .ref_ty or raw_base_tag == .mut_ref_ty)
+                {
+                    if (base_node.tag == .array_ty) {
+                        const arr_align: u64 = @max(
+                            @as(u64, self.computeTypeLayout(base_ty, self.target_layout).align_bytes),
+                            1,
+                        );
+                        const elem_sz = elem_layout.byte_size;
+                        return .{
+                            .cur_align = if (elem_sz == 0) arr_align else std.math.gcd(arr_align, elem_sz),
+                            .crossed_packed = false,
+                            .packed_container_name = "",
+                            .last_field_name = "",
+                        };
+                    }
+                    return .{
+                        .cur_align = @max(@as(u64, elem_layout.align_bytes), 1),
+                        .crossed_packed = false,
+                        .packed_container_name = "",
+                        .last_field_name = "",
+                    };
+                }
+                var parent = self.tracePlaceAlignment(base_id, depth + 1);
+                if (base_node.tag == .array_ty) {
+                    const elem_sz = elem_layout.byte_size;
+                    if (elem_sz > 0) parent.cur_align = std.math.gcd(parent.cur_align, elem_sz);
+                }
+                return parent;
+            },
+            .field_access => {
+                if (node.lhs.tag != .node or node.rhs.tag != .token) {
+                    const fallback_align: u64 = if (place_ty.isError())
+                        1
+                    else
+                        @max(@as(u64, self.computeTypeLayout(place_ty, self.target_layout).align_bytes), 1);
+                    return .{
+                        .cur_align = fallback_align,
+                        .crossed_packed = false,
+                        .packed_container_name = "",
+                        .last_field_name = "",
+                    };
+                }
+                const base_id = NodeIndex.fromInt(node.lhs.payload);
+                const raw_base_ty = if (base_id.asInt() < self.node_types.len)
+                    self.node_types[base_id.asInt()]
+                else
+                    TypeId.err_ty;
+                const unwrapped_raw_base = self.pool.unwrapUnderlyingType(raw_base_ty);
+                const raw_base_tag = self.pool.getTag(unwrapped_raw_base);
+                const base_ty = self.pool.unwrapUnderlyingType(self.unwrapRefType(raw_base_ty));
+
+                var trace: PlaceAlignTrace = if (raw_base_tag == .ref_ty or raw_base_tag == .mut_ref_ty) .{
+                    .cur_align = @max(@as(u64, self.computeTypeLayout(base_ty, self.target_layout).align_bytes), 1),
+                    .crossed_packed = false,
+                    .packed_container_name = "",
+                    .last_field_name = "",
+                } else self.tracePlaceAlignment(base_id, depth + 1);
+
+                const member_tok = TokenIndex.fromInt(node.rhs.payload);
+                const member_lexeme = symbol_resolver.extractTokenSlice(self.source, self.token_buffer, member_tok);
+                const base_node = self.pool.getNode(base_ty);
+                if (base_node.tag == .struct_ty) {
+                    const st_sym_idx = SymbolIndex.fromInt(base_node.rhs);
+                    if (!st_sym_idx.isNone() and st_sym_idx.asInt() < self.sym_table.symbols.items.len) {
+                        const st_sym = self.sym_table.getSymbol(st_sym_idx).*;
+                        if (st_sym.packedCapBytes() > 0) {
+                            trace.crossed_packed = true;
+                            trace.packed_container_name = st_sym.name_text;
+                            trace.last_field_name = member_lexeme;
+                        }
+                        if (place_id.asInt() < self.node_symbols.len) {
+                            const f_sym_idx = self.node_symbols[place_id.asInt()];
+                            if (!f_sym_idx.isNone() and f_sym_idx.asInt() < self.sym_table.symbols.items.len) {
+                                const f_sym = self.sym_table.getSymbol(f_sym_idx).*;
+                                if (f_sym.kind == .field_sym) {
+                                    const f_off = computeStructFieldOffset(
+                                        self.pool,
+                                        self.sym_table,
+                                        base_ty,
+                                        f_sym.member_ordinal,
+                                        self.target_layout,
+                                    ) orelse 0;
+                                    if (f_off > 0) {
+                                        trace.cur_align = std.math.gcd(trace.cur_align, f_off);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if (base_node.tag == .tuple_ty) {
+                    if (extractIntLiteralValue(member_lexeme)) |parsed_idx| {
+                        if (parsed_idx.value >= 0) {
+                            const t_off = computeTupleElemOffset(
+                                self.pool,
+                                self.sym_table,
+                                base_ty,
+                                @intCast(parsed_idx.value),
+                                self.target_layout,
+                            ) orelse 0;
+                            if (t_off > 0) {
+                                trace.cur_align = std.math.gcd(trace.cur_align, t_off);
+                            }
+                        }
+                    }
+                }
+                return trace;
+            },
+            else => {
+                const root_align: u64 = if (place_ty.isError())
+                    1
+                else
+                    @max(@as(u64, self.computeTypeLayout(place_ty, self.target_layout).align_bytes), 1);
+                return .{
+                    .cur_align = root_align,
+                    .crossed_packed = false,
+                    .packed_container_name = "",
+                    .last_field_name = "",
+                };
+            },
+        }
+    }
+
+    /// Emits `E0441` (`e0441_unaligned_packed_field_borrow`) when `place_expr_id` borrows a misaligned packed field.
+    fn checkAlignedPlaceBorrow(self: *TypeChecker, place_expr_id: NodeIndex, borrow_span: Span) !void {
+        if (place_expr_id.isNone() or place_expr_id.asInt() >= self.ast_arena.countNodes()) return;
+        const place_ty = if (place_expr_id.asInt() < self.node_types.len)
+            self.node_types[place_expr_id.asInt()]
+        else
+            TypeId.err_ty;
+        if (place_ty.isError() or self.pool.getFlags(place_ty).has_type_vars) return;
+        const req_align: u64 = @max(@as(u64, self.computeTypeLayout(place_ty, self.target_layout).align_bytes), 1);
+        if (req_align <= 1) return;
+
+        const trace = self.tracePlaceAlignment(place_expr_id, 0);
+        if (!trace.crossed_packed or trace.cur_align >= req_align) return;
+
+        var msg_buf: [256]u8 = undefined;
+        const msg = if (trace.last_field_name.len > 0 and trace.packed_container_name.len > 0)
+            std.fmt.bufPrint(
+                &msg_buf,
+                "cannot take safe reference to misaligned field `{s}` (aligned to {d} B, requires {d} B) of packed struct `{s}`",
+                .{ trace.last_field_name, trace.cur_align, req_align, trace.packed_container_name },
+            ) catch "cannot take safe reference to misaligned field of packed struct"
+        else
+            "cannot take safe reference to misaligned field of `@repr(C, packed: …)` struct";
+        try self.emitDiagnosticSimple(
+            .e0441_unaligned_packed_field_borrow,
+            borrow_span,
+            msg,
+            "copy the field into a local variable first, or take a raw pointer with `&raw` / `&raw mut`",
+        );
     }
 
     /// Returns `true` when `op_kind` is a homogeneous numeric/bitwise binary operator preserving operand type `T`.
@@ -30154,6 +32206,9 @@ pub const TypeChecker = struct {
                         }
                         const target_idx = self.unwrapAliasSymbolIdx(sym_idx);
                         const sym = self.sym_table.getSymbol(target_idx).*;
+                        if (sym.kind == .fn_sym and expr_id != self.suppress_ident_deprecated_node) {
+                            self.sym_table.getSymbolMut(target_idx).layout_inline_flags.is_fn_value_reified = true;
+                        }
                         if (sym.kind == .fn_sym and sym.type_id.isError()) {
                             try self.resolveFnSignatureSymbol(target_idx);
                         }
@@ -30270,6 +32325,9 @@ pub const TypeChecker = struct {
                                     );
                                 }
                                 const m_sym = self.sym_table.getSymbol(m_idx).*;
+                                if (m_sym.kind == .fn_sym and expr_id != self.suppress_ident_deprecated_node) {
+                                    self.sym_table.getSymbolMut(m_idx).layout_inline_flags.is_fn_value_reified = true;
+                                }
                                 if (m_sym.kind == .enum_variant_sym) {
                                     const var_payload = try self.substituteNominalMemberType(
                                         unwrapped_static,
@@ -30691,6 +32749,43 @@ pub const TypeChecker = struct {
         return .err_ty;
     }
 
+    /// Returns `true` if `raw_fn_sym_idx` declares an explicit leading `self` parameter.
+    fn hasExplicitSelfParam(self: *const TypeChecker, raw_fn_sym_idx: SymbolIndex) bool {
+        const fn_sym_idx = self.unwrapAliasSymbolIdx(raw_fn_sym_idx);
+        if (fn_sym_idx.isNone() or fn_sym_idx.asInt() >= self.sym_table.symbols.items.len) return false;
+        const param_specs = self.sym_table.getFnParamSpecs(fn_sym_idx);
+        if (param_specs.len > 0) {
+            return std.mem.eql(u8, param_specs[0].name_text, "self");
+        }
+        const fn_sym = self.sym_table.getSymbol(fn_sym_idx).*;
+        if (!fn_sym.target_scope.isNone()) {
+            for (self.sym_table.getScopeMembers(fn_sym.target_scope)) |mem_idx| {
+                const mem_sym = self.sym_table.getSymbol(mem_idx).*;
+                if (mem_sym.kind == .param_sym) {
+                    return std.mem.eql(u8, mem_sym.name_text, "self");
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Returns `true` if `subscript` symbol `raw_sub_sym_idx` borrows its receiver via `&self` or `&mut self`.
+    fn doesSubscriptBorrowSelf(self: *const TypeChecker, raw_sub_sym_idx: SymbolIndex) bool {
+        const sub_sym_idx = self.unwrapAliasSymbolIdx(raw_sub_sym_idx);
+        if (sub_sym_idx.isNone() or sub_sym_idx.asInt() >= self.sym_table.symbols.items.len) return false;
+        if (self.hasExplicitSelfParam(sub_sym_idx)) {
+            if (self.pool.getFnSignatureView(self.sym_table.getSymbol(sub_sym_idx).type_id)) |sig| {
+                if (sig.paramCount() >= 1) {
+                    const p0_ty = self.pool.unwrapUnderlyingType(sig.getParamType(0));
+                    const p0_tag = self.pool.getTag(p0_ty);
+                    return sig.getParamMode(0) == .inout_mode or p0_tag == .ref_ty or p0_tag == .mut_ref_ty;
+                }
+            }
+            return false;
+        }
+        return true;
+    }
+
     /// Synthesizes `base[index]`, `base[i, j]` (`SE-21` `subscript`), and `base[low..high]` (`DR-21` `SE-04`, `SE-09`).
     fn synthIndexExpr(self: *TypeChecker, expr_id: NodeIndex) !TypeId {
         const ast_node = self.ast_arena.getNode(expr_id);
@@ -30814,10 +32909,24 @@ pub const TypeChecker = struct {
                                 expr_id,
                                 sub_fn_ty,
                                 sub_idx,
-                                null,
+                                if (self.hasExplicitSelfParam(sub_idx)) base_id else null,
                                 &.{},
                                 idx_nodes,
                             );
+                        }
+                        const resolved_sub_idx = if (expr_id.asInt() < self.node_symbols.len and
+                            !self.node_symbols[expr_id.asInt()].isNone())
+                            self.node_symbols[expr_id.asInt()]
+                        else
+                            sub_idx;
+                        const raw_outer_tag = self.pool.getTag(unwrapped_raw_base);
+                        if ((sub_sym.flags.is_overload or !self.hasExplicitSelfParam(sub_idx)) and
+                            raw_outer_tag != .ref_ty and
+                            raw_outer_tag != .mut_ref_ty and
+                            raw_outer_tag != .raw_ptr_ty and
+                            self.doesSubscriptBorrowSelf(resolved_sub_idx))
+                        {
+                            try self.checkAlignedPlaceBorrow(base_id, self.getAstNodeSpan(base_id));
                         }
                         if (!raw_sub_ret.isError()) {
                             const ret_node = self.pool.getNode(raw_sub_ret);
@@ -30895,6 +33004,16 @@ pub const TypeChecker = struct {
         if (base_ty.isError()) return .err_ty;
 
         if (is_range_index) {
+            const raw_outer_tag = self.pool.getTag(unwrapped_raw_base);
+            if (unwrapped_raw_base != .str_ty and
+                raw_outer_tag != .ref_ty and
+                raw_outer_tag != .mut_ref_ty and
+                raw_outer_tag != .slice_ty and
+                raw_outer_tag != .soa_slice_ty and
+                raw_outer_tag != .raw_ptr_ty)
+            {
+                try self.checkAlignedPlaceBorrow(base_id, self.getAstNodeSpan(expr_id));
+            }
             if (base_ty == .str_ty) return .str_ty;
             if (union_caps.has_len_and_empty and !union_caps.shared_elem_ty.isError()) {
                 return base_ty;
@@ -31484,7 +33603,11 @@ pub const TypeChecker = struct {
             SymbolIndex.none;
         if (!callee_sym_idx.isNone()) {
             self.recordNodeSymbol(expr_id, callee_sym_idx);
-            const resolved_sym = self.sym_table.getSymbol(callee_sym_idx).*;
+            const resolved_callee_idx = self.unwrapAliasSymbolIdx(callee_sym_idx);
+            const resolved_sym = self.sym_table.getSymbol(resolved_callee_idx).*;
+            if (ast_node.tag == .generic_call and resolved_sym.kind == .fn_sym and args.len == 0) {
+                self.sym_table.getSymbolMut(resolved_callee_idx).layout_inline_flags.is_fn_value_reified = true;
+            }
             if (resolved_sym.flags.is_overload) {
                 if (self.sym_table.getOverloadSet(resolved_sym.scope_id, resolved_sym.name)) |ov_set| {
                     if (ov_set.members.items.len > 1) {
@@ -31845,9 +33968,11 @@ pub const TypeChecker = struct {
                     );
                     return .err_ty;
                 };
-                const cooked_path = lexer.cookStringLiteral(self.allocator, raw_lit) catch null;
+                const dr24_path = symbol_resolver.decodeDr24PlainStringAlloc(self.allocator, raw_lit) catch null;
+                defer if (dr24_path) |bytes| self.allocator.free(bytes);
+                const cooked_path = if (dr24_path == null) (lexer.cookStringLiteral(self.allocator, raw_lit) catch null) else null;
                 defer if (cooked_path) |bytes| self.allocator.free(bytes);
-                const header_path = cooked_path orelse
+                const header_path = dr24_path orelse cooked_path orelse
                     (if (raw_lit.len >= 2) raw_lit[1 .. raw_lit.len - 1] else "");
 
                 if (self.sym_table.getFilePackageId(self.file_id).asInt() >= 2 and
@@ -32074,9 +34199,11 @@ pub const TypeChecker = struct {
                         self.token_buffer,
                         spec_node.main_token,
                     );
-                    const cooked_field = lexer.cookStringLiteral(self.allocator, raw_lit) catch null;
+                    const dr24_field = symbol_resolver.decodeDr24PlainStringAlloc(self.allocator, raw_lit) catch null;
+                    defer if (dr24_field) |bytes| self.allocator.free(bytes);
+                    const cooked_field = if (dr24_field == null) (lexer.cookStringLiteral(self.allocator, raw_lit) catch null) else null;
                     defer if (cooked_field) |bytes| self.allocator.free(bytes);
-                    const field_name = cooked_field orelse
+                    const field_name = dr24_field orelse cooked_field orelse
                         (if (raw_lit.len >= 2) raw_lit[1 .. raw_lit.len - 1] else "");
                     if ((target_node.tag == .slice_ty or target_node.tag == .array_ty or target_ty == .str_ty) and
                         std.mem.eql(u8, field_name, "len"))
@@ -33676,19 +35803,19 @@ pub const TypeChecker = struct {
             ) catch "range-refined type cannot satisfy `FromBytes`",
             .unzeroed_inter_field_padding => std.fmt.bufPrint(
                 &msg_buf,
-                "type `{s}` has {d} uninitialized padding byte(s) before field `{s}` at byte offset {d}; add `@zero_pad` for `{s}`",
+                "type `{s}` has {d} uninitialized padding byte(s) before field `{s}` at byte offset {d}; add `@repr(zero_pad: true)` for `{s}`",
                 .{ root_str, violation.padding_bytes, violation.field_name, violation.byte_offset, contract_name },
-            ) catch "type has uninitialized inter-field padding bytes; add `@zero_pad` for `IntoBytes`",
+            ) catch "type has uninitialized inter-field padding bytes; add `@repr(zero_pad: true)` for `IntoBytes`",
             .unzeroed_tail_padding => std.fmt.bufPrint(
                 &msg_buf,
-                "type `{s}` has {d} uninitialized trailing padding byte(s) at byte offset {d}; add `@zero_pad` for `{s}`",
+                "type `{s}` has {d} uninitialized trailing padding byte(s) at byte offset {d}; add `@repr(zero_pad: true)` for `{s}`",
                 .{ root_str, violation.padding_bytes, violation.byte_offset, contract_name },
-            ) catch "type has uninitialized trailing padding bytes; add `@zero_pad` for `IntoBytes`",
+            ) catch "type has uninitialized trailing padding bytes; add `@repr(zero_pad: true)` for `IntoBytes`",
             .union_requires_zero_pad => std.fmt.bufPrint(
                 &msg_buf,
-                "union `{s}` (at byte offset {d}) may contain uninitialized variant tail bytes; add `@zero_pad` for `{s}`",
+                "union `{s}` (at byte offset {d}) may contain uninitialized variant tail bytes; add `@repr(zero_pad: true)` for `{s}`",
                 .{ member_label, violation.byte_offset, contract_name },
-            ) catch "union requires `@zero_pad` to satisfy `IntoBytes`",
+            ) catch "union requires `@repr(zero_pad: true)` to satisfy `IntoBytes`",
             .size_mismatch => std.fmt.bufPrint(
                 &msg_buf,
                 "type `{s}` byte size ({d}) does not match expected wire layout size ({d})",
@@ -34061,6 +36188,9 @@ pub const TypeChecker = struct {
                                 self.sym_table.markSymbolUsed(m_idx);
                                 self.recordNodeSymbol(expr_id, m_idx);
                                 const m_sym = self.sym_table.getSymbol(m_idx).*;
+                                if (m_sym.kind == .fn_sym and expr_id != self.suppress_ident_deprecated_node) {
+                                    self.sym_table.getSymbolMut(m_idx).layout_inline_flags.is_fn_value_reified = true;
+                                }
                                 if (m_sym.kind == .enum_variant_sym) {
                                     const saved_walrus = self.is_dominating_walrus_pos;
                                     self.is_dominating_walrus_pos = false;
@@ -35633,17 +37763,24 @@ pub const TypeChecker = struct {
         if (param_offset == 1 and sig.paramCount() >= 1) {
             if (optional_self_recv) |recv_id| {
                 const recv_param_ty = self.pool.unwrapUnderlyingType(sig.getParamType(0));
-                const is_mut_self = sig.getParamMode(0) == .inout_mode or
-                    self.pool.getTag(recv_param_ty) == .mut_ref_ty;
-                if (is_mut_self and recv_id.asInt() < self.node_types.len) {
+                const recv_param_tag = self.pool.getTag(recv_param_ty);
+                const is_mut_self = sig.getParamMode(0) == .inout_mode or recv_param_tag == .mut_ref_ty;
+                if (recv_id.asInt() < self.node_types.len) {
                     const recv_ty = self.node_types[recv_id.asInt()];
-                    if (!self.isScrutineeMutRefBindable(recv_id, recv_ty)) {
+                    if (is_mut_self and !self.isScrutineeMutRefBindable(recv_id, recv_ty)) {
                         try self.emitDiagnosticSimple(
                             .e0305_exclusivity_violation,
                             self.getAstNodeSpan(recv_id),
                             "cannot invoke `&mut self` method on an immutable binding or `&T` borrow",
                             "receiver requires a mutable `var` binding or `&mut` borrow",
                         );
+                    }
+                    const recv_outer_tag = self.pool.getTag(self.pool.unwrapUnderlyingType(recv_ty));
+                    if ((recv_param_tag == .ref_ty or recv_param_tag == .mut_ref_ty or is_mut_self) and
+                        recv_outer_tag != .ref_ty and recv_outer_tag != .mut_ref_ty and
+                        recv_outer_tag != .raw_ptr_ty)
+                    {
+                        try self.checkAlignedPlaceBorrow(recv_id, self.getAstNodeSpan(recv_id));
                     }
                 }
             }
@@ -37655,7 +39792,15 @@ pub const TypeChecker = struct {
         if (actual_ty == .never_ty) return true;
         if (actual_ty == expected_ty) return true;
 
-        if (actual_ty == .str_ty and expected_ty == .fmt_args_ty) return true;
+        if (actual_ty == .str_ty and expected_ty == .fmt_args_ty) {
+            if (!expr_id.isNone() and expr_id.asInt() < self.ast_arena.countNodes() and
+                self.ast_arena.getNode(expr_id).tag == .string_lit and
+                !self.string_interps.contains(expr_id.asInt()))
+            {
+                _ = try self.checkPlainStringForFmtArgs(expr_id);
+            }
+            return true;
+        }
 
         const act_node = self.pool.getNode(actual_ty);
         const exp_node = self.pool.getNode(expected_ty);
@@ -39475,7 +41620,7 @@ test "test_redteam_3a_attr_escapes_enum_ordinals_string_interp_and_large_arity" 
         \\
         \\@TraceAttr(marker: '\x41', unicode_ch: '\u{03B1}', decoded_text: "hi\x21", raw_text: r"a\nb{x}", mode: .Verbose)
         \\pub fn traced_fn(used_val: i32) -> str {
-        \\    return "value={used_val + 1}";
+        \\    return f"value={used_val + 1}";
         \\}
     ;
     var interner = try StringInterner.init(std.testing.allocator);
@@ -39536,10 +41681,10 @@ test "test_redteam_3a_attr_escapes_enum_ordinals_string_interp_and_large_arity" 
     try std.testing.expectEqualStrings("a\\nb{x}", interner.get(fields[3].value.str_val));
     try std.testing.expectEqual(@as(u16, 2), fields[4].value.enum_tag);
 
-    // [2] Unresolved identifier inside `"{missing_ident}"` interpolation emits `E0403`:
+    // [2] Unresolved identifier inside `f"{missing_ident}"` interpolation emits `E0403`:
     const bad_interp_src =
         \\pub fn broken_interp() -> str {
-        \\    return "hello {missing_ident}";
+        \\    return f"hello {missing_ident}";
         \\}
     ;
     var bad_interp_res = try typecheckSource(std.testing.allocator, FileId.fromInt(26), bad_interp_src);
@@ -39720,7 +41865,7 @@ test "test_phase6_wire_contracts_from_bytes_into_bytes_and_zero_pad" {
         \\    is_fin: bool | 1,
         \\    opcode: u8 | 7,
         \\}
-        \\@zero_pad
+        \\@repr(zero_pad: true)
         \\pub struct ZeroPaddedHdr {
         \\    pub tag: u8,
         \\    pub len: u32,
@@ -40045,7 +42190,7 @@ test "test_phase6_fn_ptr_contracts_trait_nonescalation_and_sandbox_e0320_e0327" 
     try std.testing.expect(!symbol_resolver.isForbiddenExecutableSection(".rodata.lookup"));
 
     const sandbox_src =
-        \\@link_section(".init_array")
+        \\@link(section: ".init_array")
         \\pub fn evil_ctor() -> unit {}
         \\@std_cap_boundary(emits: [FS])
         \\pub fn user_spoof() -> unit {}
@@ -40519,8 +42664,8 @@ test "test_phase76_se12_se13_se14_se15_fmt_literals_struct_update_and_destructur
         \\    let magic: &[u8] = b"CX76";
         \\    let count_val: u32 = 42_u32;
         \\    let ratio: f32 = 0.5_f32;
-        \\    let formatted: str = "hdr={count_val=:#06x}";
-        \\    let logged: usize = sink_fmt("magic_len={magic.len()}");
+        \\    let formatted: str = f"hdr={count_val=:#06x}";
+        \\    let logged: usize = sink_fmt(f"magic_len={magic.len()}");
         \\    let cfg_a = PacketCfg { port: 9000, .. };
         \\    let cfg_b = PacketCfg { retries: 5, ..cfg_a };
         \\    let box_a = OwnedBox { tag: 1, buf: Vec { len: 2 } };
@@ -40599,7 +42744,7 @@ test "test_phase76_se12_se13_se14_se15_fmt_literals_struct_update_and_destructur
         \\    (immut_x, mut_y) = (3, 4);
         \\    (mut_y, mut_y) = (5, 6);
         \\    _ = bad_s;
-        \\    return "{flag:#x}";
+        \\    return f"{flag:#x}";
         \\}
     ;
     var errs_res = try typecheckSource(std.testing.allocator, FileId.fromInt(53), errs_src);
@@ -40837,10 +42982,10 @@ test "test_stage4_mvs_mutability_casts_default_init_cmpxchg6_and_dependent_gener
         \\    let cmpx_res: (u32, bool) = unsafe {
         \\        @atomic_cmpxchg((&raw atom_slot) as *mut u32, 1, 2, 0_u8, 0_u8, true)
         \\    };
-        \\    let interp_ok: str = "hole={if true { /* {brace} */ r#""""#.len() } else { 0 }}";
-        \\    let raw_ml_ok: str = r"""
+        \\    let interp_ok: str = f"hole={if true => r#"{brace}"#.len() else 0}";
+        \\    let raw_ml_ok: str = r#"
         \\        {not_an_interp_hole}
-        \\        """;
+        \\        "#;
         \\    @cfg(debug)
         \\    let stepped: i32 = fsm: match 0 {
         \\        0 => continue :fsm 1,
@@ -41717,4 +43862,111 @@ test "test_adr23d_e_foreign_scalar_autofix_must_use_suppress_and_e0439" {
     try std.testing.expect(has_must_use_e0413);
     try std.testing.expect(has_result_e0414);
     try std.testing.expectEqual(@as(u32, 4), count_e0439);
+}
+
+test "test_dr24_fmt_strings_w0120_repr_e0440_packed_borrow_e0441_and_w0333" {
+    const valid_src =
+        \\const INLINE_LEN: usize = if true => 8 else 16;
+        \\
+        \\@repr(C, packed: true, align: 64)
+        \\pub struct XregsHeader {
+        \\    pub aligned_first: u64,
+        \\    pub tag: u8,
+        \\    pub word: u32,
+        \\}
+        \\
+        \\@repr(transparent)
+        \\pub struct HandleWrap {
+        \\    pub inner: u32,
+        \\}
+        \\
+        \\@inline
+        \\pub fn exported_hot(val: u32) -> u32 {
+        \\    let step = val + 1;
+        \\    return step * 2;
+        \\}
+        \\
+        \\pub fn check_dr24(hdr: &XregsHeader, port: u16) -> usize {
+        \\    let literal_braces: str = "{{not_interpolated}}";
+        \\    let formatted: str = f"port={port + 1}";
+        \\    let aligned_ref: &u64 = &hdr.aligned_first;
+        \\    let raw_unaligned: *u32 = &raw hdr.word;
+        \\    let arr: [u8; INLINE_LEN] = [0; 8];
+        \\    _ = (literal_braces, formatted, aligned_ref, raw_unaligned);
+        \\    return arr.len() + exported_hot(1) as usize;
+        \\}
+    ;
+    var ok_res = try typecheckSource(std.testing.allocator, FileId.fromInt(90), valid_src);
+    defer ok_res.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ok_res.diagnostics.countDiagnostics());
+
+    const mod_scope = ok_res.symbol_table.file_module_scopes.get(90).?;
+    const xregs_idx = ok_res.symbol_table.lookupInScopeDirect(
+        mod_scope,
+        try ok_res.interner.intern("XregsHeader"),
+        NamespaceMask.TYPE_ONLY,
+    );
+    const xregs_ty = ok_res.symbol_table.getSymbol(xregs_idx).type_id;
+    const xregs_lay = computeTypeLayoutWithPool(&ok_res.type_pool, &ok_res.symbol_table, xregs_ty, TargetLayout.NATIVE_64);
+    try std.testing.expectEqual(@as(u32, 64), xregs_lay.align_bytes);
+    try std.testing.expectEqual(@as(u64, 64), xregs_lay.byte_size);
+    try std.testing.expectEqual(
+        @as(?u64, 9),
+        computeStructFieldOffset(&ok_res.type_pool, &ok_res.symbol_table, xregs_ty, 2, TargetLayout.NATIVE_64),
+    );
+
+    const wrap_idx = ok_res.symbol_table.lookupInScopeDirect(
+        mod_scope,
+        try ok_res.interner.intern("HandleWrap"),
+        NamespaceMask.TYPE_ONLY,
+    );
+    const wrap_ty = ok_res.symbol_table.getSymbol(wrap_idx).type_id;
+    const wrap_lay = computeTypeLayoutWithPool(&ok_res.type_pool, &ok_res.symbol_table, wrap_ty, TargetLayout.NATIVE_64);
+    try std.testing.expectEqual(@as(u64, 4), wrap_lay.byte_size);
+    try std.testing.expectEqual(@as(u32, 4), wrap_lay.align_bytes);
+
+    const neg_src =
+        \\@repr(packed: true)
+        \\pub struct MissingC {
+        \\    pub a: u8,
+        \\    pub b: u32,
+        \\}
+        \\
+        \\@repr(C, packed: 4, align: 2)
+        \\pub struct AlignBelowCap {
+        \\    pub a: u8,
+        \\    pub b: u32,
+        \\}
+        \\
+        \\@repr(C, packed: true)
+        \\pub struct PackedWire {
+        \\    pub tag: u8,
+        \\    pub word: u32,
+        \\}
+        \\
+        \\@inline
+        \\fn redundant_priv_inline(val: u32) -> u32 {
+        \\    let next = val + 1;
+        \\    return next;
+        \\}
+        \\
+        \\pub fn sink_fmt(args: FmtArgs) {
+        \\    _ = args;
+        \\}
+        \\
+        \\pub fn trigger_dr24_diags(wire: &PackedWire) -> u32 {
+        \\    let unused_port: u16 = 8080;
+        \\    sink_fmt("port={unused_port}");
+        \\    let bad_ref: &u32 = &wire.word;
+        \\    _ = bad_ref;
+        \\    return redundant_priv_inline(1);
+        \\}
+    ;
+    var neg_res = try typecheckSource(std.testing.allocator, FileId.fromInt(91), neg_src);
+    defer neg_res.deinit();
+    try std.testing.expect(hasDiagnosticCode(&neg_res.diagnostics, .e0440_invalid_repr_or_inline_attribute));
+    try std.testing.expect(hasDiagnosticCode(&neg_res.diagnostics, .e0441_unaligned_packed_field_borrow));
+    try std.testing.expect(hasDiagnosticCode(&neg_res.diagnostics, .w0120_uninterpolated_fmt_placeholder));
+    try std.testing.expect(hasDiagnosticCode(&neg_res.diagnostics, .w0402_unused_binding));
+    try std.testing.expect(hasDiagnosticCode(&neg_res.diagnostics, .w0333_redundant_private_contract));
 }

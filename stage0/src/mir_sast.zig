@@ -838,6 +838,18 @@ pub const DenseBitSet = union(enum) {
         }
     }
 
+    /// Performs `self &= mask` in-place.
+    pub inline fn intersectInPlace(self: *DenseBitSet, mask: DenseBitSet) void {
+        switch (self.*) {
+            .inline_words => |*bits| bits.* &= mask.wordAt(0),
+            .arena_words => |words| {
+                for (words, 0..) |*dst_word, word_i| {
+                    dst_word.* &= mask.wordAt(word_i);
+                }
+            },
+        }
+    }
+
     /// Returns `true` if `(self & other) != 0`.
     pub inline fn intersects(self: DenseBitSet, other: DenseBitSet) bool {
         if (self == .inline_words and other == .inline_words) {
@@ -1545,6 +1557,13 @@ pub const SIGN_BIAS_U64: u64 = 0x8000_0000_0000_0000;
 /// Maximum backward-sliced SSA variables tracked in the Pentagon relational sub-domain (`256`).
 pub const MAX_SUB_VARS: usize = 256;
 
+/// $O(1)$ set of redundant private/generic effect-contract attributes flagged by `W0333` (`ADR-24C`).
+const REDUNDANT_EFFECT_CONTRACT_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "no_alloc", {} },
+    .{ "no_block", {} },
+    .{ "no_panic", {} },
+});
+
 /// Maximum active RPO block relational states pooled simultaneously in Pentagon (`128 -> 1.0 MiB`).
 pub const MAX_PENTAGON_BLOCKS: usize = 128;
 
@@ -2019,6 +2038,208 @@ fn resolveBodyDeclSpan(body: *const MirBody, sym_table: *const SymbolTable) Span
         }
     }
     return Span.init(body.file_id, 0, 0);
+}
+
+/// Returns `true` if `@allow(W0333)` / `@allow(redundant_private_contract)` covers `sym_idx` or its enclosing scope.
+inline fn isSymbolW0333Suppressed(
+    sym_table: *const SymbolTable,
+    sym_idx: SymbolIndex,
+    scope_id: symbol_resolver.ScopeId,
+) bool {
+    return sym_table.getSymbolAllowMask(sym_idx)
+        .merge(sym_table.getScopeAllowMask(scope_id))
+        .isCodeAllowed(.w0333_redundant_private_contract);
+}
+
+/// Emits `W0333` (`w0333_redundant_private_contract`, `ADR-24C`) for redundant `@no_alloc`/`@no_panic`/`@no_block` on non-`pub` functions.
+fn emitRedundantPrivateContractsW0333(
+    sym_table: *const SymbolTable,
+    store: *const FnSummaryStore,
+    resolved_sym_idx: SymbolIndex,
+    srec: SymbolRecord,
+    active_file_id: FileId,
+    config: SastConfig,
+) !void {
+    const sink = config.diagnostic_sink orelse return;
+    if (resolved_sym_idx.isNone() or srec.kind != .fn_sym) return;
+    if (srec.flags.is_builtin or srec.flags.is_extern or srec.flags.is_prototype_only) return;
+    if (!srec.contract_flags.is_no_alloc and !srec.contract_flags.is_no_panic and !srec.contract_flags.is_no_block) {
+        return;
+    }
+    if (sym_table.getFilePackageId(srec.decl_span.file_id) != .root) return;
+    if (sym_table.isEffectivePubBoundary(resolved_sym_idx)) return;
+    if (isSymbolW0333Suppressed(sym_table, resolved_sym_idx, srec.scope_id)) return;
+
+    const has_wasm_export = if (sym_table.getFfiContract(resolved_sym_idx)) |ffi_c|
+        ffi_c.wasm_export_name != .empty
+    else
+        false;
+
+    // Exempt entry points, FFI/linker exports, GPU kernels, capability boundaries, trait impls, and reified fns:
+    const is_gpu_kernel_flag = if (@hasField(@TypeOf(srec.extra_flags), "is_gpu_kernel"))
+        srec.extra_flags.is_gpu_kernel
+    else
+        false;
+    if (std.mem.eql(u8, srec.name_text, "main") or
+        srec.contract_flags.is_export or
+        srec.contract_flags.is_ifunc or
+        is_gpu_kernel_flag or
+        has_wasm_export or
+        srec.contract_flags.has_link_section or
+        srec.contract_flags.has_link_name or
+        srec.contract_flags.is_std_cap_boundary or
+        srec.isFnValueReified() or
+        sym_table.impl_method_trait.contains(resolved_sym_idx.asInt()))
+    {
+        return;
+    }
+    if (!srec.def_id.isNone()) {
+        const target_def_raw = srec.def_id.asInt();
+        for (store.edges) |edge| {
+            if (edge.callee_def == target_def_raw and edge.meta().edge_kind == .reify_fn_addr) {
+                return;
+            }
+        }
+    }
+
+    var src_opt: ?[]const u8 = null;
+    var tok_opt: ?*const TokenBuffer = null;
+    var cst_opt: ?*const LosslessCstArena = null;
+    if (!srec.decl_span.file_id.isNone() and srec.decl_span.file_id == active_file_id) {
+        src_opt = config.source_text;
+        tok_opt = config.token_buffer;
+        cst_opt = config.cst_arena;
+    }
+    if (src_opt == null or tok_opt == null or cst_opt == null) {
+        if (config.external_resolver) |ext_res| {
+            if (ext_res.compiler_db) |db| {
+                const fid_raw = srec.decl_span.file_id.asInt();
+                if (db.source_inputs.getPtr(fid_raw)) |src_in| {
+                    if (db.parsed_artifacts.getPtr(fid_raw)) |parsed_art| {
+                        src_opt = src_in.owned_text;
+                        tok_opt = &parsed_art.token_buffer;
+                        cst_opt = &parsed_art.cst_arena;
+                    }
+                }
+            }
+        }
+    }
+
+    const arena_alloc = sink.arena.asAllocator();
+    if (src_opt != null and tok_opt != null and cst_opt != null and
+        !srec.cst_node.isNone() and srec.cst_node.asInt() < cst_opt.?.countNodes())
+    {
+        const src_bytes = src_opt.?;
+        const tok_buf = tok_opt.?;
+        const cst_ar = cst_opt.?;
+        const start_idx: usize = srec.cst_node.asInt();
+        const root_rec = cst_ar.getNode(srec.cst_node);
+        const end_idx: usize = @min(
+            start_idx + @max(@as(usize, root_rec.subtree_size), 1),
+            cst_ar.countNodes(),
+        );
+        var scan_idx: usize = start_idx + 1;
+        while (scan_idx < end_idx) {
+            const scan_node = cst_ar.getNode(CstNodeIndex.fromInt(@intCast(scan_idx)));
+            if (scan_node.kind == .block or scan_node.kind == .fn_expr_body) break;
+            if (scan_node.kind == .attribute) {
+                const scan_attr_end = @min(scan_idx + @max(@as(usize, scan_node.subtree_size), 1), end_idx);
+                var leaf_scan = scan_idx + 1;
+                while (leaf_scan < scan_attr_end) : (leaf_scan += 1) {
+                    const leaf = cst_ar.getNode(CstNodeIndex.fromInt(@intCast(leaf_scan)));
+                    if (leaf.subtree_size <= 1 and !leaf.token.isNone() and leaf.token.asInt() < tok_buf.countTokens()) {
+                        const tok = tok_buf.getToken(leaf.token);
+                        if (symbol_resolver.isIdentifierToken(tok.kind) and tok.byte_offset < src_bytes.len) {
+                            const end_off = @min(@as(usize, tok.byte_offset) + tok.byte_len, src_bytes.len);
+                            if (std.mem.eql(u8, src_bytes[tok.byte_offset..end_off], "gpu_kernel")) return;
+                            break;
+                        }
+                    }
+                }
+                scan_idx = scan_attr_end;
+                continue;
+            }
+            scan_idx += 1;
+        }
+        var cur_idx: usize = start_idx + 1;
+        while (cur_idx < end_idx) {
+            const node = cst_ar.getNode(CstNodeIndex.fromInt(@intCast(cur_idx)));
+            if (node.kind == .block or node.kind == .fn_expr_body) break;
+            if (node.kind == .attribute) {
+                const attr_cst = CstNodeIndex.fromInt(@intCast(cur_idx));
+                const attr_end = @min(cur_idx + @max(@as(usize, node.subtree_size), 1), end_idx);
+                var attr_ident: []const u8 = "";
+                var leaf_cur = cur_idx + 1;
+                while (leaf_cur < attr_end) : (leaf_cur += 1) {
+                    const leaf = cst_ar.getNode(CstNodeIndex.fromInt(@intCast(leaf_cur)));
+                    if (leaf.subtree_size <= 1 and !leaf.token.isNone() and
+                        leaf.token.asInt() < tok_buf.countTokens())
+                    {
+                        const tok = tok_buf.getToken(leaf.token);
+                        if (symbol_resolver.isIdentifierToken(tok.kind) and tok.byte_offset < src_bytes.len) {
+                            const end_off = @min(@as(usize, tok.byte_offset) + tok.byte_len, src_bytes.len);
+                            attr_ident = src_bytes[tok.byte_offset..end_off];
+                            break;
+                        }
+                    }
+                }
+                const is_redundant_contract = REDUNDANT_EFFECT_CONTRACT_SET.has(attr_ident);
+                if (is_redundant_contract) {
+                    const attr_span = symbol_resolver.computeCstSubtreeSpan(
+                        srec.decl_span.file_id,
+                        tok_buf,
+                        cst_ar,
+                        attr_cst,
+                    ) orelse srec.decl_span;
+                    const removal_span = symbol_resolver.computeAttributeRemovalSpan(
+                        src_bytes,
+                        srec.decl_span.file_id,
+                        attr_span,
+                    );
+                    const labels = try arena_alloc.alloc(LabeledSpan, 1);
+                    labels[0] = .{
+                        .span = attr_span,
+                        .label = "effects on non-`pub` functions are inferred automatically by `mir_sast`",
+                        .style = .primary,
+                    };
+                    const edits = try arena_alloc.alloc(diagnostic.TextEdit, 1);
+                    edits[0] = .{
+                        .file_id = removal_span.file_id,
+                        .start_byte = removal_span.start_byte,
+                        .end_byte = removal_span.end_byte,
+                        .replacement_id = .empty,
+                    };
+                    const fixes = try arena_alloc.alloc(diagnostic.SuggestedFix, 1);
+                    fixes[0] = .{
+                        .message = try std.fmt.allocPrint(arena_alloc, "remove redundant `@{s}` attribute", .{attr_ident}),
+                        .applicability = .machine_applicable,
+                        .priority = .lint_idiom,
+                        .edits = edits,
+                    };
+                    _ = try sink.emit(.{
+                        .code = .w0333_redundant_private_contract,
+                        .severity = .warning,
+                        .primary_span = attr_span,
+                        .message = try std.fmt.allocPrint(
+                            arena_alloc,
+                            "redundant `@{s}` contract on non-`pub` function (`ADR-24C`); " ++
+                                "reserve explicit contracts for `pub` boundaries and entry points",
+                            .{attr_ident},
+                        ),
+                        .labels = labels,
+                        .suggestions = fixes,
+                    });
+                }
+                cur_idx = attr_end;
+                continue;
+            }
+            if (node.subtree_size > 1) {
+                cur_idx += node.subtree_size;
+                continue;
+            }
+            cur_idx += 1;
+        }
+    }
 }
 
 /// Emits a structured Phase 6 diagnostic with primary span, optional secondary spans, and `help:` note.
@@ -3627,6 +3848,8 @@ const BodyProvenanceHorizon = struct {
     live_loans_in: []DenseBitSet,
     /// Active NLL `loan_mask` (`DenseBitSet`) on exit from each basic block (`len == block_count`).
     live_loans_out: []DenseBitSet,
+    /// Forward may-have-been-minted NLL `loan_mask` (`DenseBitSet`) on entry to each basic block (`len == block_count`).
+    avail_loans_in: []DenseBitSet,
     /// Active `Context.scratch[0..2]` mask (`u2`) on entry to each basic block (`len == block_count`).
     live_scratch_in: []u2,
     /// Active `Context.scratch[0..2]` mask (`u2`) on exit from each basic block (`len == block_count`).
@@ -5288,6 +5511,59 @@ fn computeBodyProvenanceAndNllHorizonExt(
         }
     }
 
+    const avail_loans_in = try arena_alloc.alloc(DenseBitSet, block_count);
+    const avail_loans_out = try arena_alloc.alloc(DenseBitSet, block_count);
+    for (0..block_count) |b_i| {
+        avail_loans_in[b_i] = try DenseBitSet.initEmpty(arena_alloc, loan_count);
+        avail_loans_out[b_i] = try DenseBitSet.initEmpty(arena_alloc, loan_count);
+    }
+    if (loan_count > 0 and loan_list.items[loan_count - 1].is_overflow_wildcard) {
+        avail_loans_in[0].set(loan_count - 1);
+    }
+
+    var avail_work = try DenseBitSet.initEmpty(arena_alloc, loan_count);
+    const avail_iter_cap: usize = @max(@as(usize, 64), block_count * 4);
+    var has_avail_changed = true;
+    var avail_iter: usize = 0;
+    while (has_avail_changed and avail_iter < avail_iter_cap) : (avail_iter += 1) {
+        has_avail_changed = false;
+        for (dom.rpo_blocks) |bb_idx| {
+            const bb_id = MirBlockId.fromInt(bb_idx);
+            if (bb_idx != 0) {
+                avail_work.clearAll();
+                for (body.getPredEdges(bb_id)) |pred_eid| {
+                    const edge = body.extra_edges.items[pred_eid.asInt()];
+                    if (!dom.isReachable(edge.src_bb)) continue;
+                    avail_work.unionInPlace(avail_loans_out[edge.src_bb.asInt()]);
+                }
+                if (avail_loans_in[bb_idx].unionAssignChanged(avail_work)) {
+                    has_avail_changed = true;
+                }
+            }
+
+            avail_work.copyFrom(avail_loans_in[bb_idx]);
+            for (body.getBlockInsts(bb_id)) |inst_vid| {
+                const minted_idx = inst_minted_loan[inst_vid.asInt()];
+                if (minted_idx < loan_count) {
+                    avail_work.set(minted_idx);
+                }
+            }
+            const blk_term = body.blocks.items[bb_idx].terminator;
+            if (blk_term.kind == .call and blk_term.cond_or_val < call_minted_mask.len) {
+                avail_work.unionInPlace(call_minted_mask[blk_term.cond_or_val]);
+            }
+            if (avail_loans_out[bb_idx].unionAssignChanged(avail_work)) {
+                has_avail_changed = true;
+            }
+        }
+    }
+    if (has_avail_changed) {
+        for (0..block_count) |b_i| {
+            avail_loans_in[b_i].setAll(loan_count);
+            avail_loans_out[b_i].setAll(loan_count);
+        }
+    }
+
     const live_loans_in = try arena_alloc.alloc(DenseBitSet, block_count);
     const live_loans_out = try arena_alloc.alloc(DenseBitSet, block_count);
     for (0..block_count) |b_i| {
@@ -5536,6 +5812,12 @@ fn computeBodyProvenanceAndNllHorizonExt(
         }
     }
 
+    // Intersect backward liveness with forward mint availability so branch-local loans never leak upstream:
+    for (0..block_count) |b_i| {
+        live_loans_in[b_i].intersectInPlace(avail_loans_in[b_i]);
+        live_loans_out[b_i].intersectInPlace(avail_loans_out[b_i]);
+    }
+
     const block_ctx_alloc0_prov_out = try arena_alloc.alloc(ValueProvenance, block_count);
     const block_ctx_alloc4_prov_out = try arena_alloc.alloc(ValueProvenance, block_count);
     for (0..block_count) |b_i| {
@@ -5552,6 +5834,7 @@ fn computeBodyProvenanceAndNllHorizonExt(
         .loans = loan_list.items,
         .live_loans_in = live_loans_in,
         .live_loans_out = live_loans_out,
+        .avail_loans_in = avail_loans_in,
         .live_scratch_in = live_scratch_in,
         .live_scratch_out = live_scratch_out,
         .inst_minted_loan = inst_minted_loan,
@@ -9096,6 +9379,22 @@ fn computeBlockStepHorizons(
                 }
             }
         }
+    }
+
+    // Intersect per-step backward horizons with forward intra-block loan availability:
+    if (bb_idx < horizon.avail_loans_in.len) {
+        var avail_step = try horizon.avail_loans_in[bb_idx].clone(arena_alloc);
+        for (inst_slice, 0..) |inst_vid, fwd_pos| {
+            loans_before_out[fwd_pos].intersectInPlace(avail_step);
+            const val_raw = inst_vid.asInt();
+            if (val_raw < horizon.inst_minted_loan.len) {
+                const minted_idx = horizon.inst_minted_loan[val_raw];
+                if (minted_idx < loan_count) {
+                    avail_step.set(minted_idx);
+                }
+            }
+        }
+        term_loans_out.intersectInPlace(avail_step);
     }
 
     // Union active unjoined nursery task loans forward across `inst_slice` and at `term_loans_out`:
@@ -21056,6 +21355,23 @@ fn runPass3SummaryContractsAndSandbox(
             }
         }
 
+        // `W0333` redundant `@no_alloc` / `@no_panic` / `@no_block` on verified non-`pub` functions (`ADR-24C`):
+        if (sym_opt) |srec| {
+            const has_any_contract_violation = (cs_mask.has_no_alloc and inferred.alloc) or
+                (cs_mask.has_no_panic and (inferred.may_panic or has_emitted_e0321)) or
+                (cs_mask.has_no_block and inferred.hasAnyBits(EffectCapabilityMask.BLOCKING_BITS));
+            if (!has_any_contract_violation) {
+                try emitRedundantPrivateContractsW0333(
+                    sym_table,
+                    &store,
+                    resolved_sym_idx,
+                    srec,
+                    body.file_id,
+                    config,
+                );
+            }
+        }
+
         // Cross-thread `TaskGroup.spawn` (`is_local == 0`) `Send`/`Sync`, `@thread_local`, & opaque `Future` check (`E0309`):
         try verifyCrossThreadSpawnsInBody(
             allocator,
@@ -23032,7 +23348,7 @@ fn solveBodySignBiasedIntervals(
     };
 }
 
-/// Returns `true` when `&place` / `&mut place` ends inside a `@packed` aggregate or raw-pointer dereference.
+/// Returns `true` when `&place` / `&mut place` has effective byte alignment below its natural pointee alignment (`ADR-24C`).
 fn hasUnalignedPlaceProjection(
     body: *const MirBody,
     pool: *const InternPool,
@@ -23047,36 +23363,97 @@ fn hasUnalignedPlaceProjection(
     var active_subst: type_system.NominalTypeSubst = .{};
     var active_dc: ?u32 = null;
     var active_soa: ?TypeId = null;
-    var is_unaligned = false;
+    var cur_align: u64 = @max(
+        @as(u64, 1),
+        type_system.computeTypeLayoutWithPool(pool, sym_table, cur_ty, body.target_layout).align_bytes,
+    );
 
     for (body.getPlaceProjections(place_id)) |proj| {
         const resolved_cur = pool.unwrapUnderlyingType(active_subst.resolve(cur_ty));
+        const had_active_dc = active_dc != null;
+        const next_ty = stepProjectedType(pool, sym_table, cur_ty, proj, &active_subst, &active_dc, &active_soa);
+        const resolved_next = pool.unwrapUnderlyingType(active_subst.resolve(next_ty));
+
         if (!resolved_cur.isError() and !resolved_cur.isPrimitive()) {
             const c_node = pool.getNode(resolved_cur);
             switch (proj.kind) {
                 .deref => {
-                    is_unaligned = (c_node.tag == .raw_ptr_ty);
-                },
-                .field => {
-                    if (c_node.tag == .struct_ty or c_node.tag == .union_ty) {
-                        const sym_idx = symbol_resolver.SymbolIndex.fromInt(c_node.rhs);
-                        if (!sym_idx.isNone() and sym_idx.asInt() < sym_table.symbols.items.len) {
-                            if (sym_table.getSymbol(sym_idx).contract_flags.is_packed) {
-                                is_unaligned = true;
-                            }
-                        }
+                    if (c_node.tag == .raw_ptr_ty) {
+                        cur_align = 1;
+                    } else {
+                        cur_align = @max(
+                            @as(u64, 1),
+                            type_system.computeTypeLayoutWithPool(pool, sym_table, resolved_next, body.target_layout).align_bytes,
+                        );
                     }
                 },
-                .soa_elem => is_unaligned = false,
+                .field => {
+                    if (!had_active_dc) {
+                        if (c_node.tag == .struct_ty) {
+                            if (type_system.computeStructFieldOffset(
+                                pool,
+                                sym_table,
+                                resolved_cur,
+                                proj.payload,
+                                body.target_layout,
+                            )) |field_off| {
+                                if (field_off > 0) cur_align = std.math.gcd(cur_align, field_off);
+                            } else {
+                                const sym_idx = symbol_resolver.SymbolIndex.fromInt(c_node.rhs);
+                                if (!sym_idx.isNone() and sym_idx.asInt() < sym_table.symbols.items.len) {
+                                    const packed_cap = sym_table.getSymbol(sym_idx).packedCapBytes();
+                                    if (packed_cap > 0) cur_align = @min(cur_align, packed_cap);
+                                }
+                            }
+                        } else if (c_node.tag == .tuple_ty) {
+                            if (type_system.computeTupleElemOffset(
+                                pool,
+                                sym_table,
+                                resolved_cur,
+                                proj.payload,
+                                body.target_layout,
+                            )) |elem_off| {
+                                if (elem_off > 0) cur_align = std.math.gcd(cur_align, elem_off);
+                            }
+                        }
+                    } else {
+                        cur_align = @max(
+                            @as(u64, 1),
+                            type_system.computeTypeLayoutWithPool(pool, sym_table, resolved_next, body.target_layout).align_bytes,
+                        );
+                    }
+                },
+                .soa_elem => {
+                    cur_align = @max(
+                        @as(u64, 1),
+                        type_system.computeTypeLayoutWithPool(pool, sym_table, resolved_next, body.target_layout).align_bytes,
+                    );
+                },
                 .index => {
-                    if (c_node.tag == .raw_ptr_ty) is_unaligned = true;
+                    if (c_node.tag == .raw_ptr_ty) {
+                        cur_align = 1;
+                    } else {
+                        const elem_lay = type_system.computeTypeLayoutWithPool(
+                            pool,
+                            sym_table,
+                            resolved_next,
+                            body.target_layout,
+                        );
+                        if (elem_lay.byte_size > 0) cur_align = std.math.gcd(cur_align, elem_lay.byte_size);
+                    }
                 },
                 .downcast, .slice_len => {},
             }
         }
-        cur_ty = stepProjectedType(pool, sym_table, cur_ty, proj, &active_subst, &active_dc, &active_soa);
+        cur_ty = next_ty;
     }
-    return is_unaligned;
+
+    const final_ty = pool.unwrapUnderlyingType(active_subst.resolve(cur_ty));
+    const natural_align: u64 = @max(
+        @as(u64, 1),
+        type_system.computeTypeLayoutWithPool(pool, sym_table, final_ty, body.target_layout).align_bytes,
+    );
+    return cur_align < natural_align;
 }
 
 /// Records any proven scalar interval or non-null/aligned reference fact for `v_raw` into `out_table`.
@@ -25016,4 +25393,72 @@ test "test_phase9_surface_drop_impl_and_link_ambient_policy_enforcement" {
         &policy_sink,
     );
     try std.testing.expect(policy_sink.hasErrors());
+}
+
+test "test_dr24_mir_sast_w0333_redundant_private_contracts_and_packed_proven_align" {
+    const allocator = std.testing.allocator;
+    const dr24_src =
+        \\@repr(C, packed: true, align: 64)
+        \\pub struct AlignedPackedHdr {
+        \\    pub first_word: u64,
+        \\    pub tag: u8,
+        \\    pub tail_u32: u32,
+        \\}
+        \\
+        \\@no_alloc
+        \\@no_panic
+        \\@no_block
+        \\fn redundant_private_helper(val: i32) -> i32 {
+        \\    return val +% 1;
+        \\}
+        \\
+        \\@allow(W0333)
+        \\@no_alloc
+        \\fn suppressed_private_helper(val: i32) -> i32 {
+        \\    return val +% 2;
+        \\}
+        \\
+        \\@no_alloc
+        \\fn reified_private_cb(val: i32) -> i32 {
+        \\    return val +% 3;
+        \\}
+        \\
+        \\@no_alloc
+        \\pub fn public_contract_api(hdr: &AlignedPackedHdr, val: i32) -> i32 {
+        \\    let aligned_ref: &u64 = &hdr.first_word;
+        \\    let cb: @no_alloc fn(i32) -> i32 = reified_private_cb;
+        \\    return (aligned_ref.* as i32) +% redundant_private_helper(val) +% suppressed_private_helper(val) +% cb(val);
+        \\}
+    ;
+
+    var bundle = try lowerAndVerifySourceMirSast(
+        allocator,
+        FileId.fromInt(120),
+        dr24_src,
+        TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer bundle.deinit();
+    try std.testing.expect(!bundle.diagnostics.hasErrors());
+
+    var w0333_count: usize = 0;
+    for (bundle.diagnostics.diagnostics.items) |diag_item| {
+        if (diag_item.code == .w0333_redundant_private_contract) {
+            w0333_count += 1;
+            try std.testing.expectEqual(@as(usize, 1), diag_item.suggestions.len);
+            try std.testing.expectEqual(diagnostic.FixApplicability.machine_applicable, diag_item.suggestions[0].applicability);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), w0333_count);
+
+    const api_body = bundle.mir_module.findBodyByName(&bundle.interner, "public_contract_api").?;
+    const proven = try computeBodyProvenRanges(allocator, api_body, &bundle.pool, &bundle.sym_table);
+    defer allocator.free(proven);
+    var has_seen_aligned_first_word = false;
+    for (proven) |range_item| {
+        if (range_item.flags().is_nonnull_ptr and range_item.proven_align_log2 == 3) {
+            has_seen_aligned_first_word = true;
+        }
+    }
+    try std.testing.expect(has_seen_aligned_first_word);
 }

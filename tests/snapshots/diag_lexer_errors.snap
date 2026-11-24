@@ -1,32 +1,57 @@
-✗ error[E0101]: malformed hexadecimal escape sequence `\xHH`
-  ╭─▸ src/lexer/errors.cx:1:16
+✗ error[E0118]: 3-character doc prefix `///` is retired (`ADR-24A`); use `/|` for outer docstrings
+  ╭─▸ src/lexer/errors.cx:1:1
   │
-1 │ let bad_esc = "\xGG";
+1 │ /// retired doc
+  │ ^^^ retired `///` doc prefix; use `/|` instead
+  │
+  ├╴ help: replace `///` with `/|`
+1 - /// retired doc
+1 + /| retired doc
+  ╰───────
+
+✗ error[E0101]: malformed hexadecimal escape sequence `\xHH`
+  ╭─▸ src/lexer/errors.cx:2:16
+  │
+2 │ let bad_esc = "\xGG";
   │                ^^^^ expected exactly two hexadecimal digits `[0-9a-fA-F]` after `\x`
   │
   ╰───────
 
 ✗ error[E0102]: character literal may only contain a single Unicode scalar value
-  ╭─▸ src/lexer/errors.cx:2:15
+  ╭─▸ src/lexer/errors.cx:3:15
   │
-2 │ let bad_chr = 'ab';
-  │               ^^^^ expected a single character or escape sequence enclosed in `'…'`
+3 │ let bad_chr = 'ab';
+  │               ^^^^ single quotes `'…'` are reserved for single `char` scalars; use `"…"` for strings
   │
+  ├╴ help: replace single quotes with double quotes
+3 - let bad_chr = 'ab';
+3 + let bad_chr = "ab";
   ╰───────
 
 ✗ error[E0103]: malformed numeric literal
-  ╭─▸ src/lexer/errors.cx:3:15
+  ╭─▸ src/lexer/errors.cx:4:15
   │
-3 │ let bad_num = 0x_1F;
+4 │ let bad_num = 0x_1F;
   │               ^^^^^ invalid digits, radix prefix, `_` separator placement, or trailing suffix
   │
   ╰───────
 
-✗ error[E0104]: source file token count exceeds maximum token limit
-  ╭─▸ src/lexer/errors.cx:4:1
+✗ error[E0116]: multiline string content line is indented less than the closing quote column
+  ╭─▸ src/lexer/errors.cx:6:1
   │
-4 │ ╭─▸ let overflow = 99;
-5 │ │   
+6 │   under
+  │ ^^ content line has fewer leading spaces than the closing quote column
+  │
+  ├╴ help: indent content line to match closing quote column
+6 -   under
+6 +     under
+  ╰───────
+
+✗ error[E0104]: source file token count exceeds maximum token limit
+  ╭─▸ src/lexer/errors.cx:8:1
+  │
+8 │ ╭─▸ let overflow = 99;
+9 │ │   
   │ ╰───^ remaining source bytes preserved as unparsed tail trivia
   │
   ╰───────

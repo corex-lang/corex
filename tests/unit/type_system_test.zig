@@ -1100,7 +1100,7 @@ test "test_type_system_dr22_positive_features_and_e0420_through_e0437_diagnostic
         "    let port_num = dial(\"corex.dev\", is_tls: false);\n" ++
         "    let step_val = parse_sugar()?;\n" ++
         "    let loc_line = trace_loc();\n" ++
-        "    let msg: str = \"v={step_val=:#04x}\";\n" ++
+        "    let msg: str = f\"v={step_val=:#04x}\";\n" ++
         "    _ = (moved_grid, panel_sum, port_num, loc_line, msg);\n" ++
         "    let out_val = fsm: match FsmStep.Start {\n" ++
         "        .Start => continue :fsm .Done(step_val),\n" ++
@@ -1190,7 +1190,7 @@ test "test_type_system_dr22_positive_features_and_e0420_through_e0437_diagnostic
         "        .Alpha => continue :fsm,\n" ++
         "        .Beta => 0,\n" ++
         "    };\n" ++
-        "    return \"{flag:#x}\";\n" ++
+        "    return f\"{flag:#x}\";\n" ++
         "}\n";
     var res_c = try runFullTypecheck(std.testing.allocator, e0431_to_e0437_src);
     defer res_c.deinit();
@@ -1341,4 +1341,379 @@ test "test_type_system_dr23_five_tier_discard_lattice_e0439_and_foreign_scalar_e
         try std.testing.expect(saw_bool_hint);
         try std.testing.expect(saw_u8_hint);
     }
+}
+
+// ---------- Phase 11.1b (DR-24) Sema & Layout Rules -----------
+
+test "test_type_system_dr24_repr_e0440_packed_borrow_e0441_w0120_w0333_and_inline_if" {
+    // [1] Positive `.CacheLine` (`64` vs `128`), packed raw pointer vs aligned borrow, `f"…"`, and `if … => … else …`:
+    const valid_dr24_src =
+        \\@repr(C, packed: true, align: .CacheLine, zero_pad: true)
+        \\pub struct CachePackedHeader {
+        \\    pub aligned_first: u64,
+        \\    pub tag: u8,
+        \\    pub word: u32,
+        \\}
+        \\
+        \\@inline
+        \\pub fn exported_step(val: u32) -> u32 {
+        \\    let bumped = val + 1;
+        \\    return bumped * 2;
+        \\}
+        \\
+        \\pub fn verify_dr24_positive(hdr: &CachePackedHeader, opt_port: u16?) -> usize {
+        \\    let plain_hole: str = "{not_a_hole}";
+        \\    let plain_braces: str = "{{}}";
+        \\    let chosen_port: u16 = if opt_port is .Some(port) and (next_port := port +% 1_u16) > 0_u16 => next_port
+        \\        else 80_u16;
+        \\    let formatted: str = f"port={chosen_port}";
+        \\    let aligned_ref: &u64 = &hdr.aligned_first;
+        \\    let raw_word_ptr: *u32 = unsafe { &raw hdr.word };
+        \\    _ = (plain_hole, plain_braces, formatted, aligned_ref, raw_word_ptr);
+        \\    return exported_step(chosen_port as u32) as usize;
+        \\}
+    ;
+    var ok_res = try runFullTypecheck(std.testing.allocator, valid_dr24_src);
+    defer ok_res.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ok_res.diagnostics.diagnostics.items.len);
+
+    const mod_scope = ok_res.symbol_table.file_module_scopes.get(1).?;
+    const hdr_ty = ok_res.symbol_table.getSymbol(
+        ok_res.symbol_table.lookupInScopeDirect(
+            mod_scope,
+            try ok_res.interner.intern("CachePackedHeader"),
+            corex.symbol_resolver.NamespaceMask.TYPE_ONLY,
+        ),
+    ).type_id;
+    const x86_layout = type_system.computeTypeLayoutWithPool(
+        &ok_res.type_pool,
+        &ok_res.symbol_table,
+        hdr_ty,
+        type_system.TargetLayout.NATIVE_64,
+    );
+    try std.testing.expectEqual(@as(u32, 64), x86_layout.align_bytes);
+    try std.testing.expectEqual(@as(u64, 64), x86_layout.byte_size);
+
+    const mac_layout = type_system.computeTypeLayoutWithPool(
+        &ok_res.type_pool,
+        &ok_res.symbol_table,
+        hdr_ty,
+        type_system.TargetLayout.AARCH64_MACOS,
+    );
+    try std.testing.expectEqual(@as(u32, 128), mac_layout.align_bytes);
+    try std.testing.expectEqual(@as(u64, 128), mac_layout.byte_size);
+
+    // [2] Negative `E0440` (invalid `@repr`/`@link`/`@inline`), `E0441` (misaligned `&s.field`), `W0120`, and `W0333`:
+    const neg_dr24_src =
+        \\@repr(packed: true)
+        \\pub struct PackedWithoutC {
+        \\    pub flag: u8,
+        \\    pub word: u32,
+        \\}
+        \\
+        \\@repr(C, packed: 4, align: 2)
+        \\pub struct AlignBelowCap {
+        \\    pub flag: u8,
+        \\    pub word: u32,
+        \\}
+        \\
+        \\@repr(C, align: .cache_line)
+        \\pub struct WrongCaseCacheLine {
+        \\    pub word: u64,
+        \\}
+        \\
+        \\@link()
+        \\pub fn empty_link_args() {}
+        \\
+        \\@inline(bogus)
+        \\pub fn invalid_inline_mode() -> u32 = 1;
+        \\
+        \\@repr(C, packed: true)
+        \\pub struct PackedPacket {
+        \\    pub tag: u8,
+        \\    pub payload_word: u32,
+        \\}
+        \\
+        \\@inline
+        \\fn redundant_private_inline(val: u32) -> u32 {
+        \\    let stepped = val + 1;
+        \\    return stepped;
+        \\}
+        \\
+        \\@inline
+        \\pub fn redundant_expr_inline(val: u32) -> u32 = val + 1;
+        \\
+        \\@inline
+        \\pub fn redundant_generic_inline[T: Copy](val: T) -> T {
+        \\    return val;
+        \\}
+        \\
+        \\pub fn accept_fmt(args: FmtArgs) {
+        \\    _ = args;
+        \\}
+        \\
+        \\pub fn trigger_sema_dr24(pkt: &mut PackedPacket) -> u32 {
+        \\    let port: u16 = 443;
+        \\    accept_fmt("uninterpolated {port}");
+        \\    let bad_shared: &u32 = &pkt.payload_word;
+        \\    let bad_mut: &mut u32 = &mut pkt.payload_word;
+        \\    _ = (port, bad_shared, bad_mut);
+        \\    return redundant_private_inline(1) + redundant_expr_inline(2) + redundant_generic_inline[u32](3);
+        \\}
+    ;
+    var neg_res = try runFullTypecheck(std.testing.allocator, neg_dr24_src);
+    defer neg_res.deinit();
+    try std.testing.expect(hasDiag(&neg_res.diagnostics, .e0440_invalid_repr_or_inline_attribute));
+    try std.testing.expect(hasDiag(&neg_res.diagnostics, .e0441_unaligned_packed_field_borrow));
+    try std.testing.expect(hasDiag(&neg_res.diagnostics, .w0120_uninterpolated_fmt_placeholder));
+    try std.testing.expect(hasDiag(&neg_res.diagnostics, .w0333_redundant_private_contract));
+
+    var count_e0440: usize = 0;
+    var count_e0441: usize = 0;
+    var count_w0120: usize = 0;
+    var count_w0333: usize = 0;
+    for (neg_res.diagnostics.diagnostics.items) |diag_item| {
+        switch (diag_item.code) {
+            .e0440_invalid_repr_or_inline_attribute => count_e0440 += 1,
+            .e0441_unaligned_packed_field_borrow => count_e0441 += 1,
+            .w0120_uninterpolated_fmt_placeholder => count_w0120 += 1,
+            .w0333_redundant_private_contract => count_w0333 += 1,
+            else => {},
+        }
+    }
+    try std.testing.expect(count_e0440 >= 5);
+    try std.testing.expectEqual(@as(usize, 2), count_e0441);
+    try std.testing.expectEqual(@as(usize, 1), count_w0120);
+    try std.testing.expectEqual(@as(usize, 3), count_w0333);
+}
+
+test "test_type_system_dr24_fhash_multi_hole_packed_slice_subscript_transparent_zst_and_lsp_holes" {
+    // [1] Positive: `>= 3` holes, cooked `f#"…"#`, aligned packed slicing, `Phantom[T]` transparent, trait `@inline`:
+    const pos_src =
+        \\pub struct Phantom[T] {}
+        \\
+        \\@repr(transparent)
+        \\pub struct Handle[T] {
+        \\    pub raw: u64,
+        \\    _marker: Phantom[T],
+        \\}
+        \\
+        \\pub struct Point {
+        \\    pub x: i32,
+        \\}
+        \\
+        \\trait Stepper {
+        \\    fn step(&self) -> u32;
+        \\}
+        \\
+        \\struct PrivCounter {
+        \\    val: u32,
+        \\}
+        \\
+        \\impl Stepper for PrivCounter {
+        \\    @inline
+        \\    fn step(&self) -> u32 {
+        \\        let next_val = self.val + 1;
+        \\        return next_val;
+        \\    }
+        \\}
+        \\
+        \\@repr(C, packed: true)
+        \\pub struct AlignedBytesPacket {
+        \\    pub tag: u8,
+        \\    pub bytes: [u8; 4],
+        \\}
+        \\
+        \\@repr(C, packed: 2)
+        \\pub struct Packed2Halfs {
+        \\    pub tag: u16,
+        \\    pub halfs: [u16; 2],
+        \\}
+        \\
+        \\pub fn check_all(
+        \\    pkt1: &AlignedBytesPacket,
+        \\    pkt2: &Packed2Halfs,
+        \\    first: str,
+        \\    last: str,
+        \\    third: u32,
+        \\    user_id: u64,
+        \\) -> str {
+        \\    let two_holes: str = f"{first} {last}";
+        \\    let three_holes: str = f"{first} {last} {third}";
+        \\    let cooked_guard: str = f#"{{"k": "{first}"}}\n"#;
+        \\    let field_hole: str = f"{Point { x: 7 }.x}";
+        \\    let nested_hole: str = f"outer {f"inner {user_id}"}";
+        \\    let sl_bytes: &[u8] = pkt1.bytes[0..2];
+        \\    let sl_halfs: &[u16] = pkt2.halfs[0..2];
+        \\    let handle_u32 = Handle[u32] { raw: user_id, _marker: Phantom[u32] {} };
+        \\    let cnt = PrivCounter { val: handle_u32.raw as u32 };
+        \\    _ = (two_holes, three_holes, cooked_guard, field_hole, sl_bytes, sl_halfs, cnt.step());
+        \\    return nested_hole;
+        \\}
+    ;
+    {
+        var interner = try corex.StringInterner.init(std.testing.allocator);
+        defer interner.deinit();
+        var token_buffer = corex.TokenBuffer.init(std.testing.allocator);
+        defer token_buffer.deinit();
+        var cst_arena = corex.LosslessCstArena.init(std.testing.allocator);
+        defer cst_arena.deinit();
+        var ast_arena = corex.AstArena.init(std.testing.allocator);
+        defer ast_arena.deinit();
+        var diagnostics = DiagnosticSink.init(std.testing.allocator);
+        defer diagnostics.deinit();
+        const file_id = FileId.fromInt(88);
+        _ = try corex.parseSource(pos_src, file_id, &token_buffer, &cst_arena, &ast_arena, &diagnostics, &interner);
+        var pool = try InternPool.init(std.testing.allocator);
+        defer pool.deinit();
+        var sym_table = try corex.SymbolTable.init(std.testing.allocator, &interner);
+        defer sym_table.deinit();
+        _ = try corex.symbol_resolver.collectFileModuleItems(
+            &sym_table,
+            &interner,
+            file_id,
+            pos_src,
+            &token_buffer,
+            &cst_arena,
+            &ast_arena,
+            &diagnostics,
+        );
+        var checker = try type_system.TypeChecker.init(
+            std.testing.allocator,
+            &interner,
+            &pool,
+            &sym_table,
+            file_id,
+            pos_src,
+            &token_buffer,
+            &cst_arena,
+            &ast_arena,
+            &diagnostics,
+        );
+        defer checker.deinit();
+        try checker.resolveModuleSignatures();
+        try checker.checkFileBodies();
+        try std.testing.expectEqual(@as(usize, 0), diagnostics.diagnostics.items.len);
+
+        // Verify `Point { x: 7 }.x` binds `Point.x` onto BOTH the struct-init label `x` and member `.x`:
+        const mod_scope = sym_table.file_module_scopes.get(file_id.asInt()).?;
+        const point_sym_idx = sym_table.lookupInScopeDirect(
+            mod_scope,
+            try interner.intern("Point"),
+            corex.symbol_resolver.NamespaceMask.TYPE_ONLY,
+        );
+        const point_x_sym = sym_table.lookupInScopeDirect(
+            sym_table.getSymbol(point_sym_idx).target_scope,
+            try interner.intern("x"),
+            corex.symbol_resolver.NamespaceMask.VALUE_ONLY,
+        );
+        try std.testing.expect(!point_x_sym.isNone());
+
+        var point_x_hits: usize = 0;
+        var found_rebased_user_id = false;
+        const user_id_offset_in_src: u32 = @intCast(std.mem.indexOf(u8, pos_src, "{user_id}").? + 1);
+        var interp_it = checker.string_interps.iterator();
+        while (interp_it.next()) |entry| {
+            const lit_tok = ast_arena.getNode(corex.NodeIndex.fromInt(entry.key_ptr.*)).main_token;
+            const lit_base = token_buffer.getToken(lit_tok).byte_offset;
+            for (entry.value_ptr.holes) |hole_spec| {
+                for (hole_spec.tokens) |tok_info| {
+                    if (tok_info.symbol_index == point_x_sym) point_x_hits += 1;
+                    if (lit_base + tok_info.rel_byte == user_id_offset_in_src and !tok_info.symbol_index.isNone()) {
+                        found_rebased_user_id = true;
+                    }
+                }
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 2), point_x_hits);
+        try std.testing.expect(found_rebased_user_id);
+    }
+
+    // [2] Negative: `E0441` on misaligned packed slice & `subscript`, `E0201` on `f"{}"` / `f"{:04x}"`, `E0440`, `W0120`:
+    const neg_src =
+        \\pub struct SubBox {
+        \\    pub words: [u32; 2],
+        \\}
+        \\impl SubBox {
+        \\    pub subscript(idx: usize) -> u32 {
+        \\        let {
+        \\            yield self.words[idx];
+        \\        }
+        \\    }
+        \\}
+        \\
+        \\@repr(C, packed: true)
+        \\pub struct MisalignedPacket {
+        \\    pub tag: u8,
+        \\    pub words: [u32; 4],
+        \\    pub sub_box: SubBox,
+        \\}
+        \\
+        \\@repr(transparent)
+        \\pub enum BadTransEnum {
+        \\    Alpha,
+        \\    Beta,
+        \\}
+        \\
+        \\@repr(transparent)
+        \\pub union BadTransUnion {
+        \\    pub word: u32,
+        \\}
+        \\
+        \\@repr(transparent)
+        \\pub struct ZeroArr[T] {
+        \\    pub empty_arr: [T; 0],
+        \\}
+        \\
+        \\@repr(transparent)
+        \\pub struct OveralignedZeroArr[T] {
+        \\    pub byte_val: u8,
+        \\    pub empty_arr: [T; 0],
+        \\}
+        \\
+        \\pub fn sink_fmt(args: FmtArgs) {
+        \\    _ = args;
+        \\}
+        \\
+        \\pub fn trigger_errors(pkt: &MisalignedPacket, val: u32) -> u32 {
+        \\    let bad_slice: &[u32] = pkt.words[0..2];
+        \\    let bad_sub: u32 = pkt.sub_box[0];
+        \\    let empty_hole: str = f"{}";
+        \\    let spec_only_hole: str = f"{:04x}";
+        \\    sink_fmt("{{{val}}}");
+        \\    sink_fmt("{{k: {val}}}");
+        \\    _ = (bad_slice, empty_hole, spec_only_hole);
+        \\    return bad_sub;
+        \\}
+    ;
+    var neg_res = try runFullTypecheck(std.testing.allocator, neg_src);
+    defer neg_res.deinit();
+
+    var e0441_hits: usize = 0;
+    var e0201_hits: usize = 0;
+    var e0440_hits: usize = 0;
+    var w0120_hits: usize = 0;
+    var saw_triple_fix = false;
+    var saw_kv_fix = false;
+    for (neg_res.diagnostics.diagnostics.items) |diag_item| {
+        switch (diag_item.code) {
+            .e0441_unaligned_packed_field_borrow => e0441_hits += 1,
+            .e0201_unexpected_token => e0201_hits += 1,
+            .e0440_invalid_repr_or_inline_attribute => e0440_hits += 1,
+            .w0120_uninterpolated_fmt_placeholder => {
+                w0120_hits += 1;
+                if (diag_item.suggestions.len > 0 and diag_item.suggestions[0].edits.len > 0) {
+                    const repl_txt = neg_res.interner.get(diag_item.suggestions[0].edits[0].replacement_id);
+                    if (std.mem.eql(u8, repl_txt, "f\"{{{{{val}}}}}\"")) saw_triple_fix = true;
+                    if (std.mem.eql(u8, repl_txt, "f\"{{{{k: {val}}}}}\"")) saw_kv_fix = true;
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), e0441_hits);
+    try std.testing.expectEqual(@as(usize, 2), e0201_hits);
+    try std.testing.expectEqual(@as(usize, 4), e0440_hits);
+    try std.testing.expectEqual(@as(usize, 2), w0120_hits);
+    try std.testing.expect(saw_triple_fix and saw_kv_fix);
 }

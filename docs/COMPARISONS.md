@@ -17,7 +17,7 @@ It serves two roles:
 
 ## 2. Cross-Language Capability Matrix
 
-Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `stage0/` + `core/` + `stdlib/cx/` + `vscode-ext-corex` (`Phases 0–11.1`); **`[v0.0.1]`** = scheduled in `Phases 11.2–12` prior to initial release; **`[0.x]`** = scheduled in `Phase 13.0–13.4` prior to `v1.0.0`.
+Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `stage0/` + `core/` + `stdlib/cx/` + `vscode-ext-corex` (`Phases 0–11.1b`); **`[v0.0.1]`** = scheduled in `Phases 11.1c–12` prior to initial release; **`[0.x]`** = scheduled in `Phase 13.0–13.4` prior to `v1.0.0`.
 
 | Dimension | CoreX | Rust | Zig | C23 / C++23 | Go | Python |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -28,7 +28,7 @@ Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `st
 | **Static `@no_alloc` / `@no_panic` / `@max_stack(N)` Proofs** | **Built-in call-graph verifier + counterexample trace** `[Live]` | External hacks (`no_std` / symbol linker tricks) | Partial / manual | No | No | No |
 | **Supply-Chain Capability Sandboxing** | **Lockfile-enforced (`fs`, `net`, `process`, `env`, `ffi`, `unsafe_op` per pkg)** `[Live]` | None (`build.rs` / proc-macros run arbitrary code) | Build runner sandboxing partial | None | None | None (`setup.py` / arbitrary imports) |
 | **Error Handling ABI** | **`T!E` zero-branch register return (`swiftcc` + `swifterror`)** `[Live]` | Stack/register `Result<T, E>` enum | Error union `E!T` | Exceptions (slow unwind) or `errno` | Multi-return `(T, error)` + `if err != nil` | Exceptions |
-| **Zero-Alloc Formatted Panics & Strings** | **8-byte `FmtSpec` + stack `FmtArgs` + `{x=}` (`0` heap allocs)** `[Live]` | `format_args!` (verbose macros, separate `{:?}`/`{}`) | `std.fmt` comptime format strings | `printf` (unsafe) / `std::format` (heavy) | `fmt.Sprintf` (heap/reflection) | `f"{x=}"` (heap-allocated) |
+| **Zero-Alloc Formatted Panics & Strings** | **Plain `"…"` (`str`) + `f"{x=}"` / `f#"…"#` + stack `FmtArgs` (`0` heap allocs)** `[Live]` | `format_args!` (verbose macros, separate `{:?}`/`{}`) | `std.fmt` comptime format strings | `printf` (unsafe) / `std::format` (heavy) | `fmt.Sprintf` (heap/reflection) | `f"{x=}"` (heap-allocated) |
 | **C Header Interop (`@c_import`)** | **Built-in zero-`libclang` C11/C23 translator + FFI SAST contracts** `[Live]` | External `bindgen` + `libclang` + `unsafe` everywhere | Built-in `@cImport` (bundles heavy `libclang`) | Native | `cgo` (high call overhead) | `ctypes` / `cffi` (runtime overhead) |
 | **Zero-SDK Cross-Compilation & Wasm** | **11 targets + embedded `lld` + `.def`→`.lib` + `< 10 KB` `.wasm`** `[Live]` | Needs target linkers / MSVC SDK / `wasm-bindgen` | Built-in (`~45–50 MB` compiler archive) | Per-target cross-SDKs & sysroots | Built-in (`2–10 MB+` `.wasm` / binaries) | Interpreter / heavy bundlers |
 | **Structured Concurrency & Frame Caps** | **`<= 16 KiB` stackless `async`/`await` + `@linear` `TaskGroup` (`E0309`, `E0317`)** `[Live]` | Unstructured `tokio::spawn` + `Pin<&mut Self>` + `'static` | Rebuilding `Io` interface (no `async`/`await`) | `std::coroutine` (heap HALO lottery, no race proofs) | Unstructured goroutines (GC + data races) | `asyncio` (slow, unverified cancellation) |
@@ -80,7 +80,8 @@ CoreX systematically adopts the highest-leverage ergonomic wins from Python, Swi
 
 -   **Flow-Sensitive `is` / `is not` & Positive-Spine Walrus `:=` (`SE-01`, `SE-02`):** `if (pkt := next_packet()) is .Some(header) and header.tag == 1 { … }` binds and narrows types down positive `and` chains with automatic reverse-LIFO cleanup before `else` – retiring `if let` / `while let` ceremony.
 -   **PEP 570 `/` & PEP 3102 `*` Parameter Zones + Named/Default Arguments (`SE-07`, `SE-11`):** `pub fn open(path: str, /, *, read: bool = true, create: bool = false) -> File!IoError` prevents boolean-trap call sites (`open("a.txt", read: true)`) while keeping positional-only parameters free to rename without breaking callers.
--   **Zero-Alloc `{expr=}` Debug Interpolation & `"""…"""` Multiline Strings (`SE-12`, `SE-13`):** `"state: {count=}, {mask=:#010x}"` parses format specs at compile time into 8-byte `FmtSpec` descriptors; when passed to `FmtArgs` consumers (such as `@panic("bad {code=:#06x}")` or `cx.panic.assert_true`), arguments stay on the stack with **zero heap allocation**. Swift-style `"""…"""` strips indentation relative to the closing `"""`.
+-   **Plain `"…"` Literals, Explicit `f"{expr=}"` / `f#"…"#` Formatting & `"<newline> … "` Multiline Strings (`SE-12`, `SE-13`, `DR-24`):** Unprefixed `"…"` is 100% plain `Copy` `str` (so JSON, SQL, regexes, and C codegen need zero `{{`/`}}` escaping), while `f"state: {count=}, {mask=:#010x}"` and `#`-guarded `f#"…"#` compile format specs into 8-byte `FmtSpec` descriptors (`0` heap allocations when passed to `FmtArgs` sinks like `@panic(f"bad {code=:#06x}")` or `Writer.print`). Any string form spans multiple dedented lines simply by following its opening `"` with a newline (`"<newline> … "`), retiring `"""` clutter.
+-   **Fat-Arrow `if cond => a else b`, Consolidated `@repr` / `@link` & 2-Character `/#` / `/|` Docstrings (`DR-24`):** Condition-first `if cond => a else b` supports full `SE-01` `is` and `SE-02` `:=` narrowing without `{ }` noise; `@repr(C, packed: true, align: 64, zero_pad: true)` and `@link(name: "…", section: "…")` pack horizontally on one `<= 100`-column line while solving Rust's `packed` + `align` conflict (`E0587`); and `/#` (module) + `/|` (item) + `//` (comment) form a clean 2-character line-only comment family.
 -   **Zero-Call `subscript` + `yield` Accessors (`SE-21`):** `pub subscript(row: usize, col: usize) -> T { let { yield … } inout { yield &mut … } }` compiles multi-dimensional indexing (`grid[r, c] += 1`) directly into inlined pointer projections with SAST post-`yield` writeback safety – avoiding Rust's split `Index` / `IndexMut` traits that cannot return computed views or guard invariants after mutation.
 -   **`@constructor` & `@builder` Trailing Blocks (`SE-22`):** Enables SwiftUI/Kotlin-clean declarative DSLs (`Row(gap: 8) { Button("Save"); }`) that desugar to flat sequential `&mut Scope` calls with zero vtables or temporary VDOM heap trees.
 -   **Labeled `fsm: match` State-Machine Loops (`SE-23`):** `fsm: match state { .Idle => continue :fsm .Header, … }` compiles protocol parsers, lexers, and bytecode VMs directly into tail-dispatched CFG jump blocks without `loop { match … }` nesting.
@@ -101,8 +102,8 @@ CoreX systematically adopts the highest-leverage ergonomic wins from Python, Swi
 
 -   **Sub-Millisecond `corex lsp` Over `CompilerDb` (`DR-12`, `DR-17`):** Built directly into the single `corex` binary with zero external daemons, delivering `< 10 ms` P99 keystroke-to-diagnostic, completion, semantic-token delta, hygienic cross-file rename, and `DR-17` hover cards showing inferred capabilities (`[fs, net, unsafe_op]` or `none (pure)`), `@no_alloc`/`@no_panic` verification status, and exact `@max_stack(N)` frame byte budgets on 100,000-LOC workspaces.
 -   **Zero-False-Positive Linter & Supply-Chain Capability Auditor (`corex check`):** Unifies `W0202` idiom lints, `@deprecated(upgrade: "…")` (`W0403`) call-site rewrite templates, transactional `corex check --fix`, `--deny-warnings`, `corex check --caps` package capability matrices, and `corex check --explain-caps` shortest BFS call-chain witnesses.
--   **3-Tier Zero-Legacy `corex upgrade` Engine (`DR-14`, `UR-21-00`–`UR-23-06`):** Automatically rewrites legacy syntax, `TypeId`-resolved idioms, `@deprecated` / `@fix_inline` library calls, and `corex.toml` / `corex.lock` manifests (`--accept-caps` without ever overriding `deny_caps`) while preserving 100% of comments and rolling back atomically if syntax errors increase.
--   **Zero-Dependency `< 25 KB` Official VS Code & OpenVSX Extension (`vscode-ext-corex` `v1.0.0`):** Ships a non-backtracking CoreX v1.0 TextMate grammar (powering both offline editor highlighting and GitHub PrettyLights) paired with a zero-runtime-dependency `corex lsp` and `corex fmt` client featuring custom MVS/SAST semantic token modifiers (`mutable`, `consumedMove`, `unsafe`, `attribute`, `linearResource`) and Workspace Trust gating (`[Live]` locally; Marketplace release in Stage `L1`).
+-   **3-Tier Zero-Legacy `corex upgrade` Engine (`DR-14`, `UR-21-00`–`UR-24-06`):** Automatically rewrites legacy syntax, `TypeId`-resolved idioms, `@deprecated` / `@fix_inline` library calls, and `corex.toml` / `corex.lock` manifests (`--accept-caps` without ever overriding `deny_caps`) while preserving 100% of comments and rolling back atomically if syntax errors increase.
+-   **Zero-Dependency `< 25 KB` Official VS Code & OpenVSX Extension (`vscode-ext-corex` `v1.0.0`):** Ships a non-backtracking CoreX v1.0 TextMate grammar (highlighting `/#` & `/|` docstrings, bright-red `{placeholder}` spans in plain `"…"`, and nested `{expr}` scopes in `f"…"` / `f#"…"#`) paired with a zero-runtime-dependency `corex lsp` and `corex fmt` client featuring full `f"…"` hole IntelliSense, `1px` multiline strip-margin guides, `0.58` opacity dimming on `_ = ident;` discards and `_unused` bindings, custom MVS/SAST semantic token modifiers, and Workspace Trust gating (`[Live]` locally; Marketplace release in Stage `L1`).
 
 ---
 
@@ -124,7 +125,7 @@ CoreX systematically adopts the highest-leverage ergonomic wins from Python, Swi
 
 -   **Where C / C++ Hurt:** Silent Use-After-Free, double-free, uninitialized stack reads, spatial buffer overflows, signed overflow UB, preprocessor macro traps, sluggish C++ header/template compilation, implicit copy-constructor landmines, and lack of a built-in package manager, formatter, test runner, or fuzz/sim harness.
 -   **How CoreX Wins:**
-    -   **Eliminates UAF, double-free, uninitialized reads (`&out` `E0422`), exclusivity bugs (`E0305`), and static OOB (`E0307`) at compile time** while keeping C-identical struct layout control (`@repr(C)`, `bit_field Name: u32 | [u8; N]`, `enum Name: u8`, `*opaque`) (`[Live]`).
+    -   **Eliminates UAF, double-free, uninitialized reads (`&out` `E0422`), exclusivity bugs (`E0305`), misaligned packed borrows (`E0441`), and static OOB (`E0307`) at compile time** while keeping C-identical struct layout control (`@repr(C, packed: true, align: 64, zero_pad: true)`, `bit_field Name: u32 | [u8; N]`, `enum Name: u8`, `*opaque`) (`[Live]`).
     -   **Explicit `own` moves and `Copy`-gated value parameters (`E0420`, `E0421`)** eliminate hidden C++ copy constructors (`[Live]`).
     -   **All-in-one `< 1 MB` binary** (`build`, `run`, `test`, `bench`, `fmt`, `check`, `lsp`, `upgrade`, `translate-c`) replacing CMake + Ninja + clang-format + clang-tidy + AddressSanitizer + GoogleTest (`[Live]` / `[v0.0.1]`).
 
@@ -150,7 +151,7 @@ CoreX systematically adopts the highest-leverage ergonomic wins from Python, Swi
 
 -   **Where Python Hurts:** `50–200x` slower execution, GIL/multiprocessing friction, runtime `TypeError`/`KeyError`/`AttributeError` surprises in production, fragile packaging/virtualenv sprawl, and inability to ship a tiny standalone native binary or `< 10 KB` WASM module.
 -   **How CoreX Wins:**
-    -   **Preserves the exact ergonomic features Python developers love most** – `and` / `or` / `not`, `(x := expr)` walrus bindings, `x is Pattern` / `is not`, `"{val=:#06x}"` self-documenting interpolation, `"""…"""` multiline strings, `/` and `*` keyword-only parameter zones, `= default` parameters, `[Data: str | &[u8]]` inline union bounds, and `[T = f64]` generic defaults – **compiled to 100% statically verified native machine code at C speed** (`[Live]`).
+    -   **Preserves the exact ergonomic features Python developers love most** – `and` / `or` / `not`, `(x := expr)` walrus bindings, `x is Pattern` / `is not`, `if cond => a else b` inline conditionals, `f"{val=:#06x}"` / `f#"…"#` self-documenting interpolation, `"<newline> … "` dedented multiline strings, `/` and `*` keyword-only parameter zones, `= default` parameters, `[Data: str | &[u8]]` inline union bounds, and `[T = f64]` generic defaults – **compiled to 100% statically verified native machine code at C speed** (`[Live]`).
     -   **Ships zero-dependency standalone binaries across all 11 desktop/server targets and `< 10 KB` `wasm32-unknown-freestanding` modules** from a single command (`[Live]`).
 
 ---
@@ -175,15 +176,11 @@ pub fn longest_non_empty<'a>(primary: &'a str, fallback: &'a str) -> Option<&'a 
 ```
 
 ```cx
-// CoreX: identical zero-GC borrow safety, zero lifetime annotations
-pub fn longest_non_empty(primary: str, fallback: str) -> str? {
-    if not primary.is_empty() {
-        return .Some(primary);
-    } else if not fallback.is_empty() {
-        return .Some(fallback);
-    }
-    return .None;
-}
+/| Returns the first non-empty borrowed `str` with zero lifetime annotations.
+pub fn longest_non_empty(primary: str, fallback: str) -> str? =
+    if not primary.is_empty() => .Some(primary)
+    else if not fallback.is_empty() => .Some(fallback)
+    else .None;
 ```
 
 ### Showcase 2: Compile-Time Bounds, `&out` & `@linear` Safety vs. C Bugs (`[Live]`)
@@ -247,16 +244,16 @@ pub fn load_endpoint(raw_env: str?, /, *, default_port: u16 = 8080) -> u16!Confi
 }
 ```
 
-### Showcase 4: `@no_alloc` + `@max_stack` + Zero-Alloc `{x=}` Diagnostics (`[Live]`)
+### Showcase 4: `@no_alloc` + `@max_stack` + Zero-Alloc `f"{x=}"` Diagnostics (`[Live]`)
 
 ```cx
-// Statically proven: 0 heap allocations, <= 512 bytes stack across entire call graph!
+// Statically proven: 0 heap allocations, <= 512 bytes stack across entire call graph:
 @no_alloc @max_stack(512)
 pub fn decode_register(raw_word: u32) -> u16 {
     let magic = raw_word >> 16;
     if magic != 0x4358_u32 {
-        // Formatted `{magic=:#06x}` builds `FmtArgs` on the stack with ZERO heap allocation!
-        @panic("corrupt hardware register header: {magic=:#06x}");
+        // Formatted `f"{magic=:#06x}"` builds `FmtArgs` on the stack with ZERO heap allocation:
+        @panic(f"corrupt hardware register header: {magic=:#06x}");
     }
     return (raw_word & 0xFFFF_u32) as u16;
 }
@@ -444,11 +441,7 @@ pub fn summarize_tokens(tokens: &[str]) -> String!AllocError {
     // nested same-slot `with_scratch` while `scratch` is live is rejected at compile time (`E0328`):
     var counts = Map[str, u32].in_arena(&mut arena);
     for token in tokens {
-        let prev: u32 = if counts.get(&token) is .Some(cnt) {
-            cnt.*
-        } else {
-            0_u32
-        };
+        let prev: u32 = if counts.get(&token) is .Some(cnt) => cnt.* else 0_u32;
         _ = counts.try_insert(token, prev + 1_u32)?;
     }
 
@@ -461,6 +454,39 @@ pub fn summarize_tokens(tokens: &[str]) -> String!AllocError {
     })?;
 
     // `<= 23`-byte UTF-8 stays 100% inline on the stack (`24B` SSO; `String?` is also `24B`):
-    return .Ok(String.fmt("u={counts.len()},n={seen_len}"));
+    return .Ok(String.fmt(f"u={counts.len()},n={seen_len}"));
+}
+```
+
+### Showcase 11: Consolidated `@repr`, `/#` & `/|` Docstrings, Plain `"…"` vs. `f#"…"#` & `if =>` (`[Live]`)
+
+```cx
+/# Telemetry Wire Header and Zero-Allocation JSON Health Formatter
+
+use cx.io.{IoError, Writer};
+
+/| 16-byte cache-friendly DMA header (`@repr` solves Rust's `packed` + `align` conflict).
+@repr(C, align: 8, zero_pad: true) @derive(Copy, Equatable, Debug)
+pub struct FrameHeader {
+    /| Monotonic sequence number.
+    pub seq: u64,
+    /| Payload byte length (`0..=65_535`).
+    pub payload_len: u32,
+    /| Explicit wire flags (`bit 0` = healthy).
+    pub flags: u32,
+}
+
+/| Plain `"…"` keeps `{}` 100% literal, while `f#"\n … "#` formats unescaped JSON on the stack.
+@no_alloc
+pub fn write_status(out: &mut Writer, hdr: FrameHeader?, node: str) -> unit!IoError {
+    const EMPTY_META_SQL: str = "SELECT id FROM nodes WHERE meta != '{}'";
+    _ = EMPTY_META_SQL;
+    let state: str = if hdr is .Some(active) and (active.flags & 1_u32) != 0_u32 => "UP" else "DOWN";
+    let seq_num: u64 = if hdr is .Some(active) => active.seq else 0_u64;
+    return out.print(
+        f#"
+        {"node": "{node}", "state": "{state}", "seq": {seq_num}}
+        "#,
+    );
 }
 ```

@@ -11,7 +11,7 @@
 //!   (`MirVm`, `--dev` C99, `--release` C99 `-O2`, `LLVM`) differential parity across `#soa Vec[S]`,
 //!   `@derive(Comparable, Default)`, `@implements[T, TrivialDrop]()`, inline `Type is low..=high`,
 //!   `for` `.next()`/`.as_slice()`, inherent `impl str`, streaming `@fmt_write`, `@ctx_next_rng_seed`,
-//!   `@tls_scratch_ptr`, `@tls_alloc_state`, `@noinline`, scalar/ptr/slice methods, and SIMD intrinsics.
+//!   `@tls_scratch_ptr`, `@tls_alloc_state`, `@inline(never)`, scalar/ptr/slice methods, and SIMD intrinsics.
 
 const std = @import("std");
 const corex = @import("corex");
@@ -355,7 +355,7 @@ test "test_step1_cx_prelude_auto_mount_and_4_tier_differential_parity" {
     const io = std.testing.io;
 
     const cx_prelude_src =
-        "//! Synthetic `cx` Prelude Root for Step 1 Seam Verification\n" ++
+        "/# Synthetic `cx` Prelude Root for Step 1 Seam Verification\n" ++
         "@derive(Copy, Equatable, Comparable, Default, Clone, Debug)\n" ++
         "pub struct PairKey {\n" ++
         "    pub major: u32 = 1,\n" ++
@@ -389,7 +389,7 @@ test "test_step1_cx_prelude_auto_mount_and_4_tier_differential_parity" {
         "}\n";
 
     const app_src =
-        "//! Step 1 End-to-End 4-Tier Differential Verification App\n" ++
+        "/# Step 1 End-to-End 4-Tier Differential Verification App\n" ++
         "@soa\n" ++
         "@derive(Copy, Equatable)\n" ++
         "pub struct Particle {\n" ++
@@ -415,7 +415,7 @@ test "test_step1_cx_prelude_auto_mount_and_4_tier_differential_parity" {
         "    pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec) -> unit!FmtError {\n" ++
         "        if spec.has_alt() { out.write_str(\"#\")?; }\n" ++
         "        out.write_str(\"T=\")?;\n" ++
-        "        return @fmt_write(out, \"{self.code}\");\n" ++
+        "        return @fmt_write(out, f\"{self.code}\");\n" ++
         "    }\n" ++
         "}\n" ++
         "pub struct FixedSink {\n" ++
@@ -436,7 +436,7 @@ test "test_step1_cx_prelude_auto_mount_and_4_tier_differential_parity" {
         "    sink.len = sink.len + chunk.len();\n" ++
         "    return .Ok(());\n" ++
         "}\n" ++
-        "@noinline\n" ++
+        "@inline(never)\n" ++
         "pub fn unwrap_nonzero[T: Unsigned](val: T is 1..=T.MAX) -> T {\n" ++
         "    return val;\n" ++
         "}\n" ++
@@ -450,10 +450,10 @@ test "test_step1_cx_prelude_auto_mount_and_4_tier_differential_parity" {
         "    // [1] Prelude auto-import (`PairKey`), `@derive(Comparable, Default)`, `<` / `>`:\n" ++
         "    let def_k = PairKey.default();\n" ++
         "    let hi_k = PairKey { major: 1, minor: 9 };\n" ++
-        "    let cmp_score: i32 = if def_k < hi_k and hi_k > def_k { 10 } else { 0 };\n" ++
+        "    let cmp_score: i32 = if def_k < hi_k and hi_k > def_k => 10 else 0;\n" ++
         "\n" ++
         "    // [2] `@implements[T, TrivialDrop]()`, inline refinement, explicit `[TypeArgs]`:\n" ++
-        "    let td_ok: i32 = if comptime @implements[u64, TrivialDrop]() { 5 } else { 0 };\n" ++
+        "    let td_ok: i32 = if comptime @implements[u64, TrivialDrop]() => 5 else 0;\n" ++
         "    let nz_v: u32 is 1..=u32.MAX = 7;\n" ++
         "    let nz_u: i32 = unwrap_nonzero[u32](nz_v) as i32;\n" ++
         "    let grp_sum: i32 = add_explicit_group[u16](10_u16, 2_u16) + add_any_group[u16, u8](2_u16, 1_u8);\n" ++
@@ -491,11 +491,11 @@ test "test_step1_cx_prelude_auto_mount_and_4_tier_differential_parity" {
         "    let v_a: [u8; 16] = @simd_splat[[u8; 16]](0x81_u8);\n" ++
         "    let v_b: [u8; 16] = @simd_splat[[u8; 16]](0x81_u8);\n" ++
         "    let eq_mask: u16 = @simd_bitmask(@simd_eq(v_a, v_b));\n" ++
-        "    let simd_ok: i32 = if eq_mask == 0xFFFF_u16 { 4 } else { 0 };\n" ++
+        "    let simd_ok: i32 = if eq_mask == 0xFFFF_u16 => 4 else 0;\n" ++
         "    let s1: u64 = @ctx_next_rng_seed();\n" ++
         "    let s2: u64 = @ctx_next_rng_seed();\n" ++
-        "    let tls_ok: i32 = if not @tls_scratch_ptr().is_null() and\n" ++
-        "        not @tls_alloc_state().is_null() and s1 != s2 { 3 } else { 0 };\n" ++
+        "    let tls_ok: i32 = if not @tls_scratch_ptr().is_null() and " ++
+        "not @tls_alloc_state().is_null() and s1 != s2 => 3 else 0;\n" ++
         "\n" ++
         "    var sink = FixedSink { buf: [0; 16], len: 0 };\n" ++
         "    var writer = FmtWriter { ctx: (&raw mut sink) as *mut opaque, write_fn: sink_write_cb };\n" ++
@@ -505,7 +505,7 @@ test "test_step1_cx_prelude_auto_mount_and_4_tier_differential_parity" {
         "        width_or_none: 0xFFFF_u16,\n" ++
         "        precision_or_none: 0xFFFF_u16,\n" ++
         "    };\n" ++
-        "    let ok_res = @fmt_write(&mut writer, \"{tag:#}!\");\n" ++
+        "    let ok_res = @fmt_write(&mut writer, f\"{tag:#}!\");\n" ++
         "    let ovf_res = @fmt_write(&mut writer, \"0123456789ABCDEF\");\n" ++
         "    let fmt_ok: i32 = if manual_spec.has_alt() and ok_res is .Ok(()) and\n" ++
         "        ovf_res is .Err(.BufferFull) and sink.len == 6 {\n" ++

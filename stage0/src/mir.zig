@@ -8077,6 +8077,84 @@ const MirLowerer = struct {
         }, tok);
     }
 
+    /// Outer scrutinee or arm borrow that may escape across `hir_cond_if` `join_bb` (`ADR-24D`).
+    const CondRefLoanSpec = struct {
+        /// Dominator-safe outer `PlaceId` borrowed by the condition pattern or branch tail.
+        place_id: PlaceId,
+        /// Whether an exclusive `&mut` borrow (`ghost_access_inout`) was opened.
+        is_mut: bool,
+    };
+
+    /// Truncates `raw_place` before any `.index` operand defined at/after `pre_cond_inst_len` and merges into `loans`.
+    fn recordDominatorSafeCondRefLoan(
+        self: *MirLowerer,
+        loans: *std.ArrayListUnmanaged(CondRefLoanSpec),
+        raw_place: PlaceId,
+        is_mut: bool,
+        pre_cond_inst_len: usize,
+        pre_cond_local_len: usize,
+    ) !void {
+        if (raw_place.isNone() or raw_place.asInt() >= self.body.places.items.len) return;
+        const place_rec = self.body.places.items[raw_place.asInt()];
+        if (place_rec.base >= pre_cond_local_len) return;
+
+        const projs = self.body.getPlaceProjections(raw_place);
+        var valid_proj_len: usize = projs.len;
+        for (projs, 0..) |proj, proj_idx| {
+            if (proj.kind == .index and proj.payload >= pre_cond_inst_len) {
+                valid_proj_len = proj_idx;
+                break;
+            }
+        }
+        const safe_place = if (valid_proj_len == projs.len)
+            raw_place
+        else
+            try self.makePlace(LocalId.fromInt(place_rec.base), projs[0..valid_proj_len]);
+
+        for (loans.items) |*existing| {
+            if (isSamePlacePath(self.body, existing.place_id, safe_place)) {
+                existing.is_mut = existing.is_mut or is_mut;
+                return;
+            }
+            if (self.hasOverlappingPlaces(existing.place_id, safe_place) and (existing.is_mut or is_mut)) {
+                if (isPlacePrefixOrEqual(self.body, safe_place, existing.place_id)) {
+                    existing.place_id = safe_place;
+                } else if (!isPlacePrefixOrEqual(self.body, existing.place_id, safe_place)) {
+                    existing.place_id = try self.makePlace(LocalId.fromInt(place_rec.base), &.{});
+                }
+                existing.is_mut = true;
+                return;
+            }
+        }
+        try loans.append(self.allocator, .{
+            .place_id = safe_place,
+            .is_mut = is_mut,
+        });
+    }
+
+    /// Records active Ghost borrows in `active_expr_borrows[borrow_base..]` into `loans` before closing the arm edge.
+    fn collectBranchBorrowsIntoCondRefLoans(
+        self: *MirLowerer,
+        loans: *std.ArrayListUnmanaged(CondRefLoanSpec),
+        borrow_base: usize,
+        pre_cond_inst_len: usize,
+        pre_cond_local_len: usize,
+    ) !void {
+        if (borrow_base >= self.active_expr_borrows.items.len) return;
+        for (self.active_expr_borrows.items[borrow_base..]) |tok_val| {
+            if (tok_val.isNone() or tok_val.asInt() >= self.body.insts.len) continue;
+            const inst = self.body.getInst(tok_val);
+            if (inst.op != .ghost_access_let and inst.op != .ghost_access_inout) continue;
+            try self.recordDominatorSafeCondRefLoan(
+                loans,
+                PlaceId.fromInt(inst.operands.lhs),
+                inst.op == .ghost_access_inout,
+                pre_cond_inst_len,
+                pre_cond_local_len,
+            );
+        }
+    }
+
     /// Lowers conjunctive `ConditionScope` clauses (`bool_pred` & `is_match`) with Two-Checkpoint pre-`else` cleanup (`SE-01`/`SE-02`).
     fn lowerCondClauseList(
         self: *MirLowerer,
@@ -8086,6 +8164,9 @@ const MirLowerer = struct {
         outer_borrow_floor: usize,
         false_target_bb: MirBlockId,
         tok: TokenIndex,
+        out_cond_ref_loans: ?*std.ArrayListUnmanaged(CondRefLoanSpec),
+        pre_cond_inst_len: usize,
+        pre_cond_local_len: usize,
     ) anyerror!bool {
         var clause_i: u32 = 0;
         while (clause_i < clause_count and cursor_io.* < self.hir_store.extra_data.items.len) : (clause_i += 1) {
@@ -8211,7 +8292,9 @@ const MirLowerer = struct {
                     return false;
                 }
                 self.cur_bb = arm_blocks[0];
+                var has_mut_clause_ref = false;
                 for (arm_ref_specs[0].items) |spec| {
+                    if (spec.is_mut) has_mut_clause_ref = true;
                     const ref_tok = try self.emitGhostOpen(
                         if (spec.is_mut) .ghost_access_inout else .ghost_access_let,
                         spec.place_id,
@@ -8219,6 +8302,19 @@ const MirLowerer = struct {
                         tok,
                     );
                     try self.active_expr_borrows.append(self.allocator, ref_tok);
+                }
+                if (out_cond_ref_loans) |loans_ptr| {
+                    if (arm_ref_specs[0].items.len > 0 and
+                        (scrut_node.flags.category == .place_imm or scrut_node.flags.category == .place_mut))
+                    {
+                        try self.recordDominatorSafeCondRefLoan(
+                            loans_ptr,
+                            scrut_place,
+                            has_mut_clause_ref,
+                            pre_cond_inst_len,
+                            pre_cond_local_len,
+                        );
+                    }
                 }
             } else {
                 if (cursor_io.* >= self.hir_store.extra_data.items.len) return false;
@@ -8260,10 +8356,16 @@ const MirLowerer = struct {
         }
 
         const has_val = node.type_id != .unit_ty and node.type_id != .never_ty;
+        const has_result_regions = has_val and self.hasTypeRegions(node.type_id);
+        const pre_cond_local_len = self.body.locals.items.len;
+        const pre_cond_inst_len = self.body.insts.len;
         const res_var = if (has_val)
             try self.allocTempLocal(node.type_id, tok, false, false)
         else
             LocalId.none;
+
+        var cond_ref_loans: std.ArrayListUnmanaged(CondRefLoanSpec) = .empty;
+        defer cond_ref_loans.deinit(self.allocator);
 
         const outer_storage_floor = self.storage_locals.items.len;
         const outer_borrow_floor = self.active_expr_borrows.items.len;
@@ -8289,6 +8391,9 @@ const MirLowerer = struct {
             outer_borrow_floor,
             else_entry_bb,
             tok,
+            if (has_result_regions) &cond_ref_loans else null,
+            pre_cond_inst_len,
+            pre_cond_local_len,
         );
         self.active_cond_scope_depth = saved_cond_depth;
         self.enclosing_real_block_depth = saved_real_depth;
@@ -8311,6 +8416,14 @@ const MirLowerer = struct {
             const then_val = try self.lowerRValue(then_hir);
             const is_then_live = !self.cur_bb.isNone() and !self.ssa.isBlockTerminated(self.cur_bb);
             if (is_then_live) {
+                if (has_result_regions) {
+                    try self.collectBranchBorrowsIntoCondRefLoans(
+                        &cond_ref_loans,
+                        then_borrow_base,
+                        pre_cond_inst_len,
+                        pre_cond_local_len,
+                    );
+                }
                 try self.popAndCloseBorrowsTo(then_borrow_base, tok);
                 if (has_val) try self.ssa.writeVariable(res_var.asInt(), self.cur_bb, then_val);
                 try self.popAndCloseBorrowsTo(outer_borrow_floor, tok);
@@ -8339,6 +8452,14 @@ const MirLowerer = struct {
             else
                 try self.emitUnitVal(tok);
             if (!self.cur_bb.isNone() and !self.ssa.isBlockTerminated(self.cur_bb)) {
+                if (has_result_regions) {
+                    try self.collectBranchBorrowsIntoCondRefLoans(
+                        &cond_ref_loans,
+                        else_borrow_base,
+                        pre_cond_inst_len,
+                        pre_cond_local_len,
+                    );
+                }
                 try self.popAndCloseBorrowsTo(else_borrow_base, tok);
                 if (has_val) try self.ssa.writeVariable(res_var.asInt(), self.cur_bb, else_val);
                 try self.emitBr(join_bb, &.{});
@@ -8357,6 +8478,17 @@ const MirLowerer = struct {
             return self.ssa.emitDefaultScalarInBlock(.fromInt(0), node.type_id);
         }
         self.cur_bb = join_bb;
+        if (has_result_regions) {
+            for (cond_ref_loans.items) |loan_spec| {
+                const join_ref_tok = try self.emitGhostOpen(
+                    if (loan_spec.is_mut) .ghost_access_inout else .ghost_access_let,
+                    loan_spec.place_id,
+                    .addr_borrow,
+                    tok,
+                );
+                try self.active_expr_borrows.append(self.allocator, join_ref_tok);
+            }
+        }
         if (has_val) return self.ssa.readVariable(res_var.asInt(), join_bb);
         return self.emitUnitVal(tok);
     }
@@ -8408,6 +8540,9 @@ const MirLowerer = struct {
             outer_borrow_floor,
             exit_bb,
             tok,
+            null,
+            0,
+            0,
         );
         self.active_cond_scope_depth = saved_cond_depth;
         self.enclosing_real_block_depth = saved_real_depth;
@@ -8837,6 +8972,12 @@ const MirLowerer = struct {
         const cond_scope_depth = outer_scope_depth + 1;
         const cond_storage_base = self.storage_locals.items.len;
         const cond_borrow_base = self.active_expr_borrows.items.len;
+        const has_val = node.type_id != .unit_ty and node.type_id != .never_ty;
+        const has_result_regions = has_val and self.hasTypeRegions(node.type_id);
+        const pre_cond_local_len = self.body.locals.items.len;
+        const pre_cond_inst_len = self.body.insts.len;
+        var cond_ref_loans: std.ArrayListUnmanaged(CondRefLoanSpec) = .empty;
+        defer cond_ref_loans.deinit(self.allocator);
 
         self.scope_depth = cond_scope_depth;
         const cond_val = try self.lowerRValue(cond_hir);
@@ -8857,7 +8998,6 @@ const MirLowerer = struct {
             self.scope_depth = outer_scope_depth;
         }
 
-        const has_val = node.type_id != .unit_ty and node.type_id != .never_ty;
         const res_var = if (has_val)
             try self.allocTempLocal(node.type_id, tok, false, false)
         else
@@ -8877,6 +9017,14 @@ const MirLowerer = struct {
         const then_borrow_base = self.active_expr_borrows.items.len;
         const then_val = try self.lowerRValue(then_hir);
         if (!self.cur_bb.isNone() and !self.ssa.isBlockTerminated(self.cur_bb)) {
+            if (has_result_regions) {
+                try self.collectBranchBorrowsIntoCondRefLoans(
+                    &cond_ref_loans,
+                    then_borrow_base,
+                    pre_cond_inst_len,
+                    pre_cond_local_len,
+                );
+            }
             try self.popAndCloseBorrowsTo(then_borrow_base, tok);
             if (has_val) try self.ssa.writeVariable(res_var.asInt(), self.cur_bb, then_val);
             if (cond_temps.len > 0) {
@@ -8913,6 +9061,14 @@ const MirLowerer = struct {
         else
             try self.emitUnitVal(tok);
         if (!self.cur_bb.isNone() and !self.ssa.isBlockTerminated(self.cur_bb)) {
+            if (has_result_regions) {
+                try self.collectBranchBorrowsIntoCondRefLoans(
+                    &cond_ref_loans,
+                    else_borrow_base,
+                    pre_cond_inst_len,
+                    pre_cond_local_len,
+                );
+            }
             try self.popAndCloseBorrowsTo(else_borrow_base, tok);
             if (has_val) try self.ssa.writeVariable(res_var.asInt(), self.cur_bb, else_val);
             try self.emitBr(join_bb, &.{});
@@ -8929,6 +9085,17 @@ const MirLowerer = struct {
         }
 
         self.cur_bb = join_bb;
+        if (has_result_regions) {
+            for (cond_ref_loans.items) |loan_spec| {
+                const join_ref_tok = try self.emitGhostOpen(
+                    if (loan_spec.is_mut) .ghost_access_inout else .ghost_access_let,
+                    loan_spec.place_id,
+                    .addr_borrow,
+                    tok,
+                );
+                try self.active_expr_borrows.append(self.allocator, join_ref_tok);
+            }
+        }
         if (has_val) {
             return self.ssa.readVariable(res_var.asInt(), join_bb);
         }
@@ -15471,10 +15638,9 @@ test "test_phase6_mir_intrinsics_vacated_windows_and_subscript_defer" {
     try std.testing.expect(MirIntrinsicKind.ghost_storage_free.isGhostIntrinsic());
     try std.testing.expect(!MirIntrinsicKind.drop_in_place.isGhostIntrinsic());
 
-    // [1] Lower `.narrow`, `.try_narrow`, `@zero_pad`, wire intrinsics, `@drop_trace`, `bounds_check`, and `Fix-06B` `subscript`:
+    // [1] Lower `.narrow`, `.try_narrow`, `@repr(C, zero_pad: true)`, wire intrinsics, `@drop_trace`, `bounds_check`, and `Fix-06B` `subscript`:
     const phase6_src =
-        \\@zero_pad
-        \\@repr(C)
+        \\@repr(C, zero_pad: true)
         \\pub struct WireHdr {
         \\    pub tag: u8,
         \\    pub code: u32,
@@ -15712,4 +15878,33 @@ test "test_phase76_stage4_mir_cross_store_subscript_and_nested_fsm_continue" {
         // `fsm_res == 77` (`continue :outer .Finish(77)` targets `outer`!), `slot_x == 99`, `slot_y == 20`, `tag_out == 5`:
         try std.testing.expectEqual(@as(i64, 779925), eval_res.slot.scalar_i64);
     }
+}
+
+test "test_dr24_mir_inline_cond_if_ref_borrow_lifetime_soundness" {
+    const alloc = std.testing.allocator;
+
+    const valid_src =
+        \\pub struct LabelBox {
+        \\    pub text: str,
+        \\}
+        \\pub fn read_inline_if_ref(opt_box: LabelBox?, fallback: str) -> str {
+        \\    let chosen: str = if opt_box is .Some(&inner_box) => inner_box.text else fallback;
+        \\    return chosen;
+        \\}
+    ;
+    var ok_bundle = try lowerSourceToMir(alloc, FileId.fromInt(92), valid_src, TargetLayout.NATIVE_64, .{});
+    defer ok_bundle.deinit();
+    try std.testing.expect(!ok_bundle.hir_bundle.diagnostics.hasErrors());
+
+    const invalid_mutation_src =
+        \\pub fn overwrite_while_inline_if_ref_live(var opt_num: i32?, fallback_ref: &i32) -> i32 {
+        \\    let chosen_ref: &i32 = if opt_num is .Some(&bound_ref) => bound_ref else fallback_ref;
+        \\    opt_num = .None;
+        \\    return chosen_ref.*;
+        \\}
+    ;
+    try std.testing.expectError(
+        error.V4GhostExclusivityConflict,
+        lowerSourceToMir(alloc, FileId.fromInt(93), invalid_mutation_src, TargetLayout.NATIVE_64, .{}),
+    );
 }

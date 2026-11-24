@@ -1,9 +1,14 @@
+/# Dashboard formatting showcase.
+
 use cx.io.{self, BufReader as Br, Read, Write};
 use cx.mem;
 
 const MIN_PORT: u16 = 80;
 const MAX_PORT: u16 = 65535;
+const SQL_FILTER: str = "meta != '{}'";
 
+/| Aligned metric wrapper.
+@repr(C, align: 8, zero_pad: true) @derive(Copy, Debug)
 pub struct Metric[T] {
     pub val: T,
 }
@@ -26,11 +31,18 @@ pub fn render_dashboard[T](opt_val: T?, raw_score: i32) -> View {
         x: score,
         y: total,
     };
+    let query = "
+        SELECT id FROM metrics WHERE meta != '{}'
+        ";
+    let tier = if score == 0 => "idle"
+        else if score < 50 => "warm"
+        else "hot";
+    let summary = f"{score=} tier={tier} sql={query}";
     let label = match score {
         0 => "idle",
         _ => "active",
     };
-    Card(padding: 8) {
-        Text(value: label);
+    Card(padding: if score > 0 => 16 else 8) {
+        Text(value: label, detail: summary);
     }
 }

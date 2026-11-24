@@ -74,9 +74,9 @@ fn normalizeLfAlloc(allocator: std.mem.Allocator, raw_bytes: []const u8) ![]u8 {
     return out_buf.toOwnedSlice(allocator);
 }
 
-/// Validates `< 150` column width, `//!` module header, and 90/65-char dividers in `cx_path`.
+/// Validates `< 150` column width, `/#` module header, and 90/65-char dividers in `cx_path`.
 fn verifyCxStyleAndDividers(cx_path: []const u8, normalized_source: []const u8) !void {
-    try std.testing.expect(std.mem.startsWith(u8, normalized_source, "//! "));
+    try std.testing.expect(std.mem.startsWith(u8, normalized_source, "/# "));
 
     var line_iter = std.mem.splitScalar(u8, normalized_source, '\n');
     var line_num: usize = 1;
@@ -670,7 +670,7 @@ test "test_regression_critical04_sast_arena_drop_elision_nontrivial_string_and_p
         "    }\n" ++
         "}\n" ++
         "\n" ++
-        "@noinline\n" ++
+        "@inline(never)\n" ++
         "pub fn run_arena_nontrivial_vec() -> usize {\n" ++
         "    var arena = Arena.new();\n" ++
         "    var count: usize = 0_usize;\n" ++
@@ -684,7 +684,7 @@ test "test_regression_critical04_sast_arena_drop_elision_nontrivial_string_and_p
         "    return count;\n" ++
         "}\n" ++
         "\n" ++
-        "@noinline\n" ++
+        "@inline(never)\n" ++
         "pub fn run_with_ctx_inline_containers() -> usize {\n" ++
         "    var arena = Arena.new();\n" ++
         "    let total: usize = with context.allocator = &mut arena {\n" ++

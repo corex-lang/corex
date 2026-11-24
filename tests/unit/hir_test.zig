@@ -1000,7 +1000,7 @@ test "test_hir_desugar_string_interpolation_and_hylo_post_arg_sequencing" {
         "    return AdderBox { bias: 0 };\n" ++
         "}\n" ++
         "pub fn format_banner(label: str) -> str {\n" ++
-        "    return \"hdr={label}:ok\";\n" ++
+        "    return f\"hdr={label}:ok\";\n" ++
         "}\n" ++
         "pub fn run_hylo_order() -> i32 {\n" ++
         "    var trace: i32 = 0;\n" ++
@@ -1310,7 +1310,7 @@ test "test_hir_dr22_caller_location_builder_blocks_struct_update_and_labeled_fsm
         "        add_weight(10);\n" ++
         "        add_weight(25);\n" ++
         "    };\n" ++
-        "    let line_bonus: i32 = if caller_line() > 0 { 5 } else { 0 };\n" ++
+        "    let line_bonus: i32 = if caller_line() > 0 => 5 else 0;\n" ++
         "    let fsm_res: i32 = fsm: match StepFsm.Init {\n" ++
         "        .Init => continue :fsm .Step(next_cfg.port + next_cfg.retries),\n" ++
         "        .Step(cur) => continue :fsm .Done(cur + built_val),\n" ++
@@ -1339,6 +1339,51 @@ test "test_hir_dr22_caller_location_builder_blocks_struct_update_and_labeled_fsm
             dr22_hir_src,
             TargetLayout.NATIVE_64,
             "eval_dr22_hir",
+            &.{},
+            20_000,
+        ),
+    );
+}
+
+// Phase 11.1b (`DR-24`) plain vs `f"…"` / `f#"…"#` strings and `if cond => a else b` HIR lowering:
+
+test "test_hir_dr24_plain_vs_fmt_strings_fhash_quote_guard_and_inline_if" {
+    const dr24_hir_src =
+        "pub fn make_win_path(name: str) -> str {\n" ++
+        "    return f#\"C:\\\\dir\\\\\"{name}\"\\n\"#;\n" ++
+        "}\n" ++
+        "pub fn choose_scaled(opt_val: i32?, fallback: i32) -> i32 {\n" ++
+        "    return if opt_val is .Some(val) and (doubled := val * 2) > 10 => doubled\n" ++
+        "        else if fallback > 0 => fallback\n" ++
+        "        else 0;\n" ++
+        "}\n" ++
+        "pub fn eval_dr24_hir() -> i32 {\n" ++
+        "    let x: i32 = 99;\n" ++
+        "    let plain_hole: str = \"{x}\";\n" ++
+        "    let plain_braces: str = \"{{}}\";\n" ++
+        "    let win_len = make_win_path(\"alice\").len() as i32;\n" ++
+        "    let picked = choose_scaled(.Some(8), 3);\n" ++
+        "    _ = x;\n" ++
+        "    return (plain_hole.len() as i32) * 1000 + (plain_braces.len() as i32) * 100 + win_len * 10 + picked;\n" ++
+        "}\n";
+
+    var bundle = try hir.lowerSourceToHir(
+        std.testing.allocator,
+        dr24_hir_src,
+        TargetLayout.NATIVE_64,
+    );
+    defer bundle.deinit();
+    try std.testing.expect(!bundle.diagnostics.hasErrors());
+    try std.testing.expectEqual(@as(usize, 0), bundle.diagnostics.diagnostics.items.len);
+
+    // `plain_hole.len() == 3` (`3000`) + `plain_braces.len() == 4` (`400`) + `win_len == 15` (`C:\dir\"alice"\n`, `150`) + `picked == 16` = `3566`:
+    try std.testing.expectEqual(
+        @as(i64, 3566),
+        try evalSourceFnI64(
+            std.testing.allocator,
+            dr24_hir_src,
+            TargetLayout.NATIVE_64,
+            "eval_dr24_hir",
             &.{},
             20_000,
         ),

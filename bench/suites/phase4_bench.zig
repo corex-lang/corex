@@ -71,7 +71,7 @@ const IncrementalTypecheckState = struct {
 
 /// Representative 16-line `.cx` function block repeated 128 times to form a 64 KiB (`2,048` LOC) module.
 const SYNTHETIC_TYPED_BLOCK_16_LOC =
-    "/// Computes bounded frame score with Constrained Type Groups, `T!E` `?`, and `match`.\n" ++
+    "/| Computes bounded frame score with Constrained Type Groups, `T!E` `?`, and `match`.\n" ++
     "pub fn evaluate_frame_metric(seed_val: u64, flag_byte: u8) -> u64!u32 {\n" ++
     "    let base_offset: u64 = 1_000_000;\n" ++
     "    let combined: u64 = seed_val + base_offset;\n" ++
@@ -99,7 +99,7 @@ const SYNTHETIC_TYPED_MODULE_64K: [SYNTHETIC_TYPED_BLOCK_16_LOC.len * 128]u8 = b
         @memcpy(buf[start .. start + SYNTHETIC_TYPED_BLOCK_16_LOC.len], SYNTHETIC_TYPED_BLOCK_16_LOC);
         // Stamp a unique 3-character suffix into `evaluate_frame_metric` -> `evaluate_frame_metXXX`:
         const name_end = start +
-            ("/// Computes bounded frame score with Constrained Type Groups, `T!E` `?`, and `match`.\n" ++
+            ("/| Computes bounded frame score with Constrained Type Groups, `T!E` `?`, and `match`.\n" ++
                 "pub fn evaluate_frame_met").len;
         buf[name_end + 0] = '0' + @as(u8, @intCast((i / 100) % 10));
         buf[name_end + 1] = '0' + @as(u8, @intCast((i / 10) % 10));
@@ -110,7 +110,7 @@ const SYNTHETIC_TYPED_MODULE_64K: [SYNTHETIC_TYPED_BLOCK_16_LOC.len * 128]u8 = b
 
 /// Byte offset of `1_000_000` inside function #64 of `SYNTHETIC_TYPED_MODULE_64K`.
 const FN_64_LITERAL_OFFSET: usize = 64 * SYNTHETIC_TYPED_BLOCK_16_LOC.len +
-    ("/// Computes bounded frame score with Constrained Type Groups, `T!E` `?`, and `match`.\n" ++
+    ("/| Computes bounded frame score with Constrained Type Groups, `T!E` `?`, and `match`.\n" ++
         "pub fn evaluate_frame_metric(seed_val: u64, flag_byte: u8) -> u64!u32 {\n" ++
         "    let base_offset: u64 = ").len;
 

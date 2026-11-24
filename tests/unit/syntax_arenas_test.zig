@@ -1,7 +1,7 @@
 //! Unit Tests for Lossless CST, TokenBuffer & AST Arenas (`tests/unit/syntax_arenas_test.zig`)
 //!
-//! Verifies the 120-variant `TokenKind` table, SoA `TokenBuffer` and `TriviaPiece` storage,
-//! `LosslessCstArena` pre-order `subtree_size` skipping and source reconstruction, and `AstArena`.
+//! Verifies the 121-variant `TokenKind` table, 9-variant `TriviaKind` table, 98-variant `AstTag`
+//! table, SoA `TokenBuffer`, `LosslessCstArena` source reconstruction, and `AstArena`.
 //!
 //! Enforces zero memory leaks and tests resource caps (`MAX_PARSE_DEPTH`) and semantic hole nodes.
 
@@ -25,8 +25,14 @@ const AstStore = corex.AstStore;
 // ----------------- TokenBuffer & Trivia Tests -----------------
 
 test "test_token_kind_taxonomy_and_soa_token_buffer" {
-    // [1] Verify 120-variant `TokenKind` taxonomy, `DR-22` ordinals, and canonical aliases:
-    try std.testing.expectEqual(@as(usize, 120), @typeInfo(TokenKind).@"enum".field_names.len);
+    // [1] Verify 121-variant `TokenKind` (`0..120`), 9-variant `TriviaKind`, 98-variant `AstTag`, and `DR-24` ordinals:
+    try std.testing.expectEqual(@as(usize, 121), @typeInfo(TokenKind).@"enum".field_names.len);
+    try std.testing.expectEqual(@as(usize, 9), @typeInfo(syntax.TriviaKind).@"enum".field_names.len);
+    try std.testing.expect(!@hasField(syntax.TriviaKind, "block_comment"));
+    try std.testing.expect(@hasField(syntax.TriviaKind, "doc_comment"));
+    try std.testing.expect(@hasField(syntax.TriviaKind, "module_doc_comment"));
+    try std.testing.expectEqual(@as(usize, 98), @typeInfo(syntax.AstTag).@"enum".field_names.len);
+    try std.testing.expect(@hasField(syntax.AstTag, "fmt_string_lit"));
     try std.testing.expectEqual(TokenKind.lbrace, TokenKind.l_brace);
     try std.testing.expectEqual(TokenKind.rbrace, TokenKind.r_brace);
     try std.testing.expectEqual(TokenKind.lparen, TokenKind.l_paren);
@@ -39,9 +45,13 @@ test "test_token_kind_taxonomy_and_soa_token_buffer" {
     try std.testing.expectEqual(@as(u8, 42), @backingInt(TokenKind.kw_yield));
     try std.testing.expectEqual(@as(u8, 58), @backingInt(TokenKind.byte_lit));
     try std.testing.expectEqual(@as(u8, 59), @backingInt(TokenKind.byte_string_lit));
-    try std.testing.expectEqual(@as(u8, 72), @backingInt(TokenKind.dotdotdot));
-    try std.testing.expectEqual(@as(u8, 80), @backingInt(TokenKind.colon_eq));
-    try std.testing.expectEqual(@as(u8, 81), @backingInt(TokenKind.dollar));
+    try std.testing.expectEqual(@as(u8, 60), @backingInt(TokenKind.fmt_string_lit));
+    try std.testing.expectEqual(@as(u8, 73), @backingInt(TokenKind.dotdotdot));
+    try std.testing.expectEqual(@as(u8, 75), @backingInt(TokenKind.fat_arrow));
+    try std.testing.expectEqual(@as(u8, 81), @backingInt(TokenKind.colon_eq));
+    try std.testing.expectEqual(@as(u8, 82), @backingInt(TokenKind.dollar));
+    try std.testing.expectEqual(@as(u8, 119), @backingInt(TokenKind.invalid_token));
+    try std.testing.expectEqual(@as(u8, 120), @backingInt(TokenKind.eof));
     try std.testing.expectEqual(TokenKind.invalid_token, TokenKind.invalid);
 
     var token_buffer = TokenBuffer.init(std.testing.allocator);
@@ -89,7 +99,7 @@ test "test_token_kind_taxonomy_and_soa_token_buffer" {
 // ------------------- LosslessCstArena Tests -------------------
 
 test "test_lossless_cst_subtree_skipping_and_exact_source_reconstruction" {
-    const raw_source = "/// Doc header\r\npub fn calc(val: i32) -> i32 {\n    val +% 1\n}\n";
+    const raw_source = "/| Doc header\r\npub fn calc(val: i32) -> i32 {\n    val +% 1\n}\n";
     var token_buffer = TokenBuffer.init(std.testing.allocator);
     defer token_buffer.deinit();
 
@@ -97,21 +107,21 @@ test "test_lossless_cst_subtree_skipping_and_exact_source_reconstruction" {
     const first_tok = try token_buffer.appendToken(
         .kw_pub,
         .{},
-        16,
+        15,
         3,
         &.{
-            .{ .kind = .doc_comment, .byte_offset = 0, .byte_len = 14 },
-            .{ .kind = .newline_crlf, .byte_offset = 14, .byte_len = 2 },
+            .{ .kind = .doc_comment, .byte_offset = 0, .byte_len = 13 },
+            .{ .kind = .newline_crlf, .byte_offset = 13, .byte_len = 2 },
         },
         &.{
-            .{ .kind = .spaces, .byte_offset = 19, .byte_len = 1 },
+            .{ .kind = .spaces, .byte_offset = 18, .byte_len = 1 },
         },
     );
     const rest_tok = try token_buffer.appendToken(
         .ident,
         .{},
-        20,
-        @intCast(raw_source.len - 20),
+        19,
+        @intCast(raw_source.len - 19),
         &.{},
         &.{},
     );

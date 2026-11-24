@@ -357,8 +357,8 @@ test "test_drift_guard_phase1_token_kind_contiguity_and_keyword_table" {
     @setEvalBranchQuota(20_000);
     const token_enum_info = @typeInfo(TokenKind).@"enum";
     const token_values = std.enums.values(TokenKind);
-    try std.testing.expectEqual(@as(usize, 120), token_enum_info.field_names.len);
-    try std.testing.expectEqual(@as(usize, 120), token_values.len);
+    try std.testing.expectEqual(@as(usize, 121), token_enum_info.field_names.len);
+    try std.testing.expectEqual(@as(usize, 121), token_values.len);
 
     inline for (token_values, 0..) |tok_val, i| {
         try std.testing.expectEqual(@as(u8, @intCast(i)), @backingInt(tok_val));
@@ -411,9 +411,9 @@ test "test_drift_guard_phase2_cst_node_kind_ast_tag_and_parser_diagnostics" {
         try std.testing.expectEqualStrings(ast_enum_info.field_names[i], @tagName(ast_val));
     }
 
-    // [3] Verify `TokenSet128` covers all 120 `TokenKind`s (`@backingInt(tok) < 128`):
+    // [3] Verify `TokenSet128` covers all 121 `TokenKind`s (`@backingInt(tok) < 128`):
     const token_values = std.enums.values(TokenKind);
-    try std.testing.expectEqual(@as(usize, 120), token_values.len);
+    try std.testing.expectEqual(@as(usize, 121), token_values.len);
     var full_set = TokenSet128.EMPTY;
     for (token_values) |tok_val| {
         try std.testing.expect(@backingInt(tok_val) < 128);
@@ -990,7 +990,7 @@ test "test_drift_guard_phase7_abi_codegen_seam_layouts_and_core" {
 }
 
 test "test_drift_guard_phase7_5_dr21_surface_syntax_and_diagnostics" {
-    // [1] Verify retired tokens and canonical `120`-variant `TokenKind` ordinals (`DR-21` & `DR-22` §3.1):
+    // [1] Verify retired tokens and canonical `121`-variant `TokenKind` ordinals (`DR-21`, `DR-22` §3.1 & `DR-24` §2.1):
     try std.testing.expect(!@hasField(TokenKind, "coloncolon"));
     try std.testing.expect(!@hasDecl(TokenKind, "colon_colon"));
     try std.testing.expect(!@hasField(TokenKind, "kw_ref"));
@@ -1004,9 +1004,10 @@ test "test_drift_guard_phase7_5_dr21_surface_syntax_and_diagnostics" {
     try std.testing.expectEqual(@as(u8, 42), @backingInt(TokenKind.kw_yield));
     try std.testing.expectEqual(@as(u8, 58), @backingInt(TokenKind.byte_lit));
     try std.testing.expectEqual(@as(u8, 59), @backingInt(TokenKind.byte_string_lit));
-    try std.testing.expectEqual(@as(u8, 72), @backingInt(TokenKind.dotdotdot));
-    try std.testing.expectEqual(@as(u8, 80), @backingInt(TokenKind.colon_eq));
-    try std.testing.expectEqual(@as(u8, 81), @backingInt(TokenKind.dollar));
+    try std.testing.expectEqual(@as(u8, 60), @backingInt(TokenKind.fmt_string_lit));
+    try std.testing.expectEqual(@as(u8, 73), @backingInt(TokenKind.dotdotdot));
+    try std.testing.expectEqual(@as(u8, 81), @backingInt(TokenKind.colon_eq));
+    try std.testing.expectEqual(@as(u8, 82), @backingInt(TokenKind.dollar));
 
     // [2] Verify `--internal-core` CLI flag parsing and subcommand `--help` parity across `check`, `fmt`, and `upgrade`:
     var internal_sink = corex.DiagnosticSink.init(std.testing.allocator);
@@ -1066,8 +1067,8 @@ test "test_drift_guard_phase7_5_dr21_surface_syntax_and_diagnostics" {
         try std.testing.expectEqual(@as(u8, @intCast(i)), resolved.?.slot_ordinal);
     }
 
-    // [4] Verify all 8 `DR-21` `DiagnosticCode` tags (`138` total catalog entries) and test coverage:
-    try std.testing.expectEqual(@as(usize, 138), diagnostic.DIAGNOSTIC_CATALOG.len);
+    // [4] Verify all 8 `DR-21` `DiagnosticCode` tags (`146` total catalog entries) and test coverage:
+    try std.testing.expectEqual(@as(usize, 146), diagnostic.DIAGNOSTIC_CATALOG.len);
     const dr21_specs = [_]struct {
         /// Canonical Phase 7.5 `DR-21` `DiagnosticCode` tag.
         code: DiagnosticCode,
@@ -1121,10 +1122,10 @@ test "test_drift_guard_phase7_5_dr21_surface_syntax_and_diagnostics" {
 }
 
 test "test_drift_guard_phase7_6_dr22_surface_syntax_upgrade_rules_and_diagnostics" {
-    // [1] Verify 22-rule `UPGRADE_RULE_CATALOG` (`UR-21-00`–`UR-21-07`, `UR-22-00`–`UR-22-06`, `UR-23-00`–`UR-23-06`):
+    // [1] Verify `UPGRADE_RULE_CATALOG` (`UR-21-00`–`UR-24-06`) contiguous parity:
     try expectContiguousEnum(corex.UpgradeRuleId);
     const upgrade_catalog = corex.upgrade_rules.UPGRADE_RULE_CATALOG;
-    try std.testing.expectEqual(@as(usize, 22), upgrade_catalog.len);
+    try std.testing.expectEqual(@as(usize, 29), upgrade_catalog.len);
 
     const expected_rule_codes = [_][]const u8{
         "UR-21-00",
@@ -1149,6 +1150,13 @@ test "test_drift_guard_phase7_6_dr22_surface_syntax_upgrade_rules_and_diagnostic
         "UR-23-04",
         "UR-23-05",
         "UR-23-06",
+        "UR-24-00",
+        "UR-24-01",
+        "UR-24-02",
+        "UR-24-03",
+        "UR-24-04",
+        "UR-24-05",
+        "UR-24-06",
     };
     for (upgrade_catalog, 0..) |rule_desc, i| {
         try std.testing.expectEqual(i, @as(usize, @backingInt(rule_desc.id)));
@@ -1467,9 +1475,9 @@ test "test_drift_guard_phase8_cross_compile_ffi_async_seams_and_diagnostics" {
 }
 
 test "test_drift_guard_phase9_pkg_seams_diagnostics_and_cli" {
-    // [1] Verify `TokenKind` stays frozen at `120` (`0..119`) and `router.SUBCOMMANDS.len` stays frozen at `9`:
+    // [1] Verify `TokenKind` stays frozen at `121` (`0..120`) and `router.SUBCOMMANDS.len` stays frozen at `9`:
     try expectContiguousEnum(TokenKind);
-    try std.testing.expectEqual(@as(usize, 120), std.enums.values(TokenKind).len);
+    try std.testing.expectEqual(@as(usize, 121), std.enums.values(TokenKind).len);
     const frozen_subcommands = [_][]const u8{
         "bench",
         "build",
@@ -1564,7 +1572,7 @@ test "test_drift_guard_phase9_pkg_seams_diagnostics_and_cli" {
 
     // [5] Verify all 7 new Phase 9 `DiagnosticCode` tags (`E0010`–`E0016`) + reused `DR-17` codes (`E0324`–`E0327`,
     //     `E0435`, `W0330`) in `DIAGNOSTIC_CATALOG`, `stage0/src/`, and `tests/unit/`:
-    try std.testing.expectEqual(@as(usize, 138), diagnostic.DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 146), diagnostic.DIAGNOSTIC_CATALOG.len);
     try std.testing.expectEqual(
         DiagnosticCode.e0435_invalid_cfg_predicate,
         DiagnosticCode.e0435_unknown_cfg_feature,
@@ -1636,10 +1644,10 @@ test "test_drift_guard_phase9_pkg_seams_diagnostics_and_cli" {
 }
 
 test "test_drift_guard_phase10_tooling_lsp_check_and_upgrade" {
-    // [1] Verify `DIAGNOSTIC_CATALOG` (`138` contiguous entries) and `W0202` / `W0403` coverage:
+    // [1] Verify `DIAGNOSTIC_CATALOG` (`146` contiguous entries) and `W0202` / `W0403` coverage:
     try expectContiguousEnum(DiagnosticCode);
-    try std.testing.expectEqual(@as(usize, 138), diagnostic.DIAGNOSTIC_CATALOG.len);
-    try std.testing.expectEqual(@as(usize, 138), std.enums.values(DiagnosticCode).len);
+    try std.testing.expectEqual(@as(usize, 146), diagnostic.DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 146), std.enums.values(DiagnosticCode).len);
 
     const phase10_diag_specs = [_]struct {
         /// Canonical Phase 10 `DiagnosticCode` tag exercised by `check` and `upgrade`.
@@ -1682,11 +1690,11 @@ test "test_drift_guard_phase10_tooling_lsp_check_and_upgrade" {
         try std.testing.expect(has_test_ref[i]);
     }
 
-    // [2] Verify frozen `SUBCOMMANDS` (`9`), `TokenKind` (`120`), and `COMPILE_FLAGS` (`25`):
+    // [2] Verify frozen `SUBCOMMANDS` (`9`), `TokenKind` (`121`), and `COMPILE_FLAGS` (`25`):
     try expectContiguousEnum(router.SubcommandId);
     try std.testing.expectEqual(@as(usize, 9), router.SUBCOMMANDS.len);
     try expectContiguousEnum(TokenKind);
-    try std.testing.expectEqual(@as(usize, 120), std.enums.values(TokenKind).len);
+    try std.testing.expectEqual(@as(usize, 121), std.enums.values(TokenKind).len);
     try expectContiguousEnum(router.CompileFlagId);
     try std.testing.expectEqual(@as(usize, 25), router.COMPILE_FLAGS.len);
 
@@ -1764,10 +1772,10 @@ test "test_drift_guard_phase10_tooling_lsp_check_and_upgrade" {
         try std.testing.expect(std.mem.indexOf(u8, lsp_help_text, lsp_desc.summary) != null);
     }
 
-    // [4] Verify `UPGRADE_RULE_CATALOG` (`22` contiguous rules `UR-21-00`–`UR-23-06`):
+    // [4] Verify `UPGRADE_RULE_CATALOG` (`29` contiguous rules `UR-21-00`–`UR-24-06`):
     try expectContiguousEnum(corex.UpgradeRuleId);
-    try std.testing.expectEqual(@as(usize, 22), corex.UPGRADE_RULE_COUNT);
-    try std.testing.expectEqual(@as(usize, 22), corex.UPGRADE_RULE_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 29), corex.UPGRADE_RULE_COUNT);
+    try std.testing.expectEqual(@as(usize, 29), corex.UPGRADE_RULE_CATALOG.len);
     const expected_rule_codes = [_][]const u8{
         "UR-21-00",
         "UR-21-01",
@@ -1791,6 +1799,13 @@ test "test_drift_guard_phase10_tooling_lsp_check_and_upgrade" {
         "UR-23-04",
         "UR-23-05",
         "UR-23-06",
+        "UR-24-00",
+        "UR-24-01",
+        "UR-24-02",
+        "UR-24-03",
+        "UR-24-04",
+        "UR-24-05",
+        "UR-24-06",
     };
     for (corex.UPGRADE_RULE_CATALOG, 0..) |rule_desc, i| {
         try std.testing.expectEqual(i, @as(usize, rule_desc.id.asInt()));
@@ -1813,18 +1828,18 @@ test "test_drift_guard_phase10_tooling_lsp_check_and_upgrade" {
 }
 
 test "test_drift_guard_phase106_dr23_diagnostics_tokens_and_upgrade_rules" {
-    // [1] Verify `TokenKind` remains frozen at `120` variants (`8` spare bits in `TokenSet128`, `DR-23` §2.1):
+    // [1] Verify `TokenKind` is locked at `121` variants (`7` spare bits in `TokenSet128`, `DR-23` §2.1 & `DR-24` §2.1):
     try expectContiguousEnum(TokenKind);
     const token_count = std.enums.values(TokenKind).len;
-    try std.testing.expectEqual(@as(usize, 120), token_count);
-    try std.testing.expectEqual(@as(usize, 8), 128 - token_count);
+    try std.testing.expectEqual(@as(usize, 121), token_count);
+    try std.testing.expectEqual(@as(usize, 7), 128 - token_count);
     try std.testing.expect(!@hasField(TokenKind, "kw_elif"));
     try std.testing.expect(!@hasField(TokenKind, "kw_elsif"));
     try std.testing.expect(!@hasField(TokenKind, "kw_elseif"));
 
-    // [2] Verify all 10 `DR-23` `DiagnosticCode` tags (`138` total catalog entries) and `.err` severity:
+    // [2] Verify all 10 `DR-23` `DiagnosticCode` tags (`146` total catalog entries) and `.err` severity:
     try expectContiguousEnum(DiagnosticCode);
-    try std.testing.expectEqual(@as(usize, 138), diagnostic.DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 146), diagnostic.DIAGNOSTIC_CATALOG.len);
     const dr23_diag_specs = [_]struct {
         /// Canonical Phase 10.6 `DR-23` `DiagnosticCode` tag.
         code: DiagnosticCode,
@@ -1890,7 +1905,7 @@ test "test_drift_guard_phase106_dr23_diagnostics_tokens_and_upgrade_rules" {
 
     // [3] Verify all 7 `DR-23` `UpgradeRuleId` entries (`UR-23-00`–`UR-23-06`) under `.dr23_phase106`:
     try expectContiguousEnum(corex.UpgradeRuleId);
-    try std.testing.expectEqual(@as(usize, 22), corex.UPGRADE_RULE_COUNT);
+    try std.testing.expectEqual(@as(usize, 29), corex.UPGRADE_RULE_COUNT);
     const dr23_rule_specs = [_]struct {
         /// Canonical `DR-23` `UpgradeRuleId` tag (`15..21`).
         id: corex.UpgradeRuleId,
@@ -1940,4 +1955,106 @@ test "test_drift_guard_phase106_dr23_diagnostics_tokens_and_upgrade_rules" {
         );
     }
     try std.testing.expect(corex.symbol_resolver.lookupUnambiguousForeignScalar("PacketHeader") == null);
+}
+
+test "test_drift_guard_phase111b_dr24_diagnostics_tokens_and_upgrade_rules" {
+    // [1] Verify `TokenKind.fmt_string_lit == 60` (`121` variants `< 128`), `TriviaKind` (`9` variants, `0` block comments),
+    //     and `AstTag.fmt_string_lit`:
+    try expectContiguousEnum(TokenKind);
+    try std.testing.expectEqual(@as(usize, 121), std.enums.values(TokenKind).len);
+    try std.testing.expectEqual(@as(u8, 60), @backingInt(TokenKind.fmt_string_lit));
+    try std.testing.expectEqual(@as(u8, 120), @backingInt(TokenKind.eof));
+    try std.testing.expect(!@hasField(TokenKind, "kw_then"));
+
+    try expectContiguousEnum(corex.syntax_arenas.TriviaKind);
+    try std.testing.expectEqual(@as(usize, 9), std.enums.values(corex.syntax_arenas.TriviaKind).len);
+    try std.testing.expect(!@hasField(corex.syntax_arenas.TriviaKind, "block_comment"));
+    try std.testing.expect(@hasField(AstTag, "fmt_string_lit"));
+
+    // [2] Verify all 8 new `DR-24` `DiagnosticCode` tags (`146` total catalog entries) and `stage0/src` + `tests/unit` coverage:
+    try expectContiguousEnum(DiagnosticCode);
+    try std.testing.expectEqual(@as(usize, 146), diagnostic.DIAGNOSTIC_CATALOG.len);
+    const dr24_diag_specs = [_]struct {
+        /// Canonical Phase 11.1b `DR-24` `DiagnosticCode` tag.
+        code: DiagnosticCode,
+        /// Expected 5-character CLI diagnostic code string.
+        expected_str: []const u8,
+        /// Expected default diagnostic severity.
+        expected_sev: corex.Severity,
+    }{
+        .{ .code = .e0237_inline_if_missing_else, .expected_str = "E0237", .expected_sev = .err },
+        .{ .code = .e0238_mixed_if_arrow_and_block, .expected_str = "E0238", .expected_sev = .err },
+        .{ .code = .e0239_retired_layout_or_link_attribute, .expected_str = "E0239", .expected_sev = .err },
+        .{ .code = .e0440_invalid_repr_or_inline_attribute, .expected_str = "E0440", .expected_sev = .err },
+        .{ .code = .e0441_unaligned_packed_field_borrow, .expected_str = "E0441", .expected_sev = .err },
+        .{ .code = .w0119_useless_format_string, .expected_str = "W0119", .expected_sev = .warning },
+        .{ .code = .w0120_uninterpolated_fmt_placeholder, .expected_str = "W0120", .expected_sev = .warning },
+        .{ .code = .w0333_redundant_private_contract, .expected_str = "W0333", .expected_sev = .warning },
+    };
+
+    var diag_tag_names: [dr24_diag_specs.len][]const u8 = undefined;
+    var has_src_ref: [dr24_diag_specs.len]bool = @splat(false);
+    var has_test_ref: [dr24_diag_specs.len]bool = @splat(false);
+    for (dr24_diag_specs, 0..) |spec, i| {
+        const cat_entry = diagnostic.DIAGNOSTIC_CATALOG[@backingInt(spec.code)];
+        try std.testing.expectEqual(spec.code, cat_entry.code);
+        try std.testing.expectEqualStrings(spec.expected_str, spec.code.asCodeStr());
+        try std.testing.expectEqualStrings(spec.expected_str, cat_entry.code_str);
+        try std.testing.expectEqual(spec.expected_sev, cat_entry.default_severity);
+        try std.testing.expect(cat_entry.title.len > 0);
+        try std.testing.expect(cat_entry.explanation.len > 0);
+        diag_tag_names[i] = @tagName(spec.code);
+    }
+    try markReferencedIdentifiersInDir(
+        std.testing.allocator,
+        std.testing.io,
+        "stage0/src",
+        &diag_tag_names,
+        &has_src_ref,
+    );
+    try markReferencedIdentifiersInDir(
+        std.testing.allocator,
+        std.testing.io,
+        "tests/unit",
+        &diag_tag_names,
+        &has_test_ref,
+    );
+    for (0..dr24_diag_specs.len) |i| {
+        if (!has_src_ref[i]) {
+            std.debug.print(
+                "Phase 11.1b diagnostic `{s}` is not referenced in `stage0/src/`\n",
+                .{diag_tag_names[i]},
+            );
+        }
+        try std.testing.expect(has_src_ref[i]);
+        if (!has_test_ref[i]) {
+            std.debug.print(
+                "Phase 11.1b diagnostic `{s}` is not referenced in `tests/unit/`\n",
+                .{diag_tag_names[i]},
+            );
+        }
+        try std.testing.expect(has_test_ref[i]);
+    }
+
+    // [3] Verify all 7 `DR-24` `UpgradeRuleId` entries (`UR-24-00`–`UR-24-06`, indices `22..28`) under `.dr24_phase111b`:
+    try expectContiguousEnum(corex.UpgradeRuleId);
+    try std.testing.expectEqual(@as(usize, 29), corex.UPGRADE_RULE_COUNT);
+    const dr24_rule_codes = [_][]const u8{
+        "UR-24-00",
+        "UR-24-01",
+        "UR-24-02",
+        "UR-24-03",
+        "UR-24-04",
+        "UR-24-05",
+        "UR-24-06",
+    };
+    for (dr24_rule_codes, 0..) |expected_code, offset| {
+        const rule_idx = 22 + offset;
+        const desc = corex.UPGRADE_RULE_CATALOG[rule_idx];
+        try std.testing.expectEqual(@as(usize, rule_idx), @as(usize, desc.id.asInt()));
+        try std.testing.expectEqualStrings(expected_code, desc.rule_code);
+        try std.testing.expectEqual(corex.upgrade_rules.UpgradeWave.dr24_phase111b, desc.wave);
+        try std.testing.expectEqual(desc.id, corex.lookupUpgradeRule(expected_code).?);
+        try std.testing.expect(desc.summary.len > 0);
+    }
 }

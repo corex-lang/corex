@@ -1621,3 +1621,64 @@ test "test_phase106_mir_discard_stmt_immediate_autodrop_before_next_statement" {
     try std.testing.expectEqualSlices(i64, &[_]i64{ 20, 30, 10 }, vm.asDropTraceSlice());
     try std.testing.expectEqual(@as(u32, 0), vm.countUnfreedHeapAllocations());
 }
+
+test "test_mir_dr24_inline_if_condition_temp_lifo_drop_before_else_arm" {
+    const inline_if_drop_src =
+        \\pub struct DropGuard {
+        \\    pub tag: i64,
+        \\}
+        \\impl DropGuard {
+        \\    pub fn drop(&mut self) {
+        \\        @drop_trace(self.tag);
+        \\    }
+        \\}
+        \\pub fn make_guard(tag: i64) -> DropGuard {
+        \\    return DropGuard { tag: tag };
+        \\}
+        \\pub fn run_else_arm(code: i64) -> i64 {
+        \\    @drop_trace(code);
+        \\    return code;
+        \\}
+        \\pub fn verify_inline_if_else_drop() -> i64 {
+        \\    return if (cond_guard := make_guard(11)).tag > 100 => cond_guard.tag else run_else_arm(22);
+        \\}
+    ;
+
+    var bundle = try corex.lowerAndVerifySourceMirSast(
+        std.testing.allocator,
+        FileId.fromInt(91),
+        inline_if_drop_src,
+        TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer bundle.deinit();
+    try std.testing.expect(!bundle.diagnostics.hasErrors());
+
+    const entry_body = bundle.mir_module.findBodyByName(
+        &bundle.interner,
+        "verify_inline_if_else_drop",
+    ).?;
+
+    var rodata = mir_vm.RodataPool.init(std.testing.allocator);
+    defer rodata.deinit();
+    var vm_engine = try mir_vm.MirVm.init(
+        std.testing.allocator,
+        &bundle.interner,
+        &bundle.pool,
+        &bundle.sym_table,
+        &rodata,
+        null,
+        null,
+        .{ .target_layout = TargetLayout.NATIVE_64 },
+    );
+    defer vm_engine.deinit();
+    for (bundle.mir_module.bodies.items) |*body_ptr| {
+        _ = try vm_engine.registerBody(body_ptr, body_ptr.symbol_index);
+    }
+
+    const eval_res = try vm_engine.evalBody(entry_body, &.{});
+    try std.testing.expectEqual(@as(i64, 22), eval_res.slot.scalar_i64);
+    // `cond_guard` (`11`) must drop along the false CFG edge before `run_else_arm(22)` executes:
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 11, 22 }, vm_engine.asDropTraceSlice());
+    try std.testing.expectEqual(@as(u32, 0), vm_engine.countUnfreedHeapAllocations());
+}

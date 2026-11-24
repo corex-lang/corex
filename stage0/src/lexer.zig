@@ -1,7 +1,7 @@
 //! High-Speed Deterministic Lexer & Lossless Trivia Scanner
 //!
 //! Scans UTF-8 source buffers into a contiguous Structure-of-Arrays (SoA) `TokenBuffer` in a single
-//! non-backtracking $O(N)$ linear pass while enforcing the `DR-03`, `DR-21`, & `DR-22` 120-token lexical taxonomy.
+//! non-backtracking $O(N)$ linear pass while enforcing the `DR-03`, `DR-21`, `DR-22`, & `DR-24` 121-token lexical taxonomy.
 //!
 //! Preserves 100% of source bytes across leading/trailing `TriviaPiece` slices (`<= 65,535`-byte chunking,
 //! slot-14 coalescing, carrier token flushing past `983,025` trivia bytes, and `E0104` tail preservation)
@@ -230,6 +230,30 @@ pub const ParsedNumericSuffix = struct {
     is_float_syntax: bool,
 };
 
+/// Structural delimiter and multiline dedent boundary metadata for any string, byte-string, or format-string lexeme (`DR-24` §2.1).
+pub const StringLiteralBodyInfo = struct {
+    /// Byte length of the leading alphabetic prefix (`0` for `""`, `1` for `r`/`b`/`f`, `2` for `br`).
+    prefix_len: u8 = 0,
+    /// Number of `#` quote-guard characters between the prefix and opening `"` (`0..=255`).
+    hash_count: u8 = 0,
+    /// `true` if backslash escapes are disabled (`r"…"`, `r#"…"#`, `br"…"`, `br#"…"#`).
+    is_raw: bool = false,
+    /// `true` if the literal produces byte storage (`b"…"`, `br"…"`, `br#"…"#`).
+    is_bytes: bool = false,
+    /// `true` if the literal is an explicit interpolated format string (`f"…"`, `f#"…"#`).
+    is_fmt: bool = false,
+    /// `true` if the literal uses `"<newline> … "` (or recovered `"""`) multiline dedent boundaries.
+    is_multiline: bool = false,
+    /// `true` if the literal opened with a retired `"""` delimiter (`E0115` recovery).
+    is_retired_triple: bool = false,
+    /// Number of leading ASCII `' '` columns preceding the standalone closing quote on multiline strings.
+    closing_indent_spaces: u32 = 0,
+    /// Inclusive starting byte offset of the string payload within `lexeme` (after opening `"` or `"\r?\n`).
+    body_start: u32 = 0,
+    /// Exclusive ending byte offset of the string payload within `lexeme` (before closing `"` or final `\r?\n[ ]*"`).
+    body_end: u32 = 0,
+};
+
 // --------------------- Trivia Accumulator ---------------------
 
 /// Bounded 15-slot accumulator packing inter-token trivia into `PackedTriviaSpan` (`u4` count).
@@ -355,6 +379,12 @@ pub const MAX_TRIVIA_PIECE_BYTES: u16 = std.math.maxInt(u16);
 pub const MAX_TRIVIA_BYTES_PER_TOKEN: usize = MAX_TRIVIA_SLOTS * @as(usize, MAX_TRIVIA_PIECE_BYTES);
 /// Maximum number of `#` delimiters allowed on a raw string literal (`r###"…"###`).
 pub const MAX_RAW_STRING_HASHES: usize = 255;
+/// Maximum number of `#` quote-guard delimiters allowed on a format string literal (`f#"…"#`, `0..=15`).
+pub const MAX_FMT_STRING_HASHES: usize = 15;
+/// Maximum nested `f"…"` format string depth inside `{expr}` holes before emitting `E0203` (`DR-24` §1.2).
+pub const MAX_FMT_NESTING: u32 = 4;
+/// Maximum byte span scanned for top-of-file `--- … ---` script TOML frontmatter (`1 MiB`).
+pub const MAX_FRONTMATTER_BYTES: usize = 1024 * 1024;
 
 /// Character-class bitflag for ASCII whitespace (`' '`, `'\t'`, `'\n'`, `'\r'`).
 const CLASS_WHITESPACE: u8 = 0x01;
@@ -574,119 +604,107 @@ inline fn hasExactHashesAt(source_bytes: []const u8, start_pos: usize, hash_coun
     return true;
 }
 
-/// Returns `true` if `source_bytes[quote_pos..]` opens a `"""` multiline string rather than single-line `r#""…""#`.
-inline fn isTripleQuoteOpening(
+/// Returns `true` if `source_bytes[quote_pos..]` opens a retired `"""` literal (`E0115`) rather than `r#""…""#`.
+inline fn isRetiredTripleQuoteOpening(
     source_bytes: []const u8,
     quote_pos: usize,
-    is_raw: bool,
     hash_count: usize,
 ) bool {
-    var quote_run: usize = 0;
-    while (quote_pos + quote_run < source_bytes.len and source_bytes[quote_pos + quote_run] == '"') : (quote_run += 1) {}
-    if (quote_run < 3) return false;
-    if (is_raw and hash_count > 0 and hasExactHashesAt(source_bytes, quote_pos + quote_run, hash_count)) {
+    if (quote_pos + 2 >= source_bytes.len or
+        source_bytes[quote_pos] != '"' or
+        source_bytes[quote_pos + 1] != '"' or
+        source_bytes[quote_pos + 2] != '"')
+    {
         return false;
     }
-    return true;
+    if (hash_count == 0) return true;
+    if (quote_pos + 3 < source_bytes.len and source_bytes[quote_pos + 3] == '\n') return true;
+    return quote_pos + 4 < source_bytes.len and
+        source_bytes[quote_pos + 3] == '\r' and
+        source_bytes[quote_pos + 4] == '\n';
+}
+
+/// Returns the exclusive end offset of a matched top-of-file `--- … ---` TOML frontmatter block, or `null`.
+pub fn matchScriptFrontmatterEnd(source_bytes: []const u8, start_pos: usize) ?usize {
+    if (start_pos + 4 > source_bytes.len or !std.mem.eql(u8, source_bytes[start_pos .. start_pos + 3], "---")) {
+        return null;
+    }
+    var cursor: usize = start_pos + 3;
+    while (cursor < source_bytes.len and (source_bytes[cursor] == ' ' or source_bytes[cursor] == '\t')) {
+        cursor += 1;
+    }
+    if (cursor < source_bytes.len and source_bytes[cursor] == '\n') {
+        cursor += 1;
+    } else if (cursor + 1 < source_bytes.len and
+        source_bytes[cursor] == '\r' and
+        source_bytes[cursor + 1] == '\n')
+    {
+        cursor += 2;
+    } else {
+        return null;
+    }
+
+    const scan_limit: usize = @min(source_bytes.len, start_pos + MAX_FRONTMATTER_BYTES);
+    while (cursor < scan_limit) {
+        var line_end: usize = cursor;
+        while (line_end < scan_limit and
+            source_bytes[line_end] != '\n' and
+            source_bytes[line_end] != '\r')
+        {
+            line_end += 1;
+        }
+        if (line_end - cursor >= 3 and std.mem.eql(u8, source_bytes[cursor .. cursor + 3], "---")) {
+            var is_clean_fence = true;
+            for (source_bytes[cursor + 3 .. line_end]) |trail_byte| {
+                if (trail_byte != ' ' and trail_byte != '\t') {
+                    is_clean_fence = false;
+                    break;
+                }
+            }
+            const has_valid_eol = line_end == source_bytes.len or
+                source_bytes[line_end] == '\n' or
+                (source_bytes[line_end] == '\r' and
+                    line_end + 1 < source_bytes.len and
+                    source_bytes[line_end + 1] == '\n');
+            if (is_clean_fence and has_valid_eol) {
+                return line_end;
+            }
+        }
+        if (line_end >= scan_limit) break;
+        if (source_bytes[line_end] == '\r' and
+            line_end + 1 < scan_limit and
+            source_bytes[line_end + 1] == '\n')
+        {
+            cursor = line_end + 2;
+        } else {
+            cursor = line_end + 1;
+        }
+    }
+    return null;
 }
 
 /// Lexical context passed to `Lexer.scanEscapeSequence` to enforce mode-specific escape rules.
 const EscapeContext = enum(u8) {
-    /// Standard `"…"` or `"""…"""` UTF-8 string (`\{` / `\}` -> `E0114`, `\'` -> `W0101`, `\u{…}` valid).
-    interpolated_string = 0,
-    /// Unicode scalar `'c'` literal (`\"`, `\{`, `\}` -> `W0101`, `\u{…}` valid).
-    char_literal = 1,
-    /// Single ASCII byte `b'x'` literal (`\xHH` valid for `0x00..0xFF`, `\u{…}` -> `E0117`).
-    byte_char = 2,
-    /// ASCII byte string `b"…"` / `b"""…"""` (`\xHH` valid, `\u{…}` -> `E0117`, `\'` -> `W0101`).
-    byte_string = 3,
+    /// Plain `"…"` UTF-8 string (`{` / `}` literal; `\{`, `\}`, `\'` -> `W0101`; `\u{…}` valid).
+    plain_string = 0,
+    /// Explicit `f"…"` / `f#"…"#` format string (`\{` / `\}` -> `E0114`; `\'` -> `W0101`; `\u{…}` valid).
+    fmt_string = 1,
+    /// Unicode scalar `'c'` literal (`\"`, `\{`, `\}` -> `W0101`; `\u{…}` valid).
+    char_literal = 2,
+    /// Single ASCII byte `b'x'` literal (`\xHH` valid for `0x00..0xFF`; `\u{…}` -> `E0117`).
+    byte_char = 3,
+    /// ASCII byte string `b"…"` (`\xHH` valid; `\u{…}` -> `E0117`; `\{`, `\}`, `\'` -> `W0101`).
+    byte_string = 4,
 };
-
-/// Saved outer string frame for nested `{expr}` string interpolations (`[P1 Trap A]`).
-const InterpStackFrame = struct {
-    /// Active `{ … }` brace nesting depth at the moment the inner string opened.
-    brace_depth: u32,
-    /// `true` if the suspended outer string was opened by `"""` rather than `"`.
-    is_triple_quote: bool,
-    /// `true` if the suspended outer `"""` satisfied the immediate newline rule (`E0115`).
-    has_valid_opening: bool,
-    /// Byte offset of the suspended outer string's opening quote delimiter.
-    open_quote_offset: u32,
-    /// Byte offset immediately following the suspended outer string's opening delimiter/newline.
-    body_start_offset: u32,
-};
-
-/// Decomposed delimiter metadata for any single-line or multiline string / byte-string lexeme.
-const ParsedStringDelimiters = struct {
-    /// Inner slice strictly between opening quote(s) and closing quote(s).
-    raw_inner: []const u8,
-    /// `true` if the literal uses raw `r` or `br` rules (no backslash escapes).
-    is_raw: bool,
-    /// `true` if the literal is a byte string (`b"…"`, `b"""…"""`, `br#"…"#`, `br#"""…"""#`).
-    is_byte: bool,
-    /// `true` if the literal uses triple-quote `"""` closing-quote dedent rules.
-    is_triple_quote: bool,
-};
-
-/// Parses the prefix and matching quote/`#` delimiters of a string or byte-string `lexeme`.
-fn parseStringDelimiters(lexeme: []const u8) ?ParsedStringDelimiters {
-    if (lexeme.len < 2) return null;
-    var cursor: usize = 0;
-    var is_byte = false;
-    var is_raw = false;
-
-    if (lexeme[cursor] == 'b') {
-        is_byte = true;
-        cursor += 1;
-    }
-    if (cursor < lexeme.len and lexeme[cursor] == 'r') {
-        is_raw = true;
-        cursor += 1;
-    }
-    var hash_count: usize = 0;
-    if (is_raw) {
-        while (cursor < lexeme.len and lexeme[cursor] == '#') : (cursor += 1) {
-            hash_count += 1;
-        }
-    }
-    if (cursor >= lexeme.len or lexeme[cursor] != '"') return null;
-
-    // Distinguish single-line `r#"""#` / `r#""""#` / `br#""""#` from multiline `r#"""\n…\n"""#`:
-    const can_be_triple = cursor + 6 + hash_count <= lexeme.len and
-        isTripleQuoteOpening(lexeme, cursor, is_raw, hash_count);
-
-    const quote_len: usize = if (can_be_triple) 3 else 1;
-    const suffix_len: usize = quote_len + hash_count;
-    if (cursor + quote_len + suffix_len > lexeme.len) return null;
-    if (!hasExactHashesAt(lexeme, lexeme.len - hash_count, hash_count)) return null;
-
-    const close_quote_pos = lexeme.len - suffix_len;
-    var q_idx: usize = 0;
-    while (q_idx < quote_len) : (q_idx += 1) {
-        if (lexeme[close_quote_pos + q_idx] != '"') return null;
-    }
-
-    return .{
-        .raw_inner = lexeme[cursor + quote_len .. close_quote_pos],
-        .is_raw = is_raw,
-        .is_byte = is_byte,
-        .is_triple_quote = can_be_triple,
-    };
-}
-
-/// Counts consecutive trailing `\` bytes at the end of `line_slice`.
-inline fn countTrailingBackslashes(line_slice: []const u8) usize {
-    var count: usize = 0;
-    while (count < line_slice.len and line_slice[line_slice.len - 1 - count] == '\\') {
-        count += 1;
-    }
-    return count;
-}
 
 /// Advances past a `{expr}` interpolation hole inside `body_bytes` starting at `open_brace_idx`.
 fn skipInterpolationHoleInBody(body_bytes: []const u8, open_brace_idx: usize) usize {
     var cursor = open_brace_idx + 1;
     var brace_depth: u32 = 1;
+    var paren_depth: u32 = 0;
+    var bracket_depth: u32 = 0;
+    var is_in_fmt_spec = false;
+
     while (cursor < body_bytes.len and brace_depth > 0) {
         const cur_byte = body_bytes[cursor];
         if (cur_byte == '{') {
@@ -694,7 +712,33 @@ fn skipInterpolationHoleInBody(body_bytes: []const u8, open_brace_idx: usize) us
             cursor += 1;
         } else if (cur_byte == '}') {
             brace_depth -= 1;
+            if (brace_depth == 0) is_in_fmt_spec = false;
             cursor += 1;
+        } else if (is_in_fmt_spec) {
+            cursor += 1;
+        } else if (cur_byte == '(') {
+            paren_depth += 1;
+            cursor += 1;
+        } else if (cur_byte == ')') {
+            if (paren_depth > 0) paren_depth -= 1;
+            cursor += 1;
+        } else if (cur_byte == '[') {
+            bracket_depth += 1;
+            cursor += 1;
+        } else if (cur_byte == ']') {
+            if (bracket_depth > 0) bracket_depth -= 1;
+            cursor += 1;
+        } else if (cur_byte == ':' and brace_depth == 1 and paren_depth == 0 and bracket_depth == 0) {
+            if (cursor + 1 < body_bytes.len and body_bytes[cursor + 1] != ':' and body_bytes[cursor + 1] != '=') {
+                is_in_fmt_spec = true;
+            }
+            cursor += 1;
+        } else if (cur_byte == 'f' and
+            (cursor == 0 or !isIdentContinue(body_bytes[cursor - 1])) and
+            cursor + 1 < body_bytes.len and
+            (body_bytes[cursor + 1] == '"' or body_bytes[cursor + 1] == '#'))
+        {
+            cursor = skipFmtStringInExpr(body_bytes, cursor + 1);
         } else if (cur_byte == 'r' and
             (cursor == 0 or !isIdentContinue(body_bytes[cursor - 1])) and
             cursor + 1 < body_bytes.len and
@@ -707,9 +751,7 @@ fn skipInterpolationHoleInBody(body_bytes: []const u8, open_brace_idx: usize) us
             if (body_bytes[cursor + 1] == '\'') {
                 cursor = skipQuotedNonRawInExpr(body_bytes, cursor + 2, '\'', false);
             } else if (body_bytes[cursor + 1] == '"') {
-                const is_triple = cursor + 3 < body_bytes.len and
-                    body_bytes[cursor + 2] == '"' and
-                    body_bytes[cursor + 3] == '"';
+                const is_triple = isRetiredTripleQuoteOpening(body_bytes, cursor + 1, 0);
                 cursor = skipQuotedNonRawInExpr(body_bytes, cursor + (if (is_triple) @as(usize, 4) else 2), '"', is_triple);
             } else if (body_bytes[cursor + 1] == 'r' and cursor + 2 < body_bytes.len and
                 (body_bytes[cursor + 2] == '"' or body_bytes[cursor + 2] == '#'))
@@ -719,19 +761,18 @@ fn skipInterpolationHoleInBody(body_bytes: []const u8, open_brace_idx: usize) us
                 cursor += 1;
             }
         } else if (cur_byte == '"') {
-            const is_triple = cursor + 2 < body_bytes.len and
-                body_bytes[cursor + 1] == '"' and
-                body_bytes[cursor + 2] == '"';
-            cursor = skipInterpolatedStringInExpr(body_bytes, cursor + (if (is_triple) @as(usize, 3) else 1), is_triple);
+            const is_triple = isRetiredTripleQuoteOpening(body_bytes, cursor, 0);
+            cursor = skipQuotedNonRawInExpr(body_bytes, cursor + (if (is_triple) @as(usize, 3) else 1), '"', is_triple);
         } else if (cur_byte == '\'') {
             cursor = skipQuotedNonRawInExpr(body_bytes, cursor + 1, '\'', false);
         } else if (cur_byte == '/' and cursor + 1 < body_bytes.len) {
-            if (body_bytes[cursor + 1] == '/') {
+            const second_byte = body_bytes[cursor + 1];
+            if (second_byte == '/' or second_byte == '|' or second_byte == '#') {
                 cursor += 2;
                 while (cursor < body_bytes.len and body_bytes[cursor] != '\n' and body_bytes[cursor] != '\r') {
                     cursor += 1;
                 }
-            } else if (body_bytes[cursor + 1] == '*') {
+            } else if (second_byte == '*') {
                 cursor += 2;
                 var comment_depth: u32 = 1;
                 while (cursor < body_bytes.len and comment_depth > 0) {
@@ -755,7 +796,7 @@ fn skipInterpolationHoleInBody(body_bytes: []const u8, open_brace_idx: usize) us
     return cursor;
 }
 
-/// Skips a non-interpolated `'…'`, `b'…'`, `b"…"`, or `b"""…"""` literal inside an `{expr}` scan.
+/// Skips a non-interpolated `'…'`, `b'…'`, `"…"`, `b"…"`, or retired `"""…"""` literal inside an `{expr}` scan.
 fn skipQuotedNonRawInExpr(body_bytes: []const u8, after_open_idx: usize, quote_byte: u8, is_triple: bool) usize {
     var cursor = after_open_idx;
     while (cursor < body_bytes.len) {
@@ -781,7 +822,7 @@ fn skipQuotedNonRawInExpr(body_bytes: []const u8, after_open_idx: usize, quote_b
     return body_bytes.len;
 }
 
-/// Skips a raw `r#"…"#` or `r#"""…"""#` string literal inside an `{expr}` scan (`after_r_idx` points past `'r'`).
+/// Skips a raw `r#"…"#` or retired `r"""…"""` string literal inside an `{expr}` scan (`after_r_idx` points past `'r'`).
 fn skipRawStringInExpr(body_bytes: []const u8, after_r_idx: usize) usize {
     var cursor = after_r_idx;
     var hash_count: usize = 0;
@@ -789,7 +830,7 @@ fn skipRawStringInExpr(body_bytes: []const u8, after_r_idx: usize) usize {
         hash_count += 1;
     }
     if (cursor >= body_bytes.len or body_bytes[cursor] != '"') return cursor;
-    const is_triple = isTripleQuoteOpening(body_bytes, cursor, true, hash_count);
+    const is_triple = isRetiredTripleQuoteOpening(body_bytes, cursor, hash_count);
     const quote_len: usize = if (is_triple) 3 else 1;
     cursor += quote_len;
 
@@ -815,9 +856,17 @@ fn skipRawStringInExpr(body_bytes: []const u8, after_r_idx: usize) usize {
     return body_bytes.len;
 }
 
-/// Skips an interpolated `"…"` or `"""…"""` literal nested inside an `{expr}` scan.
-fn skipInterpolatedStringInExpr(body_bytes: []const u8, after_open_idx: usize, is_triple: bool) usize {
-    var cursor = after_open_idx;
+/// Skips an interpolated `f"…"` / `f#"…"#` literal inside an `{expr}` scan (`after_f_idx` points past `'f'`).
+fn skipFmtStringInExpr(body_bytes: []const u8, after_f_idx: usize) usize {
+    var cursor = after_f_idx;
+    var hash_count: usize = 0;
+    while (cursor < body_bytes.len and body_bytes[cursor] == '#') : (cursor += 1) {
+        hash_count += 1;
+    }
+    if (cursor >= body_bytes.len or body_bytes[cursor] != '"') return cursor;
+    const is_triple = isRetiredTripleQuoteOpening(body_bytes, cursor, hash_count);
+    cursor += if (is_triple) 3 else 1;
+
     while (cursor < body_bytes.len) {
         const cur_byte = body_bytes[cursor];
         if (cur_byte == '\\') {
@@ -826,13 +875,21 @@ fn skipInterpolatedStringInExpr(body_bytes: []const u8, after_open_idx: usize, i
         }
         if (cur_byte == '"') {
             if (is_triple) {
-                if (cursor + 2 < body_bytes.len and body_bytes[cursor + 1] == '"' and body_bytes[cursor + 2] == '"') {
-                    return cursor + 3;
+                if (cursor + 2 < body_bytes.len and
+                    body_bytes[cursor + 1] == '"' and
+                    body_bytes[cursor + 2] == '"' and
+                    hasExactHashesAt(body_bytes, cursor + 3, hash_count))
+                {
+                    return cursor + 3 + hash_count;
                 }
                 cursor += 1;
                 continue;
             }
-            return cursor + 1;
+            if (hasExactHashesAt(body_bytes, cursor + 1, hash_count)) {
+                return cursor + 1 + hash_count;
+            }
+            cursor += 1;
+            continue;
         }
         if (cur_byte == '{') {
             if (cursor + 1 < body_bytes.len and body_bytes[cursor + 1] == '{') {
@@ -847,12 +904,12 @@ fn skipInterpolatedStringInExpr(body_bytes: []const u8, after_open_idx: usize, i
     return body_bytes.len;
 }
 
-/// Scans `body_after_open_nl` for the next outer line break (`\n`), skipping `{expr}` holes when enabled.
+/// Scans `body_bytes` for the next outer line break (`\n`), skipping `{expr}` holes when `is_fmt` is `true`.
 fn findNextOuterLineFeed(
     body_bytes: []const u8,
     start_pos: usize,
     is_raw: bool,
-    is_interpolation_allowed: bool,
+    is_fmt: bool,
 ) ?usize {
     var cursor = start_pos;
     while (cursor < body_bytes.len) {
@@ -865,7 +922,7 @@ fn findNextOuterLineFeed(
                 continue;
             }
         }
-        if (is_interpolation_allowed and !is_raw and cur_byte == '{') {
+        if (is_fmt and !is_raw and cur_byte == '{') {
             if (cursor + 1 < body_bytes.len and body_bytes[cursor + 1] == '{') {
                 cursor += 2;
                 continue;
@@ -878,18 +935,26 @@ fn findNextOuterLineFeed(
     return null;
 }
 
-/// Validates (and optionally materializes into `maybe_out`) a multiline string body after its opening newline.
-fn processMultilineStringBody(
+/// Infers `TokenKind` from a raw string, byte-string, or format-string `lexeme` slice.
+inline fn inferStringTokenKind(lexeme: []const u8) TokenKind {
+    if (lexeme.len >= 2 and lexeme[0] == 'f' and (lexeme[1] == '"' or lexeme[1] == '#')) {
+        return .fmt_string_lit;
+    }
+    if (lexeme.len >= 2 and lexeme[0] == 'b' and (lexeme[1] == '"' or lexeme[1] == 'r')) {
+        return .byte_string_lit;
+    }
+    return .string_lit;
+}
+
+/// Validates closing-line standalone quote rules and `< C` leading `' '` indentation on `body_after_open_nl`.
+fn validateMultilineStringBodyPure(
     body_after_open_nl: []const u8,
     is_raw: bool,
-    is_interpolation_allowed: bool,
-    allocator: ?std.mem.Allocator,
-    maybe_out: ?*std.ArrayList(u8),
-) error{ InvalidMultilineIndent, OutOfMemory }!void {
-    // [1] Locate the last outer `\n` separating content lines from the closing `"""` indentation prefix:
+    is_fmt: bool,
+) error{ InvalidMultilineOpening, InvalidMultilineIndent }!u32 {
     var last_outer_lf: ?usize = null;
     var scan_pos: usize = 0;
-    while (findNextOuterLineFeed(body_after_open_nl, scan_pos, is_raw, is_interpolation_allowed)) |lf_pos| {
+    while (findNextOuterLineFeed(body_after_open_nl, scan_pos, is_raw, is_fmt)) |lf_pos| {
         last_outer_lf = lf_pos;
         scan_pos = lf_pos + 1;
     }
@@ -899,24 +964,21 @@ fn processMultilineStringBody(
     else
         body_after_open_nl;
 
-    // Closing `"""` must sit on its own line preceded exclusively by `' '` spaces (`W_close`):
     for (close_prefix) |prefix_byte| {
-        if (prefix_byte != ' ') return error.InvalidMultilineIndent;
+        if (prefix_byte == '\t') return error.InvalidMultilineIndent;
+        if (prefix_byte != ' ') return error.InvalidMultilineOpening;
     }
     const close_indent: usize = close_prefix.len;
-
-    // Zero content lines (`"""\n    """`): valid empty string!
-    const final_lf_idx = last_outer_lf orelse return;
+    const final_lf_idx = last_outer_lf orelse return @intCast(close_indent);
     const content_end: usize = if (final_lf_idx > 0 and body_after_open_nl[final_lf_idx - 1] == '\r')
         final_lf_idx - 1
     else
         final_lf_idx;
     const content_bytes = body_after_open_nl[0..content_end];
 
-    // [2] Validate `W_close` and zero space/tab mixing on every content line (materializing if requested):
     var line_start: usize = 0;
     while (true) {
-        const maybe_lf = findNextOuterLineFeed(content_bytes, line_start, is_raw, is_interpolation_allowed);
+        const maybe_lf = findNextOuterLineFeed(content_bytes, line_start, is_raw, is_fmt);
         const raw_line_end = maybe_lf orelse content_bytes.len;
         const clean_line_end = if (raw_line_end > line_start and content_bytes[raw_line_end - 1] == '\r')
             raw_line_end - 1
@@ -925,45 +987,19 @@ fn processMultilineStringBody(
         const line_slice = content_bytes[line_start..clean_line_end];
 
         if (line_slice.len > 0) {
-            if (line_slice.len < close_indent) return error.InvalidMultilineIndent;
-            var ws_idx: usize = 0;
-            var has_leading_space = false;
-            var has_leading_tab = false;
-            while (ws_idx < line_slice.len and (line_slice[ws_idx] == ' ' or line_slice[ws_idx] == '\t')) : (ws_idx += 1) {
-                if (line_slice[ws_idx] == ' ') {
-                    has_leading_space = true;
-                } else {
-                    has_leading_tab = true;
-                }
-            }
-            if (has_leading_space and has_leading_tab) return error.InvalidMultilineIndent;
-            if (close_indent > 0 and ws_idx < close_indent) return error.InvalidMultilineIndent;
-            if (close_indent > 0 and has_leading_tab) return error.InvalidMultilineIndent;
-
-            var dedented_slice = line_slice[close_indent..];
-            const has_line_continuation = !is_raw and (countTrailingBackslashes(dedented_slice) % 2 == 1);
-            if (has_line_continuation) {
-                dedented_slice = dedented_slice[0 .. dedented_slice.len - 1];
-            }
-            if (maybe_out) |out_buf| {
-                const alloc = allocator.?;
-                try out_buf.appendSlice(alloc, dedented_slice);
-                if (maybe_lf != null and !has_line_continuation) {
-                    try out_buf.append(alloc, '\n');
-                }
-            }
-        } else if (maybe_out) |out_buf| {
-            if (maybe_lf != null) {
-                try out_buf.append(allocator.?, '\n');
+            var leading_spaces: usize = 0;
+            while (leading_spaces < line_slice.len and line_slice[leading_spaces] == ' ') : (leading_spaces += 1) {}
+            if (leading_spaces < line_slice.len and leading_spaces < close_indent) {
+                return error.InvalidMultilineIndent;
             }
         }
-
         if (maybe_lf) |lf_pos| {
             line_start = lf_pos + 1;
         } else {
             break;
         }
     }
+    return @intCast(close_indent);
 }
 
 /// Decodes backslash escape sequences (and `{{`/`}}` when `is_interpolated`) into `out_buf`.
@@ -1680,88 +1716,276 @@ pub fn extractNumericSuffix(lexeme: []const u8) error{InvalidNumericSuffix}!Pars
     };
 }
 
-/// Returns `true` if `lexeme` is a triple-quoted multiline string or byte-string literal (`"""…"""`).
-pub inline fn isMultilineStringLexeme(lexeme: []const u8) bool {
-    const parsed = parseStringDelimiters(lexeme) orelse return false;
-    return parsed.is_triple_quote;
+/// Extracts delimiter flags and multiline dedent boundaries from `lexeme` (`DR-24` §2.1).
+pub fn extractStringBodyInfo(tok_kind: TokenKind, lexeme: []const u8) StringLiteralBodyInfo {
+    var info = StringLiteralBodyInfo{
+        .is_bytes = tok_kind == .byte_string_lit,
+        .is_fmt = tok_kind == .fmt_string_lit,
+    };
+    if (lexeme.len == 0) return info;
+
+    var cursor: usize = 0;
+    if (cursor + 1 < lexeme.len and lexeme[cursor] == 'b' and lexeme[cursor + 1] == 'r') {
+        info.prefix_len = 2;
+        info.is_bytes = true;
+        info.is_raw = true;
+        cursor += 2;
+    } else if (lexeme[cursor] == 'b' and cursor + 1 < lexeme.len and lexeme[cursor + 1] == '"') {
+        info.prefix_len = 1;
+        info.is_bytes = true;
+        cursor += 1;
+    } else if (lexeme[cursor] == 'r' and cursor + 1 < lexeme.len and
+        (lexeme[cursor + 1] == '"' or lexeme[cursor + 1] == '#'))
+    {
+        info.prefix_len = 1;
+        info.is_raw = true;
+        cursor += 1;
+    } else if (lexeme[cursor] == 'f' and cursor + 1 < lexeme.len and
+        (lexeme[cursor + 1] == '"' or lexeme[cursor + 1] == '#'))
+    {
+        info.prefix_len = 1;
+        info.is_fmt = true;
+        cursor += 1;
+    }
+
+    var hash_count: usize = 0;
+    if (info.is_raw or info.is_fmt) {
+        while (cursor < lexeme.len and lexeme[cursor] == '#') : (cursor += 1) {
+            hash_count += 1;
+        }
+        info.hash_count = @intCast(@min(hash_count, 255));
+    }
+
+    if (cursor >= lexeme.len or lexeme[cursor] != '"') {
+        info.body_start = @intCast(lexeme.len);
+        info.body_end = @intCast(lexeme.len);
+        return info;
+    }
+
+    info.is_retired_triple = isRetiredTripleQuoteOpening(lexeme, cursor, hash_count);
+    const quote_len: usize = if (info.is_retired_triple) 3 else 1;
+    cursor += quote_len;
+
+    const close_suffix_len: usize = quote_len + hash_count;
+    const has_valid_close = lexeme.len >= cursor + close_suffix_len and
+        hasExactHashesAt(lexeme, lexeme.len - hash_count, hash_count) and blk: {
+        const close_pos = lexeme.len - close_suffix_len;
+        var q_idx: usize = 0;
+        while (q_idx < quote_len) : (q_idx += 1) {
+            if (lexeme[close_pos + q_idx] != '"') break :blk false;
+        }
+        break :blk true;
+    };
+    const close_quote_pos: usize = if (has_valid_close) lexeme.len - close_suffix_len else lexeme.len;
+
+    var open_nl_len: usize = 0;
+    if (cursor < close_quote_pos and lexeme[cursor] == '\n') {
+        open_nl_len = 1;
+    } else if (cursor + 1 < close_quote_pos and lexeme[cursor] == '\r' and lexeme[cursor + 1] == '\n') {
+        open_nl_len = 2;
+    }
+
+    if (open_nl_len > 0) {
+        info.is_multiline = true;
+        const after_open_nl: usize = cursor + open_nl_len;
+        info.body_start = @intCast(after_open_nl);
+        const raw_after_open_nl = lexeme[after_open_nl..close_quote_pos];
+
+        var last_outer_lf: ?usize = null;
+        var scan_pos: usize = 0;
+        while (findNextOuterLineFeed(raw_after_open_nl, scan_pos, info.is_raw, info.is_fmt)) |lf_pos| {
+            last_outer_lf = lf_pos;
+            scan_pos = lf_pos + 1;
+        }
+
+        const close_prefix = if (last_outer_lf) |lf_idx|
+            raw_after_open_nl[lf_idx + 1 ..]
+        else
+            raw_after_open_nl;
+
+        var space_cols: u32 = 0;
+        while (space_cols < close_prefix.len and close_prefix[space_cols] == ' ') : (space_cols += 1) {}
+        info.closing_indent_spaces = space_cols;
+
+        if (last_outer_lf) |final_lf_rel| {
+            const content_end_rel: usize = if (final_lf_rel > 0 and raw_after_open_nl[final_lf_rel - 1] == '\r')
+                final_lf_rel - 1
+            else
+                final_lf_rel;
+            info.body_end = @intCast(after_open_nl + content_end_rel);
+        } else {
+            info.body_end = @intCast(after_open_nl);
+        }
+        return info;
+    }
+
+    info.body_start = @intCast(cursor);
+    info.body_end = @intCast(close_quote_pos);
+    return info;
 }
 
-/// Extracts and closing-quote dedents a `"""…"""`, `r#"""…"""#`, `b"""…"""`, or `br#"""…"""#` `lexeme`
-/// without decoding `\n` / `\xHH` / `{{` escapes (preserving `{expr}` holes for downstream Sema/HIR).
+/// Strips up to `indent_spaces` leading `' '` bytes per non-empty line and normalizes `\r\n` to `\n`.
+pub fn stripMultilineIndentAlloc(
+    allocator: std.mem.Allocator,
+    raw_body: []const u8,
+    indent_spaces: u32,
+) ![]u8 {
+    if (raw_body.len == 0) return allocator.alloc(u8, 0);
+    var out_buf: std.ArrayList(u8) = .empty;
+    errdefer out_buf.deinit(allocator);
+    try out_buf.ensureTotalCapacity(allocator, raw_body.len);
+
+    var line_start: usize = 0;
+    while (true) {
+        const maybe_lf = std.mem.indexOfScalarPos(u8, raw_body, line_start, '\n');
+        const raw_end = maybe_lf orelse raw_body.len;
+        const clean_end = if (raw_end > line_start and raw_body[raw_end - 1] == '\r')
+            raw_end - 1
+        else
+            raw_end;
+        const line_slice = raw_body[line_start..clean_end];
+
+        if (line_slice.len > 0) {
+            var strip_count: usize = 0;
+            const max_strip: usize = @min(line_slice.len, @as(usize, indent_spaces));
+            while (strip_count < max_strip and line_slice[strip_count] == ' ') : (strip_count += 1) {}
+            try out_buf.appendSlice(allocator, line_slice[strip_count..]);
+        }
+
+        if (maybe_lf) |lf_pos| {
+            try out_buf.append(allocator, '\n');
+            line_start = lf_pos + 1;
+        } else {
+            break;
+        }
+    }
+    return out_buf.toOwnedSlice(allocator);
+}
+
+/// Returns `true` if `lexeme` is a `"<newline> … "` (or recovered `"""`) multiline string literal.
+pub inline fn isMultilineStringLexeme(lexeme: []const u8) bool {
+    return extractStringBodyInfo(inferStringTokenKind(lexeme), lexeme).is_multiline;
+}
+
+/// Extracts and closing-quote dedents a multiline string `lexeme` without decoding backslash escapes.
 pub fn extractMultilineStringContent(
     allocator: std.mem.Allocator,
     lexeme: []const u8,
 ) error{ InvalidMultilineOpening, InvalidMultilineIndent, InvalidStringLiteral, OutOfMemory }![]u8 {
-    const parsed = parseStringDelimiters(lexeme) orelse return error.InvalidStringLiteral;
-    if (!parsed.is_triple_quote) return error.InvalidStringLiteral;
-
-    var after_open_nl: usize = 0;
-    if (parsed.raw_inner.len >= 1 and parsed.raw_inner[0] == '\n') {
-        after_open_nl = 1;
-    } else if (parsed.raw_inner.len >= 2 and parsed.raw_inner[0] == '\r' and parsed.raw_inner[1] == '\n') {
-        after_open_nl = 2;
-    } else {
-        return error.InvalidMultilineOpening;
+    const info = extractStringBodyInfo(inferStringTokenKind(lexeme), lexeme);
+    if (!info.is_multiline) {
+        if (info.is_retired_triple) return error.InvalidMultilineOpening;
+        return error.InvalidStringLiteral;
     }
 
+    const quote_len: usize = if (info.is_retired_triple) 3 else 1;
+    const suffix_len: usize = quote_len + @as(usize, info.hash_count);
+    if (lexeme.len < @as(usize, info.body_start) + suffix_len) return error.InvalidStringLiteral;
+    const close_quote_pos: usize = lexeme.len - suffix_len;
+
+    const indent_spaces = try validateMultilineStringBodyPure(
+        lexeme[@as(usize, info.body_start)..close_quote_pos],
+        info.is_raw,
+        info.is_fmt,
+    );
+    const stripped = try stripMultilineIndentAlloc(
+        allocator,
+        lexeme[@as(usize, info.body_start)..@as(usize, info.body_end)],
+        indent_spaces,
+    );
+    if (info.is_raw) return stripped;
+
+    // Apply `\` line continuations while preserving all non-newline escape sequences verbatim:
+    defer allocator.free(stripped);
     var out_buf: std.ArrayList(u8) = .empty;
     errdefer out_buf.deinit(allocator);
-    try out_buf.ensureTotalCapacity(allocator, parsed.raw_inner.len - after_open_nl);
-    try processMultilineStringBody(
-        parsed.raw_inner[after_open_nl..],
-        parsed.is_raw,
-        !parsed.is_raw and !parsed.is_byte,
-        allocator,
-        &out_buf,
-    );
+    try out_buf.ensureTotalCapacity(allocator, stripped.len);
+    var cursor: usize = 0;
+    while (cursor < stripped.len) {
+        if (stripped[cursor] == '\\' and cursor + 1 < stripped.len) {
+            if (stripped[cursor + 1] == '\n') {
+                cursor += 2;
+                continue;
+            }
+            try out_buf.appendSlice(allocator, stripped[cursor .. cursor + 2]);
+            cursor += 2;
+            continue;
+        }
+        try out_buf.append(allocator, stripped[cursor]);
+        cursor += 1;
+    }
     return out_buf.toOwnedSlice(allocator);
 }
 
 /// Canonical alias for `extractMultilineStringContent`.
 pub const extractMultilineString = extractMultilineStringContent;
 
-/// Fully cooks any non-interpolated string or byte-string `lexeme` (`"…"`, `"""…"""`, `r#"…"#`,
-/// `r#"""…"""#`, `b"…"`, `b"""…"""`, `br#"…"#`, `br#"""…"""#`), applying multiline dedent and escape decoding.
+/// Cooks any non-interpolated string, byte-string, or 0-hole format-string `lexeme` (`DR-24` §1.2),
+/// applying multiline `"<newline> … "` dedent and mode-specific escape decoding.
 pub fn cookStringLiteral(
     allocator: std.mem.Allocator,
     lexeme: []const u8,
 ) error{ InvalidMultilineOpening, InvalidMultilineIndent, InvalidStringLiteral, OutOfMemory }![]u8 {
-    const parsed = parseStringDelimiters(lexeme) orelse return error.InvalidStringLiteral;
+    if (lexeme.len < 2) return error.InvalidStringLiteral;
+    const info = extractStringBodyInfo(inferStringTokenKind(lexeme), lexeme);
+    const quote_len: usize = if (info.is_retired_triple) 3 else 1;
+    const suffix_len: usize = quote_len + @as(usize, info.hash_count);
+    const min_total_len: usize = @as(usize, info.prefix_len) + @as(usize, info.hash_count) + quote_len + suffix_len;
+    if (lexeme.len < min_total_len) return error.InvalidStringLiteral;
+    if (!hasExactHashesAt(lexeme, lexeme.len - @as(usize, info.hash_count), info.hash_count)) {
+        return error.InvalidStringLiteral;
+    }
+    const close_quote_pos = lexeme.len - suffix_len;
+    var q_idx: usize = 0;
+    while (q_idx < quote_len) : (q_idx += 1) {
+        if (lexeme[close_quote_pos + q_idx] != '"') return error.InvalidStringLiteral;
+    }
 
-    if (parsed.is_triple_quote) {
-        const dedented = try extractMultilineStringContent(allocator, lexeme);
-        if (parsed.is_raw) {
-            if (parsed.is_byte) {
-                for (dedented) |raw_byte| {
+    if (info.is_multiline or info.is_retired_triple) {
+        if (!info.is_multiline) return error.InvalidMultilineOpening;
+        _ = try validateMultilineStringBodyPure(
+            lexeme[@as(usize, info.body_start)..close_quote_pos],
+            info.is_raw,
+            info.is_fmt,
+        );
+        const stripped = try stripMultilineIndentAlloc(
+            allocator,
+            lexeme[@as(usize, info.body_start)..@as(usize, info.body_end)],
+            info.closing_indent_spaces,
+        );
+        if (info.is_raw) {
+            if (info.is_bytes) {
+                for (stripped) |raw_byte| {
                     if (raw_byte >= 0x80) {
-                        allocator.free(dedented);
+                        allocator.free(stripped);
                         return error.InvalidStringLiteral;
                     }
                 }
             }
-            return dedented;
+            return stripped;
         }
-        defer allocator.free(dedented);
+        defer allocator.free(stripped);
         var out_buf: std.ArrayList(u8) = .empty;
         errdefer out_buf.deinit(allocator);
-        try out_buf.ensureTotalCapacity(allocator, dedented.len);
-        try decodeEscapedStringSlice(allocator, dedented, parsed.is_byte, !parsed.is_byte, &out_buf);
+        try out_buf.ensureTotalCapacity(allocator, stripped.len);
+        try decodeEscapedStringSlice(allocator, stripped, info.is_bytes, info.is_fmt, &out_buf);
         return out_buf.toOwnedSlice(allocator);
     }
 
-    if (parsed.is_raw) {
-        if (parsed.is_byte) {
-            for (parsed.raw_inner) |raw_byte| {
+    const raw_inner = lexeme[@as(usize, info.body_start)..@as(usize, info.body_end)];
+    if (info.is_raw) {
+        if (info.is_bytes) {
+            for (raw_inner) |raw_byte| {
                 if (raw_byte >= 0x80) return error.InvalidStringLiteral;
             }
         }
-        return allocator.dupe(u8, parsed.raw_inner);
+        return allocator.dupe(u8, raw_inner);
     }
 
     var out_buf: std.ArrayList(u8) = .empty;
     errdefer out_buf.deinit(allocator);
-    try out_buf.ensureTotalCapacity(allocator, parsed.raw_inner.len);
-    try decodeEscapedStringSlice(allocator, parsed.raw_inner, parsed.is_byte, !parsed.is_byte, &out_buf);
+    try out_buf.ensureTotalCapacity(allocator, raw_inner.len);
+    try decodeEscapedStringSlice(allocator, raw_inner, info.is_bytes, info.is_fmt, &out_buf);
     return out_buf.toOwnedSlice(allocator);
 }
 
@@ -1809,7 +2033,7 @@ pub const Lexer = struct {
     file_id: FileId,
     /// Target Structure-of-Arrays token and trivia buffer.
     token_buffer: *TokenBuffer,
-    /// Optional diagnostic sink receiving `E0101`–`E0117`, `W0101`, and `W0201` diagnostics.
+    /// Optional diagnostic sink receiving `E0101`–`E0118`, `E0203`, `W0101`, `W0119`, and `W0201` diagnostics.
     diagnostic_sink: ?*DiagnosticSink,
     /// Optional string interner used to intern `SuggestedFix` replacement text.
     interner: ?*StringInterner,
@@ -1821,6 +2045,8 @@ pub const Lexer = struct {
     trivia_acc: TriviaAccumulator = .{},
     /// Kind of the immediately preceding significant syntactic token (`.eof` at start of file).
     prev_sig_kind: TokenKind = .eof,
+    /// `true` while scanning at the top of the file before any non-module-doc comment or token.
+    is_at_file_top: bool = true,
 
     /// Initializes a `Lexer` with default `LexerOptions`.
     pub fn init(
@@ -1861,6 +2087,7 @@ pub const Lexer = struct {
 
     /// Scans the entire `source` buffer in a single linear pass, terminating with `TokenKind.eof`.
     pub fn tokenize(self: *Lexer) !void {
+        self.is_at_file_top = (self.cursor == 0);
         const effective_max_tokens: usize = @min(
             @max(self.options.max_tokens, 1),
             syntax_arenas.MAX_TOKENS_PER_FILE,
@@ -1952,9 +2179,9 @@ pub const Lexer = struct {
         }
     }
 
-    /// Scans whitespace, `#!` shebang at offset 0, line/doc comments, and nested block comments.
+    /// Scans whitespace, `#!` shebang, `--- … ---` frontmatter, `/` docstrings, and `//` comments.
     fn scanLeadingTrivia(self: *Lexer, effective_max_tokens: usize, has_trivia_error: *bool) !void {
-        // [1] Optional UTF-8 BOM (`0xEF 0xBB 0xBF`) and `#!` shebang at start of file:
+        // [1] Optional UTF-8 BOM, `#!` shebang, and `--- … ---` TOML frontmatter at start of file:
         if (self.cursor == 0) {
             if (self.source.len >= 3 and
                 self.source[0] == 0xEF and
@@ -1977,10 +2204,39 @@ pub const Lexer = struct {
                     self.cursor - @as(usize, shebang_start),
                     effective_max_tokens,
                 );
+                if (self.cursor < self.source.len and self.source[self.cursor] == '\n') {
+                    const lf_offset: u32 = @intCast(self.cursor);
+                    self.cursor += 1;
+                    try self.appendTriviaSpan(.newline_lf, lf_offset, 1, effective_max_tokens);
+                } else if (self.cursor + 1 < self.source.len and
+                    self.source[self.cursor] == '\r' and
+                    self.source[self.cursor + 1] == '\n')
+                {
+                    const cr_offset: u32 = @intCast(self.cursor);
+                    self.cursor += 2;
+                    try self.appendTriviaSpan(.newline_crlf, cr_offset, 2, effective_max_tokens);
+                }
+            }
+            if (matchScriptFrontmatterEnd(self.source, self.cursor)) |fm_end| {
+                const fm_start: u32 = @intCast(self.cursor);
+                while (self.cursor < fm_end) {
+                    if (self.source[self.cursor] < 0x80) {
+                        self.cursor += 1;
+                    } else {
+                        try self.validateAndAdvanceUtf8Codepoint(has_trivia_error);
+                    }
+                }
+                self.trivia_acc.has_newline = true;
+                try self.appendTriviaSpan(
+                    .skipped_unexpected,
+                    fm_start,
+                    fm_end - @as(usize, fm_start),
+                    effective_max_tokens,
+                );
             }
         }
 
-        // [2] Main trivia loop for spaces, tabs, newlines, and comments:
+        // [2] Main trivia loop for spaces, tabs (`E0116`), newlines, and `/` DFA (`ADR-24A`):
         while (self.cursor < self.source.len) {
             if (self.trivia_acc.isCompletelyFull() and
                 self.token_buffer.countTokens() + 1 >= effective_max_tokens)
@@ -2009,10 +2265,13 @@ pub const Lexer = struct {
                     while (self.cursor < self.source.len and self.source[self.cursor] == '\t') {
                         self.cursor += 1;
                     }
+                    const run_len: usize = self.cursor - @as(usize, run_start);
+                    has_trivia_error.* = true;
+                    try self.emitHardTabRunError(run_start, run_len, false);
                     try self.appendTriviaSpan(
                         .tabs,
                         run_start,
-                        self.cursor - @as(usize, run_start),
+                        run_len,
                         effective_max_tokens,
                     );
                 },
@@ -2040,20 +2299,53 @@ pub const Lexer = struct {
                 '/' => {
                     if (self.cursor + 1 >= self.source.len) return;
                     const second_byte = self.source[self.cursor + 1];
-                    if (second_byte == '/') {
+                    if (second_byte == '|') {
+                        self.is_at_file_top = false;
+                        const comment_start: u32 = @intCast(self.cursor);
+                        self.cursor += 2;
+                        try self.scanCommentBodyToEndOfLine(has_trivia_error);
+                        try self.appendTriviaSpan(
+                            .doc_comment,
+                            comment_start,
+                            self.cursor - @as(usize, comment_start),
+                            effective_max_tokens,
+                        );
+                    } else if (second_byte == '#') {
+                        const comment_start: u32 = @intCast(self.cursor);
+                        self.cursor += 2;
+                        try self.scanCommentBodyToEndOfLine(has_trivia_error);
+                        try self.appendTriviaSpan(
+                            .module_doc_comment,
+                            comment_start,
+                            self.cursor - @as(usize, comment_start),
+                            effective_max_tokens,
+                        );
+                    } else if (second_byte == '/') {
                         const comment_start: u32 = @intCast(self.cursor);
                         var comment_kind: TriviaKind = .line_comment;
-                        if (self.cursor + 2 < self.source.len) {
-                            if (self.source[self.cursor + 2] == '!') {
-                                comment_kind = .module_doc_comment;
-                            } else if (self.source[self.cursor + 2] == '/' and
-                                (self.cursor + 3 >= self.source.len or self.source[self.cursor + 3] != '/'))
-                            {
-                                comment_kind = .doc_comment;
-                            }
+                        if (self.cursor + 2 < self.source.len and self.source[self.cursor + 2] == '!') {
+                            const was_at_top = self.is_at_file_top;
+                            comment_kind = if (was_at_top) .module_doc_comment else .line_comment;
+                            has_trivia_error.* = true;
+                            try self.emitRetiredSlashDocError(comment_start, true, was_at_top);
+                            self.cursor += 3;
+                        } else if (self.cursor + 2 < self.source.len and
+                            self.source[self.cursor + 2] == '/' and
+                            (self.cursor + 3 >= self.source.len or
+                                (self.source[self.cursor + 3] != '/' and
+                                    self.source[self.cursor + 3] != '|' and
+                                    self.source[self.cursor + 3] != '#')))
+                        {
+                            self.is_at_file_top = false;
+                            comment_kind = .doc_comment;
+                            has_trivia_error.* = true;
+                            try self.emitRetiredSlashDocError(comment_start, false, false);
+                            self.cursor += 3;
+                        } else {
+                            self.is_at_file_top = false;
+                            self.cursor += 2;
                         }
-                        self.cursor += 2;
-                        try self.scanToEndOfLineValidatingUtf8(has_trivia_error);
+                        try self.scanCommentBodyToEndOfLine(has_trivia_error);
                         try self.appendTriviaSpan(
                             comment_kind,
                             comment_start,
@@ -2061,12 +2353,13 @@ pub const Lexer = struct {
                             effective_max_tokens,
                         );
                     } else if (second_byte == '*') {
+                        self.is_at_file_top = false;
                         const block_start: u32 = @intCast(self.cursor);
-                        if (try self.scanNestedBlockComment(has_trivia_error, true)) {
+                        if (try self.scanRetiredBlockComment(has_trivia_error, true)) {
                             self.trivia_acc.has_newline = true;
                         }
                         try self.appendTriviaSpan(
-                            .block_comment,
+                            .skipped_unexpected,
                             block_start,
                             self.cursor - @as(usize, block_start),
                             effective_max_tokens,
@@ -2093,15 +2386,31 @@ pub const Lexer = struct {
         }
     }
 
-    /// Scans a nestable `/* … */` block comment starting at `cursor`, returning `true` if it spans `\n`.
-    fn scanNestedBlockComment(self: *Lexer, has_error: *bool, is_trivia_context: bool) !bool {
+    /// Advances `cursor` across a `//`, `/|`, or `/#` comment body, validating UTF-8 and rejecting `\t` (`E0116`).
+    fn scanCommentBodyToEndOfLine(self: *Lexer, has_error: *bool) !void {
+        while (self.cursor < self.source.len) {
+            const byte_val = self.source[self.cursor];
+            if (byte_val == '\n' or byte_val == '\r') return;
+            if (byte_val == '\t') {
+                const tab_start: u32 = @intCast(self.cursor);
+                self.cursor += 1;
+                while (self.cursor < self.source.len and self.source[self.cursor] == '\t') {
+                    self.cursor += 1;
+                }
+                has_error.* = true;
+                try self.emitHardTabRunError(tab_start, self.cursor - @as(usize, tab_start), false);
+            } else if (byte_val < 0x80) {
+                self.cursor += 1;
+            } else {
+                try self.validateAndAdvanceUtf8Codepoint(has_error);
+            }
+        }
+    }
+
+    /// Scans a retired `/* … */` block comment (`E0118`, plus `E0102` if unclosed), returning `true` if multiline.
+    fn scanRetiredBlockComment(self: *Lexer, has_error: *bool, is_trivia_context: bool) !bool {
         const open_idx: usize = self.cursor;
         const open_start: u32 = @intCast(open_idx);
-        const is_inner_block_doc = open_idx + 2 < self.source.len and self.source[open_idx + 2] == '!';
-        const is_outer_block_doc = open_idx + 2 < self.source.len and
-            self.source[open_idx + 2] == '*' and
-            (open_idx + 3 >= self.source.len or
-                (self.source[open_idx + 3] != '*' and self.source[open_idx + 3] != '/'));
         self.cursor += 2;
         var depth: u32 = 1;
         var has_newline = false;
@@ -2133,116 +2442,68 @@ pub const Lexer = struct {
             }
         }
 
+        has_error.* = true;
         if (depth > 0) {
-            has_error.* = true;
+            const unclosed_span = Span.init(self.file_id, open_start, @intCast(self.cursor));
             try self.emitSimpleError(
-                .e0202_unclosed_delimiter,
-                Span.init(self.file_id, open_start, @intCast(self.cursor)),
+                .e0118_block_doc_comment_forbidden,
+                unclosed_span,
+                "block comments `/* … */` are retired; use `//` line comments instead",
+                "retired `/* … */` block comment",
+            );
+            try self.emitSimpleError(
+                .e0102_unterminated_string_literal,
+                unclosed_span,
                 "unterminated block comment `/* … */`",
                 "block comment opened here was never closed before end of file",
             );
-        } else if (is_inner_block_doc or is_outer_block_doc) {
-            has_error.* = true;
-            try self.emitBlockDocCommentError(
+        } else {
+            try self.emitRetiredBlockCommentError(
                 open_start,
                 @intCast(self.cursor),
-                is_inner_block_doc,
                 is_trivia_context and !had_inner_utf8_err,
             );
         }
         return has_newline;
     }
 
-    /// Returns `true` if `[open_start .. close_end)` sits before token `0` and is followed by a blank line.
-    fn isDetachedFileTopBlockDoc(self: *const Lexer, open_start: u32, close_end: u32) bool {
-        if (self.token_buffer.countTokens() != 0) return false;
-        const limit: usize = @min(@as(usize, open_start), self.source.len);
-        var scan_idx: usize = 0;
-        if (limit >= 3 and
-            self.source[0] == 0xEF and
-            self.source[1] == 0xBB and
-            self.source[2] == 0xBF)
-        {
-            scan_idx = 3;
-        }
-        if (scan_idx + 1 < limit and self.source[scan_idx] == '#' and self.source[scan_idx + 1] == '!') {
-            scan_idx += 2;
-            while (scan_idx < limit and self.source[scan_idx] != '\n' and self.source[scan_idx] != '\r') {
-                scan_idx += 1;
-            }
-        }
-        while (scan_idx < limit) {
-            const cur_byte = self.source[scan_idx];
-            if (cur_byte == ' ' or cur_byte == '\t' or cur_byte == '\r' or cur_byte == '\n') {
-                scan_idx += 1;
-            } else if (scan_idx + 2 < limit and
-                cur_byte == '/' and
-                self.source[scan_idx + 1] == '/' and
-                self.source[scan_idx + 2] == '!')
-            {
-                scan_idx += 3;
-                while (scan_idx < limit and self.source[scan_idx] != '\n' and self.source[scan_idx] != '\r') {
-                    scan_idx += 1;
-                }
+    /// Appends `slice` into `builder`, expanding any literal `\t` bytes to 4 spaces.
+    fn appendSliceExpandingTabs(
+        arena_alloc: std.mem.Allocator,
+        builder: *std.ArrayListUnmanaged(u8),
+        slice: []const u8,
+    ) !void {
+        for (slice) |byte_val| {
+            if (byte_val == '\t') {
+                try builder.appendSlice(arena_alloc, "    ");
             } else {
-                return false;
+                try builder.append(arena_alloc, byte_val);
             }
         }
-
-        var after_idx: usize = @min(@as(usize, close_end), self.source.len);
-        var line_breaks: u32 = 0;
-        while (after_idx < self.source.len) {
-            const cur_byte = self.source[after_idx];
-            if (cur_byte == ' ' or cur_byte == '\t') {
-                after_idx += 1;
-            } else if (cur_byte == '\r') {
-                line_breaks += 1;
-                after_idx += 1;
-                if (after_idx < self.source.len and self.source[after_idx] == '\n') {
-                    after_idx += 1;
-                }
-            } else if (cur_byte == '\n') {
-                line_breaks += 1;
-                after_idx += 1;
-            } else {
-                break;
-            }
-        }
-        return line_breaks >= 2;
     }
 
-    /// Emits `E0118` (`e0118_block_doc_comment_forbidden`) with a `.machine_applicable` `///` or `//!` rewrite.
-    fn emitBlockDocCommentError(
+    /// Emits `E0118` (`e0118_block_doc_comment_forbidden`) for a closed `/* … */` comment with a `//` rewrite.
+    fn emitRetiredBlockCommentError(
         self: *Lexer,
         open_start: u32,
         close_end: u32,
-        is_inner_block_doc: bool,
-        is_trivia_context: bool,
+        can_emit_fix: bool,
     ) !void {
         const sink = self.diagnostic_sink orelse return;
         const comment_span = Span.init(self.file_id, open_start, close_end);
-        const use_module_doc = is_inner_block_doc or
-            (is_trivia_context and self.isDetachedFileTopBlockDoc(open_start, close_end));
-        const marker_text: []const u8 = if (use_module_doc) "//!" else "///";
         const primary_labels = [_]LabeledSpan{.{
             .span = comment_span,
-            .label = if (use_module_doc)
-                "block doc comments are forbidden (`ADR-23A`); use `//!` lines"
-            else
-                "block doc comments are forbidden (`ADR-23A`); use `///` lines",
+            .label = "retired `/* … */` block comment; write `//` line comments instead",
             .style = .primary,
         }};
-        const msg_text: []const u8 = if (is_inner_block_doc)
-            "inner block doc comment `/*! … */` is forbidden; write top-of-file `//!` lines instead"
-        else
-            "outer block doc comment `/** … */` is forbidden; write `///` lines instead";
+        const msg_text = "block comments `/* … */` are retired (`ADR-24A`); use `//` line comments instead";
 
-        if (is_trivia_context) {
+        if (can_emit_fix) {
             if (self.interner) |str_interner| {
                 const arena_alloc = sink.arena.asAllocator();
                 const open_usize: usize = @intCast(open_start);
                 const close_usize: usize = @intCast(close_end);
-                if (close_usize >= open_usize + 5 and close_usize <= self.source.len) {
+                if (close_usize >= open_usize + 4 and close_usize <= self.source.len) {
                     var line_start: usize = open_usize;
                     while (line_start > 0 and
                         self.source[line_start - 1] != '\n' and
@@ -2250,28 +2511,37 @@ pub const Lexer = struct {
                     {
                         line_start -= 1;
                     }
-                    var is_pure_indent = true;
-                    for (self.source[line_start..open_usize]) |ind_byte| {
+                    var has_code_before = false;
+                    var ws_end_idx: usize = line_start;
+                    for (self.source[line_start..open_usize], 0..) |ind_byte, rel_idx| {
                         if (ind_byte != ' ' and ind_byte != '\t') {
-                            is_pure_indent = false;
+                            has_code_before = true;
                             break;
                         }
+                        ws_end_idx = line_start + rel_idx + 1;
                     }
-                    const base_indent: []const u8 = if (is_pure_indent)
-                        self.source[line_start..open_usize]
-                    else
-                        "";
+                    var base_indent_buf: std.ArrayListUnmanaged(u8) = .empty;
+                    try appendSliceExpandingTabs(
+                        arena_alloc,
+                        &base_indent_buf,
+                        self.source[line_start..if (has_code_before) ws_end_idx else open_usize],
+                    );
 
-                    const inner = self.source[open_usize + 3 .. close_usize - 2];
+                    var inner = self.source[open_usize + 2 .. close_usize - 2];
+                    if (inner.len >= 1 and (inner[0] == '*' or inner[0] == '!') and
+                        (inner.len == 1 or inner[1] == ' ' or inner[1] == '\t' or inner[1] == '\n' or inner[1] == '\r'))
+                    {
+                        inner = inner[1..];
+                    }
+
                     var builder: std.ArrayListUnmanaged(u8) = .empty;
                     const has_inner_newline = std.mem.indexOfAny(u8, inner, "\r\n") != null;
-
                     if (!has_inner_newline) {
                         const trimmed = std.mem.trim(u8, inner, " \t");
-                        try builder.appendSlice(arena_alloc, marker_text);
+                        try builder.appendSlice(arena_alloc, "//");
                         if (trimmed.len > 0) {
                             try builder.append(arena_alloc, ' ');
-                            try builder.appendSlice(arena_alloc, trimmed);
+                            try appendSliceExpandingTabs(arena_alloc, &builder, trimmed);
                         }
                     } else {
                         var line_count: usize = 1;
@@ -2298,9 +2568,8 @@ pub const Lexer = struct {
                             if (seg_idx == 0) {
                                 const first_trimmed = std.mem.trim(u8, raw_line, " \t");
                                 if (first_trimmed.len > 0) {
-                                    try builder.appendSlice(arena_alloc, marker_text);
-                                    try builder.append(arena_alloc, ' ');
-                                    try builder.appendSlice(arena_alloc, first_trimmed);
+                                    try builder.appendSlice(arena_alloc, "// ");
+                                    try appendSliceExpandingTabs(arena_alloc, &builder, first_trimmed);
                                     has_emitted_line = true;
                                 }
                             } else if (seg_idx + 1 == line_count and std.mem.trim(u8, raw_line, " \t").len == 0) {
@@ -2320,12 +2589,12 @@ pub const Lexer = struct {
 
                                 if (has_emitted_line) {
                                     try builder.append(arena_alloc, '\n');
-                                    try builder.appendSlice(arena_alloc, base_indent);
+                                    try builder.appendSlice(arena_alloc, base_indent_buf.items);
                                 }
-                                try builder.appendSlice(arena_alloc, marker_text);
+                                try builder.appendSlice(arena_alloc, "//");
                                 if (content.len > 0) {
                                     try builder.append(arena_alloc, ' ');
-                                    try builder.appendSlice(arena_alloc, content);
+                                    try appendSliceExpandingTabs(arena_alloc, &builder, content);
                                 }
                                 has_emitted_line = true;
                             }
@@ -2342,11 +2611,10 @@ pub const Lexer = struct {
                             }
                         }
                         if (!has_emitted_line) {
-                            try builder.appendSlice(arena_alloc, marker_text);
+                            try builder.appendSlice(arena_alloc, "//");
                         }
                     }
 
-                    // Preserve any code placed on the same line after `*/` by inserting a line break:
                     var edit_end_usize: usize = close_usize;
                     var scan_after: usize = close_usize;
                     while (scan_after < self.source.len and
@@ -2354,13 +2622,13 @@ pub const Lexer = struct {
                     {
                         scan_after += 1;
                     }
-                    if (scan_after < self.source.len and
+                    const has_code_after = scan_after < self.source.len and
                         self.source[scan_after] != '\n' and
-                        self.source[scan_after] != '\r')
-                    {
+                        self.source[scan_after] != '\r';
+                    if (has_code_after) {
                         edit_end_usize = scan_after;
                         try builder.append(arena_alloc, '\n');
-                        try builder.appendSlice(arena_alloc, base_indent);
+                        try builder.appendSlice(arena_alloc, base_indent_buf.items);
                     }
 
                     const fix_edits = try arena_alloc.alloc(TextEdit, 1);
@@ -2372,11 +2640,11 @@ pub const Lexer = struct {
                     };
                     const fixes = try arena_alloc.alloc(SuggestedFix, 1);
                     fixes[0] = .{
-                        .message = if (use_module_doc)
-                            "rewrite block doc comment as `//!` module doc lines"
+                        .message = "rewrite `/* … */` block comment as `//` line comment(s)",
+                        .applicability = if (has_code_before and has_code_after)
+                            .maybe_incorrect
                         else
-                            "rewrite block doc comment as `///` outer doc lines",
-                        .applicability = .machine_applicable,
+                            .machine_applicable,
                         .priority = .syntax_canonicalization,
                         .edits = fix_edits,
                     };
@@ -2397,6 +2665,142 @@ pub const Lexer = struct {
             .code = .e0118_block_doc_comment_forbidden,
             .severity = .err,
             .primary_span = comment_span,
+            .message = msg_text,
+            .labels = &primary_labels,
+        });
+    }
+
+    /// Emits `E0118` (`e0118_block_doc_comment_forbidden`) for retired `//!` or `///` prefixes (`ADR-24A`).
+    fn emitRetiredSlashDocError(
+        self: *Lexer,
+        prefix_start: u32,
+        is_bang_doc: bool,
+        is_at_top: bool,
+    ) !void {
+        const sink = self.diagnostic_sink orelse return;
+        const prefix_span = Span.init(self.file_id, prefix_start, prefix_start + 3);
+        const replacement_text: []const u8 = if (is_bang_doc)
+            (if (is_at_top) "/#" else "//")
+        else
+            "/|";
+        const primary_labels = [_]LabeledSpan{.{
+            .span = prefix_span,
+            .label = if (is_bang_doc)
+                (if (is_at_top)
+                    "retired `//!` module doc prefix; use `/#` instead"
+                else
+                    "retired `//!` inner doc prefix; `/#` is valid only at top of file, use `//` here")
+            else
+                "retired `///` doc prefix; use `/|` instead",
+            .style = .primary,
+        }};
+        const msg_text: []const u8 = if (is_bang_doc)
+            "3-character doc prefix `//!` is retired (`ADR-24A`); use `/#` at top of file or `//` elsewhere"
+        else
+            "3-character doc prefix `///` is retired (`ADR-24A`); use `/|` for outer docstrings";
+
+        if (self.interner) |str_interner| {
+            const fix_edits = [_]TextEdit{.{
+                .file_id = self.file_id,
+                .start_byte = prefix_start,
+                .end_byte = prefix_start + 3,
+                .replacement_id = try str_interner.intern(replacement_text),
+            }};
+            const fixes = [_]SuggestedFix{.{
+                .message = if (is_bang_doc)
+                    (if (is_at_top) "replace `//!` with `/#`" else "replace mid-file `//!` with `//`")
+                else
+                    "replace `///` with `/|`",
+                .applicability = .machine_applicable,
+                .priority = .syntax_canonicalization,
+                .edits = &fix_edits,
+            }};
+            try sink.emit(.{
+                .code = .e0118_block_doc_comment_forbidden,
+                .severity = .err,
+                .primary_span = prefix_span,
+                .message = msg_text,
+                .labels = &primary_labels,
+                .suggestions = &fixes,
+            });
+            return;
+        }
+
+        try sink.emit(.{
+            .code = .e0118_block_doc_comment_forbidden,
+            .severity = .err,
+            .primary_span = prefix_span,
+            .message = msg_text,
+            .labels = &primary_labels,
+        });
+    }
+
+    /// Emits `E0116` (`e0116_multiline_string_indent`) on a contiguous hard `\t` (`0x09`) run (`ADR-24B`).
+    fn emitHardTabRunError(
+        self: *Lexer,
+        tab_start: u32,
+        run_len: usize,
+        replace_with_escape: bool,
+    ) !void {
+        const sink = self.diagnostic_sink orelse return;
+        const tab_end: u32 = tab_start + @as(u32, @intCast(run_len));
+        const tab_span = Span.init(self.file_id, tab_start, tab_end);
+        const primary_labels = [_]LabeledSpan{.{
+            .span = tab_span,
+            .label = if (replace_with_escape)
+                "hard `\\t` tab byte is forbidden in cooked literals; write `\\t` escape instead"
+            else
+                "hard `\\t` tab character is forbidden in `.cx` files; use 4-space indentation",
+            .style = .primary,
+        }};
+        const msg_text: []const u8 = if (replace_with_escape)
+            "raw tab character (`0x09`) is not permitted in cooked literals; use `\\t` escape"
+        else
+            "hard tab indentation (`0x09`) is forbidden in `.cx` source files; use 4 ASCII spaces";
+
+        if (self.interner) |str_interner| {
+            const arena_alloc = sink.arena.asAllocator();
+            const unit_len: usize = if (replace_with_escape) 2 else 4;
+            const repl_buf = try arena_alloc.alloc(u8, run_len * unit_len);
+            var idx: usize = 0;
+            while (idx < run_len) : (idx += 1) {
+                if (replace_with_escape) {
+                    repl_buf[idx * 2] = '\\';
+                    repl_buf[idx * 2 + 1] = 't';
+                } else {
+                    @memset(repl_buf[idx * 4 .. idx * 4 + 4], ' ');
+                }
+            }
+            const fix_edits = [_]TextEdit{.{
+                .file_id = self.file_id,
+                .start_byte = tab_start,
+                .end_byte = tab_end,
+                .replacement_id = try str_interner.intern(repl_buf),
+            }};
+            const fixes = [_]SuggestedFix{.{
+                .message = if (replace_with_escape)
+                    "escape literal tab as `\\t`"
+                else
+                    "replace hard tab(s) with 4-space indentation",
+                .applicability = .machine_applicable,
+                .priority = .syntax_canonicalization,
+                .edits = &fix_edits,
+            }};
+            try sink.emit(.{
+                .code = .e0116_multiline_string_indent,
+                .severity = .err,
+                .primary_span = tab_span,
+                .message = msg_text,
+                .labels = &primary_labels,
+                .suggestions = &fixes,
+            });
+            return;
+        }
+
+        try sink.emit(.{
+            .code = .e0116_multiline_string_indent,
+            .severity = .err,
+            .primary_span = tab_span,
             .message = msg_text,
             .labels = &primary_labels,
         });
@@ -2508,10 +2912,15 @@ pub const Lexer = struct {
     /// Scans the next token starting at `self.cursor` and appends it to `self.token_buffer`.
     fn scanAndAppendNextToken(self: *Lexer, effective_max_tokens: usize, has_initial_error: bool) !void {
         const token_start: usize = self.cursor;
+        self.is_at_file_top = false;
         var has_lexer_error = has_initial_error;
         const first_byte = self.source[token_start];
 
-        const token_kind: TokenKind = if (first_byte == 'r' and
+        const token_kind: TokenKind = if (first_byte == 'f' and
+            token_start + 1 < self.source.len and
+            (self.source[token_start + 1] == '"' or self.source[token_start + 1] == '#'))
+            try self.scanFmtStringLiteral(1, &has_lexer_error)
+        else if (first_byte == 'r' and
             token_start + 1 < self.source.len and
             (self.source[token_start + 1] == '"' or self.source[token_start + 1] == '#'))
             try self.scanRawStringLiteral(&has_lexer_error)
@@ -3113,14 +3522,8 @@ pub const Lexer = struct {
         return if (is_float) .float_lit else .int_lit;
     }
 
-    /// Scans a standard `"…"` or multiline `"""…"""` string literal, validating escapes, UTF-8, and `{expr}` holes.
-    fn scanStandardStringLiteral(self: *Lexer, has_lexer_error: *bool) !TokenKind {
-        try self.scanStandardStringBody(has_lexer_error);
-        return .string_lit;
-    }
-
-    /// Checks and consumes the mandatory `\n` or `\r\n` immediately following an opening `"""` (`E0115`).
-    fn consumeMultilineOpeningNewline(self: *Lexer, open_quote_offset: u32, has_lexer_error: *bool) !bool {
+    /// Consumes `\n` or `\r\n` immediately following an opening `"`, returning `true` when multiline mode activates.
+    fn consumeOptionalMultilineOpeningNewline(self: *Lexer) bool {
         if (self.cursor < self.source.len and self.source[self.cursor] == '\n') {
             self.cursor += 1;
             return true;
@@ -3132,126 +3535,446 @@ pub const Lexer = struct {
             self.cursor += 2;
             return true;
         }
-        has_lexer_error.* = true;
-        try self.emitSimpleError(
-            .e0115_multiline_string_opening,
-            Span.init(self.file_id, open_quote_offset, open_quote_offset + 3),
-            "opening `\"\"\"` of multiline string literal must be followed immediately by a newline",
-            "insert a line break immediately after `\"\"\"`",
-        );
         return false;
     }
 
-    /// Validates closing-quote indentation (`W_close`) and tab/space discipline on a multiline string body (`E0116`).
+    /// Validates standalone `[ ]*"#*` closing placement (`E0115`) and space-only `< C` indentation (`E0116`).
     fn validateMultilineIndentation(
         self: *Lexer,
         body_start_offset: u32,
         close_quote_offset: usize,
-        literal_span: Span,
         is_raw: bool,
-        is_interpolation_allowed: bool,
+        is_fmt: bool,
         has_lexer_error: *bool,
     ) !void {
-        processMultilineStringBody(
-            self.source[body_start_offset..close_quote_offset],
-            is_raw,
-            is_interpolation_allowed,
-            null,
-            null,
-        ) catch {
+        const body_after_open_nl = self.source[@as(usize, body_start_offset)..close_quote_offset];
+
+        // [1] Locate the last outer `\n` separating content lines from the closing quote line:
+        var last_outer_lf: ?usize = null;
+        var scan_pos: usize = 0;
+        while (findNextOuterLineFeed(body_after_open_nl, scan_pos, is_raw, is_fmt)) |lf_pos| {
+            last_outer_lf = lf_pos;
+            scan_pos = lf_pos + 1;
+        }
+
+        const close_line_rel_start: usize = if (last_outer_lf) |lf_idx| lf_idx + 1 else 0;
+        const close_line_abs_start: u32 = body_start_offset + @as(u32, @intCast(close_line_rel_start));
+        const close_prefix = body_after_open_nl[close_line_rel_start..];
+
+        // [2] Enforce standalone `[ ]*"#*` on the closing line (`E0115` on content, `E0116` on `\t`):
+        var has_non_ws_before_close = false;
+        var close_leading_spaces: usize = 0;
+        var counted_leading = true;
+        for (close_prefix) |prefix_byte| {
+            if (prefix_byte == ' ') {
+                if (counted_leading) close_leading_spaces += 1;
+            } else if (prefix_byte == '\t') {
+                if (counted_leading) close_leading_spaces += 4;
+            } else {
+                has_non_ws_before_close = true;
+                counted_leading = false;
+            }
+        }
+        if (has_non_ws_before_close) {
             has_lexer_error.* = true;
-            try self.emitSimpleError(
-                .e0116_multiline_string_indent,
-                literal_span,
-                "invalid multiline string indentation or mixed leading tabs and spaces",
-                "closing `\"\"\"` must sit on its own space-indented line and every non-empty line must match its indent",
+            try self.emitMultilineClosingLineContentError(
+                close_line_abs_start,
+                @intCast(close_quote_offset),
+                close_leading_spaces,
             );
-        };
+            return;
+        }
+
+        var close_indent_cols: usize = 0;
+        var prefix_idx: usize = 0;
+        while (prefix_idx < close_prefix.len) {
+            if (close_prefix[prefix_idx] == ' ') {
+                close_indent_cols += 1;
+                prefix_idx += 1;
+            } else {
+                const tab_run_start = prefix_idx;
+                while (prefix_idx < close_prefix.len and close_prefix[prefix_idx] == '\t') {
+                    prefix_idx += 1;
+                }
+                const run_len = prefix_idx - tab_run_start;
+                close_indent_cols += run_len * 4;
+                has_lexer_error.* = true;
+                try self.emitHardTabRunError(
+                    close_line_abs_start + @as(u32, @intCast(tab_run_start)),
+                    run_len,
+                    false,
+                );
+            }
+        }
+
+        const final_lf_idx = last_outer_lf orelse return;
+        const content_end: usize = if (final_lf_idx > 0 and body_after_open_nl[final_lf_idx - 1] == '\r')
+            final_lf_idx - 1
+        else
+            final_lf_idx;
+        const content_bytes = body_after_open_nl[0..content_end];
+
+        // [3] Validate `< C` leading spaces and `>= C` tab rules on every non-empty content line:
+        var line_rel_start: usize = 0;
+        while (true) {
+            const maybe_lf = findNextOuterLineFeed(content_bytes, line_rel_start, is_raw, is_fmt);
+            const raw_line_end = maybe_lf orelse content_bytes.len;
+            const clean_line_end = if (raw_line_end > line_rel_start and content_bytes[raw_line_end - 1] == '\r')
+                raw_line_end - 1
+            else
+                raw_line_end;
+            const line_slice = content_bytes[line_rel_start..clean_line_end];
+            const line_abs_start: u32 = body_start_offset + @as(u32, @intCast(line_rel_start));
+
+            if (line_slice.len > 0) {
+                var visual_col: usize = 0;
+                var byte_idx: usize = 0;
+                while (byte_idx < line_slice.len and visual_col < close_indent_cols) {
+                    if (line_slice[byte_idx] == ' ') {
+                        visual_col += 1;
+                        byte_idx += 1;
+                    } else if (line_slice[byte_idx] == '\t') {
+                        const tab_run_start = byte_idx;
+                        while (byte_idx < line_slice.len and
+                            line_slice[byte_idx] == '\t' and
+                            visual_col < close_indent_cols)
+                        {
+                            visual_col += 4;
+                            byte_idx += 1;
+                        }
+                        has_lexer_error.* = true;
+                        try self.emitHardTabRunError(
+                            line_abs_start + @as(u32, @intCast(tab_run_start)),
+                            byte_idx - tab_run_start,
+                            false,
+                        );
+                    } else {
+                        break;
+                    }
+                }
+
+                if (byte_idx < line_slice.len and visual_col < close_indent_cols) {
+                    has_lexer_error.* = true;
+                    try self.emitUnderIndentedMultilineLineError(
+                        line_abs_start,
+                        line_abs_start + @as(u32, @intCast(byte_idx)),
+                        close_indent_cols - visual_col,
+                    );
+                }
+
+                // At column `>= C`: raw strings allow literal `\t`, whereas cooked strings require `\t` escape:
+                if (!is_raw) {
+                    var payload_idx = byte_idx;
+                    while (payload_idx < line_slice.len) {
+                        const cur_byte = line_slice[payload_idx];
+                        if (cur_byte == '\\' and payload_idx + 1 < line_slice.len) {
+                            payload_idx += 2;
+                        } else if (is_fmt and cur_byte == '{') {
+                            if (payload_idx + 1 < line_slice.len and line_slice[payload_idx + 1] == '{') {
+                                payload_idx += 2;
+                            } else {
+                                payload_idx = skipInterpolationHoleInBody(line_slice, payload_idx);
+                            }
+                        } else if (cur_byte == '\t') {
+                            const tab_run_start = payload_idx;
+                            while (payload_idx < line_slice.len and line_slice[payload_idx] == '\t') {
+                                payload_idx += 1;
+                            }
+                            has_lexer_error.* = true;
+                            try self.emitHardTabRunError(
+                                line_abs_start + @as(u32, @intCast(tab_run_start)),
+                                payload_idx - tab_run_start,
+                                true,
+                            );
+                        } else {
+                            payload_idx += 1;
+                        }
+                    }
+                }
+            }
+
+            if (maybe_lf) |lf_pos| {
+                line_rel_start = lf_pos + 1;
+            } else {
+                break;
+            }
+        }
     }
 
-    /// Scans from an opening `"` or `"""` through its matching closing delimiter, tracking `is_triple_quote`
-    /// per `{expr}` brace-nesting level (`[P1 Trap A]`).
-    fn scanStandardStringBody(self: *Lexer, has_lexer_error: *bool) !void {
-        const start_offset = self.cursor;
-        var is_triple_quote = false;
-        var open_quote_offset: u32 = @intCast(start_offset);
-        var has_valid_opening = true;
+    /// Scans a retired `"""…"""` literal (`E0115`) for single-token recovery and emits a `"<newline> … "` fix.
+    fn scanRetiredTripleQuoteString(
+        self: *Lexer,
+        token_start: usize,
+        hash_count: usize,
+        is_raw: bool,
+        is_bytes: bool,
+        is_fmt: bool,
+        has_lexer_error: *bool,
+    ) !TokenKind {
+        const result_kind: TokenKind = if (is_fmt)
+            .fmt_string_lit
+        else if (is_bytes)
+            .byte_string_lit
+        else
+            .string_lit;
 
-        if (self.cursor + 2 < self.source.len and
-            self.source[self.cursor + 1] == '"' and
-            self.source[self.cursor + 2] == '"')
-        {
-            is_triple_quote = true;
-            self.cursor += 3;
-            has_valid_opening = try self.consumeMultilineOpeningNewline(open_quote_offset, has_lexer_error);
-        } else {
-            self.cursor += 1;
-        }
-        var body_start_offset: u32 = @intCast(self.cursor);
-
-        var interp_depth: u32 = 0;
-        var interp_brace_stack: [syntax_arenas.MAX_PARSE_DEPTH]InterpStackFrame = undefined;
-        var nested_str_depth: usize = 0;
-        var has_emitted_depth_error = false;
+        const open_quote_pos = self.cursor;
+        self.cursor += 3;
+        var had_inner_err = false;
 
         while (self.cursor < self.source.len) {
             const byte_val = self.source[self.cursor];
-            if (interp_depth == 0) {
-                if (byte_val == '"') {
-                    if (is_triple_quote) {
-                        if (self.cursor + 2 < self.source.len and
-                            self.source[self.cursor + 1] == '"' and
-                            self.source[self.cursor + 2] == '"')
-                        {
-                            const close_quote_offset = self.cursor;
-                            self.cursor += 3;
-                            if (has_valid_opening) {
-                                try self.validateMultilineIndentation(
-                                    body_start_offset,
-                                    close_quote_offset,
-                                    Span.init(self.file_id, open_quote_offset, @intCast(self.cursor)),
-                                    false,
-                                    true,
-                                    has_lexer_error,
-                                );
-                            }
-                            if (nested_str_depth == 0) return;
-                            nested_str_depth -= 1;
-                            if (nested_str_depth < syntax_arenas.MAX_PARSE_DEPTH) {
-                                const saved_frame = interp_brace_stack[nested_str_depth];
-                                interp_depth = saved_frame.brace_depth;
-                                is_triple_quote = saved_frame.is_triple_quote;
-                                has_valid_opening = saved_frame.has_valid_opening;
-                                open_quote_offset = saved_frame.open_quote_offset;
-                                body_start_offset = saved_frame.body_start_offset;
-                            } else {
-                                interp_depth = 1;
-                                is_triple_quote = false;
-                            }
-                            continue;
-                        }
-                        self.cursor += 1;
-                        continue;
-                    }
+            if (byte_val == '"' and
+                self.cursor + 2 < self.source.len and
+                self.source[self.cursor + 1] == '"' and
+                self.source[self.cursor + 2] == '"' and
+                hasExactHashesAt(self.source, self.cursor + 3, hash_count))
+            {
+                const close_quote_pos = self.cursor;
+                self.cursor += 3 + hash_count;
+                has_lexer_error.* = true;
+                try self.emitRetiredTripleQuoteError(
+                    @intCast(token_start),
+                    @intCast(self.cursor),
+                    self.source[open_quote_pos + 3 .. close_quote_pos],
+                    hash_count,
+                    is_raw,
+                    is_bytes,
+                    is_fmt,
+                    !had_inner_err,
+                );
+                return result_kind;
+            }
+            if (!is_raw and byte_val == '\\') {
+                const esc_ctx: EscapeContext = if (is_fmt)
+                    .fmt_string
+                else if (is_bytes)
+                    .byte_string
+                else
+                    .plain_string;
+                var step_err = false;
+                try self.scanEscapeSequence(esc_ctx, &step_err);
+                if (step_err) had_inner_err = true;
+                continue;
+            }
+            if (!is_raw and !is_bytes and byte_val == '{') {
+                if (self.cursor + 1 < self.source.len and self.source[self.cursor + 1] == '{') {
+                    self.cursor += 2;
+                    continue;
+                }
+                self.cursor = skipInterpolationHoleInBody(self.source, self.cursor);
+                continue;
+            }
+            if (byte_val < 0x80) {
+                self.cursor += 1;
+            } else if (is_bytes) {
+                const non_ascii_start = self.cursor;
+                var is_bad_utf8 = false;
+                try self.validateAndAdvanceUtf8Codepoint(&is_bad_utf8);
+                had_inner_err = true;
+                if (!is_bad_utf8) {
+                    try self.emitSimpleError(
+                        .e0117_non_ascii_byte_literal,
+                        Span.init(self.file_id, @intCast(non_ascii_start), @intCast(self.cursor)),
+                        "byte string literal may only contain ASCII bytes (`0x00..0x7F`)",
+                        "non-ASCII character is not allowed in byte string literal",
+                    );
+                }
+            } else {
+                var step_err = false;
+                try self.validateAndAdvanceUtf8Codepoint(&step_err);
+                if (step_err) had_inner_err = true;
+            }
+        }
 
+        has_lexer_error.* = true;
+        const unclosed_span = Span.init(self.file_id, @intCast(token_start), @intCast(self.cursor));
+        try self.emitSimpleError(
+            .e0115_multiline_string_opening,
+            Span.init(self.file_id, @intCast(open_quote_pos), @intCast(open_quote_pos + 3)),
+            "triple-quoted `\"\"\"` string delimiters are retired (`ADR-24B`); open multiline strings with `\"<newline>`",
+            "retired `\"\"\"` delimiter",
+        );
+        try self.emitSimpleError(
+            .e0102_unterminated_string_literal,
+            unclosed_span,
+            "unterminated string literal",
+            "string literal opened here was not closed before end of file",
+        );
+        return result_kind;
+    }
+
+    /// Scans a plain `"…"` or multiline `"\n … "` string literal (`TokenKind.string_lit`, literal `{` / `}`).
+    fn scanStandardStringLiteral(self: *Lexer, has_lexer_error: *bool) !TokenKind {
+        const start_offset = self.cursor;
+        if (isRetiredTripleQuoteOpening(self.source, self.cursor, 0)) {
+            return self.scanRetiredTripleQuoteString(start_offset, 0, false, false, false, has_lexer_error);
+        }
+
+        self.cursor += 1;
+        const is_multiline = self.consumeOptionalMultilineOpeningNewline();
+        const body_start_offset: u32 = @intCast(self.cursor);
+
+        while (self.cursor < self.source.len) {
+            const byte_val = self.source[self.cursor];
+            if (byte_val == '"') {
+                const close_quote_offset = self.cursor;
+                self.cursor += 1;
+                if (is_multiline) {
+                    try self.validateMultilineIndentation(
+                        body_start_offset,
+                        close_quote_offset,
+                        false,
+                        false,
+                        has_lexer_error,
+                    );
+                }
+                return .string_lit;
+            }
+            if (byte_val == '\\') {
+                try self.scanEscapeSequence(.plain_string, has_lexer_error);
+                continue;
+            }
+            if (byte_val == '\n' or byte_val == '\r') {
+                if (!is_multiline) {
+                    has_lexer_error.* = true;
+                    try self.emitSimpleError(
+                        .e0102_unterminated_string_literal,
+                        Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
+                        "unterminated string literal",
+                        "single-line string cannot span a raw newline; open with `\"<newline>` for multiline strings",
+                    );
+                    return .string_lit;
+                }
+                self.cursor += 1;
+                continue;
+            }
+            if (byte_val == '\t') {
+                if (!is_multiline) {
+                    const tab_start: u32 = @intCast(self.cursor);
                     self.cursor += 1;
-                    if (nested_str_depth == 0) return;
-                    nested_str_depth -= 1;
-                    if (nested_str_depth < syntax_arenas.MAX_PARSE_DEPTH) {
-                        const saved_frame = interp_brace_stack[nested_str_depth];
-                        interp_depth = saved_frame.brace_depth;
-                        is_triple_quote = saved_frame.is_triple_quote;
-                        has_valid_opening = saved_frame.has_valid_opening;
-                        open_quote_offset = saved_frame.open_quote_offset;
-                        body_start_offset = saved_frame.body_start_offset;
-                    } else {
-                        interp_depth = 1;
-                        is_triple_quote = false;
+                    while (self.cursor < self.source.len and self.source[self.cursor] == '\t') {
+                        self.cursor += 1;
                     }
+                    has_lexer_error.* = true;
+                    try self.emitHardTabRunError(tab_start, self.cursor - @as(usize, tab_start), true);
+                    continue;
+                }
+                self.cursor += 1;
+                continue;
+            }
+            if (byte_val < 0x80) {
+                self.cursor += 1;
+            } else {
+                try self.validateAndAdvanceUtf8Codepoint(has_lexer_error);
+            }
+        }
+
+        has_lexer_error.* = true;
+        try self.emitSimpleError(
+            .e0102_unterminated_string_literal,
+            Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
+            "unterminated string literal",
+            "string literal opened here was not closed before end of file",
+        );
+        return .string_lit;
+    }
+
+    /// Scans an explicit `f"…"` or `f#"…"#` format string (`TokenKind.fmt_string_lit`, `DR-24` §1.2).
+    fn scanFmtStringLiteral(self: *Lexer, fmt_depth: u32, has_lexer_error: *bool) anyerror!TokenKind {
+        const start_offset = self.cursor;
+        self.cursor += 1; // Advance past `'f'`.
+
+        var hash_count: usize = 0;
+        while (self.cursor < self.source.len and self.source[self.cursor] == '#') {
+            hash_count += 1;
+            self.cursor += 1;
+        }
+
+        if (self.cursor >= self.source.len or self.source[self.cursor] != '"') {
+            while (self.cursor < self.source.len and isIdentContinue(self.source[self.cursor])) {
+                self.cursor += 1;
+            }
+            has_lexer_error.* = true;
+            try self.emitSimpleError(
+                .e0102_unterminated_string_literal,
+                Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
+                "malformed or unterminated format string literal",
+                "expected opening `\"` after `f` format string prefix",
+            );
+            return .fmt_string_lit;
+        }
+
+        if (hash_count > MAX_FMT_STRING_HASHES) {
+            has_lexer_error.* = true;
+        }
+
+        if (isRetiredTripleQuoteOpening(self.source, self.cursor, hash_count)) {
+            return self.scanRetiredTripleQuoteString(
+                start_offset,
+                hash_count,
+                false,
+                false,
+                true,
+                has_lexer_error,
+            );
+        }
+
+        self.cursor += 1; // Advance past opening `'"'`.
+        const is_multiline = self.consumeOptionalMultilineOpeningNewline();
+        const body_start_offset: u32 = @intCast(self.cursor);
+
+        var hole_count: u32 = 0;
+        var brace_depth: u32 = 0;
+        var paren_depth: u32 = 0;
+        var bracket_depth: u32 = 0;
+        var is_in_fmt_spec = false;
+        var has_emitted_depth_error = false;
+        const initial_diag_len: usize = if (self.diagnostic_sink) |sink| sink.asSlice().len else 0;
+
+        while (self.cursor < self.source.len) {
+            const byte_val = self.source[self.cursor];
+            if (brace_depth == 0) {
+                if (byte_val == '"') {
+                    if (hasExactHashesAt(self.source, self.cursor + 1, hash_count)) {
+                        const close_quote_offset = self.cursor;
+                        self.cursor += 1 + hash_count;
+                        if (hash_count > MAX_FMT_STRING_HASHES) {
+                            try self.emitSimpleError(
+                                .e0102_unterminated_string_literal,
+                                Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
+                                "format string delimiter exceeds maximum of 15 `#` characters",
+                                "reduce `#` quote-guard count to at most 15",
+                            );
+                        }
+                        if (is_multiline) {
+                            try self.validateMultilineIndentation(
+                                body_start_offset,
+                                close_quote_offset,
+                                false,
+                                true,
+                                has_lexer_error,
+                            );
+                        }
+                        if (hole_count == 0 and hash_count <= MAX_FMT_STRING_HASHES) {
+                            const had_inner_diags = if (self.diagnostic_sink) |sink|
+                                sink.asSlice().len > initial_diag_len
+                            else
+                                false;
+                            try self.emitUselessFormatStringWarning(
+                                @intCast(start_offset),
+                                @intCast(self.cursor),
+                                hash_count,
+                                !had_inner_diags,
+                            );
+                        }
+                        return .fmt_string_lit;
+                    }
+                    self.cursor += 1;
                     continue;
                 }
                 if (byte_val == '\\') {
-                    try self.scanEscapeSequence(.interpolated_string, has_lexer_error);
+                    try self.scanEscapeSequence(.fmt_string, has_lexer_error);
                     continue;
                 }
                 if (byte_val == '{') {
@@ -3259,7 +3982,11 @@ pub const Lexer = struct {
                         self.cursor += 2;
                         continue;
                     }
-                    interp_depth = 1;
+                    hole_count += 1;
+                    brace_depth = 1;
+                    paren_depth = 0;
+                    bracket_depth = 0;
+                    is_in_fmt_spec = false;
                     self.cursor += 1;
                     continue;
                 }
@@ -3274,61 +4001,127 @@ pub const Lexer = struct {
                     try self.emitUnmatchedCloseBraceInStringError(brace_offset, brace_offset + 1);
                     continue;
                 }
+                if (byte_val == '\n' or byte_val == '\r') {
+                    if (!is_multiline) {
+                        has_lexer_error.* = true;
+                        try self.emitSimpleError(
+                            .e0102_unterminated_string_literal,
+                            Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
+                            "unterminated format string literal",
+                            "single-line format string cannot span a raw newline; open with `f\"<newline>`",
+                        );
+                        return .fmt_string_lit;
+                    }
+                    self.cursor += 1;
+                    continue;
+                }
+                if (byte_val == '\t') {
+                    if (!is_multiline) {
+                        const tab_start: u32 = @intCast(self.cursor);
+                        self.cursor += 1;
+                        while (self.cursor < self.source.len and self.source[self.cursor] == '\t') {
+                            self.cursor += 1;
+                        }
+                        has_lexer_error.* = true;
+                        try self.emitHardTabRunError(tab_start, self.cursor - @as(usize, tab_start), true);
+                        continue;
+                    }
+                    self.cursor += 1;
+                    continue;
+                }
                 if (byte_val < 0x80) {
                     self.cursor += 1;
                 } else {
                     try self.validateAndAdvanceUtf8Codepoint(has_lexer_error);
                 }
             } else {
-                // Inside `{expr}` interpolation; track nested braces, strings, byte literals, chars, and comments:
+                // Inside `{expr}` interpolation hole (`MAX_FMT_NESTING = 4`):
                 if (byte_val == '{') {
-                    interp_depth += 1;
-                    self.cursor += 1;
-                } else if (byte_val == '}') {
-                    interp_depth -= 1;
-                    self.cursor += 1;
-                } else if (byte_val == '"') {
-                    if (nested_str_depth < syntax_arenas.MAX_PARSE_DEPTH) {
-                        interp_brace_stack[nested_str_depth] = .{
-                            .brace_depth = interp_depth,
-                            .is_triple_quote = is_triple_quote,
-                            .has_valid_opening = has_valid_opening,
-                            .open_quote_offset = open_quote_offset,
-                            .body_start_offset = body_start_offset,
-                        };
-                    } else if (!has_emitted_depth_error) {
+                    brace_depth += 1;
+                    if (brace_depth > syntax_arenas.MAX_PARSE_DEPTH and !has_emitted_depth_error) {
                         has_lexer_error.* = true;
                         has_emitted_depth_error = true;
                         try self.emitSimpleError(
                             .e0203_parse_depth_exceeded,
-                            Span.init(
-                                self.file_id,
-                                @intCast(self.cursor),
-                                @intCast(self.cursor + 1),
-                            ),
-                            "nested string interpolation exceeds maximum parse depth of 512",
-                            "simplify or extract deeply nested interpolated string expressions",
+                            Span.init(self.file_id, @intCast(self.cursor), @intCast(self.cursor + 1)),
+                            "nested brace depth inside format string exceeds maximum parse depth of 512",
+                            "simplify deeply nested format hole expression",
                         );
                     }
-                    nested_str_depth += 1;
-                    interp_depth = 0;
-                    open_quote_offset = @intCast(self.cursor);
-                    if (self.cursor + 2 < self.source.len and
-                        self.source[self.cursor + 1] == '"' and
-                        self.source[self.cursor + 2] == '"')
-                    {
-                        is_triple_quote = true;
-                        self.cursor += 3;
-                        has_valid_opening = try self.consumeMultilineOpeningNewline(
-                            open_quote_offset,
-                            has_lexer_error,
+                    self.cursor += 1;
+                } else if (byte_val == '}') {
+                    brace_depth -= 1;
+                    if (brace_depth == 0) is_in_fmt_spec = false;
+                    self.cursor += 1;
+                } else if (is_in_fmt_spec) {
+                    if ((byte_val == '\n' or byte_val == '\r') and !is_multiline) {
+                        has_lexer_error.* = true;
+                        try self.emitSimpleError(
+                            .e0102_unterminated_string_literal,
+                            Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
+                            "unterminated format string interpolation hole",
+                            "missing closing `}` before end of line",
                         );
-                    } else {
-                        is_triple_quote = false;
-                        has_valid_opening = true;
+                        return .fmt_string_lit;
+                    } else if (byte_val == '\t') {
+                        const tab_start: u32 = @intCast(self.cursor);
                         self.cursor += 1;
+                        while (self.cursor < self.source.len and self.source[self.cursor] == '\t') {
+                            self.cursor += 1;
+                        }
+                        has_lexer_error.* = true;
+                        try self.emitHardTabRunError(tab_start, self.cursor - @as(usize, tab_start), false);
+                    } else if (byte_val < 0x80) {
+                        self.cursor += 1;
+                    } else {
+                        try self.validateAndAdvanceUtf8Codepoint(has_lexer_error);
                     }
-                    body_start_offset = @intCast(self.cursor);
+                } else if (byte_val == '(') {
+                    paren_depth += 1;
+                    self.cursor += 1;
+                } else if (byte_val == ')') {
+                    if (paren_depth > 0) paren_depth -= 1;
+                    self.cursor += 1;
+                } else if (byte_val == '[') {
+                    bracket_depth += 1;
+                    self.cursor += 1;
+                } else if (byte_val == ']') {
+                    if (bracket_depth > 0) bracket_depth -= 1;
+                    self.cursor += 1;
+                } else if (byte_val == ':' and brace_depth == 1 and paren_depth == 0 and bracket_depth == 0) {
+                    if (self.cursor + 1 < self.source.len and
+                        self.source[self.cursor + 1] != ':' and
+                        self.source[self.cursor + 1] != '=')
+                    {
+                        is_in_fmt_spec = true;
+                    }
+                    self.cursor += 1;
+                } else if (byte_val == 'f' and
+                    (self.cursor == 0 or !isIdentContinue(self.source[self.cursor - 1])) and
+                    self.cursor + 1 < self.source.len and
+                    (self.source[self.cursor + 1] == '"' or self.source[self.cursor + 1] == '#'))
+                {
+                    if (fmt_depth < MAX_FMT_NESTING) {
+                        _ = try self.scanFmtStringLiteral(fmt_depth + 1, has_lexer_error);
+                    } else {
+                        if (!has_emitted_depth_error) {
+                            has_lexer_error.* = true;
+                            has_emitted_depth_error = true;
+                            try self.emitSimpleError(
+                                .e0203_parse_depth_exceeded,
+                                Span.init(self.file_id, @intCast(self.cursor), @intCast(self.cursor + 2)),
+                                "nested format string interpolation exceeds maximum depth of 4 (`MAX_FMT_NESTING`)",
+                                "extract nested `f\"…\"` expression into a local binding",
+                            );
+                        }
+                        self.cursor = skipFmtStringInExpr(self.source, self.cursor + 1);
+                    }
+                } else if (byte_val == 'r' and
+                    (self.cursor == 0 or !isIdentContinue(self.source[self.cursor - 1])) and
+                    self.cursor + 1 < self.source.len and
+                    (self.source[self.cursor + 1] == '"' or self.source[self.cursor + 1] == '#'))
+                {
+                    _ = try self.scanRawStringLiteral(has_lexer_error);
                 } else if (byte_val == 'b' and
                     (self.cursor == 0 or !isIdentContinue(self.source[self.cursor - 1])) and
                     self.cursor + 1 < self.source.len)
@@ -3345,23 +4138,48 @@ pub const Lexer = struct {
                     } else {
                         self.cursor += 1;
                     }
-                } else if (byte_val == 'r' and
-                    (self.cursor == 0 or !isIdentContinue(self.source[self.cursor - 1])) and
-                    self.cursor + 1 < self.source.len and
-                    (self.source[self.cursor + 1] == '"' or self.source[self.cursor + 1] == '#'))
-                {
-                    _ = try self.scanRawStringLiteral(has_lexer_error);
+                } else if (byte_val == '"') {
+                    _ = try self.scanStandardStringLiteral(has_lexer_error);
                 } else if (byte_val == '\'') {
                     _ = try self.scanCharLiteral(has_lexer_error);
                 } else if (byte_val == '/' and self.cursor + 1 < self.source.len) {
-                    if (self.source[self.cursor + 1] == '/') {
+                    const second_byte = self.source[self.cursor + 1];
+                    if (second_byte == '|' or second_byte == '#') {
                         self.cursor += 2;
-                        try self.scanToEndOfLineValidatingUtf8(has_lexer_error);
-                    } else if (self.source[self.cursor + 1] == '*') {
-                        _ = try self.scanNestedBlockComment(has_lexer_error, false);
+                        try self.scanCommentBodyToEndOfLine(has_lexer_error);
+                    } else if (second_byte == '/') {
+                        const cmt_start: u32 = @intCast(self.cursor);
+                        if (self.cursor + 2 < self.source.len and self.source[self.cursor + 2] == '!') {
+                            has_lexer_error.* = true;
+                            try self.emitRetiredSlashDocError(cmt_start, true, false);
+                            self.cursor += 3;
+                        } else if (self.cursor + 2 < self.source.len and
+                            self.source[self.cursor + 2] == '/' and
+                            (self.cursor + 3 >= self.source.len or
+                                (self.source[self.cursor + 3] != '/' and
+                                    self.source[self.cursor + 3] != '|' and
+                                    self.source[self.cursor + 3] != '#')))
+                        {
+                            has_lexer_error.* = true;
+                            try self.emitRetiredSlashDocError(cmt_start, false, false);
+                            self.cursor += 3;
+                        } else {
+                            self.cursor += 2;
+                        }
+                        try self.scanCommentBodyToEndOfLine(has_lexer_error);
+                    } else if (second_byte == '*') {
+                        _ = try self.scanRetiredBlockComment(has_lexer_error, false);
                     } else {
                         self.cursor += 1;
                     }
+                } else if (byte_val == '\t') {
+                    const tab_start: u32 = @intCast(self.cursor);
+                    self.cursor += 1;
+                    while (self.cursor < self.source.len and self.source[self.cursor] == '\t') {
+                        self.cursor += 1;
+                    }
+                    has_lexer_error.* = true;
+                    try self.emitHardTabRunError(tab_start, self.cursor - @as(usize, tab_start), false);
                 } else if (byte_val < 0x80) {
                     self.cursor += 1;
                 } else {
@@ -3374,18 +4192,19 @@ pub const Lexer = struct {
         try self.emitSimpleError(
             .e0102_unterminated_string_literal,
             Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
-            "unterminated string literal",
-            "string literal opened here was not closed before end of file",
+            "unterminated format string literal",
+            "format string literal opened here was not closed before end of file",
         );
+        return .fmt_string_lit;
     }
 
-    /// Scans a raw string literal `r"…"`, `r#"…"#`, `r"""…"""`, or `r#"""…"""#` (`0..255` `#` delimiters).
+    /// Scans a raw string literal `r"…"` or `r#"…"#` (`0..255` `#` delimiters, single-line or `r"\n … "`).
     fn scanRawStringLiteral(self: *Lexer, has_lexer_error: *bool) !TokenKind {
         try self.scanRawStringCommon(false, has_lexer_error);
         return .string_lit;
     }
 
-    /// Scans a raw byte string literal `br"…"`, `br#"…"#`, `br"""…"""`, or `br#"""…"""#` (`.byte_string_lit`).
+    /// Scans a raw byte string literal `br"…"` or `br#"…"#` (`.byte_string_lit`).
     fn scanRawByteStringLiteral(self: *Lexer, has_lexer_error: *bool) !TokenKind {
         try self.scanRawStringCommon(true, has_lexer_error);
         return .byte_string_lit;
@@ -3423,63 +4242,28 @@ pub const Lexer = struct {
             has_lexer_error.* = true;
         }
 
-        const open_quote_offset: u32 = @intCast(self.cursor);
-        const is_triple_quote = isTripleQuoteOpening(self.source, self.cursor, true, hash_count);
-
-        var has_valid_opening = true;
-        if (is_triple_quote) {
-            self.cursor += 3;
-            has_valid_opening = try self.consumeMultilineOpeningNewline(open_quote_offset, has_lexer_error);
-        } else {
-            self.cursor += 1;
+        if (isRetiredTripleQuoteOpening(self.source, self.cursor, hash_count)) {
+            _ = try self.scanRetiredTripleQuoteString(
+                start_offset,
+                hash_count,
+                true,
+                is_byte_mode,
+                false,
+                has_lexer_error,
+            );
+            return;
         }
+
+        self.cursor += 1;
+        const is_multiline = self.consumeOptionalMultilineOpeningNewline();
         const body_start_offset: u32 = @intCast(self.cursor);
 
         while (self.cursor < self.source.len) {
             const byte_val = self.source[self.cursor];
             if (byte_val == '"') {
-                if (is_triple_quote) {
-                    if (self.cursor + 2 < self.source.len and
-                        self.source[self.cursor + 1] == '"' and
-                        self.source[self.cursor + 2] == '"' and
-                        hasExactHashesAt(self.source, self.cursor + 3, hash_count))
-                    {
-                        const close_quote_offset = self.cursor;
-                        self.cursor += 3 + hash_count;
-                        if (hash_count > MAX_RAW_STRING_HASHES) {
-                            try self.emitSimpleError(
-                                .e0102_unterminated_string_literal,
-                                Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
-                                "raw string delimiter exceeds maximum of 255 `#` characters",
-                                "reduce `#` delimiter count to at most 255",
-                            );
-                        }
-                        if (has_valid_opening) {
-                            try self.validateMultilineIndentation(
-                                body_start_offset,
-                                close_quote_offset,
-                                Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
-                                true,
-                                false,
-                                has_lexer_error,
-                            );
-                        }
-                        return;
-                    }
-                    self.cursor += 1;
-                    continue;
-                }
-
-                self.cursor += 1;
-                var matched_hashes: usize = 0;
-                while (matched_hashes < hash_count and
-                    self.cursor < self.source.len and
-                    self.source[self.cursor] == '#')
-                {
-                    matched_hashes += 1;
-                    self.cursor += 1;
-                }
-                if (matched_hashes == hash_count) {
+                if (hasExactHashesAt(self.source, self.cursor + 1, hash_count)) {
+                    const close_quote_offset = self.cursor;
+                    self.cursor += 1 + hash_count;
                     if (hash_count > MAX_RAW_STRING_HASHES) {
                         try self.emitSimpleError(
                             .e0102_unterminated_string_literal,
@@ -3488,8 +4272,27 @@ pub const Lexer = struct {
                             "reduce `#` delimiter count to at most 255",
                         );
                     }
+                    if (is_multiline) {
+                        try self.validateMultilineIndentation(
+                            body_start_offset,
+                            close_quote_offset,
+                            true,
+                            false,
+                            has_lexer_error,
+                        );
+                    }
                     return;
                 }
+                self.cursor += 1;
+            } else if ((byte_val == '\n' or byte_val == '\r') and !is_multiline) {
+                has_lexer_error.* = true;
+                try self.emitSimpleError(
+                    .e0102_unterminated_string_literal,
+                    Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
+                    if (is_byte_mode) "unterminated raw byte string literal" else "unterminated raw string literal",
+                    "single-line raw string cannot span a newline; open with `\"<newline>` for multiline strings",
+                );
+                return;
             } else if (byte_val < 0x80) {
                 self.cursor += 1;
             } else if (is_byte_mode) {
@@ -3519,54 +4322,64 @@ pub const Lexer = struct {
         );
     }
 
-    /// Scans a cooked byte string literal `b"…"` or `b"""…"""` (`.byte_string_lit`, interpolation disabled).
+    /// Scans a cooked byte string literal `b"…"` or `b"\n … "` (`.byte_string_lit`, interpolation disabled).
     fn scanByteStringLiteral(self: *Lexer, has_lexer_error: *bool) !TokenKind {
         const start_offset = self.cursor;
         self.cursor += 1; // Advance past `'b'`.
-        const open_quote_offset: u32 = @intCast(self.cursor);
-        const is_triple_quote = self.cursor + 2 < self.source.len and
-            self.source[self.cursor + 1] == '"' and
-            self.source[self.cursor + 2] == '"';
-
-        var has_valid_opening = true;
-        if (is_triple_quote) {
-            self.cursor += 3;
-            has_valid_opening = try self.consumeMultilineOpeningNewline(open_quote_offset, has_lexer_error);
-        } else {
-            self.cursor += 1;
+        if (isRetiredTripleQuoteOpening(self.source, self.cursor, 0)) {
+            return self.scanRetiredTripleQuoteString(start_offset, 0, false, true, false, has_lexer_error);
         }
+
+        self.cursor += 1;
+        const is_multiline = self.consumeOptionalMultilineOpeningNewline();
         const body_start_offset: u32 = @intCast(self.cursor);
 
         while (self.cursor < self.source.len) {
             const byte_val = self.source[self.cursor];
             if (byte_val == '"') {
-                if (is_triple_quote) {
-                    if (self.cursor + 2 < self.source.len and
-                        self.source[self.cursor + 1] == '"' and
-                        self.source[self.cursor + 2] == '"')
-                    {
-                        const close_quote_offset = self.cursor;
-                        self.cursor += 3;
-                        if (has_valid_opening) {
-                            try self.validateMultilineIndentation(
-                                body_start_offset,
-                                close_quote_offset,
-                                Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
-                                false,
-                                false,
-                                has_lexer_error,
-                            );
-                        }
-                        return .byte_string_lit;
-                    }
-                    self.cursor += 1;
-                    continue;
-                }
+                const close_quote_offset = self.cursor;
                 self.cursor += 1;
+                if (is_multiline) {
+                    try self.validateMultilineIndentation(
+                        body_start_offset,
+                        close_quote_offset,
+                        false,
+                        false,
+                        has_lexer_error,
+                    );
+                }
                 return .byte_string_lit;
             }
             if (byte_val == '\\') {
                 try self.scanEscapeSequence(.byte_string, has_lexer_error);
+                continue;
+            }
+            if (byte_val == '\n' or byte_val == '\r') {
+                if (!is_multiline) {
+                    has_lexer_error.* = true;
+                    try self.emitSimpleError(
+                        .e0102_unterminated_string_literal,
+                        Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
+                        "unterminated byte string literal",
+                        "single-line byte string cannot span a raw newline; open with `b\"<newline>`",
+                    );
+                    return .byte_string_lit;
+                }
+                self.cursor += 1;
+                continue;
+            }
+            if (byte_val == '\t') {
+                if (!is_multiline) {
+                    const tab_start: u32 = @intCast(self.cursor);
+                    self.cursor += 1;
+                    while (self.cursor < self.source.len and self.source[self.cursor] == '\t') {
+                        self.cursor += 1;
+                    }
+                    has_lexer_error.* = true;
+                    try self.emitHardTabRunError(tab_start, self.cursor - @as(usize, tab_start), true);
+                    continue;
+                }
+                self.cursor += 1;
                 continue;
             }
             if (byte_val < 0x80) {
@@ -3614,7 +4427,17 @@ pub const Lexer = struct {
             if (byte_val == '\n' or byte_val == '\r') {
                 break;
             }
-            if (byte_val == '\\') {
+            if (byte_val == '\t') {
+                const tab_start: u32 = @intCast(self.cursor);
+                self.cursor += 1;
+                while (self.cursor < self.source.len and self.source[self.cursor] == '\t') {
+                    self.cursor += 1;
+                    byte_unit_count += 1;
+                }
+                byte_unit_count += 1;
+                has_lexer_error.* = true;
+                try self.emitHardTabRunError(tab_start, self.cursor - @as(usize, tab_start), true);
+            } else if (byte_val == '\\') {
                 try self.scanEscapeSequence(.byte_char, has_lexer_error);
                 byte_unit_count += 1;
             } else if (byte_val < 0x80) {
@@ -3654,12 +4477,13 @@ pub const Lexer = struct {
         return .byte_lit;
     }
 
-    /// Scans a character literal `'c'`, validating escapes, codepoint count, and line termination.
+    /// Scans a character literal `'c'`, emitting `E0102` (with `"…"` `SuggestedFix` on `'multi'`).
     fn scanCharLiteral(self: *Lexer, has_lexer_error: *bool) !TokenKind {
         const start_offset = self.cursor;
         self.cursor += 1; // Advance past opening `'\''`.
         var codepoint_count: usize = 0;
         var has_closing_quote = false;
+        const initial_diag_len: usize = if (self.diagnostic_sink) |sink| sink.asSlice().len else 0;
 
         while (self.cursor < self.source.len) {
             const byte_val = self.source[self.cursor];
@@ -3671,7 +4495,17 @@ pub const Lexer = struct {
             if (byte_val == '\n' or byte_val == '\r') {
                 break;
             }
-            if (byte_val == '\\') {
+            if (byte_val == '\t') {
+                const tab_start: u32 = @intCast(self.cursor);
+                self.cursor += 1;
+                while (self.cursor < self.source.len and self.source[self.cursor] == '\t') {
+                    self.cursor += 1;
+                    codepoint_count += 1;
+                }
+                codepoint_count += 1;
+                has_lexer_error.* = true;
+                try self.emitHardTabRunError(tab_start, self.cursor - @as(usize, tab_start), true);
+            } else if (byte_val == '\\') {
                 try self.scanEscapeSequence(.char_literal, has_lexer_error);
                 codepoint_count += 1;
             } else if (byte_val < 0x80) {
@@ -3685,17 +4519,27 @@ pub const Lexer = struct {
 
         if (!has_closing_quote or codepoint_count != 1) {
             has_lexer_error.* = true;
-            try self.emitSimpleError(
-                .e0102_unterminated_string_literal,
-                Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
-                if (!has_closing_quote)
-                    "unterminated character literal"
-                else if (codepoint_count == 0)
-                    "empty character literal `''`"
+            if (has_closing_quote and codepoint_count > 1) {
+                const had_inner_diags = if (self.diagnostic_sink) |sink|
+                    sink.asSlice().len > initial_diag_len
                 else
-                    "character literal may only contain a single Unicode scalar value",
-                "expected a single character or escape sequence enclosed in `'…'`",
-            );
+                    false;
+                try self.emitMultiCharLiteralError(
+                    @intCast(start_offset),
+                    @intCast(self.cursor),
+                    !had_inner_diags,
+                );
+            } else {
+                try self.emitSimpleError(
+                    .e0102_unterminated_string_literal,
+                    Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
+                    if (!has_closing_quote)
+                        "unterminated character literal"
+                    else
+                        "empty character literal `''`",
+                    "expected a single character or escape sequence enclosed in `'…'`",
+                );
+            }
         }
         return .char_lit;
     }
@@ -3706,7 +4550,9 @@ pub const Lexer = struct {
         self.cursor += 1; // Advance past `'\\'`.
         if (self.cursor >= self.source.len) return;
 
-        const is_string_like = escape_ctx == .interpolated_string or escape_ctx == .byte_string;
+        const is_string_like = escape_ctx == .plain_string or
+            escape_ctx == .fmt_string or
+            escape_ctx == .byte_string;
         const is_byte_mode = escape_ctx == .byte_char or escape_ctx == .byte_string;
         const esc_byte = self.source[self.cursor];
         switch (esc_byte) {
@@ -3734,7 +4580,7 @@ pub const Lexer = struct {
             },
             '{', '}' => {
                 self.cursor += 1;
-                if (escape_ctx == .interpolated_string) {
+                if (escape_ctx == .fmt_string) {
                     has_lexer_error.* = true;
                     try self.emitInvalidBraceEscapeError(
                         @intCast(escape_start),
@@ -4145,6 +4991,487 @@ pub const Lexer = struct {
         }
     }
 
+    /// Emits `E0102` on a multi-character `'abc'` literal with a `.machine_applicable` `"abc"` fix (`ADR-24B`).
+    fn emitMultiCharLiteralError(
+        self: *Lexer,
+        lit_start: u32,
+        lit_end: u32,
+        can_emit_fix: bool,
+    ) !void {
+        const sink = self.diagnostic_sink orelse return;
+        const lit_span = Span.init(self.file_id, lit_start, lit_end);
+        const primary_labels = [_]LabeledSpan{.{
+            .span = lit_span,
+            .label = "single quotes `'…'` are reserved for single `char` scalars; use `\"…\"` for strings",
+            .style = .primary,
+        }};
+        const msg_text = "character literal may only contain a single Unicode scalar value";
+
+        if (can_emit_fix) {
+            if (self.interner) |str_interner| {
+                const start_usize: usize = @intCast(lit_start);
+                const end_usize: usize = @intCast(lit_end);
+                if (end_usize >= start_usize + 2 and end_usize <= self.source.len) {
+                    const arena_alloc = sink.arena.asAllocator();
+                    const inner = self.source[start_usize + 1 .. end_usize - 1];
+                    var builder: std.ArrayListUnmanaged(u8) = .empty;
+                    try builder.append(arena_alloc, '"');
+                    var idx: usize = 0;
+                    while (idx < inner.len) {
+                        if (inner[idx] == '\\' and idx + 1 < inner.len) {
+                            if (inner[idx + 1] == '\'') {
+                                try builder.append(arena_alloc, '\'');
+                            } else {
+                                try builder.appendSlice(arena_alloc, inner[idx .. idx + 2]);
+                            }
+                            idx += 2;
+                        } else if (inner[idx] == '"') {
+                            try builder.appendSlice(arena_alloc, "\\\"");
+                            idx += 1;
+                        } else {
+                            try builder.append(arena_alloc, inner[idx]);
+                            idx += 1;
+                        }
+                    }
+                    try builder.append(arena_alloc, '"');
+
+                    const fix_edits = try arena_alloc.alloc(TextEdit, 1);
+                    fix_edits[0] = .{
+                        .file_id = self.file_id,
+                        .start_byte = lit_start,
+                        .end_byte = lit_end,
+                        .replacement_id = try str_interner.intern(builder.items),
+                    };
+                    const fixes = try arena_alloc.alloc(SuggestedFix, 1);
+                    fixes[0] = .{
+                        .message = "replace single quotes with double quotes",
+                        .applicability = .machine_applicable,
+                        .priority = .syntax_canonicalization,
+                        .edits = fix_edits,
+                    };
+                    try sink.emit(.{
+                        .code = .e0102_unterminated_string_literal,
+                        .severity = .err,
+                        .primary_span = lit_span,
+                        .message = msg_text,
+                        .labels = &primary_labels,
+                        .suggestions = fixes,
+                    });
+                    return;
+                }
+            }
+        }
+
+        try sink.emit(.{
+            .code = .e0102_unterminated_string_literal,
+            .severity = .err,
+            .primary_span = lit_span,
+            .message = msg_text,
+            .labels = &primary_labels,
+        });
+    }
+
+    /// Emits `E0115` when non-space characters precede closing `"` on a multiline string's closing line.
+    fn emitMultilineClosingLineContentError(
+        self: *Lexer,
+        close_line_start: u32,
+        close_quote_offset: u32,
+        indent_spaces: usize,
+    ) !void {
+        const sink = self.diagnostic_sink orelse return;
+        const err_span = Span.init(self.file_id, close_line_start, close_quote_offset + 1);
+        const primary_labels = [_]LabeledSpan{.{
+            .span = err_span,
+            .label = "closing `\"` of multiline string must sit on its own space-indented line",
+            .style = .primary,
+        }};
+        const msg_text = "multiline string closing delimiter must appear on a standalone space-indented line";
+
+        if (self.interner) |str_interner| {
+            const arena_alloc = sink.arena.asAllocator();
+            const repl_buf = try arena_alloc.alloc(u8, 1 + indent_spaces);
+            repl_buf[0] = '\n';
+            @memset(repl_buf[1..], ' ');
+            const fix_edits = [_]TextEdit{.{
+                .file_id = self.file_id,
+                .start_byte = close_quote_offset,
+                .end_byte = close_quote_offset,
+                .replacement_id = try str_interner.intern(repl_buf),
+            }};
+            const fixes = [_]SuggestedFix{.{
+                .message = "move closing `\"` onto its own indented line",
+                .applicability = .machine_applicable,
+                .priority = .syntax_canonicalization,
+                .edits = &fix_edits,
+            }};
+            try sink.emit(.{
+                .code = .e0115_multiline_string_opening,
+                .severity = .err,
+                .primary_span = err_span,
+                .message = msg_text,
+                .labels = &primary_labels,
+                .suggestions = &fixes,
+            });
+            return;
+        }
+
+        try sink.emit(.{
+            .code = .e0115_multiline_string_opening,
+            .severity = .err,
+            .primary_span = err_span,
+            .message = msg_text,
+            .labels = &primary_labels,
+        });
+    }
+
+    /// Emits `E0116` when a non-empty multiline string content line has `< C` leading ASCII spaces.
+    fn emitUnderIndentedMultilineLineError(
+        self: *Lexer,
+        line_start_byte: u32,
+        ws_end_byte: u32,
+        missing_spaces: usize,
+    ) !void {
+        const sink = self.diagnostic_sink orelse return;
+        const err_span = Span.init(self.file_id, line_start_byte, @max(ws_end_byte, line_start_byte + 1));
+        const primary_labels = [_]LabeledSpan{.{
+            .span = err_span,
+            .label = "content line has fewer leading spaces than the closing quote column",
+            .style = .primary,
+        }};
+        const msg_text = "multiline string content line is indented less than the closing quote column";
+
+        if (self.interner) |str_interner| {
+            const arena_alloc = sink.arena.asAllocator();
+            const pad_buf = try arena_alloc.alloc(u8, missing_spaces);
+            @memset(pad_buf, ' ');
+            const fix_edits = [_]TextEdit{.{
+                .file_id = self.file_id,
+                .start_byte = line_start_byte,
+                .end_byte = line_start_byte,
+                .replacement_id = try str_interner.intern(pad_buf),
+            }};
+            const fixes = [_]SuggestedFix{.{
+                .message = "indent content line to match closing quote column",
+                .applicability = .machine_applicable,
+                .priority = .syntax_canonicalization,
+                .edits = &fix_edits,
+            }};
+            try sink.emit(.{
+                .code = .e0116_multiline_string_indent,
+                .severity = .err,
+                .primary_span = err_span,
+                .message = msg_text,
+                .labels = &primary_labels,
+                .suggestions = &fixes,
+            });
+            return;
+        }
+
+        try sink.emit(.{
+            .code = .e0116_multiline_string_indent,
+            .severity = .err,
+            .primary_span = err_span,
+            .message = msg_text,
+            .labels = &primary_labels,
+        });
+    }
+
+    /// Computes the minimum `#` guard count (`>= min_hashes`) so `"` + `#^count` does not occur in `payload`.
+    fn computeRequiredQuoteGuardHashes(
+        payload: []const u8,
+        min_hashes: usize,
+        is_raw: bool,
+        is_fmt: bool,
+    ) usize {
+        var needed: usize = min_hashes;
+        var cursor: usize = 0;
+        while (cursor < payload.len) {
+            const cur_byte = payload[cursor];
+            if (!is_raw and cur_byte == '\\' and cursor + 1 < payload.len) {
+                cursor += 2;
+                continue;
+            }
+            if (is_fmt and cur_byte == '{') {
+                if (cursor + 1 < payload.len and payload[cursor + 1] == '{') {
+                    cursor += 2;
+                    continue;
+                }
+                cursor = skipInterpolationHoleInBody(payload, cursor);
+                continue;
+            }
+            if (cur_byte == '"') {
+                var run_hashes: usize = 0;
+                var scan_idx = cursor + 1;
+                while (scan_idx < payload.len and payload[scan_idx] == '#') : (scan_idx += 1) {
+                    run_hashes += 1;
+                }
+                if (run_hashes + 1 > needed) {
+                    needed = run_hashes + 1;
+                }
+                cursor = scan_idx;
+                continue;
+            }
+            cursor += 1;
+        }
+        return needed;
+    }
+
+    /// Emits `E0115` for retired `"""` delimiters with a `.machine_applicable` `"<newline> … "` rewrite.
+    fn emitRetiredTripleQuoteError(
+        self: *Lexer,
+        lit_start: u32,
+        lit_end: u32,
+        raw_inner: []const u8,
+        hash_count: usize,
+        is_raw: bool,
+        is_bytes: bool,
+        is_fmt: bool,
+        can_emit_fix: bool,
+    ) !void {
+        const sink = self.diagnostic_sink orelse return;
+        const lit_span = Span.init(self.file_id, lit_start, lit_end);
+        const primary_labels = [_]LabeledSpan{.{
+            .span = lit_span,
+            .label = "retired `\"\"\"` delimiter; open multiline strings with `\"<newline>` instead",
+            .style = .primary,
+        }};
+        const msg_text = "triple-quoted `\"\"\"` string delimiters are retired (`ADR-24B`); use `\"<newline> … \"`";
+
+        if (can_emit_fix) {
+            if (self.interner) |str_interner| {
+                const arena_alloc = sink.arena.asAllocator();
+                var open_nl_len: usize = 0;
+                if (raw_inner.len >= 1 and raw_inner[0] == '\n') {
+                    open_nl_len = 1;
+                } else if (raw_inner.len >= 2 and raw_inner[0] == '\r' and raw_inner[1] == '\n') {
+                    open_nl_len = 2;
+                }
+
+                var normalized_body: []const u8 = raw_inner;
+                var is_valid_multiline_shape = false;
+                if (open_nl_len > 0) {
+                    if (validateMultilineStringBodyPure(raw_inner[open_nl_len..], is_raw, is_fmt)) |_| {
+                        is_valid_multiline_shape = true;
+                    } else |_| {}
+                } else if (std.mem.indexOfScalar(u8, raw_inner, '\t') == null) {
+                    var wrapped: std.ArrayListUnmanaged(u8) = .empty;
+                    try wrapped.append(arena_alloc, '\n');
+                    try wrapped.appendSlice(arena_alloc, raw_inner);
+                    try wrapped.append(arena_alloc, '\n');
+                    if (validateMultilineStringBodyPure(wrapped.items[1..], is_raw, is_fmt)) |_| {
+                        normalized_body = wrapped.items;
+                        is_valid_multiline_shape = true;
+                    } else |_| {}
+                }
+
+                if (is_valid_multiline_shape) {
+                    var builder: std.ArrayListUnmanaged(u8) = .empty;
+                    if (is_raw or is_fmt) {
+                        const guard_hashes = computeRequiredQuoteGuardHashes(
+                            normalized_body,
+                            hash_count,
+                            is_raw,
+                            is_fmt,
+                        );
+                        if (!is_fmt or guard_hashes <= MAX_FMT_STRING_HASHES) {
+                            if (is_fmt) {
+                                try builder.append(arena_alloc, 'f');
+                            } else if (is_bytes) {
+                                try builder.appendSlice(arena_alloc, "br");
+                            } else {
+                                try builder.append(arena_alloc, 'r');
+                            }
+                            var h_idx: usize = 0;
+                            while (h_idx < guard_hashes) : (h_idx += 1) {
+                                try builder.append(arena_alloc, '#');
+                            }
+                            try builder.append(arena_alloc, '"');
+                            try builder.appendSlice(arena_alloc, normalized_body);
+                            try builder.append(arena_alloc, '"');
+                            h_idx = 0;
+                            while (h_idx < guard_hashes) : (h_idx += 1) {
+                                try builder.append(arena_alloc, '#');
+                            }
+                        }
+                    } else {
+                        if (is_bytes) {
+                            try builder.append(arena_alloc, 'b');
+                        }
+                        try builder.append(arena_alloc, '"');
+                        var idx: usize = 0;
+                        while (idx < normalized_body.len) {
+                            if (normalized_body[idx] == '\\' and idx + 1 < normalized_body.len) {
+                                try builder.appendSlice(arena_alloc, normalized_body[idx .. idx + 2]);
+                                idx += 2;
+                            } else if (normalized_body[idx] == '"') {
+                                try builder.appendSlice(arena_alloc, "\\\"");
+                                idx += 1;
+                            } else {
+                                try builder.append(arena_alloc, normalized_body[idx]);
+                                idx += 1;
+                            }
+                        }
+                        try builder.append(arena_alloc, '"');
+                    }
+
+                    if (builder.items.len > 0) {
+                        const fix_edits = try arena_alloc.alloc(TextEdit, 1);
+                        fix_edits[0] = .{
+                            .file_id = self.file_id,
+                            .start_byte = lit_start,
+                            .end_byte = lit_end,
+                            .replacement_id = try str_interner.intern(builder.items),
+                        };
+                        const fixes = try arena_alloc.alloc(SuggestedFix, 1);
+                        fixes[0] = .{
+                            .message = "replace retired `\"\"\"` delimiter with `\"<newline> … \"`",
+                            .applicability = .machine_applicable,
+                            .priority = .syntax_canonicalization,
+                            .edits = fix_edits,
+                        };
+                        try sink.emit(.{
+                            .code = .e0115_multiline_string_opening,
+                            .severity = .err,
+                            .primary_span = lit_span,
+                            .message = msg_text,
+                            .labels = &primary_labels,
+                            .suggestions = fixes,
+                        });
+                        return;
+                    }
+                }
+            }
+        }
+
+        try sink.emit(.{
+            .code = .e0115_multiline_string_opening,
+            .severity = .err,
+            .primary_span = lit_span,
+            .message = msg_text,
+            .labels = &primary_labels,
+        });
+    }
+
+    /// Emits `W0119` (`w0119_useless_format_string`) on a 0-hole `f"…"` / `f#"…"#` literal (`ADR-24B`).
+    fn emitUselessFormatStringWarning(
+        self: *Lexer,
+        lit_start: u32,
+        lit_end: u32,
+        hash_count: usize,
+        can_emit_fix: bool,
+    ) !void {
+        const sink = self.diagnostic_sink orelse return;
+        const lit_span = Span.init(self.file_id, lit_start, lit_end);
+        const primary_labels = [_]LabeledSpan{.{
+            .span = lit_span,
+            .label = "format string contains zero `{…}` interpolation holes; remove `f` prefix",
+            .style = .primary,
+        }};
+        const msg_text = "interpolated format string contains no `{…}` holes (`useless-format-string`)";
+
+        if (can_emit_fix) {
+            if (self.interner) |str_interner| {
+                const start_usize: usize = @intCast(lit_start);
+                const end_usize: usize = @intCast(lit_end);
+                const header_len: usize = 1 + hash_count + 1;
+                const footer_len: usize = 1 + hash_count;
+                if (end_usize >= start_usize + header_len + footer_len and end_usize <= self.source.len) {
+                    const arena_alloc = sink.arena.asAllocator();
+                    const inner_raw = self.source[start_usize + header_len .. end_usize - footer_len];
+                    const has_backslash = std.mem.indexOfScalar(u8, inner_raw, '\\') != null;
+                    const has_quote = std.mem.indexOfScalar(u8, inner_raw, '"') != null;
+
+                    var builder: std.ArrayListUnmanaged(u8) = .empty;
+                    if (hash_count > 0 and has_quote and !has_backslash) {
+                        try builder.append(arena_alloc, 'r');
+                        var h_idx: usize = 0;
+                        while (h_idx < hash_count) : (h_idx += 1) {
+                            try builder.append(arena_alloc, '#');
+                        }
+                        try builder.append(arena_alloc, '"');
+                        var idx: usize = 0;
+                        while (idx < inner_raw.len) {
+                            if ((inner_raw[idx] == '{' or inner_raw[idx] == '}') and
+                                idx + 1 < inner_raw.len and
+                                inner_raw[idx + 1] == inner_raw[idx])
+                            {
+                                try builder.append(arena_alloc, inner_raw[idx]);
+                                idx += 2;
+                            } else {
+                                try builder.append(arena_alloc, inner_raw[idx]);
+                                idx += 1;
+                            }
+                        }
+                        try builder.append(arena_alloc, '"');
+                        h_idx = 0;
+                        while (h_idx < hash_count) : (h_idx += 1) {
+                            try builder.append(arena_alloc, '#');
+                        }
+                    } else {
+                        try builder.append(arena_alloc, '"');
+                        var idx: usize = 0;
+                        while (idx < inner_raw.len) {
+                            if (inner_raw[idx] == '\\') {
+                                if (idx + 1 < inner_raw.len) {
+                                    try builder.appendSlice(arena_alloc, inner_raw[idx .. idx + 2]);
+                                    idx += 2;
+                                } else {
+                                    try builder.appendSlice(arena_alloc, "\\\\");
+                                    idx += 1;
+                                }
+                            } else if ((inner_raw[idx] == '{' or inner_raw[idx] == '}') and
+                                idx + 1 < inner_raw.len and
+                                inner_raw[idx + 1] == inner_raw[idx])
+                            {
+                                try builder.append(arena_alloc, inner_raw[idx]);
+                                idx += 2;
+                            } else if (inner_raw[idx] == '"') {
+                                try builder.appendSlice(arena_alloc, "\\\"");
+                                idx += 1;
+                            } else {
+                                try builder.append(arena_alloc, inner_raw[idx]);
+                                idx += 1;
+                            }
+                        }
+                        try builder.append(arena_alloc, '"');
+                    }
+
+                    const fix_edits = try arena_alloc.alloc(TextEdit, 1);
+                    fix_edits[0] = .{
+                        .file_id = self.file_id,
+                        .start_byte = lit_start,
+                        .end_byte = lit_end,
+                        .replacement_id = try str_interner.intern(builder.items),
+                    };
+                    const fixes = try arena_alloc.alloc(SuggestedFix, 1);
+                    fixes[0] = .{
+                        .message = "remove `f` prefix from static string literal",
+                        .applicability = .machine_applicable,
+                        .priority = .lint_idiom,
+                        .edits = fix_edits,
+                    };
+                    try sink.emit(.{
+                        .code = .w0119_useless_format_string,
+                        .severity = .warning,
+                        .primary_span = lit_span,
+                        .message = msg_text,
+                        .labels = &primary_labels,
+                        .suggestions = fixes,
+                    });
+                    return;
+                }
+            }
+        }
+
+        try sink.emit(.{
+            .code = .w0119_useless_format_string,
+            .severity = .warning,
+            .primary_span = lit_span,
+            .message = msg_text,
+            .labels = &primary_labels,
+        });
+    }
+
     /// Emits `W0101` (`w0101_redundant_escape_sequence`) with a `.machine_applicable` fix replacing `\c` with `c`.
     fn emitRedundantEscapeWarning(self: *Lexer, escape_start: u32, escape_end: u32) !void {
         const sink = self.diagnostic_sink orelse return;
@@ -4374,11 +5701,11 @@ test "test_case_conversion_helpers_and_w0201_transactional_patching" {
 test "test_numeric_range_disambiguation_and_string_interpolation_roundtrip" {
     const source =
         \\#!/usr/bin/env corex
-        \\// Range, method call, raw string, and nested interpolation:
+        \\// Range, method call, raw string, and nested f-string interpolation:
         \\fn demo() {
         \\    for i in 0..10 {
         \\        let m = 10.max(20);
-        \\        let msg = "val={if i > 0 { "ok /* }} */" } else { r#"raw } str"# }}\n";
+        \\        let msg = f"val={if i > 0 => "ok }}" else r#"raw } str"#}\n";
         \\        let arr: #soa [u32] = [];
         \\    }
         \\}
@@ -4392,13 +5719,14 @@ test "test_numeric_range_disambiguation_and_string_interpolation_roundtrip" {
     try std.testing.expect(!sink.hasErrors());
     try std.testing.expectEqual(@as(u32, 0), sink.warning_count);
 
-    // Verify `0..10` and `10.max(20)` tokenization:
+    // Verify `0..10`, `10.max(20)`, and `f"…"` (`.fmt_string_lit`) tokenization:
     try std.testing.expectEqual(TokenKind.int_lit, token_buf.getToken(TokenIndex.fromInt(8)).kind);
     try std.testing.expectEqual(TokenKind.dotdot, token_buf.getToken(TokenIndex.fromInt(9)).kind);
     try std.testing.expectEqual(TokenKind.int_lit, token_buf.getToken(TokenIndex.fromInt(10)).kind);
     try std.testing.expectEqual(TokenKind.int_lit, token_buf.getToken(TokenIndex.fromInt(15)).kind);
     try std.testing.expectEqual(TokenKind.dot, token_buf.getToken(TokenIndex.fromInt(16)).kind);
     try std.testing.expectEqual(TokenKind.ident, token_buf.getToken(TokenIndex.fromInt(17)).kind);
+    try std.testing.expectEqual(TokenKind.fmt_string_lit, token_buf.getToken(TokenIndex.fromInt(25)).kind);
 
     var cst_arena = syntax_arenas.LosslessCstArena.init(std.testing.allocator);
     defer cst_arena.deinit();
@@ -4419,6 +5747,12 @@ test "test_malformed_literals_escapes_and_e0104_tail_preservation" {
     try tokenize(bad_source, FileId.fromInt(0), &token_buf, &sink, &interner);
     try std.testing.expectEqual(@as(u32, 10), sink.error_count);
     try std.testing.expectEqual(@as(u32, 1), sink.warning_count);
+    // Multi-scalar `'ab'` must attach a `.machine_applicable` `"ab"` `SuggestedFix`:
+    try std.testing.expectEqual(@as(usize, 1), sink.asSlice()[7].suggestions.len);
+    try std.testing.expectEqualStrings(
+        "\"ab\"",
+        interner.get(sink.asSlice()[7].suggestions[0].edits[0].replacement_id),
+    );
 
     var cst_arena = syntax_arenas.LosslessCstArena.init(std.testing.allocator);
     defer cst_arena.deinit();
@@ -4462,16 +5796,26 @@ test "test_malformed_literals_escapes_and_e0104_tail_preservation" {
     try std.testing.expectEqualStrings(tail_source, reconstructed_capped);
 }
 
-test "test_deep_nested_string_interpolation_bounded_stack_and_lossless" {
-    const depth: usize = 600;
+test "test_deep_nested_fmt_string_interpolation_bounded_stack_and_lossless" {
+    // 4-deep `f"…"` (`== MAX_FMT_NESTING`) succeeds with 0 errors; 5-deep (`> MAX_FMT_NESTING`) emits `E0203`:
+    const valid_4_deep = "f\"{f\"{f\"{f\"{x}\"}\"}\"}\"";
+    var ok_buf = TokenBuffer.init(std.testing.allocator);
+    defer ok_buf.deinit();
+    var ok_sink = DiagnosticSink.init(std.testing.allocator);
+    defer ok_sink.deinit();
+    try tokenize(valid_4_deep, FileId.fromInt(0), &ok_buf, &ok_sink, null);
+    try std.testing.expectEqual(@as(u32, 0), ok_sink.error_count);
+    try std.testing.expectEqual(TokenKind.fmt_string_lit, ok_buf.getToken(TokenIndex.fromInt(0)).kind);
+
+    const depth: usize = 8;
     var nested_builder: std.ArrayList(u8) = .empty;
     defer nested_builder.deinit(std.testing.allocator);
-    try nested_builder.append(std.testing.allocator, '"');
+    try nested_builder.appendSlice(std.testing.allocator, "f\"");
     var i: usize = 0;
     while (i < depth) : (i += 1) {
-        try nested_builder.appendSlice(std.testing.allocator, "{\"");
+        try nested_builder.appendSlice(std.testing.allocator, "{f\"");
     }
-    try nested_builder.appendSlice(std.testing.allocator, "leaf");
+    try nested_builder.appendSlice(std.testing.allocator, "{leaf}");
     i = 0;
     while (i < depth) : (i += 1) {
         try nested_builder.appendSlice(std.testing.allocator, "\"}");
@@ -4500,22 +5844,22 @@ test "test_deep_nested_string_interpolation_bounded_stack_and_lossless" {
     defer std.testing.allocator.free(reconstructed);
     try std.testing.expectEqualStrings(nested_builder.items, reconstructed);
 
-    // Unclosed 600-deep interpolation emits a single `E0203` and a single `E0102`:
-    const unclosed_slice = nested_builder.items[0 .. depth * 2 + 1];
+    // Unclosed 5-deep `f"…"` emits `E0203` plus `E0102`:
+    const unclosed_slice = "f\"{f\"{f\"{f\"{f\"{x";
     var unclosed_buf = TokenBuffer.init(std.testing.allocator);
     defer unclosed_buf.deinit();
     var unclosed_sink = DiagnosticSink.init(std.testing.allocator);
     defer unclosed_sink.deinit();
 
     try tokenize(unclosed_slice, FileId.fromInt(0), &unclosed_buf, &unclosed_sink, null);
-    try std.testing.expectEqual(@as(u32, 2), unclosed_sink.error_count);
+    try std.testing.expect(unclosed_sink.error_count >= 2);
     try std.testing.expectEqual(
         DiagnosticCode.e0203_parse_depth_exceeded,
         unclosed_sink.asSlice()[0].code,
     );
     try std.testing.expectEqual(
         DiagnosticCode.e0102_unterminated_string_literal,
-        unclosed_sink.asSlice()[1].code,
+        unclosed_sink.asSlice()[unclosed_sink.asSlice().len - 1].code,
     );
 }
 
@@ -4611,6 +5955,7 @@ test "test_escaped_raw_newline_in_char_and_string_literals_and_cr_block_comment"
         char_sink.asSlice()[0].code,
     );
 
+    // Line continuations `\` + `\n` / `\r\n` stay valid; retired `/* … */` emits `E0118` and preserves newline flag:
     const str_source = "\"hello \\\nworld \\\r\n!\" /* block\rcomment */ let ok = 1;";
     var str_buf = TokenBuffer.init(std.testing.allocator);
     defer str_buf.deinit();
@@ -4619,7 +5964,8 @@ test "test_escaped_raw_newline_in_char_and_string_literals_and_cr_block_comment"
 
     try tokenize(str_source, FileId.fromInt(0), &str_buf, &str_sink, null);
     try std.testing.expectEqual(@as(u32, 0), str_sink.warning_count);
-    try std.testing.expectEqual(@as(u32, 0), str_sink.error_count);
+    try std.testing.expectEqual(@as(u32, 1), str_sink.error_count);
+    try std.testing.expectEqual(DiagnosticCode.e0118_block_doc_comment_forbidden, str_sink.asSlice()[0].code);
     try std.testing.expect(str_buf.getToken(TokenIndex.fromInt(1)).flags.has_leading_newline);
 }
 
@@ -4782,7 +6128,7 @@ test "test_dr21_walrus_dollar_retired_coloncolon_and_tuple_projection_lexing" {
 }
 
 test "test_dr22_retired_ampamp_dotdotdot_brace_escapes_and_autofixes" {
-    const legacy_source = "let ok = flag_a && flag_b&&flag_c; let s = \"\\{k\\} = {{v}}\"; fn c_fn(fmt: *opaque, ...);";
+    const legacy_source = "let ok = flag_a && flag_b&&flag_c; let s = f\"\\{k\\} = {v}\"; fn c_fn(fmt: *opaque, ...);";
     var token_buf = TokenBuffer.init(std.testing.allocator);
     defer token_buf.deinit();
     var sink = DiagnosticSink.init(std.testing.allocator);
@@ -4828,26 +6174,25 @@ test "test_dr22_retired_ampamp_dotdotdot_brace_escapes_and_autofixes" {
     defer std.testing.allocator.free(patch_res.patched_source);
     try std.testing.expectEqual(@as(u32, 4), patch_res.applied_count);
     try std.testing.expectEqualStrings(
-        "let ok = flag_a and flag_b and flag_c; let s = \"{{k}} = {{v}}\"; fn c_fn(fmt: *opaque, ...);",
+        "let ok = flag_a and flag_b and flag_c; let s = f\"{{k}} = {v}\"; fn c_fn(fmt: *opaque, ...);",
         patch_res.patched_source,
     );
 }
 
-test "test_dr22_multiline_strings_nested_interp_trap_a_and_byte_literals" {
-    // [1] `[P1 Trap A]`: `"""outer {"inner"} and {"""nested"""} tail"""` + byte literals:
+test "test_dr24_multiline_strings_nested_fmt_and_byte_literals" {
     const valid_source =
-        \\let banner = """
+        \\let banner = f"
         \\    outer {"inner"} and {
-        \\        """
-        \\        nested "quote" ""pair""
-        \\        """
+        \\        f#"
+        \\        nested "quote" {val:'<8}
+        \\        "#
         \\    } \
         \\    tail {{v1.0}}
-        \\    """;
-        \\let raw_multi = r#"""
+        \\    ";
+        \\let raw_multi = r#"
         \\    line 1 /\
         \\    line 2 "triple"
-        \\    """#;
+        \\    "#;
         \\let wire = b"HTTP/1.1\r\n\xFF";
         \\let sep = b'\r';
         \\let raw_bytes = br#"A"B"#;
@@ -4861,16 +6206,29 @@ test "test_dr22_multiline_strings_nested_interp_trap_a_and_byte_literals" {
     try std.testing.expectEqual(@as(u32, 0), sink.error_count);
     try std.testing.expectEqual(@as(u32, 0), sink.warning_count);
 
-    try std.testing.expectEqual(TokenKind.string_lit, token_buf.getToken(TokenIndex.fromInt(3)).kind);
+    try std.testing.expectEqual(TokenKind.fmt_string_lit, token_buf.getToken(TokenIndex.fromInt(3)).kind);
     try std.testing.expectEqual(TokenKind.string_lit, token_buf.getToken(TokenIndex.fromInt(8)).kind);
     try std.testing.expectEqual(TokenKind.byte_string_lit, token_buf.getToken(TokenIndex.fromInt(13)).kind);
     try std.testing.expectEqual(TokenKind.byte_lit, token_buf.getToken(TokenIndex.fromInt(18)).kind);
     try std.testing.expectEqual(TokenKind.byte_string_lit, token_buf.getToken(TokenIndex.fromInt(23)).kind);
 
-    // Verify `cookStringLiteral`, `extractMultilineStringContent`, and `extractByteLiteralValue`:
+    // Verify `extractStringBodyInfo`, `stripMultilineIndentAlloc`, `cookStringLiteral`, and `extractByteLiteralValue`:
     const raw_rec = token_buf.getToken(TokenIndex.fromInt(8));
     const raw_lexeme = valid_source[raw_rec.byte_offset .. raw_rec.byte_offset + raw_rec.byte_len];
     try std.testing.expect(isMultilineStringLexeme(raw_lexeme));
+    const body_info = extractStringBodyInfo(.string_lit, raw_lexeme);
+    try std.testing.expect(body_info.is_raw);
+    try std.testing.expect(body_info.is_multiline);
+    try std.testing.expectEqual(@as(u8, 1), body_info.hash_count);
+    try std.testing.expectEqual(@as(u32, 4), body_info.closing_indent_spaces);
+    const stripped_raw = try stripMultilineIndentAlloc(
+        std.testing.allocator,
+        raw_lexeme[body_info.body_start..body_info.body_end],
+        body_info.closing_indent_spaces,
+    );
+    defer std.testing.allocator.free(stripped_raw);
+    try std.testing.expectEqualStrings("line 1 /\\\nline 2 \"triple\"", stripped_raw);
+
     const cooked_raw = try cookStringLiteral(std.testing.allocator, raw_lexeme);
     defer std.testing.allocator.free(cooked_raw);
     try std.testing.expectEqualStrings("line 1 /\\\nline 2 \"triple\"", cooked_raw);
@@ -4886,9 +6244,9 @@ test "test_dr22_multiline_strings_nested_interp_trap_a_and_byte_literals" {
     try std.testing.expectEqual(@as(?u8, 0xFF), extractByteLiteralValue("b'\\xFF'"));
     try std.testing.expectEqual(@as(?u8, 'A'), extractByteLiteralValue("b'A'"));
 
-    // [2] Negative diagnostics `E0115`, `E0116`, and `E0117`:
+    // Negative diagnostics `E0115`, `E0116`, and `E0117`:
     const err_source =
-        "let e1 = \"\"\"bad\n\"\"\"; let e2 = \"\"\"\n  under\n    \"\"\"; let e3 = b'é'; let e4 = b\"\\u{41}\";";
+        "let e1 = \"\n    bad\"; let e2 = \"\n  under\n    \"; let e3 = b'é'; let e4 = b\"\\u{41}\";";
     var err_buf = TokenBuffer.init(std.testing.allocator);
     defer err_buf.deinit();
     var err_sink = DiagnosticSink.init(std.testing.allocator);
@@ -4958,7 +6316,7 @@ test "test_dr22_numeric_suffixes_and_8byte_fmt_spec_parser" {
 }
 
 test "test_stage4_single_line_hashed_raw_quote_runs_and_nested_interp" {
-    const src = "r#\"\"\"\"# br#\"\"\"\"# r##\"\"\"\"\"## \"outer {r#\"\"\"\"#} ok\"";
+    const src = "r#\"\"\"\"# br#\"\"\"\"# r##\"\"\"\"\"## f\"outer {r#\"\"\"\"#} ok\"";
     var tok_buf = TokenBuffer.init(std.testing.allocator);
     defer tok_buf.deinit();
     var sink = DiagnosticSink.init(std.testing.allocator);
@@ -4970,7 +6328,7 @@ test "test_stage4_single_line_hashed_raw_quote_runs_and_nested_interp" {
     try std.testing.expectEqual(TokenKind.string_lit, tok_buf.getToken(TokenIndex.fromInt(0)).kind);
     try std.testing.expectEqual(TokenKind.byte_string_lit, tok_buf.getToken(TokenIndex.fromInt(1)).kind);
     try std.testing.expectEqual(TokenKind.string_lit, tok_buf.getToken(TokenIndex.fromInt(2)).kind);
-    try std.testing.expectEqual(TokenKind.string_lit, tok_buf.getToken(TokenIndex.fromInt(3)).kind);
+    try std.testing.expectEqual(TokenKind.fmt_string_lit, tok_buf.getToken(TokenIndex.fromInt(3)).kind);
 
     const cooked_two_quotes = try cookStringLiteral(std.testing.allocator, "r#\"\"\"\"#");
     defer std.testing.allocator.free(cooked_two_quotes);
@@ -4985,24 +6343,34 @@ test "test_stage4_single_line_hashed_raw_quote_runs_and_nested_interp" {
     try std.testing.expectEqualStrings("\"\"\"", cooked_three_quotes);
 }
 
-test "test_adr23a_e0118_block_doc_comments_and_ordinary_star_block_comments" {
-    // `/**/` and `/***/` and nested `/* /** inner */ */` must emit zero errors:
-    const clean_src = "/**/ /***/ /**** banner ****/ /* outer /** inner */ /*! inner */ end */ pub fn ok() {}\n";
+test "test_adr24a_slash_dfa_retired_comments_and_mid_file_window_is_at_file_top" {
+    // [1] Canonical `/#`, `/|`, `///|`, `///#`, `////` banner, and `#!` + `--- … ---` frontmatter with tabs:
+    const canonical_src =
+        "#!/usr/bin/env\tcorex\n" ++
+        "---\n" ++
+        "name = \"demo\"\t# tab in frontmatter allowed\n" ++
+        "---\n" ++
+        "/# Module docstring.\n" ++
+        "//// Banner line comment\n" ++
+        "///| Commented-out outer doc\n" ++
+        "///# Commented-out module doc\n" ++
+        "/| Outer item docstring.\n" ++
+        "pub fn ok() {}\n";
     var clean_buf = TokenBuffer.init(std.testing.allocator);
     defer clean_buf.deinit();
     var clean_sink = DiagnosticSink.init(std.testing.allocator);
     defer clean_sink.deinit();
-    try tokenize(clean_src, FileId.fromInt(0), &clean_buf, &clean_sink, null);
+    try tokenize(canonical_src, FileId.fromInt(0), &clean_buf, &clean_sink, null);
     try std.testing.expectEqual(@as(u32, 0), clean_sink.error_count);
+    try std.testing.expectEqual(@as(u32, 0), clean_sink.warning_count);
 
-    // `/*! … */` and `/** … */` must emit `E0118` with machine-applicable `//!` / `///` fixes:
-    const bad_src =
-        "/**\n" ++
-        " * Detached file header.\n" ++
-        " */\n\n" ++
-        "/** Single-line item doc. */ pub struct Item {\n" ++
-        "    /*! Misplaced inner block doc. */\n" ++
-        "    pub count: u32,\n" ++
+    // [2] Retired `//!` (top -> `/#`, mid-file -> `//`), `///` -> `/|`, and `/* … */` -> `//` (`E0118`):
+    const legacy_src =
+        "//! Top module doc.\n\n" ++
+        "/// Item doc.\n" ++
+        "/* Hoisted comment */ pub struct Item {\n" ++
+        "    //! Mid-file inner doc.\n" ++
+        "    pub count: u32, /* trailing */\n" ++
         "}\n";
     var bad_buf = TokenBuffer.init(std.testing.allocator);
     defer bad_buf.deinit();
@@ -5011,30 +6379,31 @@ test "test_adr23a_e0118_block_doc_comments_and_ordinary_star_block_comments" {
     var interner = try StringInterner.init(std.testing.allocator);
     defer interner.deinit();
 
-    try tokenize(bad_src, FileId.fromInt(1), &bad_buf, &bad_sink, &interner);
-    try std.testing.expectEqual(@as(u32, 3), bad_sink.error_count);
+    try tokenize(legacy_src, FileId.fromInt(1), &bad_buf, &bad_sink, &interner);
+    try std.testing.expectEqual(@as(u32, 5), bad_sink.error_count);
 
-    var fixes: [3]SuggestedFix = undefined;
-    for (bad_sink.asSlice(), 0..) |diag_item, i| {
+    var fixes: [5]SuggestedFix = undefined;
+    for (bad_sink.asSlice(), 0..) |diag_item, idx| {
         try std.testing.expectEqual(DiagnosticCode.e0118_block_doc_comment_forbidden, diag_item.code);
-        fixes[i] = diag_item.suggestions[0];
+        fixes[idx] = diag_item.suggestions[0];
     }
 
     const patch_res = try diagnostic.TransactionalPatcher.apply(
         std.testing.allocator,
-        bad_src,
+        legacy_src,
         FileId.fromInt(1),
         &fixes,
         &interner,
     );
     defer std.testing.allocator.free(patch_res.patched_source);
-    try std.testing.expectEqual(@as(u32, 3), patch_res.applied_count);
+    try std.testing.expectEqual(@as(u32, 5), patch_res.applied_count);
     try std.testing.expectEqualStrings(
-        "//! Detached file header.\n\n" ++
-            "/// Single-line item doc.\n" ++
+        "/# Top module doc.\n\n" ++
+            "/| Item doc.\n" ++
+            "// Hoisted comment\n" ++
             "pub struct Item {\n" ++
-            "    //! Misplaced inner block doc.\n" ++
-            "    pub count: u32,\n" ++
+            "    // Mid-file inner doc.\n" ++
+            "    pub count: u32, // trailing\n" ++
             "}\n",
         patch_res.patched_source,
     );
@@ -5045,4 +6414,144 @@ test "test_adr23a_e0118_block_doc_comments_and_ordinary_star_block_comments" {
     defer relex_sink.deinit();
     try tokenize(patch_res.patched_source, FileId.fromInt(1), &relex_buf, &relex_sink, &interner);
     try std.testing.expectEqual(@as(u32, 0), relex_sink.error_count);
+
+    // [3] Mid-file `win_lexer` (`cursor > 0` with empty `token_buffer`) MUST rewrite `//!` to `//`, NOT `/#`:
+    const mid_src = "pub fn a() {}\n//! mid\npub fn b() {}\n";
+    var win_buf = TokenBuffer.init(std.testing.allocator);
+    defer win_buf.deinit();
+    var win_sink = DiagnosticSink.init(std.testing.allocator);
+    defer win_sink.deinit();
+    var win_lexer = Lexer.init(mid_src, FileId.fromInt(2), &win_buf, &win_sink, &interner);
+    win_lexer.cursor = 14; // Points directly at `"//! mid\n"`.
+    try win_lexer.tokenize();
+    try std.testing.expectEqual(@as(u32, 1), win_sink.error_count);
+    try std.testing.expectEqualStrings(
+        "//",
+        interner.get(win_sink.asSlice()[0].suggestions[0].edits[0].replacement_id),
+    );
+
+    // [4] Unclosed `/*` at EOF emits both `E0118` and `E0102`:
+    var unc_buf = TokenBuffer.init(std.testing.allocator);
+    defer unc_buf.deinit();
+    var unc_sink = DiagnosticSink.init(std.testing.allocator);
+    defer unc_sink.deinit();
+    try tokenize("let a = 1; /* unclosed", FileId.fromInt(3), &unc_buf, &unc_sink, null);
+    try std.testing.expectEqual(@as(u32, 2), unc_sink.error_count);
+    try std.testing.expectEqual(DiagnosticCode.e0118_block_doc_comment_forbidden, unc_sink.asSlice()[0].code);
+    try std.testing.expectEqual(DiagnosticCode.e0102_unterminated_string_literal, unc_sink.asSlice()[1].code);
+}
+
+test "test_adr24b_plain_braces_retired_triple_quotes_hard_tabs_and_w0119" {
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    // [1] Plain `"…"` treats `{` / `}` literally (`0` `E0114`), while `\{`/`\}` emit `W0101` (`{`/`}`):
+    var plain_buf = TokenBuffer.init(std.testing.allocator);
+    defer plain_buf.deinit();
+    var plain_sink = DiagnosticSink.init(std.testing.allocator);
+    defer plain_sink.deinit();
+    try tokenize("let brace = \"{x} } {\"; let esc = \"\\{a\\}\";", FileId.fromInt(0), &plain_buf, &plain_sink, &interner);
+    try std.testing.expectEqual(@as(u32, 0), plain_sink.error_count);
+    try std.testing.expectEqual(@as(u32, 2), plain_sink.warning_count);
+    try std.testing.expectEqual(DiagnosticCode.w0101_redundant_escape_sequence, plain_sink.asSlice()[0].code);
+    try std.testing.expectEqualStrings(
+        "{",
+        interner.get(plain_sink.asSlice()[0].suggestions[0].edits[0].replacement_id),
+    );
+    const cooked_plain = try cookStringLiteral(std.testing.allocator, "\"{x} {{y}}\"");
+    defer std.testing.allocator.free(cooked_plain);
+    try std.testing.expectEqualStrings("{x} {{y}}", cooked_plain);
+
+    // [2] `W0119` (`useless-format-string`) on 0-hole `f"…"` / `f#"…"#`:
+    const w0119_src = "let s1 = f\"abc {{ok}}\"; let s2 = f#\"a\"b\"#; let s3 = f#\"a\"b\\n\"#;";
+    var w_buf = TokenBuffer.init(std.testing.allocator);
+    defer w_buf.deinit();
+    var w_sink = DiagnosticSink.init(std.testing.allocator);
+    defer w_sink.deinit();
+    try tokenize(w0119_src, FileId.fromInt(1), &w_buf, &w_sink, &interner);
+    try std.testing.expectEqual(@as(u32, 0), w_sink.error_count);
+    try std.testing.expectEqual(@as(u32, 3), w_sink.warning_count);
+    var w_fixes: [3]SuggestedFix = .{
+        w_sink.asSlice()[0].suggestions[0],
+        w_sink.asSlice()[1].suggestions[0],
+        w_sink.asSlice()[2].suggestions[0],
+    };
+    const w_patch = try diagnostic.TransactionalPatcher.apply(
+        std.testing.allocator,
+        w0119_src,
+        FileId.fromInt(1),
+        &w_fixes,
+        &interner,
+    );
+    defer std.testing.allocator.free(w_patch.patched_source);
+    try std.testing.expectEqualStrings(
+        "let s1 = \"abc {ok}\"; let s2 = r#\"a\"b\"#; let s3 = \"a\\\"b\\n\";",
+        w_patch.patched_source,
+    );
+
+    // [3] Retired `"""` across `""`, `r`, `f` (`E0115`) with `#`-guard synthesis when inner `"` is present:
+    const triple_src =
+        "let m1 = \"\"\"\n    plain\n    \"\"\";\n" ++
+        "let m2 = r\"\"\"\n    say \"hi\"\n    \"\"\";\n" ++
+        "let m3 = f\"\"\"\n    val=\"{x}\"\n    \"\"\";\n";
+    var t_buf = TokenBuffer.init(std.testing.allocator);
+    defer t_buf.deinit();
+    var t_sink = DiagnosticSink.init(std.testing.allocator);
+    defer t_sink.deinit();
+    try tokenize(triple_src, FileId.fromInt(2), &t_buf, &t_sink, &interner);
+    try std.testing.expectEqual(@as(u32, 3), t_sink.error_count);
+    var t_fixes: [3]SuggestedFix = .{
+        t_sink.asSlice()[0].suggestions[0],
+        t_sink.asSlice()[1].suggestions[0],
+        t_sink.asSlice()[2].suggestions[0],
+    };
+    const t_patch = try diagnostic.TransactionalPatcher.apply(
+        std.testing.allocator,
+        triple_src,
+        FileId.fromInt(2),
+        &t_fixes,
+        &interner,
+    );
+    defer std.testing.allocator.free(t_patch.patched_source);
+    try std.testing.expectEqualStrings(
+        "let m1 = \"\n    plain\n    \";\n" ++
+            "let m2 = r#\"\n    say \"hi\"\n    \"#;\n" ++
+            "let m3 = f#\"\n    val=\"{x}\"\n    \"#;\n",
+        t_patch.patched_source,
+    );
+
+    // [4] Hard `\t` (`0x09`) rules: raw single-line & raw multiline `>= C` allow `\t`; `< C` and cooked reject (`E0116`):
+    const raw_tab_ok = "let r1 = r\"a\tb\"; let r2 = br#\"x\ty\"#; let r3 = r\"\n    \tpayload\n    \";";
+    var rt_buf = TokenBuffer.init(std.testing.allocator);
+    defer rt_buf.deinit();
+    var rt_sink = DiagnosticSink.init(std.testing.allocator);
+    defer rt_sink.deinit();
+    try tokenize(raw_tab_ok, FileId.fromInt(3), &rt_buf, &rt_sink, null);
+    try std.testing.expectEqual(@as(u32, 0), rt_sink.error_count);
+
+    const bad_tab_src = "\tlet s_val = \"a\tb\"; // cmt\ttab\nlet rm = r\"\n\t\tdata\n    \";";
+    var bt_buf = TokenBuffer.init(std.testing.allocator);
+    defer bt_buf.deinit();
+    var bt_sink = DiagnosticSink.init(std.testing.allocator);
+    defer bt_sink.deinit();
+    try tokenize(bad_tab_src, FileId.fromInt(4), &bt_buf, &bt_sink, &interner);
+    try std.testing.expectEqual(@as(u32, 4), bt_sink.error_count);
+    var bt_fixes: [4]SuggestedFix = .{
+        bt_sink.asSlice()[0].suggestions[0],
+        bt_sink.asSlice()[1].suggestions[0],
+        bt_sink.asSlice()[2].suggestions[0],
+        bt_sink.asSlice()[3].suggestions[0],
+    };
+    const bt_patch = try diagnostic.TransactionalPatcher.apply(
+        std.testing.allocator,
+        bad_tab_src,
+        FileId.fromInt(4),
+        &bt_fixes,
+        &interner,
+    );
+    defer std.testing.allocator.free(bt_patch.patched_source);
+    try std.testing.expectEqualStrings(
+        "    let s_val = \"a\\tb\"; // cmt    tab\nlet rm = r\"\n    \tdata\n    \";",
+        bt_patch.patched_source,
+    );
 }

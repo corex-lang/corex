@@ -1,9 +1,10 @@
 //! Phase 3 Deterministic Formatter Idempotency, Zero Comment Loss & Query Engine Fuzzing Suite (`tests/fuzz/phase3_fmt_fuzz.zig`)
 //!
-//! Executes structure-aware and mutated `.cx` programs with random comments (`//`, `///`, `//!`,
-//! `/* … */`), arbitrary whitespace/newlines, trailing commas, `// corex fmt: off` / `on` directives,
-//! and `--fix` mode through `corex.fmt_engine`, plus random multi-revision edit sequences through
-//! `corex.CompilerDb`.
+//! Executes structure-aware and mutated `DR-24` `.cx` programs with random comments (`//`, `/|`, `/#`,
+//! `///|`, `///#`), arbitrary whitespace/newlines, trailing commas, `@repr` / `@link` horizontal packing,
+//! `f"…"` / `"<newline> … "` dedented strings, `if cond => a else b` inline conditionals,
+//! `// corex fmt: off` / `on` directives, and `--fix` mode through `corex.fmt_engine`, plus random
+//! multi-revision edit sequences through `corex.CompilerDb`.
 //!
 //! - Asserts 100% second-pass idempotency (`fmt(fmt(x)) == fmt(x)`), 100% comment preservation
 //!   (zero comment loss), and syntax error freedom on valid inputs.
@@ -45,7 +46,10 @@ const FMT_SEED_ITEMS = [_][]const u8{
     "pub trait Measurable { fn measure(&self) -> i32; }\n",
     "unsafe impl Send for Point[i32] {}\n",
     "impl Point[i32] { pub subscript(idx: usize, /) -> i32 { let { yield self.x; } inout { yield &mut self.x; } } }\n",
-    "@no_panic @inline @no_alloc\npub fn scale_val(val: i32, /, *, factor: i32 = 2) -> i32 = val * factor;\n",
+    "@no_panic @must_use @no_alloc\npub fn scale_val(val: i32, /, *, factor: i32 = 2) -> i32 = val * factor;\n",
+    "@derive(Copy, Equatable, Debug)\n@repr(zero_pad: true, align: .CacheLine, packed: 4, C)\n@cfg(target.ptr_width == 64)\n" ++
+        "pub struct DmaSlot { /| Physical address.\n pub dma_addr: u64, }\n",
+    "@link(section: \".text.hot\", name: \"cx_fast_hook\")\nextern \"C\" fn fast_hook(code: i32) -> i32;\n",
     "pub fn normalize_sigs[Data: str | &[u8]](\n" ++
         "    opt_in: Option[Data], out_slot: &out i32, owned_pt: own Point[i32],\n" ++
         ") -> Result[i32, IoError] {\n" ++
@@ -60,19 +64,38 @@ const FMT_SEED_ITEMS = [_][]const u8{
         "}\n",
     "pub fn multiline_interp_showcase(flag: bool, port: u16, mask: u32) -> str {\n" ++
         "    if flag {\n" ++
-        "        let nested_banner = \"\"\"\n" ++
+        "        let nested_banner = f\"\n" ++
         "            ╭─ Wire {{v1.0}} ────────────────╮\n" ++
-        "            │ {port=} mask={mask:#010x} {if flag { \"inner\" } else { \"\"\"\n" ++
+        "            │ {port=} mask={mask:#010x} {if flag => \"inner\" else f\"\n" ++
         "                deep {port}\n" ++
-        "                \"\"\" }}\n" ++
+        "                \"}\n" ++
         "            ╰────────────────────────────────╯\n" ++
-        "            \"\"\";\n" ++
+        "            \";\n" ++
+        "        let guarded_json = f#\"\n" ++
+        "            {\"port\": {port:04}, \"raw\": \"{r#\"ok\"#}\"}\n" ++
+        "            \"#;\n" ++
+        "        _ = guarded_json;\n" ++
         "        return nested_banner;\n" ++
         "    }\n" ++
-        "    return \"\"\"\n" ++
-        "        plain line one\n" ++
+        "    let raw_dedent = r#\"\n" ++
+        "        raw \"quoted\" {brace}\n" ++
+        "        \"#;\n" ++
+        "    let byte_dedent = b\"\n" ++
+        "        HTTP/1.1 200 OK\n" ++
+        "        \";\n" ++
+        "    _ = (raw_dedent, byte_dedent);\n" ++
+        "    return \"\n" ++
+        "        plain {literal} line one\n" ++
         "          indented line two\n" ++
-        "        \"\"\";\n" ++
+        "        \";\n" ++
+        "}\n",
+    "pub fn inline_if_and_braced_normalization(level: i32, compact: bool) -> i32 {\n" ++
+        "    let pad = if compact => 8_i32 else 16_i32;\n" ++
+        "    let normalized = if compact { 1_i32 } else { 2_i32 };\n" ++
+        "    let tier = if level > 90 => 3_i32\n" ++
+        "        else if level > 50 => 2_i32\n" ++
+        "        else 1_i32;\n" ++
+        "    return pad + normalized + tier;\n" ++
         "}\n",
     "pub fn compute_pipeline(val: i32, flag: bool) -> i32 {\n" ++
         "    ;\n" ++
@@ -88,7 +111,7 @@ const FMT_SEED_ITEMS = [_][]const u8{
         "    return fsm: match (piped) { 0 => continue :fsm 1, 1 => chained, _ => neg, };\n" ++
         "}\n",
     "test \"formatter prose test\" (raw: &[u8]) -> unit { _ = raw.len(); }\n",
-    "bench \"formatter bench\" (b: &mut Bencher) -> unit { _ = b; }\n",
+    "bench \"formatter bench\" (bencher: &mut Bencher) -> unit { _ = bencher; }\n",
     "// corex fmt: off\nconst   RAW_UNTOUCHED:   i32  =   777;\n// corex fmt: on\n",
     "@fmt_off\nconst   ATTR_UNTOUCHED:  i32  =   888;\n",
     "const unfixed_const: i32 = 42\nstruct bad_struct { FieldOne: i32 }\nfn BadFunc( ArgVal: i32 ) -> i32 { return ArgVal }\n",
@@ -96,11 +119,12 @@ const FMT_SEED_ITEMS = [_][]const u8{
 
 /// Comment snippets injected at valid positions between seed items.
 const RANDOM_COMMENT_SNIPPETS = [_][]const u8{
-    "//! module doc comment snippet\n\n",
-    "/// item doc comment snippet\n",
-    "// standalone line comment snippet\n",
-    "/* inline block comment snippet */\n",
-    "pub fn empty_holder( /* comment in params */ ) { // comment in empty body\n}\n",
+    "/# module doc comment snippet\n\n",
+    "/| item doc comment snippet\n",
+    "// standalone line comment snippet:\n",
+    "///| commented-out item docstring snippet\n",
+    "///# commented-out module docstring snippet\n",
+    "pub fn empty_holder(\n    // comment in params:\n) {\n    // comment in empty body.\n}\n",
 };
 
 /// Function body variants for `CompilerDb` incremental firewall fuzzing.
@@ -126,7 +150,6 @@ inline fn isCommentTrivia(kind: TriviaKind) bool {
         .line_comment,
         .doc_comment,
         .module_doc_comment,
-        .block_comment,
         .shebang,
         => true,
         else => false,
@@ -149,7 +172,15 @@ fn verifyZeroCommentLoss(
         const end: usize = @min(source.len, start + piece.byte_len);
         const trimmed = std.mem.trim(u8, source[start..end], " \t\r\n");
         if (trimmed.len == 0) continue;
-        try std.testing.expect(std.mem.indexOf(u8, formatted_text, trimmed) != null);
+        if ((piece.kind == .doc_comment or piece.kind == .module_doc_comment) and trimmed.len > 2) {
+            // `corex fmt` normalizes `/|Text` -> `/| Text`, and `fmt --fix` repairs misplaced/dangling
+            // `/#` or `/|` prefixes to `//` (`ADR-24A` §4.1) while preserving the comment body:
+            try std.testing.expect(
+                std.mem.indexOf(u8, formatted_text, std.mem.trimStart(u8, trimmed[2..], " ")) != null,
+            );
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, formatted_text, trimmed) != null);
+        }
     }
 }
 
@@ -164,7 +195,7 @@ fn buildMultiItemModule(
     errdefer builder.deinit(allocator);
 
     if (has_extra_header_comments) {
-        try builder.appendSlice(allocator, "//! Fuzz header doc comment\n\n// Extra banner comment\n\n");
+        try builder.appendSlice(allocator, "/# Fuzz header doc comment\n\n// Extra banner comment:\n\n");
     }
     try builder.appendSlice(allocator, "pub const MODULE_BASE: i32 = (100);\n\n");
 

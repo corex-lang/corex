@@ -127,9 +127,9 @@ const SymFfiMeta = struct {
     is_mut: bool = false,
     /// `true` when annotated with `@thread_local`.
     is_thread_local: bool = false,
-    /// Explicit `@link_name("…")` override (`""` when absent).
+    /// Explicit `@link(name: "…")` override (`""` when absent).
     link_name: []const u8 = "",
-    /// Explicit `@link_section("…")` override (`""` when absent).
+    /// Explicit `@link(section: "…")` override (`""` when absent).
     link_section: []const u8 = "",
     /// Explicit `@wasm_import("module", …)` host module (`""` when absent).
     wasm_import_module: []const u8 = "",
@@ -211,6 +211,10 @@ const CModuleEmitter = struct {
     closure_thunk_map: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     /// Ordered list of synthesized closure thunks.
     closure_thunks: std.ArrayListUnmanaged(ClosureThunkSpec) = .empty,
+    /// Set of C-ABI `MirBody` indices requiring `_cx_cabi_reify_<idx>` CoreX function-pointer bridges.
+    c_abi_reify_set: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Ordered list of C-ABI `MirBody` indices requiring `_cx_cabi_reify_<idx>` bridge thunks.
+    c_abi_reify_bodies: std.ArrayListUnmanaged(u32) = .empty,
     /// Index of CoreX `main` in `input.bodies` if present (`null` for libraries).
     entry_main_body_idx: ?u32 = null,
     /// Whether any `MirBody` executes `ctx_get` or `ctx_set` (`SE-08`).
@@ -314,6 +318,8 @@ const CModuleEmitter = struct {
             }
         }
         self.closure_thunks.deinit(self.allocator);
+        self.c_abi_reify_set.deinit(self.allocator);
+        self.c_abi_reify_bodies.deinit(self.allocator);
     }
 
     /// Appends raw `text` to `self.out`.
@@ -1811,6 +1817,115 @@ fn needsCompositeTypedef(emitter: *CModuleEmitter, unwrapped: TypeId) !bool {
     };
 }
 
+/// Resolves the single non-ZST field `(decl_ord, inner_ty)` of a `@repr(transparent)` struct (`null` otherwise).
+fn resolveTransparentNonZstField(
+    emitter: *CModuleEmitter,
+    raw_ty: TypeId,
+    depth: u32,
+) !?struct { decl_ord: u32, inner_ty: TypeId } {
+    if (depth >= MAX_C_TYPE_DEPTH) return null;
+    const cur_ty = emitter.input.pool.unwrapUnderlyingType(raw_ty);
+    if (cur_ty.isError() or
+        cur_ty.isPrimitiveOrSentinel() or
+        cur_ty.isBuiltinGroup() or
+        isBuiltInRuntimeType(emitter.input.pool, cur_ty)) return null;
+    const node = emitter.input.pool.getNode(cur_ty);
+    if (node.tag != .struct_ty) return null;
+    const sym_idx = SymbolIndex.fromInt(node.rhs);
+    if (sym_idx.isNone() or sym_idx.asInt() >= emitter.input.sym_table.symbols.items.len) return null;
+    if (!emitter.input.sym_table.getSymbol(sym_idx).isReprTransparent()) return null;
+
+    const lay = try emitter.resolver.resolveTypeBounded(cur_ty, depth);
+    var found_ord: u32 = 0;
+    var found_ty: TypeId = .unit_ty;
+    var non_zst_count: u32 = 0;
+    var fld_i: u32 = 0;
+    while (fld_i < lay.aux_len) : (fld_i += 1) {
+        const fld = emitter.resolver.fields_by_decl.items[lay.aux_start + fld_i];
+        if (fld.size_bytes > 0 and !(try isZeroSizedType(emitter, fld.field_ty))) {
+            found_ord = fld_i;
+            found_ty = emitter.input.pool.unwrapUnderlyingType(fld.field_ty);
+            non_zst_count += 1;
+        }
+    }
+    if (non_zst_count != 1) return null;
+    return .{ .decl_ord = found_ord, .inner_ty = found_ty };
+}
+
+/// Recursively unwraps `@repr(transparent)` single-field structs to their C-ABI inner `TypeId`.
+fn unwrapTransparentCType(emitter: *CModuleEmitter, raw_ty: TypeId) !TypeId {
+    var cur_ty = emitter.input.pool.unwrapUnderlyingType(raw_ty);
+    var depth: u32 = 0;
+    while (depth < MAX_C_TYPE_DEPTH) : (depth += 1) {
+        const step = (try resolveTransparentNonZstField(emitter, cur_ty, depth)) orelse break;
+        cur_ty = step.inner_ty;
+    }
+    return cur_ty;
+}
+
+/// Formats a C99 expression projecting `@repr(transparent)` wrapper `expr_str` down to its inner C-ABI value.
+fn formatUnwrapTransparentExprC(
+    emitter: *CModuleEmitter,
+    raw_ty: TypeId,
+    expr_str: []const u8,
+    depth: u32,
+) anyerror![]u8 {
+    var cur_ty = emitter.input.pool.unwrapUnderlyingType(raw_ty);
+    var cur_expr = try emitter.allocator.dupe(u8, expr_str);
+    errdefer emitter.allocator.free(cur_expr);
+    var cur_depth = depth;
+    while (cur_depth < MAX_C_TYPE_DEPTH) : (cur_depth += 1) {
+        const step = (try resolveTransparentNonZstField(emitter, cur_ty, cur_depth)) orelse break;
+        const next_expr = try std.fmt.allocPrint(
+            emitter.allocator,
+            "(({s})._f{d})",
+            .{ cur_expr, step.decl_ord },
+        );
+        emitter.allocator.free(cur_expr);
+        cur_expr = next_expr;
+        cur_ty = step.inner_ty;
+    }
+    return cur_expr;
+}
+
+/// Formats a C99 compound-literal expression wrapping an inner C-ABI value `inner_expr` into `raw_ty`.
+fn formatWrapTransparentExprC(
+    emitter: *CModuleEmitter,
+    raw_ty: TypeId,
+    inner_expr: []const u8,
+    depth: u32,
+) anyerror![]u8 {
+    if (depth >= MAX_C_TYPE_DEPTH) return emitter.allocator.dupe(u8, inner_expr);
+    const outer_ty = emitter.input.pool.unwrapUnderlyingType(raw_ty);
+    if (try resolveTransparentNonZstField(emitter, outer_ty, depth)) |step| {
+        const child_wrapped = try formatWrapTransparentExprC(emitter, step.inner_ty, inner_expr, depth + 1);
+        defer emitter.allocator.free(child_wrapped);
+        const outer_c = try formatCType(emitter, outer_ty);
+        defer emitter.allocator.free(outer_c);
+        return std.fmt.allocPrint(
+            emitter.allocator,
+            "(({s}){{ ._f{d} = {s} }})",
+            .{ outer_c, step.decl_ord, child_wrapped },
+        );
+    }
+    return emitter.allocator.dupe(u8, inner_expr);
+}
+
+/// Returns `true` if `body` has any by-value parameter or return type unwrapped by `@repr(transparent)`.
+fn hasTransparentAbiWrapperInBody(emitter: *CModuleEmitter, body: *const MirBody) !bool {
+    const ret_unwrapped = emitter.input.pool.unwrapUnderlyingType(body.ret_ty);
+    if ((try unwrapTransparentCType(emitter, ret_unwrapped)) != ret_unwrapped) return true;
+    var arg_i: u32 = 0;
+    while (arg_i < body.param_count and 1 + arg_i < body.locals.items.len) : (arg_i += 1) {
+        const param_decl = body.locals.items[1 + arg_i];
+        const param_mode = param_decl.mode();
+        if (param_mode == .inout_mode or param_mode == .set_mode) continue;
+        const param_unwrapped = emitter.input.pool.unwrapUnderlyingType(param_decl.type_id);
+        if ((try unwrapTransparentCType(emitter, param_unwrapped)) != param_unwrapped) return true;
+    }
+    return false;
+}
+
 /// Formats the canonical C99 type spelling of `raw_ty` iteratively (allocating once in `emitter.allocator`).
 fn formatCType(emitter: *CModuleEmitter, raw_ty: TypeId) ![]u8 {
     var unwrapped = emitter.input.pool.unwrapUnderlyingType(raw_ty);
@@ -2656,8 +2771,26 @@ fn indexModuleEntities(emitter: *CModuleEmitter) !void {
             const inst = body_ptr.insts.get(inst_raw);
             try discoverTypeRecursive(emitter, inst.type_id, 0);
             if (inst.op == .fn_addr) {
+                const target_def = DefId.fromInt(inst.operands.lhs);
                 const target_sym = SymbolIndex.fromInt(inst.operands.rhs);
-                try maybeRegisterExternSymbol(emitter, DefId.fromInt(inst.operands.lhs), target_sym);
+                try maybeRegisterExternSymbol(emitter, target_def, target_sym);
+                if (resolveBodyIndex(emitter, target_def, target_sym)) |target_b| {
+                    const target_body = &emitter.input.bodies[target_b];
+                    if (isBodyCAbiBoundary(emitter, target_body) and
+                        (try hasTransparentAbiWrapperInBody(emitter, target_body)))
+                    {
+                        const inst_fn_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
+                        const needs_bridge = if (emitter.input.pool.getFnSignatureView(inst_fn_ty)) |fn_sig|
+                            !fn_sig.is_c_abi
+                        else
+                            false;
+                        if (needs_bridge and
+                            !(try emitter.c_abi_reify_set.getOrPut(emitter.allocator, target_b)).found_existing)
+                        {
+                            try emitter.c_abi_reify_bodies.append(emitter.allocator, target_b);
+                        }
+                    }
+                }
             } else if (inst.op == .bin_op) {
                 const bkind: BinOpKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
                 if (bkind == .eq or bkind == .ne) {
@@ -2954,10 +3087,11 @@ fn emitTypeDeclarations(emitter: *CModuleEmitter) !void {
         const node = emitter.input.pool.getNode(ty);
         if (node.tag == .fn_ty) {
             const sig = emitter.input.pool.getFnSignatureView(ty) orelse continue;
-            const ret_c = if (try isZeroSizedType(emitter, sig.ret_ty))
+            const abi_ret_ty = if (sig.is_c_abi) try unwrapTransparentCType(emitter, sig.ret_ty) else sig.ret_ty;
+            const ret_c = if (try isZeroSizedType(emitter, abi_ret_ty))
                 try emitter.allocator.dupe(u8, "void")
             else
-                try formatCType(emitter, sig.ret_ty);
+                try formatCType(emitter, abi_ret_ty);
             defer emitter.allocator.free(ret_c);
 
             try emitter.print("typedef {s} (*_cx_ty_{d})(", .{ ret_c, ty_u32 });
@@ -2978,7 +3112,11 @@ fn emitTypeDeclarations(emitter: *CModuleEmitter) !void {
                     emitted_params += 1;
                 } else if (!(try isZeroSizedType(emitter, param_ty))) {
                     if (emitted_params > 0) try emitter.writeAll(", ");
-                    const param_c = try formatCType(emitter, param_ty);
+                    const abi_param_ty = if (sig.is_c_abi)
+                        try unwrapTransparentCType(emitter, param_ty)
+                    else
+                        param_ty;
+                    const param_c = try formatCType(emitter, abi_param_ty);
                     defer emitter.allocator.free(param_c);
                     try emitter.writeAll(param_c);
                     emitted_params += 1;
@@ -3101,8 +3239,31 @@ fn emitTypeDeclarations(emitter: *CModuleEmitter) !void {
                 try emitter.writeAll("};\n");
             },
             .struct_ty, .tuple_ty => {
+                const packed_cap: u32 = if (node.tag == .struct_ty) blk_pk: {
+                    const sym_idx = SymbolIndex.fromInt(node.rhs);
+                    break :blk_pk if (!sym_idx.isNone() and sym_idx.asInt() < emitter.input.sym_table.symbols.items.len)
+                        emitter.input.sym_table.getSymbol(sym_idx).packedCapBytes()
+                    else
+                        0;
+                } else 0;
+                const is_transparent_struct = node.tag == .struct_ty and blk_tr: {
+                    const sym_idx = SymbolIndex.fromInt(node.rhs);
+                    break :blk_tr !sym_idx.isNone() and
+                        sym_idx.asInt() < emitter.input.sym_table.symbols.items.len and
+                        emitter.input.sym_table.getSymbol(sym_idx).isReprTransparent();
+                };
+                if (packed_cap > 1) {
+                    try emitter.print("#pragma pack(push, {d})\n", .{packed_cap});
+                }
                 if (rflags.is_packed) {
-                    try emitter.print("struct __attribute__((packed)) _cx_ty_{d} {{\n", .{ty_u32});
+                    if (lay.alignBytes() > 1) {
+                        try emitter.print(
+                            "struct __attribute__((packed, aligned({d}))) _cx_ty_{d} {{\n",
+                            .{ lay.alignBytes(), ty_u32 },
+                        );
+                    } else {
+                        try emitter.print("struct __attribute__((packed)) _cx_ty_{d} {{\n", .{ty_u32});
+                    }
                 } else {
                     try emitter.print("struct __attribute__((aligned({d}))) _cx_ty_{d} {{\n", .{
                         lay.alignBytes(),
@@ -3111,7 +3272,7 @@ fn emitTypeDeclarations(emitter: *CModuleEmitter) !void {
                 }
                 const fld_start = lay.aux_start;
                 const fld_len = lay.aux_len;
-                const is_natural_c_float = rflags.is_repr_c and !rflags.is_packed and
+                const is_natural_c_float = (rflags.is_repr_c or is_transparent_struct) and !rflags.is_packed and
                     (try hasFloatFieldForCAbi(emitter, ty, 0));
                 var cur_byte: u64 = 0;
                 var pad_idx: u32 = 0;
@@ -3145,6 +3306,9 @@ fn emitTypeDeclarations(emitter: *CModuleEmitter) !void {
                     );
                 }
                 try emitter.writeAll("};\n");
+                if (packed_cap > 1) {
+                    try emitter.writeAll("#pragma pack(pop)\n");
+                }
             },
             .optional_ty, .result_ty, .enum_ty => {
                 const sum_detail = (try emitter.resolver.getSumDetail(ty)) orelse continue;
@@ -4132,8 +4296,18 @@ fn lookupDropBodyIndexForType(emitter: *const CModuleEmitter, ty: TypeId) ?u32 {
     return null;
 }
 
-/// Emits function signature parameter list `(Param0 _arg_1, …)` for `body` (`emit_names = false` for typedefs).
+/// Emits function signature parameter list `(Param0 _arg_1, …)` for `body` (`has_param_names = false` for typedefs).
 fn emitBodyParamList(emitter: *CModuleEmitter, body: *const MirBody, has_param_names: bool) !void {
+    try emitBodyParamListMode(emitter, body, has_param_names, isBodyCAbiBoundary(emitter, body));
+}
+
+/// Emits function signature parameter list for `body`, unwrapping `@repr(transparent)` by-value params when `is_c_abi`.
+fn emitBodyParamListMode(
+    emitter: *CModuleEmitter,
+    body: *const MirBody,
+    has_param_names: bool,
+    is_c_abi: bool,
+) !void {
     try emitter.writeAll("(");
     var emitted_count: u32 = 0;
     var arg_i: u32 = 0;
@@ -4161,7 +4335,11 @@ fn emitBodyParamList(emitter: *CModuleEmitter, body: *const MirBody, has_param_n
             emitted_count += 1;
         } else if (!(try isZeroSizedType(emitter, loc_decl.type_id))) {
             if (emitted_count > 0) try emitter.writeAll(", ");
-            const param_c = try formatCType(emitter, loc_decl.type_id);
+            const abi_param_ty = if (is_c_abi)
+                try unwrapTransparentCType(emitter, loc_decl.type_id)
+            else
+                loc_decl.type_id;
+            const param_c = try formatCType(emitter, abi_param_ty);
             defer emitter.allocator.free(param_c);
             if (has_param_names) {
                 try emitter.print("{s} _arg_{d}", .{ param_c, loc_idx });
@@ -4175,7 +4353,7 @@ fn emitBodyParamList(emitter: *CModuleEmitter, body: *const MirBody, has_param_n
     try emitter.writeAll(")");
 }
 
-/// Returns `true` if `body` carries `@export`, `@wasm_export`, or `@link_name` external visibility.
+/// Returns `true` if `body` carries `@export`, `@wasm_export`, or `@link(name: "…")` external visibility.
 fn isBodyExternallyVisible(emitter: *const CModuleEmitter, body: *const MirBody) bool {
     if (body.symbol_index.isNone() or
         body.symbol_index.asInt() >= emitter.input.sym_table.symbols.items.len) return false;
@@ -4185,7 +4363,31 @@ fn isBodyExternallyVisible(emitter: *const CModuleEmitter, body: *const MirBody)
     return ffi_meta.wasm_export_name.len > 0;
 }
 
-/// Emits C99 function attributes (`export_name`, `section`, `nothrow`) for `body`.
+/// Resolves the C99 storage and inline specifier prefix (`static `, `__attribute__((always_inline)) inline `, etc.).
+fn resolveBodyStoragePrefixC(emitter: *const CModuleEmitter, body: *const MirBody) []const u8 {
+    const is_ext_vis = isBodyExternallyVisible(emitter, body);
+    if (!body.symbol_index.isNone() and
+        body.symbol_index.asInt() < emitter.input.sym_table.symbols.items.len)
+    {
+        const sym_rec = emitter.input.sym_table.getSymbol(body.symbol_index).*;
+        if (!sym_rec.extra_flags.is_noinline and !body.is_async) {
+            switch (sym_rec.inlineMode()) {
+                .always => return if (is_ext_vis)
+                    "extern __attribute__((always_inline)) inline "
+                else
+                    "static __attribute__((always_inline)) inline ",
+                .hint => return if (is_ext_vis)
+                    "extern inline "
+                else
+                    "static inline ",
+                .none, .never => {},
+            }
+        }
+    }
+    return if (is_ext_vis) "" else "static ";
+}
+
+/// Emits C99 function attributes (`export_name`, `section`, `cold`, `noinline`, `nothrow`) for `body`.
 fn emitBodyFunctionAttributesC(
     emitter: *CModuleEmitter,
     body: *const MirBody,
@@ -4216,7 +4418,11 @@ fn emitBodyFunctionAttributesC(
         try emitter.writeAll("\"))) ");
     }
 
-    if (sym_rec.extra_flags.is_noinline) {
+    if (sym_rec.isCold()) {
+        try emitter.writeAll("__attribute__((cold)) ");
+    }
+
+    if (sym_rec.extra_flags.is_noinline or sym_rec.inlineMode() == .never) {
         try emitter.writeAll("__attribute__((noinline)) ");
     }
 
@@ -4254,10 +4460,11 @@ fn emitCallablePrototypesAndDrops(emitter: *CModuleEmitter) !void {
                 ffi_meta.wasm_import_name.len > 0 or
                 is_wasi_import or
                 emitter.cfg.target.isFreestanding());
-        const ret_c = if (try isZeroSizedType(emitter, sig.ret_ty))
+        const abi_ext_ret_ty = try unwrapTransparentCType(emitter, sig.ret_ty);
+        const ret_c = if (try isZeroSizedType(emitter, abi_ext_ret_ty))
             try emitter.allocator.dupe(u8, "void")
         else
-            try formatCType(emitter, sig.ret_ty);
+            try formatCType(emitter, abi_ext_ret_ty);
         defer emitter.allocator.free(ret_c);
         if (has_wasm_attr) {
             const mod_name = if (ffi_meta.wasm_import_module.len > 0)
@@ -4292,7 +4499,8 @@ fn emitCallablePrototypesAndDrops(emitter: *CModuleEmitter) !void {
                 emitted_p += 1;
             } else if (!(try isZeroSizedType(emitter, p_ty))) {
                 if (emitted_p > 0) try emitter.writeAll(", ");
-                const p_c = try formatCType(emitter, p_ty);
+                const abi_p_ty = try unwrapTransparentCType(emitter, p_ty);
+                const p_c = try formatCType(emitter, abi_p_ty);
                 defer emitter.allocator.free(p_c);
                 try emitter.writeAll(p_c);
                 emitted_p += 1;
@@ -4340,10 +4548,15 @@ fn emitCallablePrototypesAndDrops(emitter: *CModuleEmitter) !void {
     }
 
     for (emitter.input.bodies, 0..) |*body_ptr, b_idx| {
-        const ret_c = if (try isZeroSizedType(emitter, body_ptr.ret_ty))
+        const is_c_abi_body = isBodyCAbiBoundary(emitter, body_ptr);
+        const abi_body_ret_ty = if (is_c_abi_body)
+            try unwrapTransparentCType(emitter, body_ptr.ret_ty)
+        else
+            body_ptr.ret_ty;
+        const ret_c = if (try isZeroSizedType(emitter, abi_body_ret_ty))
             try emitter.allocator.dupe(u8, "void")
         else
-            try formatCType(emitter, body_ptr.ret_ty);
+            try formatCType(emitter, abi_body_ret_ty);
         defer emitter.allocator.free(ret_c);
 
         if (emitter.input.is_dev_got_enabled) {
@@ -4352,10 +4565,69 @@ fn emitCallablePrototypesAndDrops(emitter: *CModuleEmitter) !void {
             try emitter.writeAll(";\n");
         }
         try emitBodyFunctionAttributesC(emitter, body_ptr, false);
-        const storage_kw = if (isBodyExternallyVisible(emitter, body_ptr)) "" else "static ";
-        try emitter.print("{s}{s} {s}", .{ storage_kw, ret_c, emitter.body_c_names.items[b_idx] });
+        try emitter.print(
+            "{s}{s} {s}",
+            .{ resolveBodyStoragePrefixC(emitter, body_ptr), ret_c, emitter.body_c_names.items[b_idx] },
+        );
         try emitBodyParamList(emitter, body_ptr, true);
         try emitter.writeAll(";\n");
+    }
+
+    for (emitter.c_abi_reify_bodies.items) |reify_b_idx| {
+        const reify_body = &emitter.input.bodies[reify_b_idx];
+        const is_void_reify = try isZeroSizedType(emitter, reify_body.ret_ty);
+        const corex_ret_c = if (is_void_reify)
+            try emitter.allocator.dupe(u8, "void")
+        else
+            try formatCType(emitter, reify_body.ret_ty);
+        defer emitter.allocator.free(corex_ret_c);
+
+        try emitter.print("static {s} _cx_cabi_reify_{d}", .{ corex_ret_c, reify_b_idx });
+        try emitBodyParamListMode(emitter, reify_body, true, false);
+        try emitter.writeAll(" {\n    ");
+        if (!is_void_reify) {
+            const abi_ret_ty = try unwrapTransparentCType(emitter, reify_body.ret_ty);
+            const abi_ret_c = try formatCType(emitter, abi_ret_ty);
+            defer emitter.allocator.free(abi_ret_c);
+            try emitter.print("{s} _cr = ", .{abi_ret_c});
+        }
+        if (emitter.input.is_dev_got_enabled) {
+            try emitter.print("((_cx_body_fn_t_{d})_cx_dev_got[{d}u])(", .{ reify_b_idx, reify_b_idx });
+        } else {
+            try emitter.print("{s}(", .{emitter.body_c_names.items[reify_b_idx]});
+        }
+        var emitted_args: u32 = 0;
+        var arg_i: u32 = 0;
+        while (arg_i < reify_body.param_count) : (arg_i += 1) {
+            const loc_idx = 1 + arg_i;
+            const loc_decl = reify_body.locals.items[loc_idx];
+            const p_mode = loc_decl.mode();
+            if (p_mode == .inout_mode or p_mode == .set_mode) {
+                if (emitted_args > 0) try emitter.writeAll(", ");
+                try emitter.print("_arg_{d}", .{loc_idx});
+                emitted_args += 1;
+            } else if (!(try isZeroSizedType(emitter, loc_decl.type_id))) {
+                if (emitted_args > 0) try emitter.writeAll(", ");
+                const raw_arg_str = try std.fmt.allocPrint(emitter.allocator, "_arg_{d}", .{loc_idx});
+                defer emitter.allocator.free(raw_arg_str);
+                const unwrapped_arg_str = try formatUnwrapTransparentExprC(
+                    emitter,
+                    loc_decl.type_id,
+                    raw_arg_str,
+                    0,
+                );
+                defer emitter.allocator.free(unwrapped_arg_str);
+                try emitter.writeAll(unwrapped_arg_str);
+                emitted_args += 1;
+            }
+        }
+        try emitter.writeAll(");\n");
+        if (!is_void_reify) {
+            const wrapped_ret_str = try formatWrapTransparentExprC(emitter, reify_body.ret_ty, "_cr", 0);
+            defer emitter.allocator.free(wrapped_ret_str);
+            try emitter.print("    return {s};\n", .{wrapped_ret_str});
+        }
+        try emitter.writeAll("}\n");
     }
 
     if (emitter.input.is_dev_got_enabled) {
@@ -6414,16 +6686,22 @@ fn emitMirBody(emitter: *CModuleEmitter, body_idx: u32, body: *const MirBody) !v
     emitter.is_in_c_abi_body = isBodyCAbiBoundary(emitter, body);
     defer emitter.is_in_c_abi_body = false;
 
-    const is_void_ret = try isZeroSizedType(emitter, body.ret_ty);
+    const abi_body_ret_ty = if (emitter.is_in_c_abi_body)
+        try unwrapTransparentCType(emitter, body.ret_ty)
+    else
+        body.ret_ty;
+    const is_void_ret = try isZeroSizedType(emitter, abi_body_ret_ty);
     const ret_c = if (is_void_ret)
         try emitter.allocator.dupe(u8, "void")
     else
-        try formatCType(emitter, body.ret_ty);
+        try formatCType(emitter, abi_body_ret_ty);
     defer emitter.allocator.free(ret_c);
 
     try emitBodyFunctionAttributesC(emitter, body, true);
-    const storage_kw = if (isBodyExternallyVisible(emitter, body)) "" else "static ";
-    try emitter.print("{s}{s} {s}", .{ storage_kw, ret_c, emitter.body_c_names.items[body_idx] });
+    try emitter.print(
+        "{s}{s} {s}",
+        .{ resolveBodyStoragePrefixC(emitter, body), ret_c, emitter.body_c_names.items[body_idx] },
+    );
     try emitBodyParamList(emitter, body, true);
     try emitter.writeAll(" {\n");
 
@@ -6490,7 +6768,13 @@ fn emitMirBody(emitter: *CModuleEmitter, body_idx: u32, body: *const MirBody) !v
         } else if (is_param) {
             const loc_c = try formatCType(emitter, loc_decl.type_id);
             defer emitter.allocator.free(loc_c);
-            try emitter.print("    {s} _loc_{d} = _arg_{d}; (void)_loc_{d};\n", .{ loc_c, loc_i, loc_i, loc_i });
+            const init_rhs = if (emitter.is_in_c_abi_body) blk_wrap_param: {
+                const raw_arg_name = try std.fmt.allocPrint(emitter.allocator, "_arg_{d}", .{loc_i});
+                defer emitter.allocator.free(raw_arg_name);
+                break :blk_wrap_param try formatWrapTransparentExprC(emitter, loc_decl.type_id, raw_arg_name, 0);
+            } else try std.fmt.allocPrint(emitter.allocator, "_arg_{d}", .{loc_i});
+            defer emitter.allocator.free(init_rhs);
+            try emitter.print("    {s} _loc_{d} = {s}; (void)_loc_{d};\n", .{ loc_c, loc_i, init_rhs, loc_i });
         } else {
             const loc_c = try formatCType(emitter, loc_decl.type_id);
             defer emitter.allocator.free(loc_c);
@@ -6641,7 +6925,14 @@ fn emitMirBody(emitter: *CModuleEmitter, body_idx: u32, body: *const MirBody) !v
     emitter.active_bb_id = .none;
 
     if (body.blocks.items.len == 0) {
-        if (!is_void_ret) try emitter.writeAll("    return _loc_0;\n");
+        if (!is_void_ret) {
+            const loc0_ret = if (emitter.is_in_c_abi_body)
+                try formatUnwrapTransparentExprC(emitter, body.ret_ty, "_loc_0", 0)
+            else
+                try emitter.allocator.dupe(u8, "_loc_0");
+            defer emitter.allocator.free(loc0_ret);
+            try emitter.print("    return {s};\n", .{loc0_ret});
+        }
     }
     try emitter.writeAll("}\n\n");
 }
@@ -7511,7 +7802,12 @@ fn emitMirInstC(
             const fn_c = try formatCType(emitter, inst.type_id);
             defer emitter.allocator.free(fn_c);
             if (resolveBodyIndex(emitter, target_def, target_sym)) |b_target| {
-                if (emitter.input.is_dev_got_enabled) {
+                const inst_fn_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
+                const use_reify_bridge = emitter.c_abi_reify_set.contains(b_target) and
+                    if (emitter.input.pool.getFnSignatureView(inst_fn_ty)) |fn_sig| !fn_sig.is_c_abi else false;
+                if (use_reify_bridge) {
+                    try emitter.print("    _v_{d} = ({s})_cx_cabi_reify_{d};\n", .{ dst_raw, fn_c, b_target });
+                } else if (emitter.input.is_dev_got_enabled) {
                     try emitter.print(
                         "    _v_{d} = ({s})_cx_dev_got[{d}u];\n",
                         .{ dst_raw, fn_c, b_target },
@@ -11774,6 +12070,10 @@ fn emitMirTerminatorC(
             }
             if (is_void) {
                 try emitter.writeAll("    return;\n");
+            } else if (emitter.is_in_c_abi_body) {
+                const unwrapped_ret_expr = try formatUnwrapTransparentExprC(emitter, body.ret_ty, ret_expr, 0);
+                defer emitter.allocator.free(unwrapped_ret_expr);
+                try emitter.print("    return {s};\n", .{unwrapped_ret_expr});
             } else {
                 try emitter.print("    return {s};\n", .{ret_expr});
             }
@@ -11868,7 +12168,30 @@ fn emitMirTerminatorC(
                 call_site.args_len;
 
             const target_body_opt = resolveBodyIndex(emitter, call_site.direct_def_id, call_site.direct_symbol);
-            const has_icf_preamble = target_body_opt != null;
+            const is_c_abi_call: bool = if (target_body_opt) |tb_idx|
+                isBodyCAbiBoundary(emitter, &emitter.input.bodies[tb_idx])
+            else if (!call_site.direct_symbol.isNone() and
+                call_site.direct_symbol.asInt() < emitter.input.sym_table.symbols.items.len)
+                true
+            else if (indirect_sig) |isig|
+                isig.is_c_abi
+            else
+                false;
+            const callee_ret_ty: TypeId = if (target_body_opt) |tb_idx|
+                emitter.input.bodies[tb_idx].ret_ty
+            else if (!call_site.direct_symbol.isNone() and
+                call_site.direct_symbol.asInt() < emitter.input.sym_table.symbols.items.len)
+            blk_sym_ret: {
+                const sym_fn_ty = emitter.input.sym_table.getSymbol(call_site.direct_symbol).type_id;
+                if (emitter.input.pool.getFnSignatureView(sym_fn_ty)) |sv| break :blk_sym_ret sv.ret_ty;
+                break :blk_sym_ret call_site.ret_ty;
+            } else if (indirect_sig) |isig|
+                isig.ret_ty
+            else
+                call_site.ret_ty;
+            const cal_ret_check = emitter.input.pool.unwrapUnderlyingType(callee_ret_ty);
+            const has_icf_preamble = target_body_opt != null or
+                (is_c_abi_call and (try unwrapTransparentCType(emitter, cal_ret_check)) != cal_ret_check);
             if (has_icf_preamble) {
                 try emitter.writeAll("    {\n");
             }
@@ -11880,7 +12203,11 @@ fn emitMirTerminatorC(
                 const callee_param_ty_opt: ?TypeId = if (target_body_opt) |tb_idx| blk_cp: {
                     const cal_b = &emitter.input.bodies[tb_idx];
                     if (arg_i < cal_b.param_count and 1 + arg_i < cal_b.locals.items.len) {
-                        break :blk_cp emitter.input.pool.unwrapUnderlyingType(cal_b.locals.items[1 + arg_i].type_id);
+                        const raw_cal_p = emitter.input.pool.unwrapUnderlyingType(cal_b.locals.items[1 + arg_i].type_id);
+                        break :blk_cp if (is_c_abi_call)
+                            try unwrapTransparentCType(emitter, raw_cal_p)
+                        else
+                            raw_cal_p;
                     }
                     break :blk_cp null;
                 } else null;
@@ -11890,54 +12217,75 @@ fn emitMirTerminatorC(
                         body.getInst(MirValueId.fromInt(word)).type_id,
                     );
                     if (!(try isZeroSizedType(emitter, arg_ty))) {
+                        const eff_arg_ty = if (is_c_abi_call)
+                            try unwrapTransparentCType(emitter, arg_ty)
+                        else
+                            arg_ty;
+                        const raw_val_str = try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{word});
+                        defer emitter.allocator.free(raw_val_str);
+                        const base_val_expr = if (is_c_abi_call and eff_arg_ty != arg_ty)
+                            try formatUnwrapTransparentExprC(emitter, arg_ty, raw_val_str, 0)
+                        else
+                            try emitter.allocator.dupe(u8, raw_val_str);
+                        errdefer emitter.allocator.free(base_val_expr);
+
                         const is_vararg_tail = is_variadic_call and arg_i >= fixed_arity;
-                        const arg_expr = if (is_vararg_tail and arg_ty == .f32_ty)
-                            try std.fmt.allocPrint(emitter.allocator, "((double)_v_{d})", .{word})
-                        else if (is_vararg_tail and arg_ty == .bool_ty)
-                            try std.fmt.allocPrint(emitter.allocator, "((int32_t)(_v_{d} & 1u))", .{word})
-                        else if (is_vararg_tail) blk_va: {
-                            if (try resolveIntegerInfo(emitter, arg_ty)) |va_int| {
+                        const arg_expr = if (is_vararg_tail and eff_arg_ty == .f32_ty) blk_vf32: {
+                            defer emitter.allocator.free(base_val_expr);
+                            break :blk_vf32 try std.fmt.allocPrint(emitter.allocator, "((double){s})", .{base_val_expr});
+                        } else if (is_vararg_tail and eff_arg_ty == .bool_ty) blk_vbool: {
+                            defer emitter.allocator.free(base_val_expr);
+                            break :blk_vbool try std.fmt.allocPrint(
+                                emitter.allocator,
+                                "((int32_t)({s} & 1u))",
+                                .{base_val_expr},
+                            );
+                        } else if (is_vararg_tail) blk_va: {
+                            if (try resolveIntegerInfo(emitter, eff_arg_ty)) |va_int| {
                                 if (va_int.bits < 32) {
+                                    defer emitter.allocator.free(base_val_expr);
                                     if (va_int.is_signed) {
                                         break :blk_va try std.fmt.allocPrint(
                                             emitter.allocator,
-                                            "((int32_t)_v_{d})",
-                                            .{word},
+                                            "((int32_t){s})",
+                                            .{base_val_expr},
                                         );
                                     }
                                     break :blk_va try std.fmt.allocPrint(
                                         emitter.allocator,
-                                        "((int32_t)((uint32_t)_v_{d}))",
-                                        .{word},
+                                        "((int32_t)((uint32_t){s}))",
+                                        .{base_val_expr},
                                     );
                                 }
                             }
-                            break :blk_va try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{word});
+                            break :blk_va base_val_expr;
                         } else if (callee_param_ty_opt) |cal_p_ty| blk_icf_arg: {
-                            if (cal_p_ty != arg_ty and !(try isZeroSizedType(emitter, cal_p_ty))) {
+                            if (cal_p_ty != eff_arg_ty and !(try isZeroSizedType(emitter, cal_p_ty))) {
                                 const cal_p_c = try formatCType(emitter, cal_p_ty);
                                 defer emitter.allocator.free(cal_p_c);
-                                const arg_c = try formatCType(emitter, arg_ty);
+                                const arg_c = try formatCType(emitter, eff_arg_ty);
                                 defer emitter.allocator.free(arg_c);
                                 if (!std.mem.eql(u8, cal_p_c, arg_c)) {
+                                    defer emitter.allocator.free(base_val_expr);
                                     if (cal_p_c.len > 0 and arg_c.len > 0 and
                                         cal_p_c[cal_p_c.len - 1] == '*' and arg_c[arg_c.len - 1] == '*')
                                     {
                                         break :blk_icf_arg try std.fmt.allocPrint(
                                             emitter.allocator,
-                                            "(({s})_v_{d})",
-                                            .{ cal_p_c, word },
+                                            "(({s}){s})",
+                                            .{ cal_p_c, base_val_expr },
                                         );
                                     }
                                     try emitter.print(
-                                        "    {s} _icf_a_{d}; memcpy(&_icf_a_{d}, &_v_{d}, sizeof(_icf_a_{d}));\n",
-                                        .{ cal_p_c, arg_i, arg_i, word, arg_i },
+                                        "    {s} _icf_a_{d}; {s} _icf_s_{d} = {s}; " ++
+                                            "memcpy(&_icf_a_{d}, &_icf_s_{d}, sizeof(_icf_a_{d}));\n",
+                                        .{ cal_p_c, arg_i, arg_c, arg_i, base_val_expr, arg_i, arg_i, arg_i },
                                     );
                                     break :blk_icf_arg try std.fmt.allocPrint(emitter.allocator, "_icf_a_{d}", .{arg_i});
                                 }
                             }
-                            break :blk_icf_arg try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{word});
-                        } else try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{word});
+                            break :blk_icf_arg base_val_expr;
+                        } else base_val_expr;
                         try arg_strs.append(emitter.allocator, arg_expr);
                     }
                 } else {
@@ -11981,19 +12329,6 @@ fn emitMirTerminatorC(
                 }
             }
 
-            const callee_ret_ty: TypeId = if (target_body_opt) |tb_idx|
-                emitter.input.bodies[tb_idx].ret_ty
-            else if (!call_site.direct_symbol.isNone() and
-                call_site.direct_symbol.asInt() < emitter.input.sym_table.symbols.items.len)
-            blk_sym_ret: {
-                const sym_fn_ty = emitter.input.sym_table.getSymbol(call_site.direct_symbol).type_id;
-                if (emitter.input.pool.getFnSignatureView(sym_fn_ty)) |sv| break :blk_sym_ret sv.ret_ty;
-                break :blk_sym_ret call_site.ret_ty;
-            } else if (indirect_sig) |isig|
-                isig.ret_ty
-            else
-                call_site.ret_ty;
-
             const normal_edge = body.extra_edges.items[term.edge_start];
             const dst_params = body.getBlockParams(normal_edge.target_bb);
             const has_ret_assign = !(try isZeroSizedType(emitter, callee_ret_ty)) and
@@ -12002,12 +12337,26 @@ fn emitMirTerminatorC(
                 !(try isZeroSizedType(emitter, body.getInst(dst_params[0]).type_id));
 
             var ret_icf_memcpy_dst: ?u32 = null;
+            var ret_transparent_wrap: ?struct { dst_id: u32, dst_ty: TypeId, cal_ty: TypeId } = null;
             try emitter.writeAll("    ");
             if (has_ret_assign) {
                 const dst_id = dst_params[0].asInt();
                 const dst_ty = emitter.input.pool.unwrapUnderlyingType(body.getInst(dst_params[0]).type_id);
                 const cal_ret_unwrapped = emitter.input.pool.unwrapUnderlyingType(callee_ret_ty);
-                if (dst_ty != cal_ret_unwrapped) {
+                const abi_cal_ret_ty = if (is_c_abi_call)
+                    try unwrapTransparentCType(emitter, cal_ret_unwrapped)
+                else
+                    cal_ret_unwrapped;
+                if (abi_cal_ret_ty != cal_ret_unwrapped) {
+                    const abi_ret_c = try formatCType(emitter, abi_cal_ret_ty);
+                    defer emitter.allocator.free(abi_ret_c);
+                    try emitter.print("{s} _tr_rv = ", .{abi_ret_c});
+                    ret_transparent_wrap = .{
+                        .dst_id = dst_id,
+                        .dst_ty = dst_ty,
+                        .cal_ty = cal_ret_unwrapped,
+                    };
+                } else if (dst_ty != cal_ret_unwrapped) {
                     const dst_c = try formatCType(emitter, dst_ty);
                     defer emitter.allocator.free(dst_c);
                     const cal_c = try formatCType(emitter, cal_ret_unwrapped);
@@ -12069,6 +12418,20 @@ fn emitMirTerminatorC(
                         try emitter.writeAll(a_str);
                     }
                     try emitter.writeAll(");\n");
+                }
+            }
+            if (ret_transparent_wrap) |tr_wrap| {
+                const wrapped_rv = try formatWrapTransparentExprC(emitter, tr_wrap.cal_ty, "_tr_rv", 0);
+                defer emitter.allocator.free(wrapped_rv);
+                if (tr_wrap.dst_ty == tr_wrap.cal_ty) {
+                    try emitter.print("    _v_{d} = {s};\n", .{ tr_wrap.dst_id, wrapped_rv });
+                } else {
+                    const cal_wrap_c = try formatCType(emitter, tr_wrap.cal_ty);
+                    defer emitter.allocator.free(cal_wrap_c);
+                    try emitter.print(
+                        "    {s} _icf_tr = {s}; memcpy(&_v_{d}, &_icf_tr, sizeof(_v_{d}));\n",
+                        .{ cal_wrap_c, wrapped_rv, tr_wrap.dst_id, tr_wrap.dst_id },
+                    );
                 }
             }
             if (ret_icf_memcpy_dst) |dst_id| {
@@ -12563,7 +12926,7 @@ pub fn formatInternalBodySymbolAlloc(
     );
 }
 
-/// Verifies that unmangled external export `export_name` (`@export` / `@link_name` / `@wasm_export`)
+/// Verifies that unmangled external export `export_name` (`@export` / `@link(name: "…")` / `@wasm_export`)
 /// does not collide with another distinct `SymbolIndex` across packages (`E0011`).
 pub fn checkAndRecordExportedLinkerSymbol(
     allocator: std.mem.Allocator,
@@ -12627,7 +12990,7 @@ pub fn checkAndRecordExportedLinkerSymbol(
             .message = msg,
             .labels = labels_buf[0..label_len],
             .notes = &[_][]const u8{
-                "help: rename one of the `@export` / `@link_name` / `@wasm_export` symbols to avoid linker collision",
+                "help: rename one of the `@export` / `@link(name: …)` / `@wasm_export` symbols to avoid linker collision",
             },
         });
     }
@@ -12880,8 +13243,8 @@ test "test_codegen_c_source_loc_fmt_atomics_variadics_and_bytes" {
         \\        .Low => 1,
         \\        .High => 2,
         \\    };
-        \\    let dyn_fa: FmtArgs = "k={num:02x},{sk:?}";
-        \\    let formatted: str = "{num:08x}|{label:>6}|{num=}|{neg:x}|{dyn_fa}";
+        \\    let dyn_fa: FmtArgs = f"k={num:02x},{sk:?}";
+        \\    let formatted: str = f"{num:08x}|{label:>6}|{num=}|{neg:x}|{dyn_fa}";
         \\    let _written: isize = @sys_write(1, formatted);
         \\    let total: u32 = p0 + p1 + p2 + cur + scratch + (b_lit[0] as u32) + (inv[0] as u32) + sk_tag;
         \\    if total == 162 and loc_score > 200 {
@@ -12978,9 +13341,9 @@ test "test_codegen_c_zero_env_own_closure_cmpxchg_and_float_fmt" {
         \\    let f_nan: f64 = zero_f / zero_f;
         \\    let f_inf: f64 = 1.0 / zero_f;
         \\    let f_ninf: f64 = -1.0 / zero_f;
-        \\    let part_a: str = "{seed_five}|{seed_five:?}|{f_tiny}|{f_small}|{f_big}";
-        \\    let part_b: str = "{f_nan}|{f_nan:+}|{f_nan:E}|{f_inf}|{f_inf:+}|{f_ninf}|{f_inf:E}|{f_ninf:E}";
-        \\    return "{part_a}|{part_b}";
+        \\    let part_a: str = f"{seed_five}|{seed_five:?}|{f_tiny}|{f_small}|{f_big}";
+        \\    let part_b: str = f"{f_nan}|{f_nan:+}|{f_nan:E}|{f_inf}|{f_inf:+}|{f_ninf}|{f_inf:E}|{f_ninf:E}";
+        \\    return f"{part_a}|{part_b}";
         \\}
         \\pub fn main() -> i32 {
         \\    let niche_sum: i32 = eval_zero_env_own_niche();
@@ -13109,7 +13472,7 @@ test "test_codegen_c_freestanding_wasm_and_sdkless_aarch64_msvc_obj" {
     // [2] SDK-less `aarch64-windows-msvc` `.obj` and `.lib` static archive emission:
     const arm64_src =
         \\@export
-        \\@link_name("cx_arm64_add")
+        \\@link(name: "cx_arm64_add")
         \\pub fn arm64_add(lhs_val: i32, rhs_val: i32) -> i32 {
         \\    return lhs_val +% rhs_val;
         \\}
@@ -13169,9 +13532,9 @@ test "test_codegen_c_freestanding_wasm_and_sdkless_aarch64_msvc_obj" {
 test "test_phase9_duplicate_link_name_main_emits_e0011" {
     const allocator = std.testing.allocator;
     const dup_main_src =
-        \\@link_name("main")
+        \\@link(name: "main")
         \\pub fn entry_one() -> i32 = 0;
-        \\@link_name("main")
+        \\@link(name: "main")
         \\pub fn entry_two() -> i32 = 1;
     ;
     var dup_bundle = try mir.lowerSourceToMir(
@@ -13205,4 +13568,64 @@ test "test_phase9_duplicate_link_name_main_emits_e0011" {
         if (diag_item.code == .e0011_native_links_collision) has_e0011 = true;
     }
     try std.testing.expect(has_e0011);
+}
+
+test "test_dr24_codegen_c_packed_cap_align_and_inline_modes" {
+    const allocator = std.testing.allocator;
+    const dr24_src =
+        \\@repr(C, packed: true, align: 64)
+        \\pub struct PackedAligned64 {
+        \\    pub a: u8,
+        \\    pub b: u32,
+        \\}
+        \\@repr(C, packed: 2)
+        \\pub struct PackedCap2 {
+        \\    pub a: u8,
+        \\    pub b: u32,
+        \\}
+        \\@inline(always)
+        \\pub fn force_inline_add(lhs_val: u32, rhs_val: u32) -> u32 {
+        \\    return lhs_val + rhs_val;
+        \\}
+        \\@inline(never)
+        \\pub fn never_inline_probe(hdr1: PackedAligned64, hdr2: PackedCap2) -> u32 {
+        \\    return force_inline_add(hdr1.b, hdr2.b);
+        \\}
+    ;
+    var dr24_bundle = try mir.lowerSourceToMir(
+        allocator,
+        FileId.fromInt(212),
+        dr24_src,
+        TargetSpec.X86_64_LINUX_GNU.asTargetLayout(),
+        .{},
+    );
+    defer dr24_bundle.deinit();
+    try std.testing.expect(!dr24_bundle.hir_bundle.diagnostics.hasErrors());
+
+    var dr24_art = try emitModule(
+        allocator,
+        .{ .target = TargetSpec.X86_64_LINUX_GNU, .is_release_mode = false },
+        .{
+            .bodies = dr24_bundle.mir_bundle.bodies.items,
+            .pool = &dr24_bundle.hir_bundle.pool,
+            .sym_table = &dr24_bundle.hir_bundle.sym_table,
+            .interner = &dr24_bundle.hir_bundle.interner,
+            .module_name = "dr24_c_attrs",
+            .artifact_kind = .source_text,
+        },
+    );
+    defer dr24_art.deinit(allocator);
+
+    try std.testing.expect(
+        std.mem.indexOf(u8, dr24_art.emitted_text, "struct __attribute__((packed, aligned(64)))") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, dr24_art.emitted_text, "#pragma pack(push, 2)") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, dr24_art.emitted_text, "struct __attribute__((packed, aligned(2)))") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, dr24_art.emitted_text, "#pragma pack(pop)") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, dr24_art.emitted_text, "__attribute__((always_inline)) inline") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, dr24_art.emitted_text, "__attribute__((noinline))") != null);
 }

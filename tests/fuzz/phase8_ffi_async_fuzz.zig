@@ -199,7 +199,7 @@ fn buildRandomAsyncCxProgram(allocator: std.mem.Allocator, rng: std.Random) ![]u
 
     return std.fmt.allocPrint(
         allocator,
-        "//! Generated Phase 8 Async Coroutine & Nursery Differential Fuzz Program\n" ++
+        "/# Generated Phase 8 Async Coroutine & Nursery Differential Fuzz Program\n\n" ++
             "pub async fn pinned_accum(slot: &mut i32, first_add: i32, second_add: i32) -> i32 {{\n" ++
             "    slot.* = slot.* +% first_add;\n" ++
             "    cx.async.yield_now().await;\n" ++

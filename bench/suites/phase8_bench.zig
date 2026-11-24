@@ -87,7 +87,7 @@ const FFI_CALLEE_C_SOURCE =
     "}\n";
 /// CoreX `extern "C"` FFI caller executing `2,000,000` cross-ABI calls in Case 3.
 const FFI_CALLER_CX_SOURCE =
-    "//! Phase 8 Zero-Overhead `extern \"C\"` FFI Call Loop Benchmark\n" ++
+    "/# Phase 8 Zero-Overhead `extern \"C\"` FFI Call Loop Benchmark\n\n" ++
     "extern \"C\" fn cx_bench_c_mix_step(state_val: u64, round_idx: u64) -> u64;\n\n" ++
     "pub fn run_ffi_loop(total_rounds: u64, init_seed: u64) -> u64 {\n" ++
     "    var state_acc: u64 = init_seed;\n" ++
@@ -197,7 +197,7 @@ fn buildSyntheticAsyncModuleSource(allocator: std.mem.Allocator) ![]u8 {
 
     try builder.appendSlice(
         allocator,
-        "//! Synthetic 64-Coroutine Phase 8 Frame Coloring Benchmark Module\n" ++
+        "/# Synthetic 64-Coroutine Phase 8 Frame Coloring Benchmark Module\n\n" ++
             "pub async fn touch_pinned(slot_ref: &mut u64, step_v: u64) {\n" ++
             "    slot_ref.* = slot_ref.* +% step_v;\n" ++
             "    cx.async.yield_now().await;\n" ++

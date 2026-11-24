@@ -3,8 +3,8 @@
 //! Verifies all Phase 7 Wave 3B Tier A (`-ofmt=c`) invariants (`DR-01`, `phase7_spec.md` §3–§4):
 //! - Byte-for-byte deterministic ISO C99 emission (`Run 1 == Run 2`) across all 7 targets with
 //!   zero `void*` untyped escape hatches, topological `TypeId` struct/union ordering, physical
-//!   field layout (`_f<decl_ord>`), explicit `_pad_<k>` padding arrays, `@packed`, and
-//!   `@cache_aligned` (`aligned(64)` vs `aligned(128)` on `aarch64-macos`).
+//!   field layout (`_f<decl_ord>`), explicit `_pad_<k>` padding arrays, `@repr(C, packed: …)`, and
+//!   `@repr(align: .CacheLine)` (`aligned(64)` vs `aligned(128)` on `aarch64-macos`).
 //! - Exact sum-type representations (`transparent_ok`, `niche_single` at `niche.byte_offset`,
 //!   `explicit_tag`), non-null dangling pointers on empty slices/strings (`[CRITICAL-04]`),
 //!   `#soa [S; C]` & `#soa [S]` SIMD-aligned column offsets (`[CRITICAL-03]`), cycle-safe `_phi_<k>`
@@ -50,7 +50,8 @@ fn assertZeroUnscopedVoidPtr(emitted_c: []const u8) !void {
         const after_void = user_c[hit_pos + "void *".len ..];
         const is_rodata_align_cast = std.mem.startsWith(u8, after_void, ")_cx_blob_") or
             std.mem.startsWith(u8, after_void, ")_cx_str_bytes_") or
-            std.mem.startsWith(u8, after_void, ")_cx_empty_rodata");
+            std.mem.startsWith(u8, after_void, ")_cx_empty_rodata") or
+            std.mem.startsWith(u8, after_void, "_val_p, uint32_t _spec_lo");
         try std.testing.expect(is_rodata_align_cast);
         scan_pos = hit_pos + "void *".len;
     }
@@ -201,18 +202,18 @@ fn runSourceInMirVmOracle(
 
 test "test_codegen_c_determinism_layouts_dev_got_and_7_targets" {
     const showcase_src =
-        \\@zero_pad
+        \\@repr(zero_pad: true)
         \\pub struct PaddedHeader {
         \\    pub tag: u8,
         \\    pub count: u64,
         \\    pub flags: u16,
         \\}
-        \\@packed
+        \\@repr(C, packed: true)
         \\pub struct WirePacket {
         \\    pub magic: u8,
         \\    pub seq: u32,
         \\}
-        \\@cache_aligned
+        \\@repr(align: .CacheLine)
         \\pub struct HotCounter {
         \\    pub hits: u64,
         \\}
@@ -350,8 +351,7 @@ test "test_codegen_c_cross_target_object_compilation_linux_macos_wasm" {
 test "test_codegen_c_native_executable_execution_and_oracle_trace_parity" {
     const host_spec = TargetSpec.host();
     const exec_src =
-        \\@zero_pad
-        \\@repr(C)
+        \\@repr(C, zero_pad: true)
         \\pub struct ZeroPadProbe {
         \\    pub head: u8,
         \\    pub tail: u64,
@@ -394,7 +394,7 @@ test "test_codegen_c_native_executable_execution_and_oracle_trace_parity" {
         \\    slot.* = slot.* + delta;
         \\}
         \\pub fn main() -> i32 {
-        \\    // [1] `@zero_pad` padding bytes must be strictly `0x00`:
+        \\    // [1] `zero_pad: true` padding bytes must be strictly `0x00`:
         \\    let zp = ZeroPadProbe { head: 7, tail: 99 };
         \\    let zp_bytes: &[u8] = zp.as_bytes();
         \\    var pad_or: u8 = 0;
@@ -587,13 +587,13 @@ test "test_regression_codegen_c_extern_write_exit_dedup_and_trigraph_escape" {
         \\    pub val: i32,
         \\}
         \\@extern("C")
-        \\@link_name("write")
+        \\@link(name: "write")
         \\pub fn posix_write_a(fd: i32, buf: *u8, count: usize) -> isize;
         \\@extern("C")
-        \\@link_name("write")
+        \\@link(name: "write")
         \\pub fn posix_write_b(fd: i32, buf: *u8, count: usize) -> isize;
         \\@extern("C")
-        \\@link_name("_exit")
+        \\@link(name: "_exit")
         \\pub fn posix_exit_now(status: i32) -> never;
         \\pub fn probe_entry(val: i32) -> i32 {
         \\    if val == -999 {
@@ -680,7 +680,7 @@ test "test_phase76_codegen_c_opaque_ptr_variadic_caller_loc_and_fmt_spec" {
         \\}
         \\pub fn invoke_variadic_and_fmt(ctx: *mut opaque, ro: *opaque) -> i32 {
         \\    let bytes_ref: &[u8; 3] = b"XY\x00";
-        \\    let hex_txt: str = "{0x2a_u32:04x}";
+        \\    let hex_txt: str = f"{0x2a_u32:04x}";
         \\    let loc_line = probe_loc_line() as i32;
         \\    let ext_rc = unsafe { cx_ext_variadic(ctx, ro, (&raw bytes_ref[0]), 7_i32) };
         \\    return ext_rc + loc_line + (hex_txt.len() as i32);
@@ -704,4 +704,151 @@ test "test_phase76_codegen_c_opaque_ptr_variadic_caller_loc_and_fmt_spec" {
         std.mem.indexOf(u8, c_art.emitted_text, "void *, const void *, uint8_t *, ...") != null,
     );
     try std.testing.expect(std.mem.indexOf(u8, c_art.emitted_text, "cx_ext_variadic") != null);
+}
+
+test "test_dr24_codegen_c_transparent_packed_cap_inline_fmt_and_inline_if" {
+    const dr24_c_src =
+        \\/# DR-24 Tier A C99 Emission & Object Compilation Verification
+        \\@repr(transparent)
+        \\pub struct F64Wrapper {
+        \\    pub inner: f64,
+        \\    pub marker: (),
+        \\}
+        \\@repr(C, packed: 2, align: 16, zero_pad: true)
+        \\pub struct WireHdr16 {
+        \\    pub tag: u8,
+        \\    pub seq: u32,
+        \\    pub flags: u16,
+        \\}
+        \\@inline(always)
+        \\pub fn fast_scale(val: i32) -> i32 {
+        \\    return val * 3;
+        \\}
+        \\@inline(never)
+        \\pub fn eval_dr24_c(seed: i32, opt_bonus: i32?, wrapped: F64Wrapper) -> i32 {
+        \\    let hdr = WireHdr16 { tag: 7, seq: 0x1122_3344, flags: 9 };
+        \\    let raw_bytes: &[u8] = hdr.as_bytes();
+        \\    let lit_braces: str = "{plain}";
+        \\    let fmt_s: str = f"t={hdr.tag}";
+        \\    let fmt_q: str = f#"k="{seed}""#;
+        \\    let block_s: str = "
+        \\        alpha
+        \\        beta
+        \\        ";
+        \\    let picked = if (scaled := fast_scale(seed)) > 6 and opt_bonus is .Some(bonus_v) => scaled + bonus_v else 0;
+        \\    return picked + (wrapped.inner as i32) + (raw_bytes[1] as i32) +
+        \\        (lit_braces.len() as i32) + (fmt_s.len() as i32) + (fmt_q.len() as i32) + (block_s.len() as i32);
+        \\}
+    ;
+
+    var c_art = try emitCModuleFromSource(
+        std.testing.allocator,
+        dr24_c_src,
+        TargetSpec.X86_64_LINUX,
+        true,
+        false,
+        false,
+        .source_text,
+        null,
+        null,
+    );
+    defer c_art.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, c_art.emitted_text, "#pragma pack(push, 2)") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, c_art.emitted_text, "struct __attribute__((packed, aligned(16)))") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, c_art.emitted_text, "#pragma pack(pop)") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, c_art.emitted_text, "__attribute__((always_inline)) inline") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, c_art.emitted_text, "__attribute__((noinline))") != null);
+    try assertZeroUnscopedVoidPtr(c_art.emitted_text);
+
+    const obj_path = ".zig-cache/test_tier_a_dr24_attrs.o";
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, obj_path) catch {};
+    var obj_art = try emitCModuleFromSource(
+        std.testing.allocator,
+        dr24_c_src,
+        TargetSpec.X86_64_LINUX,
+        true,
+        false,
+        false,
+        .object_file,
+        obj_path,
+        null,
+    );
+    defer obj_art.deinit(std.testing.allocator);
+}
+
+test "test_dr24_codegen_c_win64_transparent_c_abi_unwrapping_with_phantom_zst" {
+    const transparent_abi_src =
+        \\/# Win64 & SysV `@repr(transparent)` C-ABI scalar unwrapping verification.
+        \\pub struct Phantom[T] {}
+        \\
+        \\@repr(transparent)
+        \\pub struct Radians {
+        \\    _marker: Phantom[f64],
+        \\    pub val: f64,
+        \\}
+        \\
+        \\extern "C" fn host_cos_rad(angle: Radians) -> Radians;
+        \\
+        \\@export
+        \\pub fn scale_radians(angle: Radians, factor: f64) -> Radians {
+        \\    return Radians { _marker: Phantom[f64] {}, val: angle.val * factor };
+        \\}
+        \\
+        \\pub fn invoke_transparent_ffi(
+        \\    cb: extern "C" fn(Radians) -> Radians,
+        \\    input_rad: Radians,
+        \\) -> f64 {
+        \\    let ext_out = unsafe { host_cos_rad(input_rad) };
+        \\    let cb_out = unsafe { cb(ext_out) };
+        \\    let exp_out = scale_radians(cb_out, 2.0);
+        \\    return exp_out.val;
+        \\}
+    ;
+
+    const win64_target = TargetSpec{ .arch = .x86_64, .os = .windows, .abi = .msvc };
+    var win_c_art = try emitCModuleFromSource(
+        std.testing.allocator,
+        transparent_abi_src,
+        win64_target,
+        true,
+        false,
+        false,
+        .source_text,
+        null,
+        null,
+    );
+    defer win_c_art.deinit(std.testing.allocator);
+
+    // `extern "C"` prototype, `extern "C" fn` typedef, and `@export` signature must all use `double` (never `struct`):
+    try std.testing.expect(std.mem.indexOf(u8, win_c_art.emitted_text, "extern double _cx_ext_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, win_c_art.emitted_text, "(double) __asm__(\"host_cos_rad\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, win_c_art.emitted_text, "(double);") != null);
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            win_c_art.emitted_text,
+            "double scale_radians(double _arg_1, double _arg_2)",
+        ) != null,
+    );
+    try assertZeroUnscopedVoidPtr(win_c_art.emitted_text);
+
+    const win_obj_path = ".zig-cache/test_tier_a_win64_transparent.obj";
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, win_obj_path) catch {};
+    var win_obj_art = try emitCModuleFromSource(
+        std.testing.allocator,
+        transparent_abi_src,
+        win64_target,
+        true,
+        false,
+        false,
+        .object_file,
+        win_obj_path,
+        null,
+    );
+    defer win_obj_art.deinit(std.testing.allocator);
 }

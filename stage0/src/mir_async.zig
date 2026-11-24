@@ -2599,7 +2599,7 @@ test "test_mir_async_over_aligned_64b_local_computes_aligned_frame_layout" {
     const aligned_src =
         \\use cx.async.yield_now;
         \\
-        \\@align(64)
+        \\@repr(align: 64)
         \\pub struct CacheLineBlock {
         \\    pub lanes: [u64; 8],
         \\}

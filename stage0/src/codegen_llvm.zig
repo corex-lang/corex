@@ -382,9 +382,9 @@ const SymFfiMetaLlvm = struct {
     is_export: bool = false,
     /// `true` when annotated with `@thread_local`.
     is_thread_local: bool = false,
-    /// Optional explicit `@link_name("…")` override.
+    /// Optional explicit `@link(name: "…")` override.
     link_name: []const u8 = "",
-    /// Optional explicit `@link_section("…")` target section name.
+    /// Optional explicit `@link(section: "…")` target section name.
     link_section: []const u8 = "",
     /// Optional `@wasm_import("module", "name")` module identifier.
     wasm_import_module: []const u8 = "",
@@ -1240,7 +1240,7 @@ fn recordCollectedLinkLibLlvm(emitter: *LlvmModuleEmitter, lib_name: []const u8)
     try emitter.collected_link_libs.append(emitter.allocator, lib_name);
 }
 
-/// Returns `true` if `body` carries `@export`, `@wasm_export`, or `@link_name` external symbol visibility.
+/// Returns `true` if `body` carries `@export`, `@wasm_export`, or `@link(name: "…")` external symbol visibility.
 fn isBodyExternallyVisible(emitter: *const LlvmModuleEmitter, body: *const MirBody) bool {
     if (body.symbol_index.isNone() or
         body.symbol_index.asInt() >= emitter.input.sym_table.symbols.items.len) return false;
@@ -1249,7 +1249,7 @@ fn isBodyExternallyVisible(emitter: *const LlvmModuleEmitter, body: *const MirBo
     return extractSymFfiMetaLlvm(emitter, body.symbol_index).wasm_export_name.len > 0;
 }
 
-/// Returns `true` if `body` is an `@export`, `@wasm_export`, `@link_name`, or `extern "C"` C-ABI boundary (`Fix-07`).
+/// Returns `true` if `body` is an `@export`, `@wasm_export`, `@link(name: "…")`, or `extern "C"` C-ABI boundary (`Fix-07`).
 fn isBodyCAbiBoundaryLlvm(emitter: *const LlvmModuleEmitter, body: *const MirBody) bool {
     if (body.symbol_index.isNone() or
         body.symbol_index.asInt() >= emitter.input.sym_table.symbols.items.len) return false;
@@ -2118,13 +2118,47 @@ fn resolveCallingConvPrefix(recipe: *const AbiFnRecipe) []const u8 {
     };
 }
 
+/// Unwraps `unwrapTransparentType` plus `@repr(transparent)` single-non-ZST-field structs for ABI lowering.
+fn unwrapAbiTransparentStructType(emitter: *LlvmModuleEmitter, raw_ty: TypeId) !TypeId {
+    var cur_ty = try unwrapTransparentType(emitter, raw_ty);
+    var depth: u32 = 0;
+    while (depth < 16 and
+        !cur_ty.isPrimitiveOrSentinel() and
+        !isBuiltInRuntimeTypeLlvm(emitter.input.pool, cur_ty)) : (depth += 1)
+    {
+        const node = emitter.input.pool.getNode(cur_ty);
+        if (node.tag != .struct_ty) break;
+        const sym_idx = SymbolIndex.fromInt(node.rhs);
+        if (sym_idx.isNone() or sym_idx.asInt() >= emitter.input.sym_table.symbols.items.len) break;
+        if (!emitter.input.sym_table.getSymbol(sym_idx).isReprTransparent()) break;
+        const lay = try emitter.resolver.resolveType(cur_ty);
+        var non_zst_ty: ?TypeId = null;
+        var fld_i: u32 = 0;
+        while (fld_i < lay.aux_len) : (fld_i += 1) {
+            const fld = emitter.resolver.fields_by_decl.items[lay.aux_start + fld_i];
+            if (fld.size_bytes == 0) continue;
+            if (non_zst_ty != null or fld.byte_offset != 0 or fld.size_bytes != lay.size_bytes) {
+                non_zst_ty = null;
+                break;
+            }
+            non_zst_ty = fld.field_ty;
+        }
+        if (non_zst_ty) |inner_ty| {
+            cur_ty = try unwrapTransparentType(emitter, inner_ty);
+        } else {
+            break;
+        }
+    }
+    return cur_ty;
+}
+
 /// Formats the lowered LLVM register/pointer type for `param_rec` and CoreX `raw_ty`.
 fn formatAbiParamOrRetType(
     emitter: *LlvmModuleEmitter,
     raw_ty: TypeId,
     param_rec: AbiParamRecipe,
 ) ![]u8 {
-    const ty = try unwrapTransparentType(emitter, raw_ty);
+    const ty = try unwrapAbiTransparentStructType(emitter, raw_ty);
     return switch (param_rec.pass_mode) {
         .ignore_zst => emitter.allocator.dupe(u8, "void"),
         .indirect_by_ref, .indirect_byval, .sret_ptr, .swifterror_ptr => emitter.allocator.dupe(u8, "ptr"),
@@ -8760,15 +8794,11 @@ fn lowerPlaceLlvm(
                         cur_ptr = try std.fmt.allocPrint(emitter.allocator, "%_fld_{d}", .{t_id});
                     }
                     cur_ty = fld_ty;
-                    if (parent_lay.reprFlags().is_packed) {
-                        cur_align = 1;
-                    } else {
-                        const fld_nat_align = @as(u32, 1) << @intCast(fld.align_log2);
-                        cur_align = @min(
-                            @min(@max(cur_align, 1), parent_lay.alignBytes()),
-                            effectiveOffsetAlign(fld.byte_offset, fld_nat_align),
-                        );
-                    }
+                    const f_lay = try emitter.resolver.resolveType(fld_ty);
+                    cur_align = @min(
+                        @min(@max(cur_align, 1), parent_lay.alignBytes()),
+                        effectiveOffsetAlign(fld.byte_offset, f_lay.alignBytes()),
+                    );
                 }
             },
             .index => {
@@ -9831,11 +9861,8 @@ fn emitMirInstLlvm(
                 elem_align = emitter.cfg.target.ptrBytes();
             } else if (try emitter.resolver.getFieldByDeclOrdinal(src_ty, fld_ord)) |fld| {
                 elem_off = fld.byte_offset;
-                const nat_align = @as(u32, 1) << @intCast(fld.align_log2);
-                elem_align = if (src_lay.reprFlags().is_packed)
-                    1
-                else
-                    @min(src_lay.alignBytes(), effectiveOffsetAlign(fld.byte_offset, nat_align));
+                const f_lay = try emitter.resolver.resolveType(fld.field_ty);
+                elem_align = @min(src_lay.alignBytes(), effectiveOffsetAlign(fld.byte_offset, f_lay.alignBytes()));
             }
 
             const fld_ptr = if (elem_off == 0)
@@ -9904,11 +9931,8 @@ fn emitMirInstLlvm(
                     elem_align = emitter.cfg.target.ptrBytes();
                 } else if (try emitter.resolver.getFieldByDeclOrdinal(agg_ty, fld_ord)) |fld| {
                     elem_off = fld.byte_offset;
-                    const nat_align = @as(u32, 1) << @intCast(fld.align_log2);
-                    elem_align = if (agg_lay.reprFlags().is_packed)
-                        1
-                    else
-                        @min(agg_lay.alignBytes(), effectiveOffsetAlign(fld.byte_offset, nat_align));
+                    const f_lay = try emitter.resolver.resolveType(fld.field_ty);
+                    elem_align = @min(agg_lay.alignBytes(), effectiveOffsetAlign(fld.byte_offset, f_lay.alignBytes()));
                 }
                 const fld_ptr = if (elem_off == 0)
                     try emitter.allocator.dupe(u8, scratch)
@@ -13174,11 +13198,11 @@ fn emitAggregateMakeLlvm(
                     defer emitter.allocator.free(fld_ptr);
                     const elem_ssa = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{elem_raw});
                     defer emitter.allocator.free(elem_ssa);
-                    const nat_align = @as(u32, 1) << @intCast(fld.align_log2);
-                    const fld_align = if (agg_lay.reprFlags().is_packed)
-                        1
-                    else
-                        @min(agg_lay.alignBytes(), effectiveOffsetAlign(fld.byte_offset, nat_align));
+                    const f_lay = try emitter.resolver.resolveType(fld.field_ty);
+                    const fld_align = @min(
+                        agg_lay.alignBytes(),
+                        effectiveOffsetAlign(fld.byte_offset, f_lay.alignBytes()),
+                    );
                     try emitStoreValueToPtr(
                         emitter,
                         state,
@@ -13235,10 +13259,10 @@ fn emitAggregateMakeLlvm(
                             break :blk try std.fmt.allocPrint(emitter.allocator, "%_aes_{d}", .{t_id});
                         };
                         defer emitter.allocator.free(src_fp);
-                        const src_align = if (st_lay.reprFlags().is_packed)
-                            1
-                        else
-                            @min(st_lay.alignBytes(), effectiveOffsetAlign(fld.byte_offset, f_lay.alignBytes()));
+                        const src_align = @min(
+                            st_lay.alignBytes(),
+                            effectiveOffsetAlign(fld.byte_offset, f_lay.alignBytes()),
+                        );
                         const f_val = try emitLoadValueFromPtr(
                             emitter,
                             state,
@@ -13355,10 +13379,10 @@ fn emitAggregateMakeLlvm(
                         );
                         const s_fp = try std.fmt.allocPrint(emitter.allocator, "%_rfs_{d}", .{sub_id});
                         defer emitter.allocator.free(s_fp);
-                        const src_align = if (st_lay.reprFlags().is_packed)
-                            1
-                        else
-                            @min(st_lay.alignBytes(), effectiveOffsetAlign(fld.byte_offset, f_lay.alignBytes()));
+                        const src_align = @min(
+                            st_lay.alignBytes(),
+                            effectiveOffsetAlign(fld.byte_offset, f_lay.alignBytes()),
+                        );
                         const f_val = try emitLoadValueFromPtr(
                             emitter,
                             state,
@@ -20716,10 +20740,21 @@ fn emitMirBody(emitter: *LlvmModuleEmitter, body_idx: u32, body: *const MirBody)
     }
     try emitter.print(") {s}", .{fnUnwindAttrs(emitter)});
     if (!body.symbol_index.isNone() and
-        body.symbol_index.asInt() < emitter.input.sym_table.symbols.items.len and
-        emitter.input.sym_table.getSymbol(body.symbol_index).extra_flags.is_noinline)
+        body.symbol_index.asInt() < emitter.input.sym_table.symbols.items.len)
     {
-        try emitter.writeAll(" noinline");
+        const fn_sym = emitter.input.sym_table.getSymbol(body.symbol_index).*;
+        if (fn_sym.isCold()) {
+            try emitter.writeAll(" cold");
+        }
+        if (fn_sym.extra_flags.is_noinline or fn_sym.inlineMode() == .never) {
+            try emitter.writeAll(" noinline");
+        } else if (!body.is_async) {
+            switch (fn_sym.inlineMode()) {
+                .always => try emitter.writeAll(" alwaysinline"),
+                .hint => try emitter.writeAll(" inlinehint"),
+                .none, .never => {},
+            }
+        }
     }
     const body_ffi = extractSymFfiMetaLlvm(emitter, body.symbol_index);
     if (emitter.cfg.target.isWasm()) {
@@ -22679,8 +22714,8 @@ test "test_codegen_llvm_source_loc_fmt_atomics_variadics_and_bytes" {
         \\        .Low => 1,
         \\        .High => 2,
         \\    };
-        \\    let dyn_fa: FmtArgs = "k={num:02x},{sk:?}";
-        \\    let formatted: str = "{num:08x}|{label:>6}|{num=}|{neg:x}|{dyn_fa}";
+        \\    let dyn_fa: FmtArgs = f"k={num:02x},{sk:?}";
+        \\    let formatted: str = f"{num:08x}|{label:>6}|{num=}|{neg:x}|{dyn_fa}";
         \\    let _written: isize = @sys_write(1, formatted);
         \\    let total: u32 = p0 + p1 + p2 + cur + scratch + (b_lit[0] as u32) + (inv[0] as u32) + sk_tag;
         \\    if total == 162 and loc_score > 200 {
@@ -22778,9 +22813,9 @@ test "test_codegen_llvm_zero_env_own_closure_enum128_and_float_fmt" {
         \\    let f_nan: f64 = zero_f / zero_f;
         \\    let f_inf: f64 = 1.0 / zero_f;
         \\    let f_ninf: f64 = -1.0 / zero_f;
-        \\    let part_a: str = "{seed_five}|{seed_five:?}|{f_tiny}|{f_small}|{f_big}";
-        \\    let part_b: str = "{f_nan}|{f_nan:+}|{f_nan:E}|{f_inf}|{f_inf:+}|{f_ninf}|{f_inf:E}|{f_ninf:E}";
-        \\    return "{part_a}|{part_b}";
+        \\    let part_a: str = f"{seed_five}|{seed_five:?}|{f_tiny}|{f_small}|{f_big}";
+        \\    let part_b: str = f"{f_nan}|{f_nan:+}|{f_nan:E}|{f_inf}|{f_inf:+}|{f_ninf}|{f_inf:E}|{f_ninf:E}";
+        \\    return f"{part_a}|{part_b}";
         \\}
         \\pub fn main() -> i32 {
         \\    let niche_sum: i32 = eval_zero_env_own_niche();
@@ -22904,8 +22939,7 @@ test "test_codegen_llvm_c_abi_variadic_freestanding_wasm_and_arm64_msvc" {
         \\extern "C" fn c_var_direct(fmt_ptr: *u8, ...) -> i32;
         \\
         \\@export
-        \\@link_name("cx_c_entry")
-        \\@link_section(".cx_ffi")
+        \\@link(name: "cx_c_entry", section: ".cx_ffi")
         \\pub fn exported_entry(val: i32) -> i32 {
         \\    if val < 0 {
         \\        @panic("abort across C frame");
@@ -23018,7 +23052,7 @@ test "test_codegen_llvm_c_abi_variadic_freestanding_wasm_and_arm64_msvc" {
     // [3] SDK-less `aarch64-windows-msvc` `.obj` and `.lib` static archive emission:
     const arm64_src =
         \\@export
-        \\@link_name("cx_arm64_llvm_add")
+        \\@link(name: "cx_arm64_llvm_add")
         \\pub fn arm64_llvm_add(lhs_val: i32, rhs_val: i32) -> i32 {
         \\    return lhs_val +% rhs_val;
         \\}
@@ -23073,4 +23107,64 @@ test "test_codegen_llvm_c_abi_variadic_freestanding_wasm_and_arm64_msvc" {
     const lib_file = try std.Io.Dir.cwd().openFile(io, arm64_lib_path, .{ .mode = .read_only });
     defer lib_file.close(io);
     try std.testing.expect((try lib_file.stat(io)).size > 8);
+}
+
+test "test_dr24_codegen_llvm_packed_cap_align_inline_and_transparent_abi" {
+    const allocator = std.testing.allocator;
+    const dr24_src =
+        \\@repr(C, packed: 2)
+        \\pub struct PackedCap2 {
+        \\    pub a: u8,
+        \\    pub b: u32,
+        \\}
+        \\@repr(transparent)
+        \\pub struct F64Handle {
+        \\    pub val: f64,
+        \\    pub marker: (),
+        \\}
+        \\@export
+        \\pub extern "C" fn bounce_f64_handle(handle_in: F64Handle) -> F64Handle {
+        \\    return handle_in;
+        \\}
+        \\@inline(always)
+        \\pub fn force_inline_word(hdr: &PackedCap2) -> u32 {
+        \\    return hdr.b;
+        \\}
+        \\@inline(never)
+        \\pub fn never_inline_word(hdr: &PackedCap2) -> u32 {
+        \\    return force_inline_word(hdr);
+        \\}
+    ;
+    var dr24_bundle = try mir.lowerSourceToMir(
+        allocator,
+        FileId.fromInt(223),
+        dr24_src,
+        TargetSpec.X86_64_WINDOWS_MSVC.asTargetLayout(),
+        .{},
+    );
+    defer dr24_bundle.deinit();
+    try std.testing.expect(!dr24_bundle.hir_bundle.diagnostics.hasErrors());
+
+    var dr24_ir = try emitModule(
+        allocator,
+        .{ .target = TargetSpec.X86_64_WINDOWS_MSVC },
+        .{
+            .bodies = dr24_bundle.mir_bundle.bodies.items,
+            .pool = &dr24_bundle.hir_bundle.pool,
+            .sym_table = &dr24_bundle.hir_bundle.sym_table,
+            .interner = &dr24_bundle.hir_bundle.interner,
+            .module_name = "test_dr24_llvm",
+            .artifact_kind = .source_text,
+        },
+    );
+    defer dr24_ir.deinit(allocator);
+
+    try std.testing.expect(
+        std.mem.indexOf(u8, dr24_ir.emitted_text, "define noundef double @bounce_f64_handle(double") != null or
+            std.mem.indexOf(u8, dr24_ir.emitted_text, "define double @bounce_f64_handle(double") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, dr24_ir.emitted_text, " alwaysinline") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dr24_ir.emitted_text, " noinline") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dr24_ir.emitted_text, "load i32, ptr %_fld_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dr24_ir.emitted_text, ", align 2") != null);
 }

@@ -1016,10 +1016,10 @@ test "test_mir_vm_all_nine_reflection_intrinsics_native64_vs_wasm32" {
         "    let al = @align_of[PtrRecord]();\n" ++
         "    let tname = @type_name[PtrRecord]();\n" ++
         "    let fld = @field(rec, \"tag_word\");\n" ++
-        "    let has_yes: usize = if @has_field[PtrRecord](\"ptr_ref\") { 1 } else { 0 };\n" ++
-        "    let has_no: usize = if @has_field[PtrRecord](\"absent\") { 10 } else { 0 };\n" ++
-        "    let impl_yes: usize = if @implements[PtrRecord, Identifiable]() { 2 } else { 0 };\n" ++
-        "    let impl_no: usize = if @implements[i32, Identifiable]() { 20 } else { 0 };\n" ++
+        "    let has_yes: usize = if @has_field[PtrRecord](\"ptr_ref\") => 1 else 0;\n" ++
+        "    let has_no: usize = if @has_field[PtrRecord](\"absent\") => 10 else 0;\n" ++
+        "    let impl_yes: usize = if @implements[PtrRecord, Identifiable]() => 2 else 0;\n" ++
+        "    let impl_no: usize = if @implements[i32, Identifiable]() => 20 else 0;\n" ++
         "    let meta_opt: FieldMeta? = comptime @field_attr_lookup[FieldMeta](\n" ++
         "        @type_info[PtrRecord]().id,\n" ++
         "        1,\n" ++
@@ -1351,4 +1351,68 @@ test "test_mir_vm_dr22_byte_literals_raw_ptr_deref_and_caller_location" {
     // `local_cell = 100 + 67 ('C') + 10 ('\n') = 177`; `caller_line()` at line 13 inside `"eval_dr22_vm"` (`12` bytes) = `25` -> `202`:
     const eval_res = try vm_engine.evalBody(entry_body, &.{});
     try std.testing.expectEqual(@as(i64, 202), eval_res.slot.scalar_i64);
+}
+
+// Phase 11.1b (`DR-24`) plain literal braces, `f"…"`, `.CacheLine` `@align_of`, and inline `if => else` VM execution:
+
+test "test_mir_vm_dr24_plain_literal_braces_fmt_strings_cache_line_and_inline_if" {
+    const dr24_vm_src =
+        "@repr(C, align: .CacheLine, zero_pad: true)\n" ++
+        "pub struct CacheAlignedSlot {\n" ++
+        "    pub word: u64,\n" ++
+        "}\n" ++
+        "pub fn eval_dr24_vm(seed: i64) -> usize {\n" ++
+        "    let x: i64 = 77;\n" ++
+        "    let plain_three: str = \"{x}\";\n" ++
+        "    let plain_four: str = \"{{}}\";\n" ++
+        "    let opt_val: i64? = if seed > 0 => .Some(seed) else .None;\n" ++
+        "    let chosen: i64 = if opt_val is .Some(val) and (step := val + 5) > 10 => step else 4;\n" ++
+        "    let fmt_msg: str = f\"v={chosen}\";\n" ++
+        "    _ = x;\n" ++
+        "    return @align_of[CacheAlignedSlot]() * 1000 + plain_three.len() * 100 + plain_four.len() * 10 + fmt_msg.len();\n" ++
+        "}\n";
+
+    const layouts = [_]struct {
+        target: TargetLayout,
+        expected: u64,
+    }{
+        // `64 * 1000 + 3 * 100 + 4 * 10 + 4 ("v=12") = 64_344`:
+        .{ .target = TargetLayout.NATIVE_64, .expected = 64_344 },
+        // `128 * 1000 + 3 * 100 + 4 * 10 + 4 ("v=12") = 128_344`:
+        .{ .target = TargetLayout.AARCH64_MACOS, .expected = 128_344 },
+    };
+
+    for (layouts) |case_item| {
+        var bundle = try mir.lowerSourceToMir(
+            std.testing.allocator,
+            FileId.fromInt(1),
+            dr24_vm_src,
+            case_item.target,
+            .{},
+        );
+        defer bundle.deinit();
+        try std.testing.expect(!bundle.hir_bundle.diagnostics.hasErrors());
+
+        var rodata_pool = RodataPool.init(std.testing.allocator);
+        defer rodata_pool.deinit();
+        var vm_engine = try MirVm.init(
+            std.testing.allocator,
+            &bundle.hir_bundle.interner,
+            &bundle.hir_bundle.pool,
+            &bundle.hir_bundle.sym_table,
+            &rodata_pool,
+            null,
+            &bundle.hir_bundle.diagnostics,
+            .{ .target_layout = case_item.target },
+        );
+        defer vm_engine.deinit();
+        try registerAllBodies(&vm_engine, &bundle);
+
+        const entry_body = bundle.mir_bundle.findBodyByName(
+            &bundle.hir_bundle.interner,
+            "eval_dr24_vm",
+        ).?;
+        const eval_res = try vm_engine.evalBody(entry_body, &.{.{ .scalar_i64 = 7 }});
+        try std.testing.expectEqual(case_item.expected, eval_res.slot.scalar_u64);
+    }
 }

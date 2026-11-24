@@ -33,8 +33,10 @@ const MUTATED_PROGRAM_ITERATIONS: usize = 2_500;
 /// Number of random incremental edit iterations verified in `test_fuzz_parser_incremental_reparse_matches_full_scratch_parse`.
 const INCREMENTAL_FUZZ_ITERATIONS: usize = 1_000;
 
-/// Syntactic seed fragments covering items, types, patterns, expressions, view blocks, and recovery edges.
+/// Syntactic seed fragments covering `DR-24` items, types, patterns, expressions, view blocks, and recovery edges.
 const SYNTACTIC_SEED_FRAGMENTS = [_][]const u8{
+    "/# Module banner docstring.\n\n",
+    "/| Outer item docstring.\n///| Commented-out item doc.\n///# Commented-out mod doc.\n",
     "mod net_core;\n",
     "pub(pkg) mod inner { pub(super) const LIMIT: u32 = 16_u32; }\n",
     "use cx.io.{File, BufReader as Br, *};\n",
@@ -42,48 +44,58 @@ const SYNTACTIC_SEED_FRAGMENTS = [_][]const u8{
     "pub type Port = u16 is 1..=65535;\n",
     "pub bit_field Flags: u32 { pub ready: bool | 1, mode: u8 | 3, _pad: u32 | 28 }\n",
     "@derive(Clone) pub struct Point[T: Copy = i32, const N: usize = 4] where T: Sized { pub x: T = 0, pub y: T }\n",
+    "@repr(C, packed: true, align: .CacheLine, zero_pad: true) pub struct DmaSlot { /| Address.\n pub addr: u64 }\n",
+    "@repr(C, packed: 4, align: 64) @derive(Copy, Equatable) pub struct XregsHdr { pub mask: u64 }\n",
+    "@link(name: \"cx_rt_hook\", section: \".text.hot\") extern \"C\" fn rt_hook(code: i32) -> i32;\n",
     "@route(method: \"POST\", path: \"/v1\") pub enum Resp[T] { Ok(T), Err { code: u32, msg: str }, Empty }\n",
     "pub enum Order: u8 { Relaxed = 0, SeqCst = 5 }\n",
     "pub union Word { u_val: u64, f_val: f64 }\n",
     "pub trait Hasher { type Out; const SEED: u64 = 1; fn write(&mut self, buf: &[u8]) -> Self.Out; }\n",
     "impl[T: Copy] Point[T] { pub fn origin(&self) -> i32 = 0; }\n",
-    "impl Grid { pub subscript(r: usize, c: usize, /) -> i32 { let { yield 0; } inout { yield &mut self.cell; } } }\n",
+    "impl Grid { pub subscript(row_i: usize, col_i: usize, /) -> i32 { let { yield 0; } inout { yield &mut self.cell; } } }\n",
     "extern \"C\" fn c_printf(fmt: *u8, ...) -> i32;\n",
     "@cfg(target.os == .Linux and target.ptr_width == 64)\n",
     "pub fn strip[Data: str | &[u8]](data: Data, /, *, trim: bool = true) -> Data = data;\n",
     "pub async unsafe fn compute(\n" ++
-        "    a: &mut [i32; 8], out_v: &out i32, box_v: own Box[i32], b: (#soa [u8])?,\n" ++
+        "    arr_in: &mut [i32; 8], out_v: &out i32, box_v: own Box[i32], soa_b: (#soa [u8])?,\n" ++
         ") -> i32!IoError {\n",
-    "    let .Ok(val) = parse_in(a) else { return .Err(io_err); };\n",
+    "    let .Ok(val) = parse_in(arr_in) else { return .Err(io_err); };\n",
     "    out_v.* = ~0xFF_i32 + (raw_ptr.* as i32) + (&raw val as usize as i32);\n",
     "    _ = consume_box(own box_v);\n",
     "    let upd = Point { x: 10, ..base };\n",
     "    let moved_upd = Point { x: 20, ..own base };\n",
     "    (left_v, right_v) = (right_v, left_v);\n",
     "    let bytes_lit = b\"HTTP/1.1\\r\\n\"; let sep_b = b':';\n",
-    "    let banner = \"\"\"\n        hello {val=#010x} {{ok}}\n        \"\"\";\n",
+    "    let plain_sql = \"SELECT id FROM nodes WHERE meta != '{}'\";\n",
+    "    let banner = f\"\n        hello {val=#010x} {{ok}}\n        \";\n",
+    "    let json_frame = f#\"{\"id\": {val:04x}, \"mode\": \"{if val > 0 => \"FAST\" else \"IDLE\"}\"}\"#;\n",
+    "    let inline_pt = if val > 10 => Point { x: 1, y: 2 } else if val > 0 => Point { x: 0, y: 1 } else Point { x: 0, y: 0 };\n",
     "    defer cleanup();\n",
     "    errdefer |err| { log(err); }\n",
     "    for idx in 0..10 { if idx == 2 { continue; } else { break; } }\n",
     "    while val < 100 |cap| { var tmp: i32 = cap +% 1; tmp <<= 2; }\n",
     "    while iter.next()? is .Some(&item) { _ = item |> step_a() |> step_b(); }\n",
-    "    if (rem := a[..$-1].len()) > 0 { _ = search: for elem, i in a { break :search i; } orelse rem; }\n",
+    "    if (rem := arr_in[..$-1].len()) > 0 { _ = search: for elem, i in arr_in { break :search i; } orelse rem; }\n",
     "    with context.allocator = &mut scratch { _ = opt_v orelse unreachable; }\n",
     "    let fsm_out = fsm: match state { .Idle => continue :fsm .Done, .Done => grid[0, 1] };\n",
     "    let res = op_a() catch op_b() catch |err| { 0 };\n",
     "    let cmp = (1 == 2 == 3) + (0..5..10);\n",
     "    let clos = @cold own |x: i32, var y: i32| -> i32 { y += 1; x + y };\n",
-    "    let view = Card(padding: 8) { Row { Text(val: \"hi\"); } };\n",
+    "    let view = Card(padding: if val > 0 => 8 else 16) { Row { Text(val: \"hi\"); } };\n",
+    "    let missing_else = if val > 0 => 1;\n",
+    "    let mixed_braces = if val > 0 => { 1 } else { 2 };\n",
     "    let inc = user.\n",
     "    let call_inc = connect(host, )\n",
-    "    return match val { 0 | 1 => -1, -5..=5 => 2, .Some(var v) if v > 0 => v, Point { x: px, .. } => px, _ => 0 };\n",
+    "    return match val { 0 | 1 => -1, -5..=5 => 2, .Some(var cur_v) if cur_v > 0 => cur_v, Point { x: px, .. } => px, _ => 0 };\n",
     "}\n",
     "test \"fuzz prose test\" (raw: &[u8]) -> unit!IoError { assert(raw.len() >= 0); }\n",
     "bench \"fuzz microbench\" (bencher: &mut Bencher) { _ = bencher; }\n",
     "((((((((((1 + 2))))))))))\n",
     "[[[[[[[[[[i32; 4]]]]]]]]]]\n",
     "{ { { { let x = 1; } } } }\n",
-    "/* comment */ // line\r\n",
+    "/# mid_file_mod_doc_e0229\n/| dangling_doc_e0230\n\n",
+    "@packed @align(8) @cache_aligned @zero_pad @[inline] @(cold) pub struct RetiredAttrs { pub x: u32 }\n",
+    "/* comment */ /// retired //! retired // line\r\n",
     "badCamel Bad_Type BAD__CONST ` $ := @ #bad && || !x *const\n",
 };
 
@@ -93,7 +105,8 @@ const INCREMENTAL_EDIT_SNIPPETS = [_][]const u8{
     "return (val * 3_u32) +% 42_000_u32;",
     "let step = val |> normalize() catch 0;\n    return step;",
     "let coal = opt_val orelse val;\n    return coal + (b'A' as u32);",
-    "let msg = \"\"\"\n        item={val=}\n        \"\"\";\n    _ = msg;\n    return val;",
+    "let msg = f\"\n        item={val=}\n        \";\n    _ = msg;\n    return val;",
+    "let tag = f#\"{\"v\": {if val > 0 => val else 1_u32}}\"#;\n    _ = tag;\n    return if val > 5 => val - 1_u32 else val + 1_u32;",
     "var acc: u32 = val;\n    for i in 0..4 { acc += i; }\n    return acc;",
     "return fsm: match val { 0 => continue :fsm 1, 1..=9 => 20, _ => ~val };",
     "return val; }\npub fn injected_helper(val: u32, /) -> u32 {\n    return val ^ 0xFF_u32;",
@@ -274,22 +287,36 @@ test "test_fuzz_parser_incremental_reparse_matches_full_scratch_parse" {
     const random = prng.random();
 
     const initial_module =
+        \\/# Incremental reparse fuzz seed module.
+        \\
         \\const MODULE_SEED: u32 = 100;
         \\
+        \\/| Computes slot zero.
         \\pub fn item_zero(val: u32) -> u32 {
-        \\    /*edit_0*/return val + 1;/*end_0*/
+        \\    // [edit_0]
+        \\    return val + 1;
+        \\    // [end_0]
         \\}
         \\
+        \\/| Computes slot one.
         \\pub fn item_one(val: u32) -> u32 {
-        \\    /*edit_1*/return val + 2;/*end_1*/
+        \\    // [edit_1]
+        \\    return val + 2;
+        \\    // [end_1]
         \\}
         \\
+        \\/| Computes slot two.
         \\pub fn item_two(val: u32) -> u32 {
-        \\    /*edit_2*/return val + 3;/*end_2*/
+        \\    // [edit_2]
+        \\    return val + 3;
+        \\    // [end_2]
         \\}
         \\
+        \\/| Computes slot three.
         \\pub fn item_three(val: u32) -> u32 {
-        \\    /*edit_3*/return val + 4;/*end_3*/
+        \\    // [edit_3]
+        \\    return val + 4;
+        \\    // [end_3]
         \\}
     ;
 
@@ -321,8 +348,18 @@ test "test_fuzz_parser_incremental_reparse_matches_full_scratch_parse" {
         null,
     );
 
-    const start_markers = [_][]const u8{ "/*edit_0*/", "/*edit_1*/", "/*edit_2*/", "/*edit_3*/" };
-    const end_markers = [_][]const u8{ "/*end_0*/", "/*end_1*/", "/*end_2*/", "/*end_3*/" };
+    const start_markers = [_][]const u8{
+        "// [edit_0]\n    ",
+        "// [edit_1]\n    ",
+        "// [edit_2]\n    ",
+        "// [edit_3]\n    ",
+    };
+    const end_markers = [_][]const u8{
+        "\n    // [end_0]",
+        "\n    // [end_1]",
+        "\n    // [end_2]",
+        "\n    // [end_3]",
+    };
 
     var fast_splice_count: usize = 0;
     var iter_idx: usize = 0;

@@ -1,22 +1,22 @@
-//! Universal Standard Library Prelude and Root Namespace (`cx`)
-//!
-//! Defines CoreX's implicitly imported comparison, hashing, lifecycle, and zero-allocation
-//! formatting traits alongside `FmtWriter`, `FmtArg`, `Context`, `assert`, `panic`, and `dbg`,
-//! while mounting `cx.{col, math, mem, str}` and re-exporting Stage-1 `core` bridge modules.
-//!
-//! Every prelude descriptor (`Ordering`, `FmtSpec`, `FmtWriter`, `FmtArg`, `SourceLoc`) is an
-//! unboxed `Copy` value with zero pre-`main` static constructors across native and `wasm32` targets.
+/# Universal Standard Library Prelude and Root Namespace (`cx`)
+/#
+/# Defines CoreX's implicitly imported comparison, hashing, lifecycle, and zero-allocation
+/# formatting traits alongside `FmtWriter`, `FmtArg`, `Context`, `assert`, `panic`, and `dbg`,
+/# while mounting `cx.{col, math, mem, str}` and re-exporting Stage-1 `core` bridge modules.
+/#
+/# Every prelude descriptor (`Ordering`, `FmtSpec`, `FmtWriter`, `FmtArg`, `SourceLoc`) is an
+/# unboxed `Copy` value with zero pre-`main` static constructors across native and `wasm32` targets.
 
-/// Contiguous, ring, generational, and SIMD/SWAR SwissTable collections (`cx.col`).
+/| Contiguous, ring, generational, and SIMD/SWAR SwissTable collections (`cx.col`).
 pub mod col;
 
-/// Zero-`libc` scalar, overflow-checked, IEEE-754 bit, and elementary math (`cx.math`).
+/| Zero-`libc` scalar, overflow-checked, IEEE-754 bit, and elementary math (`cx.math`).
 pub mod math;
 
-/// Arena, pool, fixed-buffer, OS/Wasm page allocators, and safe wire views (`cx.mem`).
+/| Arena, pool, fixed-buffer, OS/Wasm page allocators, and safe wire views (`cx.mem`).
 pub mod mem;
 
-/// 24-byte SSO `String`, UTF-8/Unicode tries, and zero-allocation formatters (`cx.str`).
+/| 24-byte SSO `String`, UTF-8/Unicode tries, and zero-allocation formatters (`cx.str`).
 pub mod str;
 
 pub use col.{Map, Set, Vec};
@@ -25,202 +25,199 @@ pub use str.String;
 
 // ---------------------------------------- TYPES ----------------------------------------
 // -------------------- Comparison & Hashing --------------------
-/// Canonical three-way total comparison result (`Less = -1`, `Equal = 0`, `Greater = 1`).
+/| Canonical three-way total comparison result (`Less = -1`, `Equal = 0`, `Greater = 1`).
 @derive(Copy, Equatable, Comparable, Hash, Clone, Debug)
 pub enum Ordering: i8 {
-    /// Left operand strictly precedes right operand (`-1`).
+    /| Left operand strictly precedes right operand (`-1`).
     Less = -1,
-    /// Left and right operands compare equivalent (`0`).
+    /| Left and right operands compare equivalent (`0`).
     Equal = 0,
-    /// Left operand strictly succeeds right operand (`1`).
+    /| Left operand strictly succeeds right operand (`1`).
     Greater = 1,
 }
 
-/// Structural or semantic equivalence contract backing `==` and `!=` (`STD-01` §1.1).
+/| Structural or semantic equivalence contract backing `==` and `!=` (`STD-01` §1.1).
 pub trait Equatable {
-    /// Returns `true` iff `self` and `other` represent equal values.
+    /| Returns `true` iff `self` and `other` represent equal values.
     @no_alloc @no_panic
     fn eq(&self, other: &Self, /) -> bool;
 }
 
-/// Total ordering contract refining `Equatable` and backing `<`, `<=`, `>`, and `>=`.
+/| Total ordering contract refining `Equatable` and backing `<`, `<=`, `>`, and `>=`.
 pub trait Comparable: Equatable {
-    /// Returns the total `Ordering` between `self` and `other`.
+    /| Returns the total `Ordering` between `self` and `other`.
     @no_alloc @no_panic
     fn cmp(&self, other: &Self, /) -> Ordering;
 }
 
-/// Streaming byte-oriented hash accumulator (`WyHasher` by default in `cx.col.Map`).
+/| Streaming byte-oriented hash accumulator (`WyHasher` by default in `cx.col.Map`).
 pub trait Hasher {
-    /// Feeds raw `bytes` into the running hash state.
+    /| Feeds raw `bytes` into the running hash state.
     @no_alloc @no_panic
     fn write(&mut self, bytes: &[u8], /);
 
-    /// Feeds a 64-bit unsigned `word` in canonical Little-Endian byte order.
+    /| Feeds a 64-bit unsigned `word` in canonical Little-Endian byte order.
     @no_alloc @no_panic
     fn write_u64(&mut self, word: u64, /) {
         self.write(&@to_le_bytes(word));
     }
 
-    /// Finalizes and returns the 64-bit hash digest without consuming `self`.
+    /| Finalizes and returns the 64-bit hash digest without consuming `self`.
     @no_alloc @no_panic
     fn finish(&self) -> u64;
 }
 
-/// Prefix-free structural hashing contract feeding a generic `Hasher`.
+/| Prefix-free structural hashing contract feeding a generic `Hasher`.
 pub trait Hash {
-    /// Writes `self`'s canonical hash representation into `state`.
+    /| Writes `self`'s canonical hash representation into `state`.
     @no_alloc @no_panic
     fn hash[H: Hasher](&self, state: &mut H, /);
 }
 
 // ----------------- Lifecycle & Marker Traits ------------------
-/// Canonical zero-argument value constructor trait (`Type.default()`).
+/| Canonical zero-argument value constructor trait (`Type.default()`).
 pub trait Default {
-    /// Constructs the canonical default value of `Self`.
+    /| Constructs the canonical default value of `Self`.
     fn default() -> Self;
 }
 
-/// Explicit deep duplication contract for `Copy` and `AutoDrop` types.
+/| Explicit deep duplication contract for `Copy` and `AutoDrop` types.
 pub trait Clone {
-    /// Returns an independent owned duplicate of `self`.
+    /| Returns an independent owned duplicate of `self`.
     fn clone(&self) -> Self;
 }
 
-/// Deterministic scope destructor lowered automatically by `MIR` Pass 1 (`ElaborateDrops`).
+/| Deterministic scope destructor lowered automatically by `MIR` Pass 1 (`ElaborateDrops`).
 pub trait AutoDrop {
-    /// Releases resources owned by `self` at lexical scope exit.
+    /| Releases resources owned by `self` at lexical scope exit.
     fn drop(&mut self);
 }
 
-/// Marker trait satisfied when dropping `Self` inside a `BumpArenaNoFree` region is a zero-instruction no-op.
+/| Marker trait satisfied when dropping `Self` inside a `BumpArenaNoFree` region is a zero-instruction no-op.
 pub trait TrivialDrop {}
 
 // ---------------- Formatting & Runtime Context ----------------
-/// Field alignment mode decoded from bits `21..22` of `FmtSpec.flags_and_fill` (`SE-12`).
+/| Field alignment mode decoded from bits `21..22` of `FmtSpec.flags_and_fill` (`SE-12`).
 @derive(Copy, Equatable, Clone, Debug)
 pub enum FmtAlign: u8 {
-    /// Type-default alignment (`<` for strings, `>` for numbers).
+    /| Type-default alignment (`<` for strings, `>` for numbers).
     Default = 0,
-    /// Explicit left alignment (`<`).
+    /| Explicit left alignment (`<`).
     Left = 1,
-    /// Explicit center alignment (`^`).
+    /| Explicit center alignment (`^`).
     Center = 2,
-    /// Explicit right alignment (`>`).
+    /| Explicit right alignment (`>`).
     Right = 3,
 }
 
-/// Numeric sign display mode decoded from bits `23..24` of `FmtSpec.flags_and_fill` (`SE-12`).
+/| Numeric sign display mode decoded from bits `23..24` of `FmtSpec.flags_and_fill` (`SE-12`).
 @derive(Copy, Equatable, Clone, Debug)
 pub enum FmtSign: u8 {
-    /// Emit leading `-` on negative values only (`0`).
+    /| Emit leading `-` on negative values only (`0`).
     Default = 0,
-    /// Emit leading `+` on non-negative numeric values (`+`, `1`).
+    /| Emit leading `+` on non-negative numeric values (`+`, `1`).
     Plus = 1,
-    /// Explicit minus-only sign mode (`-`, `2`).
+    /| Explicit minus-only sign mode (`-`, `2`).
     Minus = 2,
 }
 
-/// Presentation verb decoded from bits `27..30` of `FmtSpec.flags_and_fill` (`SE-12`).
+/| Presentation verb decoded from bits `27..30` of `FmtSpec.flags_and_fill` (`SE-12`).
 @derive(Copy, Equatable, Clone, Debug)
 pub enum FmtVerb: u8 {
-    /// Default human-facing `Display` formatting (`0`).
+    /| Default human-facing `Display` formatting (`0`).
     Display = 0,
-    /// Developer-facing `Debug` formatting (`?`, `1`).
+    /| Developer-facing `Debug` formatting (`?`, `1`).
     Debug = 1,
-    /// Lowercase hexadecimal integer formatting (`x`, `2`).
+    /| Lowercase hexadecimal integer formatting (`x`, `2`).
     LowerHex = 2,
-    /// Uppercase hexadecimal integer formatting (`X`, `3`).
+    /| Uppercase hexadecimal integer formatting (`X`, `3`).
     UpperHex = 3,
-    /// Base-2 binary integer formatting (`b`, `4`).
+    /| Base-2 binary integer formatting (`b`, `4`).
     Binary = 4,
-    /// Base-8 octal integer formatting (`o`, `5`).
+    /| Base-8 octal integer formatting (`o`, `5`).
     Octal = 5,
-    /// Lowercase scientific notation (`e`, `6`).
+    /| Lowercase scientific notation (`e`, `6`).
     LowerExp = 6,
-    /// Uppercase scientific notation (`E`, `7`).
+    /| Uppercase scientific notation (`E`, `7`).
     UpperExp = 7,
-    /// Fixed-point decimal notation (`f`, `8`).
+    /| Fixed-point decimal notation (`f`, `8`).
     Fixed = 8,
-    /// Hexadecimal pointer address formatting (`p`, `9`).
+    /| Hexadecimal pointer address formatting (`p`, `9`).
     Pointer = 9,
 }
 
-/// Streaming formatting failure reason returned by `FmtWriter` sinks (`STD-01` §1.1).
+/| Streaming formatting failure reason returned by `FmtWriter` sinks (`STD-01` §1.1).
 @derive(Copy, Equatable, Clone, Debug)
 pub enum FmtError: u8 {
-    /// Fixed-capacity byte sink ran out of space (`1`).
+    /| Fixed-capacity byte sink ran out of space (`1`).
     BufferFull = 1,
-    /// Underlying operating-system or transport stream write failed (`2`).
+    /| Underlying operating-system or transport stream write failed (`2`).
     IoFailure = 2,
 }
 
-/// Concrete function-pointer byte sink (`16 B` on 64-bit, `8 B` on `wasm32`; zero heap vtables).
-@repr(C)
-@derive(Copy)
+/| Concrete function-pointer byte sink (`16 B` on 64-bit, `8 B` on `wasm32`; zero heap vtables).
+@repr(C) @derive(Copy)
 pub struct FmtWriter {
-    /// Type-erased sink state pointer passed to `write_fn`.
+    /| Type-erased sink state pointer passed to `write_fn`.
     pub ctx: *mut opaque,
-    /// Direct callback streaming UTF-8/raw `bytes` into `ctx`.
+    /| Direct callback streaming UTF-8/raw `bytes` into `ctx`.
     pub write_fn: fn(*mut opaque, &[u8]) -> unit!FmtError,
 }
 
-/// Human-facing text formatting contract invoked by `"{val}"` interpolation holes (`SE-12`).
+/| Human-facing text formatting contract invoked by `"{val}"` interpolation holes (`SE-12`).
 pub trait Display {
-    /// Streams the formatted representation of `self` into `out` honoring `spec`.
+    /| Streams the formatted representation of `self` into `out` honoring `spec`.
     fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError;
 }
 
-/// Developer-facing structural formatting contract invoked by `"{val:?}"`, `"{val=}"`, and `dbg`.
+/| Developer-facing structural formatting contract invoked by `"{val:?}"`, `"{val=}"`, and `dbg`.
 pub trait Debug {
-    /// Streams the structural debug representation of `self` into `out` honoring `spec`.
+    /| Streams the structural debug representation of `self` into `out` honoring `spec`.
     fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError;
 }
 
-/// Stack-resident type-erased format argument descriptor (`24 B` on 64-bit, `E0306` escape-checked).
-@repr(C)
-@derive(Copy)
+/| Stack-resident type-erased format argument descriptor (`24 B` on 64-bit, `E0306` escape-checked).
+@repr(C) @derive(Copy)
 pub struct FmtArg {
-    /// Type-erased read-only pointer to the formatted value on the caller stack.
+    /| Type-erased read-only pointer to the formatted value on the caller stack.
     pub data: *opaque,
-    /// Monomorphized formatting shim invoking `Display.fmt` or `Debug.fmt_debug`.
+    /| Monomorphized formatting shim invoking `Display.fmt` or `Debug.fmt_debug`.
     pub fmt_fn: fn(*opaque, &mut FmtWriter, FmtSpec) -> unit!FmtError,
-    /// Compile-time validated 8-byte format specification for this hole.
+    /| Compile-time validated 8-byte format specification for this hole.
     pub spec: FmtSpec,
 }
 
-/// Canonical 10-slot implicit thread/task `Context` ABI table (`80 B` on 64-bit, `44 B` on `wasm32`).
+/| Canonical 10-slot implicit thread/task `Context` ABI table (`80 B` on 64-bit, `44 B` on `wasm32`).
 @repr(C)
 pub struct Context {
-    /// Slot `0`: Default general/arena allocator handle (`with context.allocator = …`).
+    /| Slot `0`: Default general/arena allocator handle (`with context.allocator = …`).
     pub allocator: mem.AllocatorHandle,
-    /// Slot `1`: Pointer to thread-local 2-slot ping-pong `[Arena; 2]` scratch ring (`D-04`, `E0328`).
+    /| Slot `1`: Pointer to thread-local 2-slot ping-pong `[Arena; 2]` scratch ring (`D-04`, `E0328`).
     pub scratch: *mut [mem.Arena; 2],
-    /// Slot `2`: Deterministic PRNG state advanced under `--sim --seed` (`Fix-18A`).
+    /| Slot `2`: Deterministic PRNG state advanced under `--sim --seed` (`Fix-18A`).
     pub rng_seed: u64,
-    /// Slot `3`: Nullable `FlightRecorder` trace ring sink pointer (`Phase 13.2` `D-06B`).
+    /| Slot `3`: Nullable `FlightRecorder` trace ring sink pointer (`Phase 13.2` `D-06B`).
     pub trace_sink: *mut u8,
-    /// Slot `4`: Scoped temporary allocator handle slot.
+    /| Slot `4`: Scoped temporary allocator handle slot.
     pub temp_allocator: mem.AllocatorHandle,
-    /// Slot `5`: Structured logger vtable/sink handle.
+    /| Slot `5`: Structured logger vtable/sink handle.
     pub logger: *opaque,
-    /// Slot `6`: Compiler/runtime `DiagnosticSink` handle.
+    /| Slot `6`: Compiler/runtime `DiagnosticSink` handle.
     pub diagnostics: *opaque,
-    /// Slot `7`: Cooperative structured cancellation token handle (`DR-08`).
+    /| Slot `7`: Cooperative structured cancellation token handle (`DR-08`).
     pub cancel_token: *opaque,
-    /// Slot `8`: Active I/O and virtual-clock `ReactorVTable` pointer (`DR-08`, `DR-18`).
+    /| Slot `8`: Active I/O and virtual-clock `ReactorVTable` pointer (`DR-08`, `DR-18`).
     pub reactor: *opaque,
-    /// Slot `9`: Mutable per-worker reactor context state pointer.
+    /| Slot `9`: Mutable per-worker reactor context state pointer.
     pub reactor_ctx: *mut opaque,
 }
 
 // --------------------------------------- CONSTS ----------------------------------------
-/// Sentinel `u16` stored in `FmtSpec.width_or_none` and `precision_or_none` when omitted (`0xFFFF`).
+/| Sentinel `u16` stored in `FmtSpec.width_or_none` and `precision_or_none` when omitted (`0xFFFF`).
 pub const FMT_SPEC_NONE: u16 = 0xFFFF_u16;
 
 // -------------------------------------- INTERNALS --------------------------------------
-/// Encodes Unicode scalar codepoint `raw_cp` into `out_buf` (`1..=4` UTF-8 bytes), defaulting invalid codes to `' '`.
-@inline @no_alloc @no_panic
+/| Encodes Unicode scalar codepoint `raw_cp` into `out_buf` (`1..=4` UTF-8 bytes), defaulting invalid codes to `' '`.
 fn encode_fill_utf8(raw_cp: u32, out_buf: &mut [u8; 4], /) -> usize {
     let cp: u32 = if raw_cp == 0_u32 or raw_cp > 0x10_FFFF_u32 or (
         raw_cp >= 0xD800_u32 and raw_cp <= 0xDFFF_u32
@@ -249,7 +246,7 @@ fn encode_fill_utf8(raw_cp: u32, out_buf: &mut [u8; 4], /) -> usize {
     return 4_usize;
 }
 
-/// Emits `repeat_count` copies of `encoded_fill` into `writer` in stack-batched chunks.
+/| Emits `repeat_count` copies of `encoded_fill` into `writer` in stack-batched chunks.
 @std_cap_boundary(clears: [alloc, may_panic, blocking_sync])
 fn write_repeated_fill(
     writer: &mut FmtWriter,
@@ -280,7 +277,7 @@ fn write_repeated_fill(
     return .Ok(());
 }
 
-/// Direct unbuffered standard-error sink callback (`fd = 2`) used by `dbg`.
+/| Direct unbuffered standard-error sink callback (`fd = 2`) used by `dbg`.
 @no_alloc @no_panic
 fn stderr_fmt_write_cb(ctx: *mut opaque, chunk: &[u8]) -> unit!FmtError {
     _ = ctx;
@@ -293,31 +290,31 @@ fn stderr_fmt_write_cb(ctx: *mut opaque, chunk: &[u8]) -> unit!FmtError {
 // ------------------------------------- PUBLIC API --------------------------------------
 // -------------------- Comparison & Hashing --------------------
 impl Ordering {
-    /// Returns `true` when `self` is `.Equal`.
+    /| Returns `true` when `self` is `.Equal`.
     @inline @no_alloc @no_panic
     pub fn is_eq(self) -> bool = self == .Equal;
 
-    /// Returns `true` when `self` is not `.Equal`.
+    /| Returns `true` when `self` is not `.Equal`.
     @inline @no_alloc @no_panic
     pub fn is_ne(self) -> bool = self != .Equal;
 
-    /// Returns `true` when `self` is `.Less`.
+    /| Returns `true` when `self` is `.Less`.
     @inline @no_alloc @no_panic
     pub fn is_lt(self) -> bool = self == .Less;
 
-    /// Returns `true` when `self` is `.Less` or `.Equal`.
+    /| Returns `true` when `self` is `.Less` or `.Equal`.
     @inline @no_alloc @no_panic
     pub fn is_le(self) -> bool = self != .Greater;
 
-    /// Returns `true` when `self` is `.Greater`.
+    /| Returns `true` when `self` is `.Greater`.
     @inline @no_alloc @no_panic
     pub fn is_gt(self) -> bool = self == .Greater;
 
-    /// Returns `true` when `self` is `.Greater` or `.Equal`.
+    /| Returns `true` when `self` is `.Greater` or `.Equal`.
     @inline @no_alloc @no_panic
     pub fn is_ge(self) -> bool = self != .Less;
 
-    /// Inverts `.Less` <-> `.Greater`, leaving `.Equal` unchanged.
+    /| Inverts `.Less` <-> `.Greater`, leaving `.Equal` unchanged.
     @inline @no_alloc @no_panic
     pub fn reverse(self) -> Ordering {
         return match self {
@@ -327,7 +324,7 @@ impl Ordering {
         };
     }
 
-    /// Lexicographically chains `self` with `tie_breaker` when `self` is `.Equal`.
+    /| Lexicographically chains `self` with `tie_breaker` when `self` is `.Equal`.
     @inline @no_alloc @no_panic
     pub fn then(self, tie_breaker: Ordering, /) -> Ordering {
         return match self {
@@ -339,120 +336,120 @@ impl Ordering {
 
 // -------------- Primitive Trait Implementations ---------------
 impl Hash for bool {
-    /// Writes `0_u8` (`false`) or `1_u8` (`true`) into `state`.
-    @inline @no_alloc @no_panic
+    /| Writes `0_u8` (`false`) or `1_u8` (`true`) into `state`.
+    @no_alloc @no_panic
     pub fn hash[H: Hasher](&self, state: &mut H, /) {
         state.write(&[self.* as u8]);
     }
 }
 
 impl Hash for u8 {
-    /// Writes `self` as a 1-byte slice into `state`.
-    @inline @no_alloc @no_panic
+    /| Writes `self` as a 1-byte slice into `state`.
+    @no_alloc @no_panic
     pub fn hash[H: Hasher](&self, state: &mut H, /) {
         state.write(&[self.*]);
     }
 }
 
 impl Hash for u16 {
-    /// Writes `self` in Little-Endian byte order into `state`.
-    @inline @no_alloc @no_panic
+    /| Writes `self` in Little-Endian byte order into `state`.
+    @no_alloc @no_panic
     pub fn hash[H: Hasher](&self, state: &mut H, /) {
         state.write(&@to_le_bytes(self.*));
     }
 }
 
 impl Hash for u32 {
-    /// Writes `self` in Little-Endian byte order into `state`.
-    @inline @no_alloc @no_panic
+    /| Writes `self` in Little-Endian byte order into `state`.
+    @no_alloc @no_panic
     pub fn hash[H: Hasher](&self, state: &mut H, /) {
         state.write(&@to_le_bytes(self.*));
     }
 }
 
 impl Hash for u64 {
-    /// Writes `self` via `state.write_u64` into `state`.
-    @inline @no_alloc @no_panic
+    /| Writes `self` via `state.write_u64` into `state`.
+    @no_alloc @no_panic
     pub fn hash[H: Hasher](&self, state: &mut H, /) {
         state.write_u64(self.*);
     }
 }
 
 impl Hash for u128 {
-    /// Writes `self` in Little-Endian byte order into `state`.
-    @inline @no_alloc @no_panic
+    /| Writes `self` in Little-Endian byte order into `state`.
+    @no_alloc @no_panic
     pub fn hash[H: Hasher](&self, state: &mut H, /) {
         state.write(&@to_le_bytes(self.*));
     }
 }
 
 impl Hash for usize {
-    /// Writes `self` widened to `u64` into `state`.
-    @inline @no_alloc @no_panic
+    /| Writes `self` widened to `u64` into `state`.
+    @no_alloc @no_panic
     pub fn hash[H: Hasher](&self, state: &mut H, /) {
         state.write_u64(self.* as u64);
     }
 }
 
 impl Hash for i8 {
-    /// Writes `self` in two's-complement byte form into `state`.
-    @inline @no_alloc @no_panic
+    /| Writes `self` in two's-complement byte form into `state`.
+    @no_alloc @no_panic
     pub fn hash[H: Hasher](&self, state: &mut H, /) {
         state.write(&@to_le_bytes(self.*));
     }
 }
 
 impl Hash for i16 {
-    /// Writes `self` in Little-Endian byte order into `state`.
-    @inline @no_alloc @no_panic
+    /| Writes `self` in Little-Endian byte order into `state`.
+    @no_alloc @no_panic
     pub fn hash[H: Hasher](&self, state: &mut H, /) {
         state.write(&@to_le_bytes(self.*));
     }
 }
 
 impl Hash for i32 {
-    /// Writes `self` in Little-Endian byte order into `state`.
-    @inline @no_alloc @no_panic
+    /| Writes `self` in Little-Endian byte order into `state`.
+    @no_alloc @no_panic
     pub fn hash[H: Hasher](&self, state: &mut H, /) {
         state.write(&@to_le_bytes(self.*));
     }
 }
 
 impl Hash for i64 {
-    /// Writes `self` via `state.write_u64` into `state`.
-    @inline @no_alloc @no_panic
+    /| Writes `self` via `state.write_u64` into `state`.
+    @no_alloc @no_panic
     pub fn hash[H: Hasher](&self, state: &mut H, /) {
         state.write_u64(@bit_cast[u64](self.*));
     }
 }
 
 impl Hash for i128 {
-    /// Writes `self` in Little-Endian byte order into `state`.
-    @inline @no_alloc @no_panic
+    /| Writes `self` in Little-Endian byte order into `state`.
+    @no_alloc @no_panic
     pub fn hash[H: Hasher](&self, state: &mut H, /) {
         state.write(&@to_le_bytes(self.*));
     }
 }
 
 impl Hash for isize {
-    /// Writes `self` sign-extended to `u64` into `state`.
-    @inline @no_alloc @no_panic
+    /| Writes `self` sign-extended to `u64` into `state`.
+    @no_alloc @no_panic
     pub fn hash[H: Hasher](&self, state: &mut H, /) {
         state.write_u64((self.* as i64) as u64);
     }
 }
 
 impl Hash for char {
-    /// Writes Unicode scalar `self` (`u32` Little-Endian) into `state`.
-    @inline @no_alloc @no_panic
+    /| Writes Unicode scalar `self` (`u32` Little-Endian) into `state`.
+    @no_alloc @no_panic
     pub fn hash[H: Hasher](&self, state: &mut H, /) {
         state.write(&@to_le_bytes(self.* as u32));
     }
 }
 
 impl Hash for str {
-    /// Writes UTF-8 bytes of `self` followed by sentinel `0xFF_u8` for prefix-collision resistance.
-    @inline @no_alloc @no_panic
+    /| Writes UTF-8 bytes of `self` followed by sentinel `0xFF_u8` for prefix-collision resistance.
+    @no_alloc @no_panic
     pub fn hash[H: Hasher](&self, state: &mut H, /) {
         state.write(self.*.as_bytes());
         state.write(&[0xFF_u8]);
@@ -461,20 +458,19 @@ impl Hash for str {
 
 // ---------------- Formatting & Runtime Context ----------------
 impl FmtSpec {
-    /// Canonical default `Display` format specification (`fill = ' '`, no width or precision).
+    /| Canonical default `Display` format specification (`fill = ' '`, no width or precision).
     pub const DEFAULT: FmtSpec = FmtSpec {
         flags_and_fill: 0x20_u32,
         width_or_none: FMT_SPEC_NONE,
         precision_or_none: FMT_SPEC_NONE,
     };
 
-    /// Returns the canonical default `FmtSpec` (`FmtSpec.DEFAULT`).
+    /| Returns the canonical default `FmtSpec` (`FmtSpec.DEFAULT`).
     @inline @no_alloc @no_panic
     pub fn default_spec() -> FmtSpec = FmtSpec.DEFAULT;
 
-    /// Extracts the Unicode scalar fill character (`bits 0..20`, defaulting to `' '`).
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Extracts the Unicode scalar fill character (`bits 0..20`, defaulting to `' '`).
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn fill_char(self) -> char {
         let raw_cp: u32 = self.flags_and_fill & 0x1F_FFFF_u32;
         if raw_cp == 0_u32 or raw_cp > 0x10_FFFF_u32 or (
@@ -490,7 +486,7 @@ impl FmtSpec {
         };
     }
 
-    /// Extracts the decoded `FmtAlign` mode (`bits 21..22`).
+    /| Extracts the decoded `FmtAlign` mode (`bits 21..22`).
     @inline @no_alloc @no_panic
     pub fn align_mode(self) -> FmtAlign {
         return match (self.flags_and_fill >> 21_u32) & 0x3_u32 {
@@ -501,7 +497,7 @@ impl FmtSpec {
         };
     }
 
-    /// Extracts the decoded `FmtSign` mode (`bits 23..24`).
+    /| Extracts the decoded `FmtSign` mode (`bits 23..24`).
     @inline @no_alloc @no_panic
     pub fn sign_mode(self) -> FmtSign {
         return match (self.flags_and_fill >> 23_u32) & 0x3_u32 {
@@ -511,15 +507,15 @@ impl FmtSpec {
         };
     }
 
-    /// Returns `true` when the alternate `#` flag (`bit 25`) is set.
+    /| Returns `true` when the alternate `#` flag (`bit 25`) is set.
     @inline @no_alloc @no_panic
     pub fn has_alt_prefix(self) -> bool = ((self.flags_and_fill >> 25_u32) & 0x1_u32) != 0_u32;
 
-    /// Returns `true` when the zero-padding `0` flag (`bit 26`) is set.
+    /| Returns `true` when the zero-padding `0` flag (`bit 26`) is set.
     @inline @no_alloc @no_panic
     pub fn is_zero_padded(self) -> bool = ((self.flags_and_fill >> 26_u32) & 0x1_u32) != 0_u32;
 
-    /// Extracts the presentation `FmtVerb` (`bits 27..30`).
+    /| Extracts the presentation `FmtVerb` (`bits 27..30`).
     @inline @no_alloc @no_panic
     pub fn verb(self) -> FmtVerb {
         return match (self.flags_and_fill >> 27_u32) & 0xF_u32 {
@@ -536,47 +532,38 @@ impl FmtSpec {
         };
     }
 
-    /// Returns `true` when `{expr=}` self-debugging output (`bit 31`) was requested.
+    /| Returns `true` when `{expr=}` self-debugging output (`bit 31`) was requested.
     @inline @no_alloc @no_panic
     pub fn is_debug_eq(self) -> bool = ((self.flags_and_fill >> 31_u32) & 0x1_u32) != 0_u32;
 
-    /// Returns the explicit minimum field width, or `.None` when omitted (`0xFFFF`).
+    /| Returns the explicit minimum field width, or `.None` when omitted (`0xFFFF`).
     @inline @no_alloc @no_panic
     pub fn width(self) -> u16? {
-        return if self.width_or_none == FMT_SPEC_NONE {
-            .None
-        } else {
-            .Some(self.width_or_none)
-        };
+        return if self.width_or_none == FMT_SPEC_NONE => .None else .Some(self.width_or_none);
     }
 
-    /// Returns the explicit precision, or `.None` when omitted (`0xFFFF`).
+    /| Returns the explicit precision, or `.None` when omitted (`0xFFFF`).
     @inline @no_alloc @no_panic
     pub fn precision(self) -> u16? {
-        return if self.precision_or_none == FMT_SPEC_NONE {
-            .None
-        } else {
-            .Some(self.precision_or_none)
-        };
+        return if self.precision_or_none == FMT_SPEC_NONE => .None
+            else .Some(self.precision_or_none);
     }
 }
 
 impl FmtWriter {
-    /// Streams raw `bytes` into the underlying sink callback.
-    @std_cap_boundary(clears: [alloc, may_panic, blocking_sync])
-    @inline
+    /| Streams raw `bytes` into the underlying sink callback.
+    @std_cap_boundary(clears: [alloc, may_panic, blocking_sync]) @inline
     pub fn write_bytes(&mut self, bytes: &[u8], /) -> unit!FmtError {
         return (self.write_fn)(self.ctx, bytes);
     }
 
-    /// Streams UTF-8 `text` into the underlying sink callback.
-    @std_cap_boundary(clears: [alloc, may_panic, blocking_sync])
-    @inline
+    /| Streams UTF-8 `text` into the underlying sink callback.
+    @std_cap_boundary(clears: [alloc, may_panic, blocking_sync]) @inline
     pub fn write_str(&mut self, text: str, /) -> unit!FmtError {
         return (self.write_fn)(self.ctx, text.as_bytes());
     }
 
-    /// Streams `raw` padded to `spec.width()` UTF-8 codepoints according to `spec.align_mode()`.
+    /| Streams `raw` padded to `spec.width()` UTF-8 codepoints according to `spec.align_mode()`.
     @std_cap_boundary(clears: [alloc, may_panic, blocking_sync])
     pub fn write_padded(&mut self, raw: &[u8], spec: FmtSpec, /) -> unit!FmtError {
         let min_width: usize = match spec.width() {
@@ -619,34 +606,34 @@ impl FmtWriter {
 }
 
 impl Display for SourceLoc {
-    /// Formats `self` as `<file>:<line>:<col>` into `out`.
+    /| Formats `self` as `<file>:<line>:<col>` into `out`.
     @no_alloc
     pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
-        _ = spec;
-        return @fmt_write(out, "{self.file}:{self.line}:{self.col}");
+        spec;
+        return @fmt_write(out, f"{self.file}:{self.line}:{self.col}");
     }
 }
 
 impl Debug for SourceLoc {
-    /// Formats `self` in debug mode as `<file>:<line>:<col> (<fn_name>)` into `out`.
+    /| Formats `self` in debug mode as `<file>:<line>:<col> (<fn_name>)` into `out`.
     @no_alloc
     pub fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
-        _ = spec;
-        return @fmt_write(out, "{self.file}:{self.line}:{self.col} ({self.fn_name})");
+        spec;
+        return @fmt_write(out, f"{self.file}:{self.line}:{self.col} ({self.fn_name})");
     }
 }
 
 impl Display for FmtArgs {
-    /// Streams pre-packaged `FmtArgs` directly into `out`.
+    /| Streams pre-packaged `FmtArgs` directly into `out`.
     @no_alloc
     pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
-        _ = spec;
+        spec;
         return @fmt_write(out, self.*);
     }
 }
 
 // -------------- Assertions, Panics & Diagnostics --------------
-/// Verifies `condition` in all build modes, aborting via `panic(message, loc: loc)` when `false`.
+/| Verifies `condition` in all build modes, aborting via `panic(message, loc: loc)` when `false`.
 @inline @no_alloc
 pub fn assert(
     condition: bool,
@@ -660,10 +647,8 @@ pub fn assert(
     }
 }
 
-/// Verifies `condition` in debug/dev builds (`@cfg(debug)`), eliding checks in `--release`.
-@cfg(debug)
-@std_cap_boundary(clears: [may_panic])
-@inline @no_alloc
+/| Verifies `condition` in debug/dev builds (`@cfg(debug)`), eliding checks in `--release`.
+@cfg(debug) @std_cap_boundary(clears: [may_panic]) @inline @no_alloc
 pub fn debug_assert(
     condition: bool,
     message: FmtArgs = "",
@@ -676,9 +661,8 @@ pub fn debug_assert(
     }
 }
 
-/// No-op `debug_assert` stub in non-debug (`--release`) builds (`@cfg(not debug)`).
-@cfg(not debug)
-@inline @no_alloc @no_panic
+/| No-op `debug_assert` stub in non-debug (`--release`) builds (`@cfg(not debug)`).
+@cfg(not debug) @inline @no_alloc @no_panic
 pub fn debug_assert(
     condition: bool,
     message: FmtArgs = "",
@@ -691,19 +675,19 @@ pub fn debug_assert(
     _ = loc;
 }
 
-/// Formats `[loc.file:loc.line:loc.col]` and `message` to standard error and terminates execution (`never`).
-@cold @no_alloc @noinline
+/| Formats `[loc.file:loc.line:loc.col]` and `message` to standard error and terminates execution (`never`).
+@noinline @cold @no_alloc
 pub fn panic(message: FmtArgs = "", /, *, loc: SourceLoc = @caller_location()) -> never {
-    @panic("[{loc.file}:{loc.line}:{loc.col}] {message}");
+    @panic(f"[{loc.file}:{loc.line}:{loc.col}] {message}");
 }
 
-/// Prints `[{loc.file}:{loc.line}] = {value:?}` to `stderr` and returns `value` by move (`DR-22` §2.6).
+/| Prints `[{loc.file}:{loc.line}] = {value:?}` to `stderr` and returns `value` by move (`DR-22` §2.6).
 @std_cap_boundary(clears: [fs, io_fs])
 pub fn dbg[T: Debug](value: own T, /, *, loc: SourceLoc = @caller_location()) -> T {
     var writer = FmtWriter {
         ctx: 0_usize as *mut opaque,
         write_fn: stderr_fmt_write_cb,
     };
-    @fmt_write(&mut writer, "[{loc.file}:{loc.line}] = {value:?}\n") catch {};
+    @fmt_write(&mut writer, f"[{loc.file}:{loc.line}] = {value:?}\n") catch {};
     return own value;
 }

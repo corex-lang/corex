@@ -31,14 +31,20 @@ const FAST_FUZZ_ITERS_PER_WORKER: usize = FAST_FUZZ_ITERATIONS / FAST_FUZZ_WORKE
 /// Number of rich multi-token mutated `.cx` inputs verified with `LosslessCstArena.reconstructSource`.
 const RICH_MUTATION_ITERATIONS: usize = 10_000;
 
-/// Seed fragments covering all CoreX lexical categories, delimiters, escapes, and invalid UTF-8.
+/// Seed fragments covering all CoreX `DR-24` lexical categories, delimiters, escapes, recovery edges, and invalid UTF-8.
 const LEXICAL_SEED_FRAGMENTS = [_][]const u8{
     "#!/usr/bin/env corex\n",
-    "//! module doc\r\n",
-    "/// item doc\n",
+    "/# module doc\r\n",
+    "/| item doc\n",
+    "///| commented-out item doc\n",
+    "///# commented-out module doc\n",
+    "//// banner comment\n",
     "// line comment\n",
+    "//! retired mod doc\r\n",
+    "/// retired item doc\n",
     "/* outer /* inner */ */",
     "/* unclosed",
+    "\tlet tab_indent = 1;\n",
     "pub ",
     "fn ",
     "struct ",
@@ -67,11 +73,14 @@ const LEXICAL_SEED_FRAGMENTS = [_][]const u8{
     "0..10 ",
     "0..=10 ",
     "10.max(20) ",
-    "\"hello \\n \\x7F \\u{1F600} \\'\"",
-    "\"interp {if a { \"nested\" } else { r#\"raw\"# }}\"",
-    "\"unterminated { 1 + 2",
+    "\"hello \\n \\x7F \\u{1F600} \\' {literal_brace}\"",
+    "f\"interp {if ok => f\\\"nested {r#\\\"raw\\\"#}\\\" else \\\"alt\\\":>8}\"",
+    "f#\"{\"node\": \"{id}\", \"state\": \"{if ok => \"UP\" else \"DOWN\"}\"}\"#",
+    "f\"zero_hole_warn\"",
+    "f\"unmatched } brace\"",
+    "f\"unterminated { 1 + 2",
     "\"\\xGG \\u{D800} \\u{}\"",
-    "r\"raw string\"",
+    "r\"raw string {literal}\"",
     "r#\"raw \"quoted\"\"#",
     "r#bad",
     "'a'",
@@ -97,10 +106,23 @@ const LEXICAL_SEED_FRAGMENTS = [_][]const u8{
     "0xFF_u8 ",
     "3.14_f32 ",
     "10_f64 ",
-    "\"\"\"\n    multiline {val=} {{brace}} {if ok { \"inner\" } else { \"alt\" }}\n    \"\"\"",
-    "r\"\"\"\n  raw multiline \"ok\"\n  \"\"\"",
+    "\"\n    plain multiline {literal}\n    \"",
+    "f\"\n    multiline {val=} {{brace}} {if ok => \"inner\" else \"alt\"}\n    \"",
+    "f#\"\n    {\"port\": {val:04}}\n    \"#",
+    "r\"\n  raw multiline {ok}\n  \"",
+    "r#\"\n  raw multiline \"ok\"\n  \"#",
+    "b\"\n    raw byte lines\n    \"",
+    "br#\"\n    raw \"byte\" lines\n    \"#",
     "\"\"\"bad_opening\"\"\"",
+    "f\"\"\"\n    retired triple\n    \"\"\"",
+    "r\"\"\"\n  retired raw triple\n  \"\"\"",
+    "b\"\"\"retired_byte_triple\"\"\"",
+    "\"\n  under_indented\n    \"",
+    "\"\n    shared_close\"",
     "\"bad \\{ escape \\}\"",
+    "@repr(C, packed: true, align: .CacheLine, zero_pad: true) ",
+    "@link(name: \"sym\", section: \".text\") ",
+    "if ok => 1 else 0 ",
     "&& ",
     "... ",
     "~ ",
@@ -182,7 +204,8 @@ fn runFastFuzzWorkerShard(
 ) void {
     var ring_buf: [256]u8 = undefined;
     const seed_pattern =
-        "fn calc(x: i32) { let s = \"a{x=} {{b}}\\n\"; 0x1F_u64 +% 1..10 ... ~ b'x' b\"w\" r#\"q\"# #soa }\r\n\xFF";
+        "/# mod\n/| doc\nfn calc(x: i32) { let text = f\"a{x=} {{b}}\\n\"; " ++
+        "0x1F_u64 +% if x > 0 => 1 else 0 b'x' b\"w\" r#\"q\"# f#\"z{x}\"# #soa }\r\n\xFF";
     for (&ring_buf, 0..) |*byte_ptr, i| {
         byte_ptr.* = seed_pattern[(i + @as(usize, @intCast(initial_seed & 0x3F))) % seed_pattern.len];
     }
@@ -342,5 +365,118 @@ test "test_fuzz_lexer_10k_rich_mutated_programs_with_diagnostics_and_reconstruct
             TokenKind.eof,
             token_buf.getToken(TokenIndex.fromInt(@intCast(token_buf.countTokens() - 1))).kind,
         );
+    }
+}
+
+test "test_fuzz_lexer_dr24_comments_fmt_strings_and_multiline_dedent" {
+    // [1] Enforce `DR-24` `TokenKind` (`121` variants, `fmt_string_lit = 60`) and `TriviaKind` (`9` variants):
+    try std.testing.expectEqual(@as(usize, 121), std.enums.values(TokenKind).len);
+    try std.testing.expectEqual(@as(u8, 60), @backingInt(TokenKind.fmt_string_lit));
+    try std.testing.expectEqual(@as(usize, 9), std.enums.values(syntax.TriviaKind).len);
+
+    var token_buf = TokenBuffer.init(std.testing.allocator);
+    defer token_buf.deinit();
+    var cst_arena = LosslessCstArena.init(std.testing.allocator);
+    defer cst_arena.deinit();
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+
+    // [2] Verify clean `DR-24` positive lexemes (`/#`, `/|`, `///|`, `///#`, `f"…"`, `f#"…"#`, `"<newline> … "`):
+    const canonical_dr24_source =
+        "/# Canonical DR-24 lexer verification module.\n" ++
+        "\n" ++
+        "///# Commented-out module banner scanned as line_comment.\n" ++
+        "///| Commented-out item docstring scanned as line_comment.\n" ++
+        "/| Aligned packet header.\n" ++
+        "@repr(C, align: .CacheLine, zero_pad: true)\n" ++
+        "pub struct AlignedHeader {\n" ++
+        "    /| Sequence counter.\n" ++
+        "    pub seq_id: u64,\n" ++
+        "}\n" ++
+        "\n" ++
+        "/| Formats plain and interpolated strings across all dedented multiline prefixes.\n" ++
+        "@link(name: \"cx_format_probe\", section: \".text\")\n" ++
+        "pub fn format_probe(port: u16, healthy: bool) -> str {\n" ++
+        "    let plain_sql = \"SELECT id FROM nodes WHERE meta != '{}'\";\n" ++
+        "    let fmt_line = f\"port={port:04} status={if healthy => \"UP\" else \"DOWN\":>6}\";\n" ++
+        "    let fmt_guarded = f#\"{\"port\": {port}, \"state\": \"{if healthy => \"OK\" else \"WARN\"}\"}\"#;\n" ++
+        "    let dedent_plain = \"\n" ++
+        "        plain {literal} line\n" ++
+        "        \";\n" ++
+        "    let dedent_fmt = f\"\n" ++
+        "        {{escaped}} port={port=}\n" ++
+        "        \";\n" ++
+        "    let dedent_fmt_guard = f#\"\n" ++
+        "        {\"port\": {port:#06x}}\n" ++
+        "        \"#;\n" ++
+        "    let dedent_raw = r\"\n" ++
+        "        raw {literal}\n" ++
+        "        \";\n" ++
+        "    let dedent_raw_guard = r#\"\n" ++
+        "        raw \"quoted\" {literal}\n" ++
+        "        \"#;\n" ++
+        "    let dedent_bytes = b\"\n" ++
+        "        HTTP/1.1 200 OK\n" ++
+        "        \";\n" ++
+        "    let dedent_raw_bytes = br#\"\n" ++
+        "        raw \"bytes\"\n" ++
+        "        \"#;\n" ++
+        "    _ = (plain_sql, fmt_line, fmt_guarded, dedent_fmt, dedent_fmt_guard);\n" ++
+        "    _ = (dedent_raw, dedent_raw_guard, dedent_bytes, dedent_raw_bytes);\n" ++
+        "    return dedent_plain;\n" ++
+        "}\n";
+
+    {
+        var clean_sink = DiagnosticSink.init(std.testing.allocator);
+        defer clean_sink.deinit();
+        var clean_lexer = Lexer.init(canonical_dr24_source, FileId.fromInt(0), &token_buf, &clean_sink, &interner);
+        try clean_lexer.tokenize();
+        try std.testing.expectEqual(@as(usize, 0), clean_sink.diagnostics.items.len);
+        try verifyLosslessPartitionInline(canonical_dr24_source, &token_buf);
+
+        var fmt_tok_count: usize = 0;
+        for (token_buf.tokens.items(.kind)) |tok_kind| {
+            if (tok_kind == .fmt_string_lit) fmt_tok_count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 4), fmt_tok_count);
+    }
+
+    // [3] Verify exact diagnostic codes & lossless recovery on retired/invalid `DR-24` lexical constructs:
+    const diagnostic_cases = [_]struct {
+        snippet: []const u8,
+        expected_code: []const u8,
+    }{
+        .{ .snippet = "/* retired block comment */\n", .expected_code = "E0118" },
+        .{ .snippet = "/// retired outer doc\npub const VAL: u32 = 1;\n", .expected_code = "E0118" },
+        .{ .snippet = "//! retired mod doc\n", .expected_code = "E0118" },
+        .{ .snippet = "const BAD_TRIPLE: str = \"\"\"\n    retired\n    \"\"\";\n", .expected_code = "E0115" },
+        .{ .snippet = "const BAD_CLOSE: str = \"\n    shared_line\";\n", .expected_code = "E0115" },
+        .{ .snippet = "const BAD_DEDENT: str = \"\n  under_indented\n    \";\n", .expected_code = "E0116" },
+        .{ .snippet = "pub fn tab_fn() {\n\tlet val = 1;\n}\n", .expected_code = "E0116" },
+        .{ .snippet = "const ZERO_HOLES: str = f\"plain literal\";\n", .expected_code = "W0119" },
+    };
+
+    for (diagnostic_cases) |diag_case| {
+        token_buf.tokens.shrinkRetainingCapacity(0);
+        token_buf.trivia.shrinkRetainingCapacity(0);
+        var case_sink = DiagnosticSink.init(std.testing.allocator);
+        defer case_sink.deinit();
+
+        var case_lexer = Lexer.init(diag_case.snippet, FileId.fromInt(1), &token_buf, &case_sink, &interner);
+        try case_lexer.tokenize();
+        try verifyLosslessPartitionInline(diag_case.snippet, &token_buf);
+
+        const reconstructed = try cst_arena.reconstructSource(std.testing.allocator, diag_case.snippet, &token_buf);
+        defer std.testing.allocator.free(reconstructed);
+        try std.testing.expectEqualSlices(u8, diag_case.snippet, reconstructed);
+
+        var has_expected_code = false;
+        for (case_sink.diagnostics.items) |emitted_diag| {
+            if (std.mem.eql(u8, emitted_diag.code.asCodeStr(), diag_case.expected_code)) {
+                has_expected_code = true;
+                break;
+            }
+        }
+        try std.testing.expect(has_expected_code);
     }
 }

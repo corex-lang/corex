@@ -533,8 +533,9 @@ test "test_cli_upgrade_list_explain_surgical_rule_check_and_accept_caps" {
     );
     defer list_res.deinit(allocator);
     try std.testing.expectEqual(@as(u8, 0), list_res.exit_code);
+    try std.testing.expectEqual(@as(usize, 29), corex.UPGRADE_RULE_CATALOG.len);
     try std.testing.expect(
-        std.mem.indexOf(u8, list_res.stdout, "✓ 22 canonical Zero-Legacy upgrade rules registered") != null,
+        std.mem.indexOf(u8, list_res.stdout, "✓ 29 canonical Zero-Legacy upgrade rules registered") != null,
     );
     for (corex.UPGRADE_RULE_CATALOG) |rule_entry| {
         try std.testing.expect(std.mem.indexOf(u8, list_res.stdout, rule_entry.rule_code) != null);
@@ -1195,7 +1196,10 @@ test "test_phase10_w0202_precedence_ur2204_array_multifile_upgrade_and_accept_ca
 
     const interp_after = try readDiskFileAlloc(allocator, io, interp_path);
     defer allocator.free(interp_after);
-    try std.testing.expect(std.mem.indexOf(u8, interp_after, "val={{legacy}}:{tag_mod.pick(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, interp_after, "f\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, interp_after, "\"\"\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, interp_after, "val={{legacy}}:{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, interp_after, "tag_mod.pick(") != null);
     try std.testing.expect(std.mem.indexOf(u8, interp_after, "tag_mod::pick") == null);
     try std.testing.expect(std.mem.indexOf(u8, interp_after, "\\{raw\\}") != null);
     try std.testing.expect(std.mem.indexOf(u8, interp_after, "\\{bytes\\}") != null);
@@ -1326,7 +1330,9 @@ test "test_phase106_dr23_upgrade_rules_ur2300_through_ur2306_end_to_end" {
 
     const upgraded_src = try readDiskFileAlloc(allocator, io, showcase_path);
     defer allocator.free(upgraded_src);
-    try std.testing.expect(std.mem.startsWith(u8, upgraded_src, "//! Legacy block module header"));
+    try std.testing.expect(std.mem.startsWith(u8, upgraded_src, "/# Legacy block module header"));
+    try std.testing.expect(std.mem.indexOf(u8, upgraded_src, "//!") == null);
+    try std.testing.expect(std.mem.indexOf(u8, upgraded_src, "///") == null);
     try std.testing.expect(std.mem.indexOf(u8, upgraded_src, "/**") == null);
     try std.testing.expect(std.mem.indexOf(u8, upgraded_src, "/*!") == null);
     try std.testing.expect(std.mem.indexOf(u8, upgraded_src, "pub impl") == null);
@@ -1359,4 +1365,521 @@ test "test_phase106_dr23_upgrade_rules_ur2300_through_ur2306_end_to_end" {
     );
     defer post_upg_check.deinit(allocator);
     try std.testing.expectEqual(@as(u8, 0), post_upg_check.exit_code);
+}
+
+test "test_phase111b_dr24_upgrade_rules_ur2400_through_ur2406_and_w0202_hierarchy" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const scratch_dir = try createScratchDir(allocator, io, "dr24_upgrade_w0202");
+    defer cleanupScratchDir(allocator, io, scratch_dir);
+
+    const home_dir = try std.fmt.allocPrint(allocator, "{s}/home", .{scratch_dir});
+    defer allocator.free(home_dir);
+    try std.Io.Dir.cwd().createDirPath(io, home_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("COREX_HOME", home_dir);
+
+    // [1] Verify `--explain` renders `Before:` / `After:` cards for all 7 `UR-24-00`–`UR-24-06` rules:
+    const dr24_codes = [_][]const u8{
+        "UR-24-00",
+        "UR-24-01",
+        "UR-24-02",
+        "UR-24-03",
+        "UR-24-04",
+        "UR-24-05",
+        "UR-24-06",
+    };
+    for (dr24_codes) |rule_code| {
+        const explain_arg = try std.fmt.allocPrint(allocator, "--explain={s}", .{rule_code});
+        defer allocator.free(explain_arg);
+        var exp_res = try runCliCaptured(
+            allocator,
+            io,
+            &env_map,
+            &.{ "--color=never", "upgrade", explain_arg },
+        );
+        defer exp_res.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0), exp_res.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, exp_res.stdout, rule_code) != null);
+        try std.testing.expect(std.mem.indexOf(u8, exp_res.stdout, "Before:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, exp_res.stdout, "After:") != null);
+    }
+
+    // [2] Combined pre-`DR-24` showcase exercising `UR-24-00` through `UR-24-06` into zero-warning CoreX:
+    const pre_dr24_src =
+        "//! Ring buffer module docs migrated by UR-24-00.\n\n" ++
+        "//// Decorative banner preserved verbatim ////\n\n" ++
+        "/// Cache-aligned zero-padded struct migrated by UR-24-00 & UR-24-03.\n" ++
+        "@repr_c\n" ++
+        "@cache_aligned\n" ++
+        "@zero_pad\n" ++
+        "@derive(Copy, Clone, Equatable)\n" ++
+        "pub struct RingSlot {\n" ++
+        "\tpub head: u32,\n" ++
+        "\tpub tail: u32,\n" ++
+        "}\n\n" ++
+        "@packed(2)\n" ++
+        "pub struct WireCap2 {\n" ++
+        "    pub tag: u8,\n" ++
+        "    pub word: u32,\n" ++
+        "}\n\n" ++
+        "@export\n" ++
+        "@link_name(\"__cx_ring_entry\")\n" ++
+        "@link_section(\".text.hot\")\n" ++
+        "pub fn ring_entry() -> u32 {\n" ++
+        "    return 7_u32;\n" ++
+        "}\n\n" ++
+        "@inline\n" ++
+        "@no_alloc\n" ++
+        "@no_panic\n" ++
+        "fn private_bump(cur: u16) -> u16 {\n" ++
+        "    return cur +% 1_u16;\n" ++
+        "}\n\n" ++
+        "pub fn inspect_dr24(port: u16, delta: i32) -> usize {\n" ++
+        "    let bumped = /* inline block comment */ private_bump(port);\n" ++
+        "    _ = bumped;\n" ++
+        "    let zero_hole_braces = \"{{}}\";\n" ++
+        "    let zero_hole_triple = \"\"\"\n" ++
+        "        plain line\n" ++
+        "        \"\"\";\n" ++
+        "    let route_literal = \"/users/{id}\";\n" ++
+        "    let live_endpoint = \"0.0.0.0:{port}\";\n" ++
+        "    let multi_interp = \"\"\"\n" ++
+        "        p={port}\n" ++
+        "        \"\"\";\n" ++
+        "    let raw_single = r\"\"\"ok\"\"\";\n" ++
+        "    _ = zero_hole_braces;\n" ++
+        "    _ = zero_hole_triple;\n" ++
+        "    _ = route_literal;\n" ++
+        "    _ = live_endpoint;\n" ++
+        "    _ = multi_interp;\n" ++
+        "    _ = raw_single;\n" ++
+        "    let sign_v = if delta < 0 { -1_i32 } else if delta > 0 { 1_i32 } else { 0_i32 };\n" ++
+        "    _ = sign_v;\n" ++
+        "    return if port > 0_u16 { \"live\" } else { \"idle\" }.len();\n" ++
+        "}\n";
+
+    const dr24_path = try writeScratchFile(allocator, io, scratch_dir, "dr24_showcase.cx", pre_dr24_src);
+    defer allocator.free(dr24_path);
+
+    var pre_dr24_chk = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "upgrade", "--check", dr24_path },
+    );
+    defer pre_dr24_chk.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), pre_dr24_chk.exit_code);
+
+    var apply_dr24 = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "upgrade", dr24_path },
+    );
+    defer apply_dr24.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), apply_dr24.exit_code);
+
+    const dr24_after = try readDiskFileAlloc(allocator, io, dr24_path);
+    defer allocator.free(dr24_after);
+    try std.testing.expect(std.mem.startsWith(u8, dr24_after, "/# Ring buffer module docs"));
+    try std.testing.expect(std.mem.indexOf(u8, dr24_after, "//// Decorative banner preserved verbatim ////") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dr24_after, "/| Cache-aligned zero-padded struct") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dr24_after, "\t") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dr24_after, "/*") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dr24_after, "@repr(C, align: .CacheLine, zero_pad: true)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dr24_after, "@repr(C, packed: 2)") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, dr24_after, "@link(name: \"__cx_ring_entry\", section: \".text.hot\")") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, dr24_after, "\nfn private_bump(cur: u16) -> u16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dr24_after, "let zero_hole_braces = \"{}\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dr24_after, "let route_literal = \"/users/{id}\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dr24_after, "let live_endpoint = f\"0.0.0.0:{port}\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dr24_after, "let multi_interp = f\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dr24_after, "let raw_single = r\"ok\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dr24_after, "if delta < 0 => -1_i32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dr24_after, "(if port > 0_u16 => \"live\" else \"idle\").len()") != null);
+
+    var dr24_strict = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--deny-warnings", dr24_path },
+    );
+    defer dr24_strict.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), dr24_strict.exit_code);
+
+    var post_dr24_chk = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "upgrade", "--check", dr24_path },
+    );
+    defer post_dr24_chk.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), post_dr24_chk.exit_code);
+
+    // [3] Non-oscillating 3-tier `W0202` conditional/`match` hierarchy via CLI `check --fix` + `fmt`:
+    const tiers_src =
+        "pub enum Method: u8 {\n" ++
+        "    Get = 0,\n" ++
+        "    Post = 1,\n" ++
+        "    Put = 2,\n" ++
+        "    Delete = 3,\n" ++
+        "}\n\n" ++
+        "pub fn eval_tiers(method: Method, code: u32, delta: i32, flag: bool) -> i32 {\n" ++
+        "    let by_method = if method == .Get {\n" ++
+        "        1_i32\n" ++
+        "    } else if method == .Post or method == .Put {\n" ++
+        "        2_i32\n" ++
+        "    } else if method == .Delete {\n" ++
+        "        3_i32\n" ++
+        "    } else {\n" ++
+        "        0_i32\n" ++
+        "    };\n" ++
+        "    let by_code = if code == 10_u32 => 1_i32 else if code == 20_u32 => 2_i32 else if code == 30_u32 => 3_i32 else 0_i32;\n" ++
+        "    let sign_val = if delta < 0 { -1_i32 } else if delta > 0 { 1_i32 } else { 0_i32 };\n" ++
+        "    let five_arms = if delta == 1 => 1_i32\n" ++
+        "        else if delta == 2 => 2_i32\n" ++
+        "        else if delta > 100 => 3_i32\n" ++
+        "        else if delta < -100 => -3_i32\n" ++
+        "        else if flag => 9_i32\n" ++
+        "        else 0_i32;\n" ++
+        "    return by_method +% by_code +% sign_val +% five_arms;\n" ++
+        "}\n";
+
+    const tiers_path = try writeScratchFile(allocator, io, scratch_dir, "w0202_tiers.cx", tiers_src);
+    defer allocator.free(tiers_path);
+
+    var tiers_deny_before = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--deny-warnings", tiers_path },
+    );
+    defer tiers_deny_before.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), tiers_deny_before.exit_code);
+
+    var tiers_fix_1 = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--fix", tiers_path },
+    );
+    defer tiers_fix_1.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), tiers_fix_1.exit_code);
+
+    var tiers_fmt = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "fmt", tiers_path },
+    );
+    defer tiers_fmt.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), tiers_fmt.exit_code);
+
+    const tiers_after_1 = try readDiskFileAlloc(allocator, io, tiers_path);
+    defer allocator.free(tiers_after_1);
+    try std.testing.expect(std.mem.indexOf(u8, tiers_after_1, "match method {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tiers_after_1, ".Post | .Put => 2_i32,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tiers_after_1, "match code {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tiers_after_1, "if delta < 0 => -1_i32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tiers_after_1, "if delta == 1 {") != null);
+
+    var tiers_deny_after = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--deny-warnings", tiers_path },
+    );
+    defer tiers_deny_after.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), tiers_deny_after.exit_code);
+
+    // Second `check --fix` must leave `tiers_path` byte-for-byte identical (strict non-oscillation):
+    var tiers_fix_2 = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--fix", tiers_path },
+    );
+    defer tiers_fix_2.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), tiers_fix_2.exit_code);
+    const tiers_after_2 = try readDiskFileAlloc(allocator, io, tiers_path);
+    defer allocator.free(tiers_after_2);
+    try std.testing.expectEqualStrings(tiers_after_1, tiers_after_2);
+}
+
+// Verify stripping `@inline` inside `impl` refreshes `BodySemanticSideTables` so struct `.ptr`/`.len` stay fields:
+test "test_upgrade_impl_method_attr_strip_preserves_struct_field_side_tables" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const scratch_dir = try createScratchDir(allocator, io, "p111b_impl_sidetable");
+    defer cleanupScratchDir(allocator, io, scratch_dir);
+
+    const home_dir = try std.fmt.allocPrint(allocator, "{s}/home", .{scratch_dir});
+    defer allocator.free(home_dir);
+    try std.Io.Dir.cwd().createDirPath(io, home_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("COREX_HOME", home_dir);
+
+    const impl_src =
+        "//! Impl side-table regression fixture.\n\n" ++
+        "/// Byte sink descriptor.\n" ++
+        "pub struct Sink {\n" ++
+        "    /// Backing address.\n" ++
+        "    pub ptr: usize,\n" ++
+        "    /// Written byte count.\n" ++
+        "    pub len: usize,\n" ++
+        "}\n\n" ++
+        "impl Sink {\n" ++
+        "    /// Private helper whose redundant `@inline` shifts downstream AST node IDs inside `impl Sink`.\n" ++
+        "    @inline\n" ++
+        "    fn bump_cursor(&mut self, bytes: &[u8]) -> usize {\n" ++
+        "        let slice_len = bytes.len;\n" ++
+        "        self.len = self.len +% slice_len;\n" ++
+        "        return self.ptr +% self.len;\n" ++
+        "    }\n\n" ++
+        "    /// Public caller exercising `bump_cursor`.\n" ++
+        "    pub fn push_chunk(&mut self, bytes: &[u8]) -> usize {\n" ++
+        "        return self.bump_cursor(bytes);\n" ++
+        "    }\n" ++
+        "}\n";
+
+    const impl_path = try writeScratchFile(allocator, io, scratch_dir, "sink_impl.cx", impl_src);
+    defer allocator.free(impl_path);
+
+    var apply_upg = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "upgrade", impl_path },
+    );
+    defer apply_upg.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), apply_upg.exit_code);
+
+    const impl_after = try readDiskFileAlloc(allocator, io, impl_path);
+    defer allocator.free(impl_after);
+    try std.testing.expect(std.mem.indexOf(u8, impl_after, "\n    @inline") == null);
+    try std.testing.expect(std.mem.indexOf(u8, impl_after, "bytes.len()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, impl_after, "self.ptr +% self.len") != null);
+    try std.testing.expect(std.mem.indexOf(u8, impl_after, "self.as_ptr()") == null);
+
+    var strict_chk = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--deny-warnings", impl_path },
+    );
+    defer strict_chk.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), strict_chk.exit_code);
+}
+
+// Verify `> 100`-col inline `if =>` arms stay braced without oscillation (`HIGH-1`) and header `struct` arms parenthesize (`HIGH-2`):
+test "test_w0202_and_ur24_06_long_arm_non_oscillation_and_header_struct_lit_parens" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const scratch_dir = try createScratchDir(allocator, io, "p111b_if_osc_hdr");
+    defer cleanupScratchDir(allocator, io, scratch_dir);
+
+    const home_dir = try std.fmt.allocPrint(allocator, "{s}/home", .{scratch_dir});
+    defer allocator.free(home_dir);
+    try std.Io.Dir.cwd().createDirPath(io, home_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("COREX_HOME", home_dir);
+
+    // [1] `oscillate` reproducer: `86`-char call fits braced at indent `8` (`94 <= 100`) yet exceeds `100` cols as `if flag => …` (`101`):
+    const oscillate_src =
+        "/# W0202 / UR-24-06 width-guard regression fixture.\n\n" ++
+        "/| Computes a weighted metric sample.\n" ++
+        "pub fn compute_weighted_metric_value(\n" ++
+        "    alpha_factor: i32,\n" ++
+        "    beta_factor: i32,\n" ++
+        "    gamma_factor: i32,\n" ++
+        "    delta_weight_0: i32,\n" ++
+        ") -> i32 {\n" ++
+        "    return alpha_factor +% beta_factor +% gamma_factor +% delta_weight_0;\n" ++
+        "}\n\n" ++
+        "/| Keeps braced value `if` when inline `if flag => …` would exceed 100 columns.\n" ++
+        "pub fn oscillate(\n" ++
+        "    flag: bool,\n" ++
+        "    alpha_factor: i32,\n" ++
+        "    beta_factor: i32,\n" ++
+        "    gamma_factor: i32,\n" ++
+        "    delta_weight_0: i32,\n" ++
+        ") -> i32 {\n" ++
+        "    if flag {\n" ++
+        "        compute_weighted_metric_value(alpha_factor, beta_factor, gamma_factor, delta_weight_0)\n" ++
+        "    } else {\n" ++
+        "        0\n" ++
+        "    }\n" ++
+        "}\n";
+
+    const osc_path = try writeScratchFile(allocator, io, scratch_dir, "oscillate.cx", oscillate_src);
+    defer allocator.free(osc_path);
+
+    var upg_osc_check = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "upgrade", "--check", osc_path },
+    );
+    defer upg_osc_check.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), upg_osc_check.exit_code);
+
+    var upg_osc_apply = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "upgrade", osc_path },
+    );
+    defer upg_osc_apply.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), upg_osc_apply.exit_code);
+
+    var fmt_osc_check = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "fmt", "--check", osc_path },
+    );
+    defer fmt_osc_check.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), fmt_osc_check.exit_code);
+
+    var deny_osc = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--deny-warnings", osc_path },
+    );
+    defer deny_osc.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), deny_osc.exit_code);
+
+    var cycle_idx: usize = 0;
+    while (cycle_idx < 2) : (cycle_idx += 1) {
+        var fix_res = try runCliCaptured(
+            allocator,
+            io,
+            &env_map,
+            &.{ "--color=never", "check", "--fix", osc_path },
+        );
+        defer fix_res.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0), fix_res.exit_code);
+
+        var fmt_res = try runCliCaptured(
+            allocator,
+            io,
+            &env_map,
+            &.{ "--color=never", "fmt", osc_path },
+        );
+        defer fmt_res.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0), fmt_res.exit_code);
+    }
+    const osc_after = try readDiskFileAlloc(allocator, io, osc_path);
+    defer allocator.free(osc_after);
+    try std.testing.expectEqualStrings(oscillate_src, osc_after);
+
+    // [2] Header `struct` literal parenthesization (`match if flag { Pt { x: 1 } } else { Pt { x: 0 } } { … }`):
+    const header_struct_src =
+        "/# Header struct-literal parenthesization fixture.\n\n" ++
+        "/| Point wrapper.\n" ++
+        "pub struct Pt {\n" ++
+        "    /| Coordinate value.\n" ++
+        "    pub x: i32,\n" ++
+        "}\n\n" ++
+        "/| Guard wrapper.\n" ++
+        "pub struct Guard {\n" ++
+        "    /| Predicate flag.\n" ++
+        "    pub ok: bool,\n" ++
+        "}\n\n" ++
+        "/| Evaluates `if` with struct-literal arms inside `match` and `if` headers.\n" ++
+        "pub fn eval_header_struct_if(flag: bool) -> i32 {\n" ++
+        "    let matched = match if flag { Pt { x: 1 } } else { Pt { x: 0 } } {\n" ++
+        "        Pt { x } => x,\n" ++
+        "    };\n" ++
+        "    let bonus = if if flag { Guard { ok: true }.ok } else { Guard { ok: false }.ok } {\n" ++
+        "        10_i32\n" ++
+        "    } else {\n" ++
+        "        0_i32\n" ++
+        "    };\n" ++
+        "    return matched +% bonus;\n" ++
+        "}\n";
+
+    const hdr_upg_path = try writeScratchFile(allocator, io, scratch_dir, "hdr_upg.cx", header_struct_src);
+    defer allocator.free(hdr_upg_path);
+    const hdr_fix_path = try writeScratchFile(allocator, io, scratch_dir, "hdr_fix.cx", header_struct_src);
+    defer allocator.free(hdr_fix_path);
+
+    // Verify `corex upgrade` path:
+    var hdr_upg_res = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "upgrade", hdr_upg_path },
+    );
+    defer hdr_upg_res.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), hdr_upg_res.exit_code);
+
+    const hdr_upg_after = try readDiskFileAlloc(allocator, io, hdr_upg_path);
+    defer allocator.free(hdr_upg_after);
+    try std.testing.expect(
+        std.mem.indexOf(u8, hdr_upg_after, "match (if flag => Pt { x: 1 } else Pt { x: 0 }) {") != null,
+    );
+
+    var hdr_upg_chk = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--deny-warnings", hdr_upg_path },
+    );
+    defer hdr_upg_chk.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), hdr_upg_chk.exit_code);
+
+    var hdr_upg_fmt = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "fmt", "--check", hdr_upg_path },
+    );
+    defer hdr_upg_fmt.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), hdr_upg_fmt.exit_code);
+
+    // Verify `corex check --fix` + `corex fmt` path produces identical clean output with 0 oscillation:
+    var hdr_fix_res = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--fix", hdr_fix_path },
+    );
+    defer hdr_fix_res.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), hdr_fix_res.exit_code);
+
+    var hdr_fix_fmt = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "fmt", hdr_fix_path },
+    );
+    defer hdr_fix_fmt.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), hdr_fix_fmt.exit_code);
+
+    var hdr_fix_chk = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--deny-warnings", hdr_fix_path },
+    );
+    defer hdr_fix_chk.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), hdr_fix_chk.exit_code);
+
+    const hdr_fix_after = try readDiskFileAlloc(allocator, io, hdr_fix_path);
+    defer allocator.free(hdr_fix_after);
+    try std.testing.expectEqualStrings(hdr_upg_after, hdr_fix_after);
 }

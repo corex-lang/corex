@@ -1,35 +1,35 @@
-//! Windows Win32 `kernel32` Handle Constants and C-ABI Prototypes (`core.sys.windows`)
-//!
-//! Declares Win32 standard-handle identifiers (`STD_INPUT_HANDLE`, `STD_OUTPUT_HANDLE`,
-//! `STD_ERROR_HANDLE`), `kernel32.dll` `GetStdHandle` / `WriteFile` / `ExitProcess` `extern "C"`
-//! prototypes typed with `*mut opaque` (`ADR-22F`), and safe `@sys_write` / `@sys_exit` helpers.
-//!
-//! Safe stream helpers operate in binary mode (`_O_BINARY` without `LF` to `CRLF` translation) to
-//! guarantee byte-exact output parity across Windows and POSIX hosts.
+/# Windows Win32 `kernel32` Handle Constants and C-ABI Prototypes (`core.sys.windows`)
+/#
+/# Declares Win32 standard-handle identifiers (`STD_INPUT_HANDLE`, `STD_OUTPUT_HANDLE`,
+/# `STD_ERROR_HANDLE`), `kernel32.dll` `GetStdHandle` / `WriteFile` / `ExitProcess` `extern "C"`
+/# prototypes typed with `*mut opaque` (`ADR-22F`), and safe `@sys_write` / `@sys_exit` helpers.
+/#
+/# Safe stream helpers operate in binary mode (`_O_BINARY` without `LF` to `CRLF` translation) to
+/# guarantee byte-exact output parity across Windows and POSIX hosts.
 
 // --------------------------------------- CONSTS ----------------------------------------
-/// Win32 `STD_INPUT_HANDLE` (`0xFFFF_FFF6`).
+/| Win32 `STD_INPUT_HANDLE` (`0xFFFF_FFF6`).
 pub const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6;
 
-/// Win32 `STD_OUTPUT_HANDLE` (`0xFFFF_FFF5`).
+/| Win32 `STD_OUTPUT_HANDLE` (`0xFFFF_FFF5`).
 pub const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
 
-/// Win32 `STD_ERROR_HANDLE` (`0xFFFF_FFF4`).
+/| Win32 `STD_ERROR_HANDLE` (`0xFFFF_FFF4`).
 pub const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
 
-/// Canonical CoreX standard output stream descriptor (`1`).
+/| Canonical CoreX standard output stream descriptor (`1`).
 pub const STDOUT_FD: i32 = 1;
 
-/// Canonical CoreX standard error stream descriptor (`2`).
+/| Canonical CoreX standard error stream descriptor (`2`).
 pub const STDERR_FD: i32 = 2;
 
 // ------------------------------------- PUBLIC API --------------------------------------
-/// Win32 `GetStdHandle(std_handle_id)` `kernel32` prototype returning `HANDLE` (`*mut opaque`).
-@link_name("GetStdHandle")
+/| Win32 `GetStdHandle(std_handle_id)` `kernel32` prototype returning `HANDLE` (`*mut opaque`).
+@link(name: "GetStdHandle")
 pub extern "C" fn win32_get_std_handle(std_handle_id: u32) -> *mut opaque;
 
-/// Win32 `WriteFile(handle_ptr, buf_ptr, byte_len, written_out, overlapped_ptr)` prototype.
-@link_name("WriteFile")
+/| Win32 `WriteFile(handle_ptr, buf_ptr, byte_len, written_out, overlapped_ptr)` prototype.
+@link(name: "WriteFile")
 pub extern "C" fn win32_write_file(
     handle_ptr: *mut opaque,
     buf_ptr: *u8,
@@ -38,24 +38,24 @@ pub extern "C" fn win32_write_file(
     overlapped_ptr: *mut opaque,
 ) -> i32;
 
-/// Win32 `ExitProcess(exit_code)` `kernel32` prototype.
-@link_name("ExitProcess")
+/| Win32 `ExitProcess(exit_code)` `kernel32` prototype.
+@link(name: "ExitProcess")
 pub extern "C" fn win32_exit_process(exit_code: u32) -> never;
 
-/// Safe wrapper writing `text` to standard output in binary mode (`fd = 1`).
+/| Safe wrapper writing `text` to standard output in binary mode (`fd = 1`).
 @inline @no_alloc
 pub fn write_stdout(text: str) -> isize {
     return @sys_write(STDOUT_FD, text);
 }
 
-/// Safe wrapper writing `text` to standard error in binary mode (`fd = 2`).
+/| Safe wrapper writing `text` to standard error in binary mode (`fd = 2`).
 @inline @no_alloc
 pub fn write_stderr(text: str) -> isize {
     return @sys_write(STDERR_FD, text);
 }
 
-/// Safe wrapper terminating the process with `status_code`.
-@cold @no_alloc @noinline
+/| Safe wrapper terminating the process with `status_code`.
+@noinline @cold @no_alloc
 pub fn exit_process(status_code: i32) -> never {
     @sys_exit(status_code);
 }

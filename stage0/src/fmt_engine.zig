@@ -1,22 +1,25 @@
 //! CoreX Hybrid Steerable Wadler-Lindig Formatter & 8-Byte `DocArena` (`stage0/src/fmt_engine.zig`)
 //!
 //! Implements the deterministic, comment-preserving source formatter (`corex fmt`) and autofix pass
-//! (`corex fmt --fix`) specified in `DR-03` Section 7, `DR-14` Section 1, `DR-22` Section 3.4, and
-//! `DR-23` Section 2.3. Lowers the lossless Concrete Syntax Tree (`LosslessCstArena`) and `TokenBuffer`
-//! into a flat array of 8-byte `DocInst` document algebra instructions with $O(1)$ open-group `flat_width`
-//! backpatching.
+//! (`corex fmt --fix`) specified in `DR-03` Section 7, `DR-14` Section 1, `DR-22` Section 3.4,
+//! `DR-23` Section 2.3, and `DR-24` Section 4.1. Lowers the lossless Concrete Syntax Tree
+//! (`LosslessCstArena`) and `TokenBuffer` into a flat array of 8-byte `DocInst` document algebra
+//! instructions with $O(1)$ open-group `flat_width` backpatching.
 //!
 //! - **8-Byte `DocInst` & $O(1)$ Group Backpatching:** Packs every document algebra instruction into
 //!   an `extern struct` of exactly 8 bytes (`DocOp` + `mode_or_delta` + `flat_width` + `payload`).
 //!   `DocArena.endGroup()` backpatches `flat_width` in $O(1)$ time without recursive tree walks.
 //! - **100% Comment Preservation & `line_suffix` Queue:** Pre-classifies inter-token trivia into
-//!   leading comments and same-line trailing comments (`line_suffix`), handles dangling comments in
-//!   empty `{}` / `()` / `[]` containers, and flushes all unconsumed comments up through `.eof`.
-//! - **Steerable & `DR-22` Canonical Formatting:** Respects user trailing commas (`force_break` vs
+//!   leading `//`, `/|`, and `/#` comments and same-line trailing comments (`line_suffix`), handles
+//!   dangling comments in empty `{}` / `()` / `[]` containers, and flushes all unconsumed comments
+//!   up through `.eof`.
+//! - **Steerable & `DR-24` Canonical Formatting:** Respects user trailing commas (`force_break` vs
 //!   `auto_fit`), formats literal arrays with `> 8` elements in `columnar_grid`, rewrites `Option[T]`
-//!   to `T?` and `Result[T, E]` to `T!E`, strips redundant `-> unit`, groups marker attributes onto
-//!   one sorted line, normalizes `42_u64` suffixes and `extern "C"`, shifts `"""…"""` multiline
-//!   strings by `new_indent - old_indent`, and honors `// corex fmt: off`.
+//!   to `T?` and `Result[T, E]` to `T!E`, strips redundant `-> unit`, sorts `@attribute` runs into
+//!   4 canonical tiers with `<= 100`-column horizontal `DocArena` packing, normalizes `42_u64`
+//!   suffixes and `extern "C"`, dedents/re-indents `"<newline> … "` multiline strings, formats inner
+//!   `{Expr[=][:Spec]}` holes in `f"…"` / `f#"…"#`, formats `if cond => a else b`, and honors
+//!   `// corex fmt: off`.
 
 const std = @import("std");
 const mem_foundation = @import("mem_foundation.zig");
@@ -489,9 +492,9 @@ pub const DocRenderer = struct {
         }
     }
 
-    /// Renders a triple-quoted `"""…"""` literal shifted by `emitted_open_line_indent - old_line_indent` (`DR-22` §3.4).
+    /// Renders a dedented `"<newline> … "` multiline string shifted to active 4-space block indentation (`DR-24` §4.1).
     fn renderMultilineString(self: *DocRenderer, entry: MultilineStringEntry) !void {
-        const parsed = extractMultilineTripleQuoteParts(entry.raw_lexeme) orelse {
+        const parsed = extractMultilineDedentedStringParts(entry.raw_lexeme) orelse {
             try self.writeTextSlice(entry.raw_lexeme);
             return;
         };
@@ -500,7 +503,7 @@ pub const DocRenderer = struct {
         const emitted_open_indent = self.current_line_indent;
         try self.out.append(self.allocator, '\n');
 
-        const is_interp_allowed = !parsed.is_raw and !parsed.is_byte;
+        const is_interp_allowed = parsed.is_fmt and !parsed.is_raw and !parsed.is_byte;
         var last_outer_lf: ?usize = null;
         var scan_pos: usize = 0;
         while (findNextOuterLineFeedInMultiline(parsed.body_after_open_nl, scan_pos, parsed.is_raw, is_interp_allowed)) |lf_pos| {
@@ -521,6 +524,11 @@ pub const DocRenderer = struct {
             }
         }
         var min_leading_spaces: usize = close_prefix.len;
+        const target_base: usize = if (close_prefix.len > entry.old_line_indent)
+            @as(usize, emitted_open_indent) + INDENT_SPACES
+        else
+            @as(usize, emitted_open_indent);
+        const target_close_spaces: usize = (target_base / INDENT_SPACES) * INDENT_SPACES;
 
         if (last_outer_lf) |final_lf_idx| {
             const content_end: usize = if (final_lf_idx > 0 and parsed.body_after_open_nl[final_lf_idx - 1] == '\r')
@@ -539,7 +547,7 @@ pub const DocRenderer = struct {
                     raw_line_end;
                 const line_slice = content_bytes[line_start..clean_line_end];
 
-                if (line_slice.len > 0) {
+                if (line_slice.len > 0 and !isSpacesOnlyBlankLine(line_slice)) {
                     if (line_slice[0] == '\t') {
                         is_valid_spaces_only = false;
                     } else {
@@ -555,9 +563,10 @@ pub const DocRenderer = struct {
                 }
             }
 
-            const raw_delta: isize = @as(isize, @intCast(emitted_open_indent)) -
-                @as(isize, @intCast(entry.old_line_indent));
-            const eff_delta: isize = if (!is_valid_spaces_only)
+            const is_clean_dedent = is_valid_spaces_only and min_leading_spaces >= close_prefix.len;
+            const raw_delta: isize = @as(isize, @intCast(target_close_spaces)) -
+                @as(isize, @intCast(close_prefix.len));
+            const eff_delta: isize = if (!is_clean_dedent)
                 0
             else
                 @max(raw_delta, -@as(isize, @intCast(min_leading_spaces)));
@@ -572,7 +581,7 @@ pub const DocRenderer = struct {
                     raw_line_end;
                 const line_slice = content_bytes[line_start..clean_line_end];
 
-                if (line_slice.len > 0) {
+                if (line_slice.len > 0 and (!is_clean_dedent or !isSpacesOnlyBlankLine(line_slice))) {
                     if (eff_delta >= 0) {
                         try self.out.appendNTimes(self.allocator, ' ', @intCast(eff_delta));
                         try self.appendSliceNormalizedLf(line_slice);
@@ -600,8 +609,8 @@ pub const DocRenderer = struct {
             return;
         }
 
-        const raw_delta: isize = @as(isize, @intCast(emitted_open_indent)) -
-            @as(isize, @intCast(entry.old_line_indent));
+        const raw_delta: isize = @as(isize, @intCast(target_close_spaces)) -
+            @as(isize, @intCast(close_prefix.len));
         const eff_delta: isize = if (!is_valid_spaces_only)
             0
         else
@@ -976,35 +985,84 @@ const UseSpecEntry = struct {
     }
 };
 
-/// Parsed prefix, body, and closing delimiter slices of a multiline `"""…"""` literal (`DR-22` §3.4).
+/// Parsed prefix, body, and closing delimiter slices of a multiline `"<newline> … "` literal (`DR-24` §4.1).
 const ParsedMultilineLiteral = struct {
-    /// Opening prefix through `"""` (e.g., `"""`, `r#"""`, `b"""`, `br#"""`), plus any horizontal spaces before `\n`.
+    /// Opening prefix through `"` (e.g., `"`, `f"`, `f#"`, `r"`, `r#"`, `b"`, `br#"`).
     open_header: []const u8,
-    /// Raw body bytes strictly after the opening `\r?\n` and before the closing `"""[#*]`.
+    /// Raw body bytes strictly after the opening `\r?\n` and before the closing `"[#*]`.
     body_after_open_nl: []const u8,
-    /// Closing delimiter slice (`"""` followed by matching `#` count).
+    /// Closing delimiter slice (`"` followed by matching `#` count).
     close_delim: []const u8,
     /// Whether the literal uses raw `r` / `br` escaping rules.
     is_raw: bool,
     /// Whether the literal uses byte `b` / `br` prefix rules.
     is_byte: bool,
+    /// Whether the literal uses `f` / `f#` format interpolation (`ADR-24B`).
+    is_fmt: bool,
 };
 
-/// Sortable entry for parameterless `@marker` attributes (`@inline @no_alloc @no_panic`, `DR-22` §3.4).
-const MarkerAttrEntry = struct {
-    /// CST node index of the parameterless `.attribute` node.
+/// Canonical 4-tier `@attribute` sort rank entry (`ADR-24C`).
+const AttrSortRank = struct {
+    /// Canonical tier (`1..4`: `1` = `@cfg`/`@allow`, `2` = `@repr`/`@link`, `3` = `@derive`/domain, `4` = contracts/hints).
+    tier: u8,
+    /// Deterministic sub-order within `tier`.
+    sub_rank: u8,
+};
+
+/// Sortable entry for contiguous comment-free `.attribute` sequences (`ADR-24C`).
+const SortedAttrEntry = struct {
+    /// CST node index of the `.attribute` node.
     node_idx: CstNodeIndex,
-    /// Attribute identifier lexeme used for lexicographical ASCII sorting.
-    sort_name: []const u8,
-    /// Original 0-based position for deterministic tie-breaking on duplicate markers.
+    /// Canonical tier (`1..4`).
+    tier: u8,
+    /// `true` when this attribute is a parameterless Tier-4 marker (`@inline @no_alloc @no_panic @must_use`).
+    is_trailing_marker: bool,
+    /// Deterministic sub-order within `tier`.
+    sub_rank: u8,
+    /// Original 0-based position for stable tie-breaking.
     orig_order: usize,
 
-    /// Compares two `MarkerAttrEntry` items lexicographically by `sort_name`.
-    pub fn lessThan(_: void, lhs: MarkerAttrEntry, rhs: MarkerAttrEntry) bool {
-        const cmp = std.mem.order(u8, lhs.sort_name, rhs.sort_name);
-        if (cmp != .eq) return cmp == .lt;
+    /// Orders attributes by `(tier ASC, is_trailing_marker ASC, sub_rank ASC, orig_order ASC)`.
+    pub fn lessThan(_: void, lhs: SortedAttrEntry, rhs: SortedAttrEntry) bool {
+        if (lhs.tier != rhs.tier) return lhs.tier < rhs.tier;
+        if (lhs.is_trailing_marker != rhs.is_trailing_marker) return !lhs.is_trailing_marker;
+        if (lhs.sub_rank != rhs.sub_rank) return lhs.sub_rank < rhs.sub_rank;
         return lhs.orig_order < rhs.orig_order;
     }
+};
+
+/// Single parsed argument inside a comment-free `@repr(…)` or `@link(…)` attribute (`ADR-24C`).
+const CanonicalAttrArg = struct {
+    /// Leading identifier token for `key: expr` arguments (`.none` when positional).
+    key_tok: TokenIndex = .none,
+    /// Separator `:` / `=` token for `key: expr` arguments (`.none` when positional).
+    sep_tok: TokenIndex = .none,
+    /// Expression CST subtree of the argument value.
+    val_cst: CstNodeIndex,
+    /// Canonical key-order rank (`0..4`).
+    rank: u8,
+    /// Original 0-based argument index for stable tie-breaking.
+    orig_order: usize,
+
+    /// Orders `@repr` / `@link` arguments by `(rank ASC, orig_order ASC)`.
+    pub fn lessThan(_: void, lhs: CanonicalAttrArg, rhs: CanonicalAttrArg) bool {
+        if (lhs.rank != rhs.rank) return lhs.rank < rhs.rank;
+        return lhs.orig_order < rhs.orig_order;
+    }
+};
+
+/// Single conditional arm in a flattened fat-arrow `if c1 => v1 else if c2 => v2 else v3` chain (`ADR-24D`).
+const FatArrowIfArm = struct {
+    /// `else` token preceding `if` (`TokenIndex.none` on the first arm).
+    leading_else_tok: TokenIndex = .none,
+    /// `if` keyword token of this arm.
+    if_tok: TokenIndex,
+    /// `.if_cond` CST node of this arm.
+    cond_id: CstNodeIndex,
+    /// `=>` fat-arrow token of this arm.
+    arrow_tok: TokenIndex,
+    /// Branch expression CST node of this arm.
+    then_id: CstNodeIndex,
 };
 
 /// Precedence tiers of the unified 4-tier `Type` grammar (`DR-22` Sections 1.3 & 3.3).
@@ -1056,10 +1114,90 @@ pub const COLUMNAR_GRID_MAX_COLS: usize = 8;
 const RANGE_ANCHOR_START: u8 = 1;
 /// `DocInst.mode_or_delta` `.nop` payload marking the end of a range-formatting slice (`2`).
 const RANGE_ANCHOR_END: u8 = 2;
+/// Maximum nested `f"…"` interpolation hole formatting depth (`4`, `ADR-24B`).
+const MAX_FMT_HOLE_FORMAT_DEPTH: u8 = 4;
+/// Synthetic wrapper prefix used when formatting single-line `{Expr}` holes inside `f"…"` literals.
+const FMT_HOLE_WRAPPER_PREFIX: []const u8 = "fn cx_fmt_hole() {\n    let cx_hole_val = ";
+/// Synthetic wrapper suffix used when formatting single-line `{Expr}` holes inside `f"…"` literals.
+const FMT_HOLE_WRAPPER_SUFFIX: []const u8 = ";\n}\n";
+
+/// $O(1)$ lookup table mapping built-in `@attribute` names to their canonical 4-tier sort rank (`ADR-24C`).
+const CANONICAL_ATTR_TIER_MAP = std.StaticStringMap(AttrSortRank).initComptime(.{
+    .{ "allow", AttrSortRank{ .tier = 1, .sub_rank = 1 } },
+    .{ "arg", AttrSortRank{ .tier = 3, .sub_rank = 14 } },
+    .{ "attribute_schema", AttrSortRank{ .tier = 3, .sub_rank = 0 } },
+    .{ "bench", AttrSortRank{ .tier = 3, .sub_rank = 19 } },
+    .{ "borrowed", AttrSortRank{ .tier = 4, .sub_rank = 13 } },
+    .{ "builder", AttrSortRank{ .tier = 3, .sub_rank = 10 } },
+    .{ "builder_item", AttrSortRank{ .tier = 3, .sub_rank = 11 } },
+    .{ "byte_len", AttrSortRank{ .tier = 4, .sub_rank = 21 } },
+    .{ "cfg", AttrSortRank{ .tier = 1, .sub_rank = 0 } },
+    .{ "cli_command", AttrSortRank{ .tier = 3, .sub_rank = 13 } },
+    .{ "cold", AttrSortRank{ .tier = 4, .sub_rank = 2 } },
+    .{ "component", AttrSortRank{ .tier = 3, .sub_rank = 7 } },
+    .{ "constructor", AttrSortRank{ .tier = 3, .sub_rank = 9 } },
+    .{ "consumes", AttrSortRank{ .tier = 4, .sub_rank = 22 } },
+    .{ "deprecated", AttrSortRank{ .tier = 1, .sub_rank = 2 } },
+    .{ "derive", AttrSortRank{ .tier = 3, .sub_rank = 1 } },
+    .{ "escapes", AttrSortRank{ .tier = 4, .sub_rank = 14 } },
+    .{ "expect", AttrSortRank{ .tier = 1, .sub_rank = 3 } },
+    .{ "export", AttrSortRank{ .tier = 2, .sub_rank = 3 } },
+    .{ "extern", AttrSortRank{ .tier = 2, .sub_rank = 6 } },
+    .{ "fbip", AttrSortRank{ .tier = 4, .sub_rank = 10 } },
+    .{ "fix_inline", AttrSortRank{ .tier = 1, .sub_rank = 4 } },
+    .{ "flag", AttrSortRank{ .tier = 3, .sub_rank = 15 } },
+    .{ "free_with", AttrSortRank{ .tier = 4, .sub_rank = 23 } },
+    .{ "from", AttrSortRank{ .tier = 3, .sub_rank = 2 } },
+    .{ "gpu_kernel", AttrSortRank{ .tier = 3, .sub_rank = 17 } },
+    .{ "ifunc", AttrSortRank{ .tier = 2, .sub_rank = 7 } },
+    .{ "inline", AttrSortRank{ .tier = 4, .sub_rank = 0 } },
+    .{ "lang", AttrSortRank{ .tier = 2, .sub_rank = 9 } },
+    .{ "linear", AttrSortRank{ .tier = 3, .sub_rank = 3 } },
+    .{ "link", AttrSortRank{ .tier = 2, .sub_rank = 1 } },
+    .{ "link_lib", AttrSortRank{ .tier = 2, .sub_rank = 2 } },
+    .{ "local", AttrSortRank{ .tier = 4, .sub_rank = 11 } },
+    .{ "max_stack", AttrSortRank{ .tier = 4, .sub_rank = 6 } },
+    .{ "may_be_null", AttrSortRank{ .tier = 4, .sub_rank = 18 } },
+    .{ "must_use", AttrSortRank{ .tier = 4, .sub_rank = 8 } },
+    .{ "must_vectorize", AttrSortRank{ .tier = 4, .sub_rank = 9 } },
+    .{ "no_alloc", AttrSortRank{ .tier = 4, .sub_rank = 3 } },
+    .{ "no_block", AttrSortRank{ .tier = 4, .sub_rank = 5 } },
+    .{ "no_panic", AttrSortRank{ .tier = 4, .sub_rank = 4 } },
+    .{ "noinline", AttrSortRank{ .tier = 4, .sub_rank = 1 } },
+    .{ "non_null", AttrSortRank{ .tier = 4, .sub_rank = 17 } },
+    .{ "not_send", AttrSortRank{ .tier = 3, .sub_rank = 4 } },
+    .{ "not_sync", AttrSortRank{ .tier = 3, .sub_rank = 5 } },
+    .{ "null_terminated", AttrSortRank{ .tier = 4, .sub_rank = 19 } },
+    .{ "out_param", AttrSortRank{ .tier = 4, .sub_rank = 16 } },
+    .{ "overload", AttrSortRank{ .tier = 3, .sub_rank = 12 } },
+    .{ "owned_by_caller", AttrSortRank{ .tier = 4, .sub_rank = 15 } },
+    .{ "repr", AttrSortRank{ .tier = 2, .sub_rank = 0 } },
+    .{ "route", AttrSortRank{ .tier = 3, .sub_rank = 16 } },
+    .{ "secret", AttrSortRank{ .tier = 3, .sub_rank = 6 } },
+    .{ "simd", AttrSortRank{ .tier = 2, .sub_rank = 10 } },
+    .{ "slice_len", AttrSortRank{ .tier = 4, .sub_rank = 20 } },
+    .{ "soa", AttrSortRank{ .tier = 2, .sub_rank = 11 } },
+    .{ "state", AttrSortRank{ .tier = 3, .sub_rank = 8 } },
+    .{ "std_cap_boundary", AttrSortRank{ .tier = 4, .sub_rank = 7 } },
+    .{ "test", AttrSortRank{ .tier = 3, .sub_rank = 18 } },
+    .{ "thread_local", AttrSortRank{ .tier = 2, .sub_rank = 8 } },
+    .{ "trusted", AttrSortRank{ .tier = 4, .sub_rank = 12 } },
+    .{ "vectorize_width", AttrSortRank{ .tier = 4, .sub_rank = 24 } },
+    .{ "wasm_export", AttrSortRank{ .tier = 2, .sub_rank = 4 } },
+    .{ "wasm_import", AttrSortRank{ .tier = 2, .sub_rank = 5 } },
+});
 
 // -------------------------------------- INTERNALS --------------------------------------
 
 // ---------------- Multiline String Indentation ----------------
+
+/// Returns whether `line_slice` contains exclusively ASCII `' '` space bytes (`0..N` spaces).
+inline fn isSpacesOnlyBlankLine(line_slice: []const u8) bool {
+    for (line_slice) |byte_val| {
+        if (byte_val != ' ') return false;
+    }
+    return true;
+}
 
 /// Returns whether `slice[start_idx..]` begins with at least `expected_hashes` `'#'` bytes.
 inline fn hasHashPrefixAt(slice: []const u8, start_idx: usize, expected_hashes: usize) bool {
@@ -1071,55 +1209,45 @@ inline fn hasHashPrefixAt(slice: []const u8, start_idx: usize, expected_hashes: 
     return true;
 }
 
-/// Returns whether `slice[quote_pos..]` opens a multiline `"""` literal rather than single-line `r#""…""#`.
-inline fn isTripleQuoteRunOpening(
-    slice: []const u8,
-    quote_pos: usize,
-    is_raw: bool,
-    hash_count: usize,
-) bool {
-    var quote_run: usize = 0;
-    while (quote_pos + quote_run < slice.len and slice[quote_pos + quote_run] == '"') : (quote_run += 1) {}
-    if (quote_run < 3) return false;
-    if (is_raw and hash_count > 0 and hasHashPrefixAt(slice, quote_pos + quote_run, hash_count)) {
-        return false;
-    }
-    return true;
-}
-
-/// Splits a multiline triple-quoted string or byte-string `lexeme` (`[b][r[#*]]"""\r?\n…"""[#*]`), or returns `null`.
-fn extractMultilineTripleQuoteParts(lexeme: []const u8) ?ParsedMultilineLiteral {
-    if (lexeme.len < 7) return null;
+/// Splits a dedented multiline string or byte-string `lexeme` (`([b][r[#*]]|f[#*])"\r?\n…"[#*]`), or returns `null`.
+fn extractMultilineDedentedStringParts(lexeme: []const u8) ?ParsedMultilineLiteral {
+    if (lexeme.len < 3) return null;
     var cursor: usize = 0;
     var is_byte = false;
     var is_raw = false;
+    var is_fmt = false;
 
     if (lexeme[cursor] == 'b') {
         is_byte = true;
         cursor += 1;
-    }
-    if (cursor < lexeme.len and lexeme[cursor] == 'r') {
+        if (cursor < lexeme.len and lexeme[cursor] == 'r') {
+            is_raw = true;
+            cursor += 1;
+        }
+    } else if (lexeme[cursor] == 'r') {
         is_raw = true;
         cursor += 1;
+    } else if (lexeme[cursor] == 'f') {
+        is_fmt = true;
+        cursor += 1;
     }
+
     var hash_count: usize = 0;
-    if (is_raw) {
+    if (is_raw or is_fmt) {
         while (cursor < lexeme.len and lexeme[cursor] == '#') : (cursor += 1) {
             hash_count += 1;
         }
     }
-    if (cursor + 6 + hash_count > lexeme.len) return null;
-    if (!isTripleQuoteRunOpening(lexeme, cursor, is_raw, hash_count)) return null;
+    if (cursor + 2 + hash_count > lexeme.len or lexeme[cursor] != '"') return null;
 
-    const close_len: usize = 3 + hash_count;
+    const close_len: usize = 1 + hash_count;
     const close_pos: usize = lexeme.len - close_len;
+    if (close_pos <= cursor) return null;
     if (!hasHashPrefixAt(lexeme, lexeme.len - hash_count, hash_count)) return null;
-    if (lexeme[close_pos] != '"' or lexeme[close_pos + 1] != '"' or lexeme[close_pos + 2] != '"') return null;
+    if (lexeme[close_pos] != '"') return null;
 
-    // Require an opening line break immediately after `"""` (allowing horizontal whitespace before `\r?\n`):
-    var header_end: usize = cursor + 3;
-    while (header_end < close_pos and (lexeme[header_end] == ' ' or lexeme[header_end] == '\t')) : (header_end += 1) {}
-    var body_start: usize = header_end;
+    // Multiline mode activates strictly when the opening `"` is immediately followed by `\r?\n` (`ADR-24B`):
+    var body_start: usize = cursor + 1;
     if (body_start < close_pos and lexeme[body_start] == '\r') {
         body_start += 1;
     }
@@ -1127,11 +1255,12 @@ fn extractMultilineTripleQuoteParts(lexeme: []const u8) ?ParsedMultilineLiteral 
     body_start += 1;
 
     return .{
-        .open_header = lexeme[0 .. cursor + 3],
+        .open_header = lexeme[0 .. cursor + 1],
         .body_after_open_nl = lexeme[body_start..close_pos],
         .close_delim = lexeme[close_pos..],
         .is_raw = is_raw,
         .is_byte = is_byte,
+        .is_fmt = is_fmt,
     };
 }
 
@@ -1140,12 +1269,11 @@ inline fn isAsciiIdentContinueByte(byte_val: u8) bool {
     return std.ascii.isAlphanumeric(byte_val) or byte_val == '_';
 }
 
-/// Skips a non-interpolated `'…'`, `b'…'`, `b"…"`, or `b"""…"""` literal inside an `{expr}` scan.
+/// Skips a non-interpolated `'…'`, `b'…'`, `"…"`, or `b"…"` literal inside an `{expr}` scan.
 fn skipQuotedLiteralInHole(
     body_bytes: []const u8,
     after_open_idx: usize,
     quote_byte: u8,
-    is_triple: bool,
 ) usize {
     var cursor = after_open_idx;
     while (cursor < body_bytes.len) {
@@ -1154,16 +1282,6 @@ fn skipQuotedLiteralInHole(
             continue;
         }
         if (body_bytes[cursor] == quote_byte) {
-            if (is_triple) {
-                if (cursor + 2 < body_bytes.len and
-                    body_bytes[cursor + 1] == quote_byte and
-                    body_bytes[cursor + 2] == quote_byte)
-                {
-                    return cursor + 3;
-                }
-                cursor += 1;
-                continue;
-            }
             return cursor + 1;
         }
         cursor += 1;
@@ -1171,7 +1289,7 @@ fn skipQuotedLiteralInHole(
     return body_bytes.len;
 }
 
-/// Skips a raw `r#"…"#` or `r#"""…"""#` string literal inside an `{expr}` scan (`after_r_idx` points past `'r'`).
+/// Skips a raw `r"…"`, `r#"…"#`, `br"…"`, or `br#"…"#` literal inside an `{expr}` scan (`after_r_idx` past `'r'`).
 fn skipRawStringInHole(body_bytes: []const u8, after_r_idx: usize) usize {
     var cursor = after_r_idx;
     var hash_count: usize = 0;
@@ -1179,53 +1297,35 @@ fn skipRawStringInHole(body_bytes: []const u8, after_r_idx: usize) usize {
         hash_count += 1;
     }
     if (cursor >= body_bytes.len or body_bytes[cursor] != '"') return cursor;
-    const is_triple = isTripleQuoteRunOpening(body_bytes, cursor, true, hash_count);
-    const quote_len: usize = if (is_triple) 3 else 1;
-    cursor += quote_len;
+    cursor += 1;
 
     while (cursor < body_bytes.len) {
-        if (body_bytes[cursor] == '"') {
-            if (is_triple) {
-                if (cursor + 2 < body_bytes.len and
-                    body_bytes[cursor + 1] == '"' and
-                    body_bytes[cursor + 2] == '"' and
-                    hasHashPrefixAt(body_bytes, cursor + 3, hash_count))
-                {
-                    return cursor + 3 + hash_count;
-                }
-                cursor += 1;
-                continue;
-            }
-            if (hasHashPrefixAt(body_bytes, cursor + 1, hash_count)) {
-                return cursor + 1 + hash_count;
-            }
+        if (body_bytes[cursor] == '"' and hasHashPrefixAt(body_bytes, cursor + 1, hash_count)) {
+            return cursor + 1 + hash_count;
         }
         cursor += 1;
     }
     return body_bytes.len;
 }
 
-/// Skips an interpolated `"…"` or `"""…"""` literal nested inside an `{expr}` scan.
-fn skipInterpolatedStringInHole(body_bytes: []const u8, after_open_idx: usize, is_triple: bool) usize {
-    var cursor = after_open_idx;
+/// Skips an interpolated `f"…"` or `f#"…"#` literal nested inside an `{expr}` scan (`after_f_idx` past `'f'`).
+fn skipFmtStringInHole(body_bytes: []const u8, after_f_idx: usize) usize {
+    var cursor = after_f_idx;
+    var hash_count: usize = 0;
+    while (cursor < body_bytes.len and body_bytes[cursor] == '#') : (cursor += 1) {
+        hash_count += 1;
+    }
+    if (cursor >= body_bytes.len or body_bytes[cursor] != '"') return cursor;
+    cursor += 1;
+
     while (cursor < body_bytes.len) {
         const cur_byte = body_bytes[cursor];
         if (cur_byte == '\\') {
             cursor = @min(cursor + 2, body_bytes.len);
             continue;
         }
-        if (cur_byte == '"') {
-            if (is_triple) {
-                if (cursor + 2 < body_bytes.len and
-                    body_bytes[cursor + 1] == '"' and
-                    body_bytes[cursor + 2] == '"')
-                {
-                    return cursor + 3;
-                }
-                cursor += 1;
-                continue;
-            }
-            return cursor + 1;
+        if (cur_byte == '"' and hasHashPrefixAt(body_bytes, cursor + 1, hash_count)) {
+            return cursor + 1 + hash_count;
         }
         if (cur_byte == '{') {
             if (cursor + 1 < body_bytes.len and body_bytes[cursor + 1] == '{') {
@@ -1258,18 +1358,20 @@ fn skipInterpolationHoleInMultiline(body_bytes: []const u8, open_brace_idx: usiz
             (body_bytes[cursor + 1] == '"' or body_bytes[cursor + 1] == '#'))
         {
             cursor = skipRawStringInHole(body_bytes, cursor + 1);
+        } else if (cur_byte == 'f' and
+            (cursor == 0 or !isAsciiIdentContinueByte(body_bytes[cursor - 1])) and
+            cursor + 1 < body_bytes.len and
+            (body_bytes[cursor + 1] == '"' or body_bytes[cursor + 1] == '#'))
+        {
+            cursor = skipFmtStringInHole(body_bytes, cursor + 1);
         } else if (cur_byte == 'b' and
             (cursor == 0 or !isAsciiIdentContinueByte(body_bytes[cursor - 1])) and
             cursor + 1 < body_bytes.len)
         {
             if (body_bytes[cursor + 1] == '\'') {
-                cursor = skipQuotedLiteralInHole(body_bytes, cursor + 2, '\'', false);
+                cursor = skipQuotedLiteralInHole(body_bytes, cursor + 2, '\'');
             } else if (body_bytes[cursor + 1] == '"') {
-                const is_triple = cursor + 3 < body_bytes.len and
-                    body_bytes[cursor + 2] == '"' and
-                    body_bytes[cursor + 3] == '"';
-                const step: usize = if (is_triple) 4 else 2;
-                cursor = skipQuotedLiteralInHole(body_bytes, cursor + step, '"', is_triple);
+                cursor = skipQuotedLiteralInHole(body_bytes, cursor + 2, '"');
             } else if (body_bytes[cursor + 1] == 'r' and cursor + 2 < body_bytes.len and
                 (body_bytes[cursor + 2] == '"' or body_bytes[cursor + 2] == '#'))
             {
@@ -1278,34 +1380,14 @@ fn skipInterpolationHoleInMultiline(body_bytes: []const u8, open_brace_idx: usiz
                 cursor += 1;
             }
         } else if (cur_byte == '"') {
-            const is_triple = cursor + 2 < body_bytes.len and
-                body_bytes[cursor + 1] == '"' and
-                body_bytes[cursor + 2] == '"';
-            const step: usize = if (is_triple) 3 else 1;
-            cursor = skipInterpolatedStringInHole(body_bytes, cursor + step, is_triple);
+            cursor = skipQuotedLiteralInHole(body_bytes, cursor + 1, '"');
         } else if (cur_byte == '\'') {
-            cursor = skipQuotedLiteralInHole(body_bytes, cursor + 1, '\'', false);
-        } else if (cur_byte == '/' and cursor + 1 < body_bytes.len) {
-            if (body_bytes[cursor + 1] == '/') {
-                cursor += 2;
-                while (cursor < body_bytes.len and body_bytes[cursor] != '\n' and body_bytes[cursor] != '\r') {
-                    cursor += 1;
-                }
-            } else if (body_bytes[cursor + 1] == '*') {
-                cursor += 2;
-                var comment_depth: u32 = 1;
-                while (cursor < body_bytes.len and comment_depth > 0) {
-                    if (body_bytes[cursor] == '/' and cursor + 1 < body_bytes.len and body_bytes[cursor + 1] == '*') {
-                        comment_depth += 1;
-                        cursor += 2;
-                    } else if (body_bytes[cursor] == '*' and cursor + 1 < body_bytes.len and body_bytes[cursor + 1] == '/') {
-                        comment_depth -= 1;
-                        cursor += 2;
-                    } else {
-                        cursor += 1;
-                    }
-                }
-            } else {
+            cursor = skipQuotedLiteralInHole(body_bytes, cursor + 1, '\'');
+        } else if (cur_byte == '/' and cursor + 1 < body_bytes.len and
+            (body_bytes[cursor + 1] == '/' or body_bytes[cursor + 1] == '|' or body_bytes[cursor + 1] == '#'))
+        {
+            cursor += 2;
+            while (cursor < body_bytes.len and body_bytes[cursor] != '\n' and body_bytes[cursor] != '\r') {
                 cursor += 1;
             }
         } else {
@@ -1313,6 +1395,93 @@ fn skipInterpolationHoleInMultiline(body_bytes: []const u8, open_brace_idx: usiz
         }
     }
     return cursor;
+}
+
+/// Decomposed components of a single `{Expr[=][:Spec]}` hole inside an `f"…"` literal (`ADR-24B`).
+const FmtHoleSplit = struct {
+    /// Trimmed inner expression slice (`Expr`).
+    expr_slice: []const u8,
+    /// Verbatim `:Spec` suffix including the leading `:` (empty when omitted).
+    spec_with_colon: []const u8,
+    /// `true` when the `=` self-documenting debug suffix is present (`{expr=}`).
+    has_debug_eq: bool,
+};
+
+/// Splits the interior slice of `{Expr[=][:Spec]}` at nesting depth `0` into `(expr_slice, spec_with_colon, has_debug_eq)`.
+fn splitFmtHoleTopLevel(hole_inner: []const u8) FmtHoleSplit {
+    var spec_colon_idx: ?usize = null;
+    var nesting_depth: u32 = 0;
+    var cursor: usize = 0;
+
+    while (cursor < hole_inner.len) {
+        const cur_byte = hole_inner[cursor];
+        if (cur_byte == '(' or cur_byte == '[' or cur_byte == '{') {
+            nesting_depth += 1;
+            cursor += 1;
+        } else if (cur_byte == ')' or cur_byte == ']' or cur_byte == '}') {
+            nesting_depth -|= 1;
+            cursor += 1;
+        } else if (cur_byte == 'r' and
+            (cursor == 0 or !isAsciiIdentContinueByte(hole_inner[cursor - 1])) and
+            cursor + 1 < hole_inner.len and
+            (hole_inner[cursor + 1] == '"' or hole_inner[cursor + 1] == '#'))
+        {
+            cursor = skipRawStringInHole(hole_inner, cursor + 1);
+        } else if (cur_byte == 'f' and
+            (cursor == 0 or !isAsciiIdentContinueByte(hole_inner[cursor - 1])) and
+            cursor + 1 < hole_inner.len and
+            (hole_inner[cursor + 1] == '"' or hole_inner[cursor + 1] == '#'))
+        {
+            cursor = skipFmtStringInHole(hole_inner, cursor + 1);
+        } else if (cur_byte == 'b' and
+            (cursor == 0 or !isAsciiIdentContinueByte(hole_inner[cursor - 1])) and
+            cursor + 1 < hole_inner.len)
+        {
+            if (hole_inner[cursor + 1] == '\'') {
+                cursor = skipQuotedLiteralInHole(hole_inner, cursor + 2, '\'');
+            } else if (hole_inner[cursor + 1] == '"') {
+                cursor = skipQuotedLiteralInHole(hole_inner, cursor + 2, '"');
+            } else if (hole_inner[cursor + 1] == 'r' and cursor + 2 < hole_inner.len and
+                (hole_inner[cursor + 2] == '"' or hole_inner[cursor + 2] == '#'))
+            {
+                cursor = skipRawStringInHole(hole_inner, cursor + 2);
+            } else {
+                cursor += 1;
+            }
+        } else if (cur_byte == '"') {
+            cursor = skipQuotedLiteralInHole(hole_inner, cursor + 1, '"');
+        } else if (cur_byte == '\'') {
+            cursor = skipQuotedLiteralInHole(hole_inner, cursor + 1, '\'');
+        } else if (nesting_depth == 0 and cur_byte == ':' and cursor > 0) {
+            if (lexer.parseFormatSpec(hole_inner[cursor + 1 ..], false)) |_| {
+                spec_colon_idx = cursor;
+                break;
+            } else |_| {
+                cursor += 1;
+            }
+        } else {
+            cursor += 1;
+        }
+    }
+
+    const before_spec = if (spec_colon_idx) |colon_pos| hole_inner[0..colon_pos] else hole_inner;
+    const spec_with_colon = if (spec_colon_idx) |colon_pos| hole_inner[colon_pos..] else "";
+    const trimmed_before = std.mem.trim(u8, before_spec, " \t");
+    if (trimmed_before.len >= 2 and trimmed_before[trimmed_before.len - 1] == '=') {
+        const prev_byte = trimmed_before[trimmed_before.len - 2];
+        if (prev_byte != '=' and prev_byte != '!' and prev_byte != '<' and prev_byte != '>' and prev_byte != ':') {
+            return .{
+                .expr_slice = std.mem.trimEnd(u8, trimmed_before[0 .. trimmed_before.len - 1], " \t"),
+                .spec_with_colon = spec_with_colon,
+                .has_debug_eq = true,
+            };
+        }
+    }
+    return .{
+        .expr_slice = trimmed_before,
+        .spec_with_colon = spec_with_colon,
+        .has_debug_eq = false,
+    };
 }
 
 /// Scans `body_bytes` from `start_pos` for the next outer `\n`, skipping `{expr}` holes when enabled.
@@ -1354,7 +1523,6 @@ inline fn isCommentOrShebangTrivia(kind: TriviaKind) bool {
         .line_comment,
         .doc_comment,
         .module_doc_comment,
-        .block_comment,
         .shebang,
         => true,
         else => false,
@@ -1369,9 +1537,6 @@ inline fn isNewlineTrivia(kind: TriviaKind) bool {
 /// Checks whether a `.line_comment` slice is a `// corex fmt: off` or `// corex fmt: on` directive.
 fn classifyFmtDirective(comment_slice: []const u8) enum { none, fmt_off, fmt_on } {
     if (!std.mem.startsWith(u8, comment_slice, "//")) return .none;
-    if (std.mem.startsWith(u8, comment_slice, "///") or std.mem.startsWith(u8, comment_slice, "//!")) {
-        return .none;
-    }
     const body = std.mem.trim(u8, comment_slice[2..], " \t\r\n");
     if (std.mem.eql(u8, body, "corex fmt: off")) return .fmt_off;
     if (std.mem.eql(u8, body, "corex fmt: on")) return .fmt_on;
@@ -1486,35 +1651,18 @@ fn appendExpandedTriviaPiece(
                 try appendChunkedTriviaPieces(allocator, dest, .skipped_unexpected, @intCast(cursor), 1);
                 cursor += 1;
             }
-        } else if (byte_val == '/' and cursor + 1 < end_pos and source[cursor + 1] == '/') {
+        } else if (byte_val == '/' and cursor + 1 < end_pos and
+            (source[cursor + 1] == '/' or source[cursor + 1] == '|' or source[cursor + 1] == '#'))
+        {
             const run_start = cursor;
-            var comment_kind: TriviaKind = .line_comment;
-            if (cursor + 2 < end_pos) {
-                if (source[cursor + 2] == '!') {
-                    comment_kind = .module_doc_comment;
-                } else if (source[cursor + 2] == '/' and (cursor + 3 >= end_pos or source[cursor + 3] != '/')) {
-                    comment_kind = .doc_comment;
-                }
-            }
+            const comment_kind: TriviaKind = switch (source[cursor + 1]) {
+                '#' => .module_doc_comment,
+                '|' => .doc_comment,
+                else => .line_comment,
+            };
             cursor += 2;
             while (cursor < end_pos and source[cursor] != '\n' and source[cursor] != '\r') : (cursor += 1) {}
             try appendChunkedTriviaPieces(allocator, dest, comment_kind, @intCast(run_start), cursor - run_start);
-        } else if (byte_val == '/' and cursor + 1 < end_pos and source[cursor + 1] == '*') {
-            const run_start = cursor;
-            cursor += 2;
-            var depth: u32 = 1;
-            while (cursor < end_pos and depth > 0) {
-                if (source[cursor] == '/' and cursor + 1 < end_pos and source[cursor + 1] == '*') {
-                    depth += 1;
-                    cursor += 2;
-                } else if (source[cursor] == '*' and cursor + 1 < end_pos and source[cursor + 1] == '/') {
-                    depth -= 1;
-                    cursor += 2;
-                } else {
-                    cursor += 1;
-                }
-            }
-            try appendChunkedTriviaPieces(allocator, dest, .block_comment, @intCast(run_start), cursor - run_start);
         } else {
             try appendChunkedTriviaPieces(allocator, dest, .skipped_unexpected, @intCast(cursor), 1);
             cursor += 1;
@@ -1902,6 +2050,10 @@ const CstFormatter = struct {
     index_bracket_depth: u32 = 0,
     /// Optional sibling slice target when executing surgical `formatByteRange` rendering.
     range_target: ?SiblingRangeTarget = null,
+    /// Active recursion depth when formatting inner `{Expr}` holes of `.fmt_string_lit` tokens.
+    in_fmt_hole_depth: u8 = 0,
+    /// `true` when formatting a chained fat-arrow `if` directly inside `fn … = if …;`.
+    is_direct_fn_expr_body_if: bool = false,
     /// Whether `--fix` mode (casing normalization and missing `;` synthesis) is enabled.
     is_fix_mode: bool,
 
@@ -2416,32 +2568,32 @@ const CstFormatter = struct {
         }
     }
 
-    /// Returns `true` if `trimmed` is a 3-slash `///` outer doc comment (excluding `////`+ banners).
+    /// Returns `true` if `trimmed` is a 2-byte `/|` outer doc comment (`ADR-24A`).
     inline fn isOuterDocCommentText(trimmed: []const u8) bool {
-        return std.mem.startsWith(u8, trimmed, "///") and !std.mem.startsWith(u8, trimmed, "////");
+        return std.mem.startsWith(u8, trimmed, "/|");
     }
 
-    /// Returns `true` if `trimmed` is a `//!` module doc comment.
+    /// Returns `true` if `trimmed` is a 2-byte `/#` module doc comment (`ADR-24A`).
     inline fn isModuleDocCommentText(trimmed: []const u8) bool {
-        return std.mem.startsWith(u8, trimmed, "//!");
+        return std.mem.startsWith(u8, trimmed, "/#");
     }
 
-    /// Emits a `///` or `//!` line with `ADR-23A` byte-3 space normalization while preserving fenced code blocks.
+    /// Emits a `/|` or `/#` line with `ADR-24A` 2-byte prefix space normalization while preserving fenced code blocks.
     fn emitNormalizedDocComment(
         self: *CstFormatter,
         trimmed: []const u8,
         in_doc_code_fence: *bool,
     ) !void {
-        const after_prefix = std.mem.trimStart(u8, trimmed[3..], " \t");
+        const after_prefix = std.mem.trimStart(u8, trimmed[2..], " \t");
         const is_fence_delim = std.mem.startsWith(u8, after_prefix, "```");
         if (in_doc_code_fence.* and !is_fence_delim) {
             try self.doc_arena.emitText(trimmed);
             return;
         }
-        if (trimmed.len > 3 and trimmed[3] != ' ' and trimmed[3] != '\t') {
-            try self.doc_arena.emitText(trimmed[0..3]);
+        if (trimmed.len > 2 and trimmed[2] != ' ' and trimmed[2] != '\t') {
+            try self.doc_arena.emitText(trimmed[0..2]);
             try self.doc_arena.emitText(" ");
-            try self.doc_arena.emitText(trimmed[3..]);
+            try self.doc_arena.emitText(trimmed[2..]);
         } else {
             try self.doc_arena.emitText(trimmed);
         }
@@ -2450,7 +2602,7 @@ const CstFormatter = struct {
         }
     }
 
-    /// Returns `true` when any item token or comment follows token `0`'s leading `//!` module header block.
+    /// Returns `true` when any item token or comment follows token `0`'s leading `/#` module header block.
     fn hasContentFollowingTokenZeroModDoc(self: *const CstFormatter) bool {
         if (self.token_meta.len == 0) return false;
         const tok0_rec = self.token_buffer.getToken(TokenIndex.fromInt(0));
@@ -2492,7 +2644,6 @@ const CstFormatter = struct {
         const tok_rec = self.token_buffer.getToken(tok_id);
         var newline_count: u32 = if (meta.has_split_newline) 1 else 0;
         var has_emitted_any_comment = false;
-        var last_was_line_comment = false;
         var in_doc_code_fence = false;
         var active_doc_kind: ?TriviaKind = null;
         var has_passed_top_mod_doc_region = tok_id.asInt() != 0;
@@ -2528,7 +2679,7 @@ const CstFormatter = struct {
 
             var should_force_blank_after_mod_doc = false;
             if (piece.kind == .shebang and !has_emitted_any_comment) {
-                // Keep `has_passed_top_mod_doc_region` unchanged so `#!` followed by `//!` recognizes the header.
+                // Keep `has_passed_top_mod_doc_region` unchanged so `#!` followed by `/#` recognizes the header.
             } else if (!has_passed_top_mod_doc_region and is_mod_doc) {
                 if (is_in_top_mod_doc_block and newline_count >= 2) {
                     should_force_blank_after_mod_doc = true;
@@ -2548,13 +2699,10 @@ const CstFormatter = struct {
             if (has_emitted_any_comment) {
                 if (should_force_blank_after_mod_doc or (is_blank_line_allowed and newline_count >= 2)) {
                     try self.doc_arena.emitBlankLine();
-                } else if (last_was_line_comment or newline_count >= 1) {
-                    try self.doc_arena.emitHardLine();
                 } else {
-                    try self.doc_arena.emitText(" ");
+                    try self.doc_arena.emitHardLine();
                 }
-            } else if ((piece.kind != .block_comment or newline_count >= 1) and
-                self.doc_arena.instructions.items.len > 0 and
+            } else if (self.doc_arena.instructions.items.len > 0 and
                 !self.hasTrailingNewlineInstruction())
             {
                 if (is_blank_line_allowed and newline_count >= 2) {
@@ -2570,7 +2718,6 @@ const CstFormatter = struct {
                 try self.doc_arena.emitText(trimmed);
             }
             has_emitted_any_comment = true;
-            last_was_line_comment = (piece.kind != .block_comment);
             newline_count = 0;
         }
 
@@ -2581,12 +2728,8 @@ const CstFormatter = struct {
                 (is_blank_line_allowed and newline_count >= 2 and tok_rec.kind != .eof))
             {
                 try self.doc_arena.emitBlankLine();
-            } else if (last_was_line_comment or newline_count >= 1) {
-                try self.doc_arena.emitHardLine();
             } else {
-                if (tok_rec.kind != .eof and !tok_rec.flags.is_synthesized) {
-                    try self.doc_arena.emitText(" ");
-                }
+                try self.doc_arena.emitHardLine();
             }
         }
     }
@@ -2602,11 +2745,11 @@ const CstFormatter = struct {
         const is_doc = (piece.kind == .doc_comment and isOuterDocCommentText(trimmed)) or
             (piece.kind == .module_doc_comment and isModuleDocCommentText(trimmed));
         if (is_doc) {
-            if (trimmed.len > 3 and trimmed[3] != ' ' and trimmed[3] != '\t') {
+            if (trimmed.len > 2 and trimmed[2] != ' ' and trimmed[2] != '\t') {
                 const norm_buf = try std.fmt.allocPrint(
                     self.allocator,
                     "{s} {s}",
-                    .{ trimmed[0..3], trimmed[3..] },
+                    .{ trimmed[0..2], trimmed[2..] },
                 );
                 defer self.allocator.free(norm_buf);
                 try self.doc_arena.emitLineSuffix(norm_buf);
@@ -2737,6 +2880,201 @@ const CstFormatter = struct {
         return indent_cols;
     }
 
+    /// Applies active `--fix` identifier rename maps across tokens of a single-line hole expression `expr_src`.
+    fn applyFixRenamesToSnippetAlloc(self: *const CstFormatter, expr_src: []const u8) !?[]u8 {
+        if (!self.is_fix_mode) return null;
+        if (self.value_rename_map.count() == 0 and
+            self.const_rename_map.count() == 0 and
+            self.type_rename_map.count() == 0)
+        {
+            return null;
+        }
+        var tok_buf = TokenBuffer.init(self.allocator);
+        defer tok_buf.deinit();
+        try lexer.tokenize(expr_src, FileId.fromInt(0), &tok_buf, null, null);
+        if (hasAnyErrorOrSynthesizedTokens(&tok_buf)) return null;
+
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        var has_any_rename = false;
+        var prev_end: usize = 0;
+        const tok_count = tok_buf.countTokens();
+        var tok_i: usize = 0;
+        while (tok_i < tok_count) : (tok_i += 1) {
+            const rec = tok_buf.getToken(TokenIndex.fromInt(@intCast(tok_i)));
+            if (rec.kind == .eof) break;
+            if (!isRenamableIdentifierKind(rec.kind)) continue;
+            const tok_start: usize = rec.byte_offset;
+            const tok_end: usize = @min(expr_src.len, tok_start + rec.byte_len);
+            if (tok_start < prev_end or tok_start >= tok_end) continue;
+            const raw_ident = expr_src[tok_start..tok_end];
+
+            const replacement: ?[]const u8 = if (self.declared_value_names.contains(raw_ident))
+                self.value_rename_map.get(raw_ident)
+            else if (self.declared_const_names.contains(raw_ident))
+                self.const_rename_map.get(raw_ident)
+            else if (self.declared_type_names.contains(raw_ident))
+                self.type_rename_map.get(raw_ident)
+            else
+                null;
+            if (replacement) |new_ident| {
+                if (!std.mem.eql(u8, raw_ident, new_ident)) {
+                    try out.appendSlice(self.allocator, expr_src[prev_end..tok_start]);
+                    try out.appendSlice(self.allocator, new_ident);
+                    prev_end = tok_end;
+                    has_any_rename = true;
+                }
+            }
+        }
+        if (!has_any_rename) {
+            out.deinit(self.allocator);
+            return null;
+        }
+        try out.appendSlice(self.allocator, expr_src[prev_end..]);
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    /// Formats a single-line inner `{Expr}` expression canonically via `CstFormatter` (`ADR-24B`).
+    fn formatSingleLineFmtHoleExprAlloc(self: *const CstFormatter, expr_slice: []const u8) !?[]u8 {
+        if (expr_slice.len == 0 or self.in_fmt_hole_depth >= MAX_FMT_HOLE_FORMAT_DEPTH) return null;
+        const maybe_renamed = try self.applyFixRenamesToSnippetAlloc(expr_slice);
+        defer if (maybe_renamed) |renamed| self.allocator.free(renamed);
+        const active_expr = maybe_renamed orelse expr_slice;
+
+        const wrapped_src = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}{s}{s}",
+            .{ FMT_HOLE_WRAPPER_PREFIX, active_expr, FMT_HOLE_WRAPPER_SUFFIX },
+        );
+        defer self.allocator.free(wrapped_src);
+
+        var tok_buf = TokenBuffer.init(self.allocator);
+        defer tok_buf.deinit();
+        var cst_arena = LosslessCstArena.init(self.allocator);
+        defer cst_arena.deinit();
+        var ast_arena = AstArena.init(self.allocator);
+        defer ast_arena.deinit();
+        var sink = DiagnosticSink.init(self.allocator);
+        defer sink.deinit();
+
+        _ = try parser.parseSource(wrapped_src, FileId.fromInt(0), &tok_buf, &cst_arena, &ast_arena, &sink, null);
+        if (sink.error_count > 0 or hasAnyErrorOrSynthesizedTokens(&tok_buf) or cst_arena.countNodes() == 0) {
+            return null;
+        }
+
+        var doc_arena = DocArena.init(self.allocator);
+        defer doc_arena.deinit();
+        var sub_fmt = try CstFormatter.init(
+            self.allocator,
+            wrapped_src,
+            &tok_buf,
+            &cst_arena,
+            &doc_arena,
+            false,
+        );
+        defer sub_fmt.deinit();
+        sub_fmt.in_fmt_hole_depth = self.in_fmt_hole_depth + 1;
+        try sub_fmt.formatRoot();
+
+        var renderer = DocRenderer.init(self.allocator, 4096);
+        defer renderer.deinit();
+        const rendered = try renderer.render(&doc_arena);
+        defer self.allocator.free(rendered);
+
+        if (!std.mem.startsWith(u8, rendered, FMT_HOLE_WRAPPER_PREFIX) or
+            !std.mem.endsWith(u8, rendered, FMT_HOLE_WRAPPER_SUFFIX))
+        {
+            return null;
+        }
+        const inner_start = FMT_HOLE_WRAPPER_PREFIX.len;
+        const inner_end = rendered.len - FMT_HOLE_WRAPPER_SUFFIX.len;
+        if (inner_end < inner_start) return null;
+        const formatted_expr = rendered[inner_start..inner_end];
+        if (std.mem.indexOfAny(u8, formatted_expr, "\r\n") != null) return null;
+        return try self.allocator.dupe(u8, formatted_expr);
+    }
+
+    /// Formats single-line `{Expr[=][:Spec]}` holes inside `.fmt_string_lit` (`raw_str`), returning `null` if unchanged.
+    fn formatFmtStringLiteralHolesAlloc(self: *const CstFormatter, raw_str: []const u8) !?[]u8 {
+        if (self.in_fmt_hole_depth >= MAX_FMT_HOLE_FORMAT_DEPTH or raw_str.len < 3 or raw_str[0] != 'f') {
+            return null;
+        }
+        var open_quote_idx: usize = 1;
+        var hash_count: usize = 0;
+        while (open_quote_idx < raw_str.len and raw_str[open_quote_idx] == '#') : (open_quote_idx += 1) {
+            hash_count += 1;
+        }
+        if (open_quote_idx + 2 + hash_count > raw_str.len or raw_str[open_quote_idx] != '"') return null;
+        const close_quote_idx: usize = raw_str.len - 1 - hash_count;
+        if (close_quote_idx <= open_quote_idx or raw_str[close_quote_idx] != '"') return null;
+        if (!hasHashPrefixAt(raw_str, raw_str.len - hash_count, hash_count)) return null;
+
+        const body_start = open_quote_idx + 1;
+        const body_bytes = raw_str[body_start..close_quote_idx];
+        if (std.mem.indexOfScalar(u8, body_bytes, '{') == null) return null;
+
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, raw_str[0..body_start]);
+
+        var has_any_change = false;
+        var cursor: usize = 0;
+        while (cursor < body_bytes.len) {
+            const cur_byte = body_bytes[cursor];
+            if (cur_byte == '\\' and cursor + 1 < body_bytes.len) {
+                try out.appendSlice(self.allocator, body_bytes[cursor .. cursor + 2]);
+                cursor += 2;
+                continue;
+            }
+            if (cur_byte == '{') {
+                if (cursor + 1 < body_bytes.len and body_bytes[cursor + 1] == '{') {
+                    try out.appendSlice(self.allocator, "{{");
+                    cursor += 2;
+                    continue;
+                }
+                const hole_end = skipInterpolationHoleInMultiline(body_bytes, cursor);
+                if (hole_end <= cursor + 1 or hole_end > body_bytes.len or body_bytes[hole_end - 1] != '}') {
+                    try out.appendSlice(self.allocator, body_bytes[cursor..hole_end]);
+                    cursor = hole_end;
+                    continue;
+                }
+                const raw_hole_with_braces = body_bytes[cursor..hole_end];
+                const hole_inner = body_bytes[cursor + 1 .. hole_end - 1];
+                if (std.mem.indexOfAny(u8, hole_inner, "\r\n") != null) {
+                    try out.appendSlice(self.allocator, raw_hole_with_braces);
+                    cursor = hole_end;
+                    continue;
+                }
+                const split = splitFmtHoleTopLevel(hole_inner);
+                if (try self.formatSingleLineFmtHoleExprAlloc(split.expr_slice)) |formatted_expr| {
+                    defer self.allocator.free(formatted_expr);
+                    const start_len = out.items.len;
+                    try out.append(self.allocator, '{');
+                    try out.appendSlice(self.allocator, formatted_expr);
+                    if (split.has_debug_eq) try out.append(self.allocator, '=');
+                    try out.appendSlice(self.allocator, split.spec_with_colon);
+                    try out.append(self.allocator, '}');
+                    if (!std.mem.eql(u8, out.items[start_len..], raw_hole_with_braces)) {
+                        has_any_change = true;
+                    }
+                } else {
+                    try out.appendSlice(self.allocator, raw_hole_with_braces);
+                }
+                cursor = hole_end;
+                continue;
+            }
+            try out.append(self.allocator, cur_byte);
+            cursor += 1;
+        }
+
+        if (!has_any_change) {
+            out.deinit(self.allocator);
+            return null;
+        }
+        try out.appendSlice(self.allocator, raw_str[close_quote_idx..]);
+        return try out.toOwnedSlice(self.allocator);
+    }
+
     /// Emits `tok_id`'s leading trivia and glyph text without consuming its trailing trivia yet.
     fn emitTokenLeadingAndGlyph(
         self: *CstFormatter,
@@ -2764,14 +3102,25 @@ const CstFormatter = struct {
                 } else |_| {}
             }
             if (!rec.flags.has_lexer_error and
-                (rec.kind == .string_lit or rec.kind == .byte_string_lit))
+                (rec.kind == .string_lit or rec.kind == .byte_string_lit or rec.kind == .fmt_string_lit))
             {
                 const raw_str = self.getTokenLexeme(tok_id);
-                if (extractMultilineTripleQuoteParts(raw_str) != null) {
+                const maybe_fmt_holes = if (rec.kind == .fmt_string_lit)
+                    try self.formatFmtStringLiteralHolesAlloc(raw_str)
+                else
+                    null;
+                defer if (maybe_fmt_holes) |owned_fmt| self.allocator.free(owned_fmt);
+                const active_str = maybe_fmt_holes orelse raw_str;
+
+                if (extractMultilineDedentedStringParts(active_str) != null) {
                     try self.doc_arena.emitMultilineString(
-                        raw_str,
+                        active_str,
                         self.computeLineIndentAtByte(rec.byte_offset),
                     );
+                    return;
+                }
+                if (maybe_fmt_holes != null) {
+                    try self.doc_arena.emitText(active_str);
                     return;
                 }
             }
@@ -3561,7 +3910,76 @@ const CstFormatter = struct {
         return "";
     }
 
-    /// Formats leading `.attribute` children on items/members: stacks `@attr(…)` above sorted `@marker` line (`DR-22` §3.4).
+    /// Classifies `attr_id` into its canonical 4-tier `SortedAttrEntry` (`ADR-24C`).
+    fn classifySortedAttrEntry(
+        self: *const CstFormatter,
+        attr_id: CstNodeIndex,
+        orig_order: usize,
+    ) SortedAttrEntry {
+        const attr_name = self.extractAttributeSortName(attr_id);
+        const has_parens = self.hasDirectTokenKind(attr_id, .lparen);
+        const rank: AttrSortRank = CANONICAL_ATTR_TIER_MAP.get(attr_name) orelse .{
+            .tier = 3,
+            .sub_rank = 100,
+        };
+        return .{
+            .node_idx = attr_id,
+            .tier = rank.tier,
+            .is_trailing_marker = (rank.tier == 4 and !has_parens),
+            .sub_rank = rank.sub_rank,
+            .orig_order = orig_order,
+        };
+    }
+
+    /// Returns `true` when `attr_id` carries unconsumed interior or trailing comments.
+    fn hasAttrInteriorOrTrailingComments(self: *const CstFormatter, attr_id: CstNodeIndex) bool {
+        const first_tok = self.findFirstTokenInSubtree(attr_id);
+        const last_tok = self.findLastTokenInSubtree(attr_id);
+        if (first_tok.isNone() or last_tok.isNone()) return false;
+        if (self.hasUnconsumedCommentsInTokenRange(first_tok.asInt(), last_tok.asInt(), false, true)) {
+            return true;
+        }
+        return !self.token_meta[last_tok.asInt()].is_trailing_consumed and
+            self.token_meta[last_tok.asInt()].has_trailing_comments;
+    }
+
+    /// Sorts and emits a comment-free slice of `.attribute` nodes with `group_mode` (`ADR-24C`).
+    fn emitSortedAttrRun(
+        self: *CstFormatter,
+        attr_slice: []const CstNodeIndex,
+        group_mode: GroupMode,
+    ) anyerror!void {
+        if (attr_slice.len == 0) return;
+        if (attr_slice.len == 1) {
+            try self.formatAttribute(attr_slice[0]);
+            try self.doc_arena.emitHardLine();
+            return;
+        }
+
+        var entries: std.ArrayList(SortedAttrEntry) = .empty;
+        defer entries.deinit(self.allocator);
+        try entries.ensureTotalCapacity(self.allocator, attr_slice.len);
+        for (attr_slice, 0..) |attr_id, order_i| {
+            entries.appendAssumeCapacity(self.classifySortedAttrEntry(attr_id, order_i));
+        }
+        std.mem.sort(SortedAttrEntry, entries.items, {}, SortedAttrEntry.lessThan);
+
+        _ = try self.doc_arena.beginGroup(group_mode);
+        for (entries.items, 0..) |entry, entry_i| {
+            if (entry_i > 0) {
+                if (entries.items[entry_i - 1].is_trailing_marker and entry.is_trailing_marker) {
+                    try self.doc_arena.emitText(" ");
+                } else {
+                    try self.doc_arena.emitLine();
+                }
+            }
+            try self.formatAttribute(entry.node_idx);
+        }
+        try self.doc_arena.endGroup();
+        try self.doc_arena.emitHardLine();
+    }
+
+    /// Formats leading `.attribute` children on items/members: 4-tier sorted and `<= 100`-col horizontal (`ADR-24C`).
     fn formatLeadingStackedAttributes(
         self: *CstFormatter,
         children: []const CstNodeIndex,
@@ -3578,59 +3996,67 @@ const CstFormatter = struct {
         }
 
         const first_tok = self.findFirstTokenInSubtree(children[0]);
-        const last_tok = self.findLastTokenInSubtree(children[attr_end - 1]);
         if (!first_tok.isNone()) {
             try self.emitLeadingTrivia(first_tok, false);
         }
 
-        const has_inner_comments = !first_tok.isNone() and !last_tok.isNone() and
-            (self.hasUnconsumedCommentsInTokenRange(first_tok.asInt(), last_tok.asInt(), true, true) or
-                (!self.token_meta[last_tok.asInt()].is_trailing_consumed and
-                    self.token_meta[last_tok.asInt()].has_trailing_comments));
-
-        if (has_inner_comments) {
-            for (children[0..attr_end]) |attr_id| {
-                try self.formatAttribute(attr_id);
-                try self.doc_arena.emitHardLine();
+        var has_intervening_comments = false;
+        for (children[0..attr_end], 0..) |attr_id, idx| {
+            if (idx > 0) {
+                const attr_first = self.findFirstTokenInSubtree(attr_id);
+                if (!attr_first.isNone() and
+                    !self.token_meta[attr_first.asInt()].is_leading_consumed and
+                    self.token_meta[attr_first.asInt()].has_leading_comments)
+                {
+                    has_intervening_comments = true;
+                    break;
+                }
             }
+            if (self.hasAttrInteriorOrTrailingComments(attr_id)) {
+                has_intervening_comments = true;
+                break;
+            }
+        }
+
+        if (!has_intervening_comments) {
+            try self.emitSortedAttrRun(children[0..attr_end], .auto_fit);
             return attr_end;
         }
 
-        var param_attrs: std.ArrayList(CstNodeIndex) = .empty;
-        defer param_attrs.deinit(self.allocator);
-        var marker_attrs: std.ArrayList(MarkerAttrEntry) = .empty;
-        defer marker_attrs.deinit(self.allocator);
+        var run_start: usize = 0;
+        var idx: usize = 0;
+        while (idx < attr_end) : (idx += 1) {
+            const attr_id = children[idx];
+            const attr_first = self.findFirstTokenInSubtree(attr_id);
+            const has_leading_cmt = idx > run_start and
+                !attr_first.isNone() and
+                !self.token_meta[attr_first.asInt()].is_leading_consumed and
+                self.token_meta[attr_first.asInt()].has_leading_comments;
+            const has_inner_or_trail_cmt = self.hasAttrInteriorOrTrailingComments(attr_id);
 
-        for (children[0..attr_end], 0..) |attr_id, order_i| {
-            if (self.hasDirectTokenKind(attr_id, .lparen)) {
-                try param_attrs.append(self.allocator, attr_id);
-            } else {
-                try marker_attrs.append(self.allocator, .{
-                    .node_idx = attr_id,
-                    .sort_name = self.extractAttributeSortName(attr_id),
-                    .orig_order = order_i,
-                });
-            }
-        }
-        std.mem.sort(MarkerAttrEntry, marker_attrs.items, {}, MarkerAttrEntry.lessThan);
-
-        for (param_attrs.items) |param_attr_id| {
-            try self.formatAttribute(param_attr_id);
-            try self.doc_arena.emitHardLine();
-        }
-        if (marker_attrs.items.len > 0) {
-            for (marker_attrs.items, 0..) |entry, marker_i| {
-                if (marker_i > 0) {
-                    try self.doc_arena.emitText(" ");
+            if (has_leading_cmt) {
+                try self.emitSortedAttrRun(children[run_start..idx], .force_break);
+                if (!attr_first.isNone()) {
+                    try self.emitLeadingTrivia(attr_first, true);
                 }
-                try self.formatAttribute(entry.node_idx);
+                run_start = idx;
             }
-            try self.doc_arena.emitHardLine();
+            if (has_inner_or_trail_cmt) {
+                if (run_start < idx) {
+                    try self.emitSortedAttrRun(children[run_start..idx], .force_break);
+                }
+                try self.formatAttribute(attr_id);
+                try self.doc_arena.emitHardLine();
+                run_start = idx + 1;
+            }
+        }
+        if (run_start < attr_end) {
+            try self.emitSortedAttrRun(children[run_start..attr_end], .force_break);
         }
         return attr_end;
     }
 
-    /// Formats leading inline `.attribute` children (`@builder |…|`, `@unused x: i32`, `@state var x`), sorting markers.
+    /// Formats leading inline `.attribute` children (`@builder |…|`, `@unused x: i32`, `@state var x`), sorting by tier.
     fn formatLeadingInlineAttributes(
         self: *CstFormatter,
         children: []const CstNodeIndex,
@@ -3665,33 +4091,157 @@ const CstFormatter = struct {
             return attr_end;
         }
 
-        var param_attrs: std.ArrayList(CstNodeIndex) = .empty;
-        defer param_attrs.deinit(self.allocator);
-        var marker_attrs: std.ArrayList(MarkerAttrEntry) = .empty;
-        defer marker_attrs.deinit(self.allocator);
-
+        var entries: std.ArrayList(SortedAttrEntry) = .empty;
+        defer entries.deinit(self.allocator);
+        try entries.ensureTotalCapacity(self.allocator, attr_end);
         for (children[0..attr_end], 0..) |attr_id, order_i| {
-            if (self.hasDirectTokenKind(attr_id, .lparen)) {
-                try param_attrs.append(self.allocator, attr_id);
-            } else {
-                try marker_attrs.append(self.allocator, .{
-                    .node_idx = attr_id,
-                    .sort_name = self.extractAttributeSortName(attr_id),
-                    .orig_order = order_i,
-                });
-            }
+            entries.appendAssumeCapacity(self.classifySortedAttrEntry(attr_id, order_i));
         }
-        std.mem.sort(MarkerAttrEntry, marker_attrs.items, {}, MarkerAttrEntry.lessThan);
+        std.mem.sort(SortedAttrEntry, entries.items, {}, SortedAttrEntry.lessThan);
 
-        for (param_attrs.items) |param_attr_id| {
-            try self.formatAttribute(param_attr_id);
-            try self.doc_arena.emitText(" ");
-        }
-        for (marker_attrs.items) |entry| {
+        for (entries.items) |entry| {
             try self.formatAttribute(entry.node_idx);
             try self.doc_arena.emitText(" ");
         }
         return attr_end;
+    }
+
+    /// Formats a comment-free `@repr(…)` or `@link(…)` attribute in canonical key order, or returns `false`.
+    fn tryFormatCanonicalReprOrLinkAttr(
+        self: *CstFormatter,
+        node_idx: CstNodeIndex,
+        children: []const CstNodeIndex,
+    ) anyerror!bool {
+        if (self.cst_arena.getNode(node_idx).flags.has_error or children.len < 5) return false;
+        const at_node = self.cst_arena.getNode(children[0]);
+        const name_node = self.cst_arena.getNode(children[1]);
+        const open_node = self.cst_arena.getNode(children[2]);
+        const close_node = self.cst_arena.getNode(children[children.len - 1]);
+        if (at_node.subtree_size != 1 or at_node.token.isNone() or
+            name_node.subtree_size != 1 or name_node.token.isNone() or
+            open_node.subtree_size != 1 or open_node.token.isNone() or
+            close_node.subtree_size != 1 or close_node.token.isNone())
+        {
+            return false;
+        }
+        if (self.token_buffer.getToken(at_node.token).kind != .at or
+            self.token_buffer.getToken(open_node.token).kind != .lparen or
+            self.token_buffer.getToken(close_node.token).kind != .rparen)
+        {
+            return false;
+        }
+        const attr_name = self.getTokenLexeme(name_node.token);
+        const is_repr = std.mem.eql(u8, attr_name, "repr");
+        const is_link = std.mem.eql(u8, attr_name, "link");
+        if (!is_repr and !is_link) return false;
+
+        if (self.hasUnconsumedCommentsInTokenRange(at_node.token.asInt(), close_node.token.asInt(), false, true)) {
+            return false;
+        }
+
+        var args: std.ArrayList(CanonicalAttrArg) = .empty;
+        defer args.deinit(self.allocator);
+        var comma_tokens: std.ArrayList(TokenIndex) = .empty;
+        defer comma_tokens.deinit(self.allocator);
+
+        const inner_children = children[3 .. children.len - 1];
+        var seg_start: usize = 0;
+        var idx: usize = 0;
+        while (idx <= inner_children.len) : (idx += 1) {
+            const is_comma = if (idx < inner_children.len) blk: {
+                const child = self.cst_arena.getNode(inner_children[idx]);
+                if (child.subtree_size == 1 and !child.token.isNone() and
+                    self.token_buffer.getToken(child.token).kind == .comma)
+                {
+                    try comma_tokens.append(self.allocator, child.token);
+                    break :blk true;
+                }
+                break :blk false;
+            } else true;
+
+            if (!is_comma) continue;
+            const seg = inner_children[seg_start..idx];
+            seg_start = idx + 1;
+            if (seg.len == 0) continue;
+
+            if (seg.len == 1) {
+                const val_cst = seg[0];
+                const val_first = self.findFirstTokenInSubtree(val_cst);
+                const val_last = self.findLastTokenInSubtree(val_cst);
+                var rank: u8 = if (is_repr) 4 else 2;
+                if (is_repr and !val_first.isNone() and val_first.asInt() == val_last.asInt()) {
+                    const lex = self.getTokenLexeme(val_first);
+                    if (std.mem.eql(u8, lex, "C") or std.mem.eql(u8, lex, "transparent")) {
+                        rank = 0;
+                    }
+                }
+                try args.append(self.allocator, .{
+                    .val_cst = val_cst,
+                    .rank = rank,
+                    .orig_order = args.items.len,
+                });
+            } else if (seg.len == 3) {
+                const key_node = self.cst_arena.getNode(seg[0]);
+                const sep_node = self.cst_arena.getNode(seg[1]);
+                if (key_node.subtree_size != 1 or key_node.token.isNone() or
+                    sep_node.subtree_size != 1 or sep_node.token.isNone())
+                {
+                    return false;
+                }
+                const sep_kind = self.token_buffer.getToken(sep_node.token).kind;
+                if (sep_kind != .colon and sep_kind != .eq) return false;
+                const key_lex = self.getTokenLexeme(key_node.token);
+                const rank: u8 = if (is_repr) blk_r: {
+                    if (std.mem.eql(u8, key_lex, "packed")) break :blk_r 1;
+                    if (std.mem.eql(u8, key_lex, "align")) break :blk_r 2;
+                    if (std.mem.eql(u8, key_lex, "zero_pad")) break :blk_r 3;
+                    break :blk_r 4;
+                } else blk_l: {
+                    if (std.mem.eql(u8, key_lex, "name")) break :blk_l 0;
+                    if (std.mem.eql(u8, key_lex, "section")) break :blk_l 1;
+                    break :blk_l 2;
+                };
+                try args.append(self.allocator, .{
+                    .key_tok = key_node.token,
+                    .sep_tok = sep_node.token,
+                    .val_cst = seg[2],
+                    .rank = rank,
+                    .orig_order = args.items.len,
+                });
+            } else {
+                return false;
+            }
+        }
+        if (args.items.len == 0) return false;
+
+        std.mem.sort(CanonicalAttrArg, args.items, {}, CanonicalAttrArg.lessThan);
+
+        try self.emitTokenWithTrivia(at_node.token, "@", false);
+        try self.emitTokenWithTrivia(name_node.token, null, false);
+        try self.emitTokenWithTrivia(open_node.token, "(", false);
+        for (comma_tokens.items) |comma_tok| {
+            self.token_meta[comma_tok.asInt()].is_token_emitted = true;
+        }
+        for (args.items, 0..) |arg, arg_i| {
+            if (arg_i > 0) {
+                try self.doc_arena.emitText(", ");
+            }
+            if (!arg.key_tok.isNone() and !arg.sep_tok.isNone()) {
+                try self.emitTokenWithTrivia(arg.key_tok, null, false);
+                const sep_kind = self.token_buffer.getToken(arg.sep_tok).kind;
+                if (sep_kind == .eq) {
+                    try self.doc_arena.emitText(" ");
+                    try self.emitTokenWithTrivia(arg.sep_tok, "=", false);
+                    try self.doc_arena.emitText(" ");
+                } else {
+                    try self.emitTokenWithTrivia(arg.sep_tok, ":", false);
+                    try self.doc_arena.emitText(" ");
+                }
+            }
+            try self.formatNode(arg.val_cst);
+        }
+        try self.emitTokenWithTrivia(close_node.token, ")", false);
+        return true;
     }
 
     /// Formats an `@attribute` CST node (`@attr` or `@attr(args)`).
@@ -3699,6 +4249,10 @@ const CstFormatter = struct {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
         try self.collectDirectChildren(node_idx, &children);
+
+        if (try self.tryFormatCanonicalReprOrLinkAttr(node_idx, children.items)) {
+            return;
+        }
 
         var prev_tok_kind: ?TokenKind = null;
         for (children.items) |child_id| {
@@ -4818,6 +5372,12 @@ const CstFormatter = struct {
         }
     }
 
+    /// Returns whether `cst_id` is an `.if_expr` using the fat-arrow `if cond => a else b` form (`ADR-24D`).
+    fn isFatArrowIfCst(self: *const CstFormatter, cst_id: CstNodeIndex) bool {
+        if (self.cst_arena.getNode(cst_id).kind != .if_expr) return false;
+        return self.hasDirectTokenKind(cst_id, .fat_arrow);
+    }
+
     /// Returns whether `expr_id` is a delimited/block-headed expression that hugs `=` in `= expr;`.
     fn isHuggedFnBodyExpr(self: *const CstFormatter, expr_id: CstNodeIndex) bool {
         return switch (self.cst_arena.getNode(expr_id).kind) {
@@ -4826,7 +5386,6 @@ const CstFormatter = struct {
             .struct_lit_expr,
             .view_block_expr,
             .with_expr,
-            .if_expr,
             .for_stmt,
             .while_stmt,
             .loop_expr,
@@ -4834,6 +5393,7 @@ const CstFormatter = struct {
             .call_expr,
             .closure_expr,
             => true,
+            .if_expr => !self.isFatArrowIfCst(expr_id),
             else => false,
         };
     }
@@ -4896,6 +5456,10 @@ const CstFormatter = struct {
             _ = try self.doc_arena.beginGroup(mode);
             try self.doc_arena.beginIndent(INDENT_SPACES);
             try self.doc_arena.emitLine();
+            if (self.isFatArrowIfCst(body_expr_id)) {
+                self.is_direct_fn_expr_body_if = true;
+            }
+            defer self.is_direct_fn_expr_body_if = false;
             try self.formatNode(body_expr_id);
             if (!semi_tok.isNone()) {
                 if (self.hasUnconsumedLeadingComments(semi_tok)) {
@@ -5778,7 +6342,7 @@ const CstFormatter = struct {
     fn isBlockBodiedStmtCst(self: *const CstFormatter, cst_id: CstNodeIndex) bool {
         const node = self.cst_arena.getNode(cst_id);
         return switch (node.kind) {
-            .if_expr,
+            .if_expr => !self.isFatArrowIfCst(cst_id),
             .match_expr,
             .for_stmt,
             .while_stmt,
@@ -5931,6 +6495,7 @@ const CstFormatter = struct {
                     self.token_buffer.getToken(close_child.token).kind == .rparen and
                     !self.token_buffer.getToken(close_child.token).flags.is_synthesized and
                     !self.hasStructLitOrBlockInSubtree(inner_id) and
+                    !self.isFatArrowIfCst(inner_id) and
                     !self.token_meta[open_child.token.asInt()].has_leading_comments and
                     !self.token_meta[close_child.token.asInt()].has_trailing_comments and
                     !self.hasUnconsumedCommentsInTokenRange(
@@ -5952,8 +6517,171 @@ const CstFormatter = struct {
         try self.formatNode(expr_idx);
     }
 
-    /// Formats an `.if_expr` (`if cond { … } else if cond2 { … } else { … }`).
+    /// Attempts to format a fat-arrow `if c1 => v1 else if c2 => v2 else v3` chain (`ADR-24D`).
+    fn tryFormatFatArrowIfChain(
+        self: *CstFormatter,
+        root_idx: CstNodeIndex,
+        is_fn_body_chain: bool,
+    ) anyerror!bool {
+        if (self.cst_arena.getNode(root_idx).flags.has_error) return false;
+
+        var arms: std.ArrayList(FatArrowIfArm) = .empty;
+        defer arms.deinit(self.allocator);
+        var final_else_tok: TokenIndex = .none;
+        var final_else_id: CstNodeIndex = .none;
+
+        var cur_id = root_idx;
+        var pending_else_tok: TokenIndex = .none;
+        var children: std.ArrayList(CstNodeIndex) = .empty;
+        defer children.deinit(self.allocator);
+        var else_children: std.ArrayList(CstNodeIndex) = .empty;
+        defer else_children.deinit(self.allocator);
+
+        while (true) {
+            children.clearRetainingCapacity();
+            try self.collectDirectChildren(cur_id, &children);
+
+            var if_tok: TokenIndex = .none;
+            var cond_id: CstNodeIndex = .none;
+            var arrow_tok: TokenIndex = .none;
+            var then_id: CstNodeIndex = .none;
+            var else_tok: TokenIndex = .none;
+            var else_target_id: CstNodeIndex = .none;
+
+            for (children.items) |child_id| {
+                const child = self.cst_arena.getNode(child_id);
+                if (child.subtree_size == 1 and !child.token.isNone()) {
+                    const tok_kind = self.token_buffer.getToken(child.token).kind;
+                    if ((child.kind == .if_introducer or tok_kind == .kw_if) and if_tok.isNone()) {
+                        if_tok = child.token;
+                    } else if (tok_kind == .fat_arrow and arrow_tok.isNone()) {
+                        arrow_tok = child.token;
+                    } else if (tok_kind == .kw_else and else_tok.isNone()) {
+                        else_tok = child.token;
+                    } else if (!else_tok.isNone() and else_target_id.isNone()) {
+                        else_target_id = child_id;
+                    } else if (!arrow_tok.isNone() and then_id.isNone()) {
+                        then_id = child_id;
+                    } else {
+                        return false;
+                    }
+                } else if (child.kind == .if_cond and cond_id.isNone()) {
+                    cond_id = child_id;
+                } else if (child.kind == .else_branch and else_tok.isNone()) {
+                    else_children.clearRetainingCapacity();
+                    try self.collectDirectChildren(child_id, &else_children);
+                    for (else_children.items) |eb_child_id| {
+                        const eb_child = self.cst_arena.getNode(eb_child_id);
+                        if (eb_child.subtree_size == 1 and !eb_child.token.isNone() and
+                            self.token_buffer.getToken(eb_child.token).kind == .kw_else and
+                            else_tok.isNone())
+                        {
+                            else_tok = eb_child.token;
+                        } else if (else_target_id.isNone()) {
+                            else_target_id = eb_child_id;
+                        } else {
+                            return false;
+                        }
+                    }
+                } else if (!else_tok.isNone() and else_target_id.isNone()) {
+                    else_target_id = child_id;
+                } else if (!arrow_tok.isNone() and then_id.isNone()) {
+                    then_id = child_id;
+                } else {
+                    return false;
+                }
+            }
+
+            if (if_tok.isNone() or cond_id.isNone() or arrow_tok.isNone() or
+                then_id.isNone() or else_tok.isNone() or else_target_id.isNone())
+            {
+                return false;
+            }
+
+            try arms.append(self.allocator, .{
+                .leading_else_tok = pending_else_tok,
+                .if_tok = if_tok,
+                .cond_id = cond_id,
+                .arrow_tok = arrow_tok,
+                .then_id = then_id,
+            });
+
+            if (self.cst_arena.getNode(else_target_id).kind == .if_expr and
+                self.isFatArrowIfCst(else_target_id) and
+                !self.cst_arena.getNode(else_target_id).flags.has_error)
+            {
+                pending_else_tok = else_tok;
+                cur_id = else_target_id;
+                continue;
+            }
+            final_else_tok = else_tok;
+            final_else_id = else_target_id;
+            break;
+        }
+
+        if (arms.items.len == 1) {
+            const single_arm = arms.items[0];
+            _ = try self.doc_arena.beginGroup(.auto_fit);
+            try self.emitTokenWithTrivia(single_arm.if_tok, "if", false);
+            try self.doc_arena.emitText(" ");
+            try self.formatConditionHeader(single_arm.cond_id);
+            try self.doc_arena.emitText(" ");
+            try self.emitTokenWithTrivia(single_arm.arrow_tok, "=>", false);
+            try self.doc_arena.emitText(" ");
+            try self.formatNode(single_arm.then_id);
+
+            const extra_indent: u8 = if (is_fn_body_chain) 0 else INDENT_SPACES;
+            if (extra_indent > 0) try self.doc_arena.beginIndent(extra_indent);
+            try self.doc_arena.emitLine();
+            try self.emitTokenWithTrivia(final_else_tok, "else", false);
+            try self.doc_arena.emitText(" ");
+            try self.formatNode(final_else_id);
+            if (extra_indent > 0) try self.doc_arena.endIndent(extra_indent);
+            try self.doc_arena.endGroup();
+            return true;
+        }
+
+        _ = try self.doc_arena.beginGroup(.force_break);
+        const chain_indent: u8 = if (is_fn_body_chain) 0 else INDENT_SPACES;
+        for (arms.items, 0..) |arm, arm_i| {
+            if (arm_i > 0) {
+                try self.doc_arena.emitLine();
+                try self.emitTokenWithTrivia(arm.leading_else_tok, "else", false);
+                try self.doc_arena.emitText(" ");
+            }
+            try self.emitTokenWithTrivia(arm.if_tok, "if", false);
+            try self.doc_arena.emitText(" ");
+            try self.formatConditionHeader(arm.cond_id);
+            try self.doc_arena.emitText(" ");
+            try self.emitTokenWithTrivia(arm.arrow_tok, "=>", false);
+            try self.doc_arena.emitText(" ");
+            try self.formatNode(arm.then_id);
+            if (arm_i == 0 and chain_indent > 0) {
+                try self.doc_arena.beginIndent(chain_indent);
+            }
+        }
+        try self.doc_arena.emitLine();
+        try self.emitTokenWithTrivia(final_else_tok, "else", false);
+        try self.doc_arena.emitText(" ");
+        try self.formatNode(final_else_id);
+        if (chain_indent > 0) {
+            try self.doc_arena.endIndent(chain_indent);
+        }
+        try self.doc_arena.endGroup();
+        return true;
+    }
+
+    /// Formats an `.if_expr` (`if cond { … } else { … }` or `if cond => a else b`).
     fn formatIfExpr(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
+        const is_fn_body_chain = self.is_direct_fn_expr_body_if;
+        self.is_direct_fn_expr_body_if = false;
+
+        if (self.isFatArrowIfCst(node_idx)) {
+            if (try self.tryFormatFatArrowIfChain(node_idx, is_fn_body_chain)) {
+                return;
+            }
+        }
+
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
         try self.collectDirectChildren(node_idx, &children);
@@ -5965,12 +6693,22 @@ const CstFormatter = struct {
                 if (child.kind == .if_introducer or tok_kind == .kw_if) {
                     try self.emitTokenWithTrivia(child.token, "if", false);
                     try self.doc_arena.emitText(" ");
+                } else if (tok_kind == .fat_arrow) {
+                    try self.doc_arena.emitText(" ");
+                    try self.emitTokenWithTrivia(child.token, "=>", false);
+                    try self.doc_arena.emitText(" ");
+                } else if (tok_kind == .kw_else) {
+                    try self.doc_arena.emitText(" ");
+                    try self.emitTokenWithTrivia(child.token, "else", false);
+                    try self.doc_arena.emitText(" ");
                 } else {
                     try self.emitTokenWithTrivia(child.token, null, false);
                 }
             } else if (child.kind == .if_cond) {
                 try self.formatConditionHeader(child_id);
-                try self.doc_arena.emitText(" ");
+                if (!self.isFatArrowIfCst(node_idx)) {
+                    try self.doc_arena.emitText(" ");
+                }
             } else if (child.kind == .block) {
                 try self.formatBlock(child_id);
             } else if (child.kind == .else_branch) {
@@ -8507,7 +9245,7 @@ pub fn renderBlockDocAsLineComments(
     return out.toOwnedSlice(allocator);
 }
 
-/// Collects `corex fmt --fix` patches for `E0118`, `E0230`, `E0234`, and `E0235` from `parse_sink` onto `fixes_out`.
+/// Collects `corex fmt --fix` patches for `E0118`, `E0229`, `E0230`, `E0234`, and `E0235` onto `fixes_out`.
 fn collectPreFormatSyntaxFixes(
     allocator: std.mem.Allocator,
     parse_sink: *const DiagnosticSink,
@@ -8516,6 +9254,7 @@ fn collectPreFormatSyntaxFixes(
     for (parse_sink.diagnostics.items) |diag_item| {
         const is_fmt_fix_diag = switch (diag_item.code) {
             .e0118_block_doc_comment_forbidden,
+            .e0229_misplaced_module_doc_comment,
             .e0230_unattached_doc_comment,
             .e0234_non_binding_wildcard_let_var,
             .e0235_all_wildcard_destructuring_assign,
@@ -8622,6 +9361,59 @@ fn formatMaskedTokensAndCstWithPrefix(
         .is_changed = !std.mem.eql(u8, original_source, spliced),
         .has_syntax_errors = false,
     };
+}
+
+/// Measures the canonical post-`corex fmt` single-line width of `expr_slice`, or returns `null` if forced multiline.
+fn measureCanonicalSingleLineExprWidth(
+    allocator: std.mem.Allocator,
+    expr_slice: []const u8,
+) !?usize {
+    if (expr_slice.len == 0 or std.mem.indexOfAny(u8, expr_slice, "\r\n") != null) return null;
+
+    const wrapped_src = try std.fmt.allocPrint(
+        allocator,
+        "{s}{s}{s}",
+        .{ FMT_HOLE_WRAPPER_PREFIX, expr_slice, FMT_HOLE_WRAPPER_SUFFIX },
+    );
+    defer allocator.free(wrapped_src);
+
+    var tok_buf = TokenBuffer.init(allocator);
+    defer tok_buf.deinit();
+    var cst_arena = LosslessCstArena.init(allocator);
+    defer cst_arena.deinit();
+    var ast_arena = AstArena.init(allocator);
+    defer ast_arena.deinit();
+    var sink = DiagnosticSink.init(allocator);
+    defer sink.deinit();
+
+    _ = try parser.parseSource(wrapped_src, FileId.fromInt(0), &tok_buf, &cst_arena, &ast_arena, &sink, null);
+    if (sink.error_count > 0 or hasAnyErrorOrSynthesizedTokens(&tok_buf) or cst_arena.countNodes() == 0) {
+        return expr_slice.len;
+    }
+
+    var doc_arena = DocArena.init(allocator);
+    defer doc_arena.deinit();
+    var sub_fmt = try CstFormatter.init(allocator, wrapped_src, &tok_buf, &cst_arena, &doc_arena, false);
+    defer sub_fmt.deinit();
+    sub_fmt.in_fmt_hole_depth = 1;
+    try sub_fmt.formatRoot();
+
+    var renderer = DocRenderer.init(allocator, 4096);
+    defer renderer.deinit();
+    const rendered = try renderer.render(&doc_arena);
+    defer allocator.free(rendered);
+
+    if (!std.mem.startsWith(u8, rendered, FMT_HOLE_WRAPPER_PREFIX) or
+        !std.mem.endsWith(u8, rendered, FMT_HOLE_WRAPPER_SUFFIX))
+    {
+        return null;
+    }
+    const inner_start = FMT_HOLE_WRAPPER_PREFIX.len;
+    const inner_end = rendered.len - FMT_HOLE_WRAPPER_SUFFIX.len;
+    if (inner_end < inner_start) return null;
+    const formatted_expr = rendered[inner_start..inner_end];
+    if (std.mem.indexOfAny(u8, formatted_expr, "\r\n") != null) return null;
+    return formatted_expr.len;
 }
 
 // ------------------------------------- PUBLIC API --------------------------------------
@@ -9066,6 +9858,113 @@ pub fn formatByteRange(
     };
 }
 
+/// Returns whether rewriting a braced `if` expression at `[if_start_byte, if_end_byte)` in `source`
+/// into an inline `if cond => arm` chain fits within `MAX_LINE_WIDTH` (`100` columns) under `corex fmt`
+/// without wrapping any condition or arm expression across multiple lines.
+pub fn fitsInlineFatArrowIfLineBudget(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    if_start_byte: u32,
+    if_end_byte: u32,
+    cond_slices: []const []const u8,
+    arm_slices: []const []const u8,
+    needs_parens: bool,
+    is_direct_fn_expr_body: bool,
+) !bool {
+    if (cond_slices.len == 0 or cond_slices.len > 4 or arm_slices.len != cond_slices.len + 1) {
+        return false;
+    }
+
+    var cond_lens: [4]usize = undefined;
+    var arm_lens: [5]usize = undefined;
+    for (cond_slices, 0..) |cond_str, idx| {
+        cond_lens[idx] = (try measureCanonicalSingleLineExprWidth(allocator, cond_str)) orelse return false;
+    }
+    for (arm_slices, 0..) |arm_str, idx| {
+        arm_lens[idx] = (try measureCanonicalSingleLineExprWidth(allocator, arm_str)) orelse return false;
+    }
+
+    const clamped_start = @min(@as(usize, if_start_byte), source.len);
+    const line_bol: usize = if (std.mem.lastIndexOfScalar(u8, source[0..clamped_start], '\n')) |nl_idx|
+        nl_idx + 1
+    else
+        0;
+
+    var if_start_col: usize = 0;
+    for (source[line_bol..clamped_start]) |byte_val| {
+        if (byte_val == '\r') continue;
+        if_start_col += if (byte_val == '\t') INDENT_SPACES else 1;
+    }
+
+    var line_base_indent: usize = 0;
+    var indent_scan = line_bol;
+    while (indent_scan < source.len) : (indent_scan += 1) {
+        if (source[indent_scan] == ' ') {
+            line_base_indent += 1;
+        } else if (source[indent_scan] == '\t') {
+            line_base_indent += INDENT_SPACES;
+        } else {
+            break;
+        }
+    }
+
+    var scan_after = @min(@as(usize, if_end_byte), source.len);
+    while (scan_after < source.len and (source[scan_after] == ' ' or source[scan_after] == '\t')) : (scan_after += 1) {}
+    var trailing_punct_len: usize = 0;
+    if (scan_after < source.len) {
+        switch (source[scan_after]) {
+            ';', ',' => trailing_punct_len = 1,
+            '{' => trailing_punct_len = 2,
+            '\r', '\n', '}' => trailing_punct_len = 0,
+            else => {
+                if (!(scan_after + 1 < source.len and source[scan_after] == '/' and source[scan_after + 1] == '/')) {
+                    var cur_after = scan_after;
+                    while (cur_after < source.len) : (cur_after += 1) {
+                        const after_byte = source[cur_after];
+                        if (after_byte == '\r' or after_byte == '\n' or after_byte == '}' or after_byte == '{') break;
+                        if (after_byte == '/' and cur_after + 1 < source.len and source[cur_after + 1] == '/') break;
+                        trailing_punct_len += 1;
+                        if (after_byte == ';' or after_byte == ',') break;
+                    }
+                }
+            },
+        }
+    }
+
+    const paren_len: usize = if (needs_parens) 1 else 0;
+    const max_width: usize = MAX_LINE_WIDTH;
+
+    if (cond_slices.len == 1) {
+        const flat_len = paren_len + "if ".len + cond_lens[0] + " => ".len + arm_lens[0] +
+            " else ".len + arm_lens[1] + paren_len;
+        if (if_start_col + flat_len + trailing_punct_len <= max_width) {
+            return true;
+        }
+    }
+
+    const is_aligned_fn_body = is_direct_fn_expr_body and !needs_parens;
+    const fn_body_indent = if (if_start_col == line_base_indent)
+        line_base_indent
+    else
+        line_base_indent + INDENT_SPACES;
+    const first_line_col = if (is_aligned_fn_body) fn_body_indent else if_start_col;
+    const cont_indent = if (is_aligned_fn_body) fn_body_indent else line_base_indent + INDENT_SPACES;
+
+    if (first_line_col + paren_len + "if ".len + cond_lens[0] + " => ".len + arm_lens[0] > max_width) {
+        return false;
+    }
+    var chain_idx: usize = 1;
+    while (chain_idx < cond_slices.len) : (chain_idx += 1) {
+        if (cont_indent + "else if ".len + cond_lens[chain_idx] + " => ".len + arm_lens[chain_idx] > max_width) {
+            return false;
+        }
+    }
+    if (cont_indent + "else ".len + arm_lens[cond_slices.len] + paren_len + trailing_punct_len > max_width) {
+        return false;
+    }
+    return true;
+}
+
 // ---------------------------------------- MAIN -----------------------------------------
 
 test "test_doc_inst_is_exact_8_bytes_and_arena_backpatches_flat_width" {
@@ -9354,7 +10253,10 @@ test "test_format_red_team_comments_and_idempotency" {
         "    let assigned =\n" ++
         "        // comment after eq\n" ++
         "        42;\n" ++
-        "    if (/* keep parens */ cond) {\n" ++
+        "    if (\n" ++
+        "        // keep parens\n" ++
+        "        cond\n" ++
+        "    ) {\n" ++
         "        defer {\n" ++
         "            let clean = 1;\n" ++
         "        }\n" ++
@@ -9373,7 +10275,7 @@ test "test_format_red_team_comments_and_idempotency" {
     try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "// comment before close brace") != null);
     try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "// comment on empty stmt") != null);
     try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "// comment after eq\n    42;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "if (/* keep parens */ cond)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "// keep parens") != null);
     try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "// comment before stripped defer semi") != null);
     try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "// comment before stripped if semi") != null);
 
@@ -9516,14 +10418,14 @@ test "test_format_dr22_canonical_rules_multiline_strings_and_idempotency" {
         "    out_slot = raw_p.* + count + (ratio as u64);\n" ++
         "    let updated = Config { enabled: not paused, ..own base_cfg };\n" ++
         "    let task = own async || -> unit {\n" ++
-        "  let msg = \"\"\"\n" ++
+        "  let msg = \"\n" ++
         "  line one\n" ++
         "    line two\n" ++
-        "  \"\"\";\n" ++
-        "            let dedented = \"\"\"\n" ++
+        "  \";\n" ++
+        "            let dedented = \"\n" ++
         "            alpha\n" ++
         "              beta\n" ++
-        "            \"\"\";\n" ++
+        "            \";\n" ++
         "    };\n" ++
         "    fsm: match state {\n" ++
         "        0 => continue :fsm 1,\n" ++
@@ -9547,7 +10449,7 @@ test "test_format_dr22_canonical_rules_multiline_strings_and_idempotency" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         pass1.formatted_text,
-        "@cfg(target_os: \"linux\")\n@inline @no_alloc @no_panic\npub(super) fn compute[T: Clone + Hash | Default](",
+        "@cfg(target_os: \"linux\") @inline @no_alloc @no_panic\npub(super) fn compute[T: Clone + Hash | Default](",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "ptr: *mut (u8?),") != null);
     try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "opt_ptr: *mut u8?,") != null);
@@ -9567,12 +10469,12 @@ test "test_format_dr22_canonical_rules_multiline_strings_and_idempotency" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         pass1.formatted_text,
-        "        let msg = \"\"\"\n        line one\n          line two\n        \"\"\";\n",
+        "        let msg = \"\n        line one\n          line two\n        \";\n",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         pass1.formatted_text,
-        "        let dedented = \"\"\"\n        alpha\n          beta\n        \"\"\";\n",
+        "        let dedented = \"\n        alpha\n          beta\n        \";\n",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "    fsm: match state {\n        0 => continue :fsm 1,\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "fn render(body: @builder |&mut UiScope|) {\n") != null);
@@ -9588,9 +10490,9 @@ test "test_stage4_attributed_block_match_no_spurious_semi_and_raw_quote_runs" {
     const src =
         "pub fn run(state: i32, ptr: *i32) -> i32 {\n" ++
         "    let quoted = r#\"\"\"\"#;\n" ++
-        "    let doc = \"\"\"\n" ++
+        "    let doc = f\"\n" ++
         "        prefix {r#\"\"\"\"#} suffix\n" ++
-        "        \"\"\";\n" ++
+        "        \";\n" ++
         "    @cfg(debug)\n" ++
         "    comptime {\n" ++
         "        _ = 1;\n" ++
@@ -9628,7 +10530,7 @@ test "test_format_extern_blocks_extern_static_and_comments_idempotency" {
         "    // Dangling comment before close\n" ++
         "}\n\n" ++
         "extern {}\n\n" ++
-        "@link_name(\"_errno\")\n" ++
+        "@link(name: \"_errno\")\n" ++
         "pub extern \"c\" static mut __errno_ptr: *mut i32;\n";
 
     var pass1 = try formatSource(std.testing.allocator, raw_src, FileId.fromInt(0));
@@ -9646,7 +10548,7 @@ test "test_format_extern_blocks_extern_static_and_comments_idempotency" {
         "    // Dangling comment before close\n" ++
         "}\n\n" ++
         "extern {}\n\n" ++
-        "@link_name(\"_errno\")\n" ++
+        "@link(name: \"_errno\")\n" ++
         "pub extern \"C\" static mut __errno_ptr: *mut i32;\n";
     try std.testing.expectEqualStrings(expected, pass1.formatted_text);
 
@@ -9890,20 +10792,20 @@ test "test_format_byte_range_nested_statement_trailing_comment_and_idempotency" 
 }
 
 test "test_dr23_doc_comment_normalization_mod_header_blank_line_and_fmt_fix" {
-    // [1] `ADR-23A` doc-comment normalization, fenced code preservation, and 1-blank-line `//!` rule:
+    // [1] `ADR-24A` 2-byte `/#` & `/|` doc-comment normalization, fenced code preservation, and 1-blank-line `/#` rule:
     const raw_doc_src =
-        "//!Module Header\n" ++
-        "//!   \n" ++
-        "//!     indented detail\n" ++
+        "/#Module Header\n" ++
+        "/#   \n" ++
+        "/#     indented detail\n" ++
         "// ---------------------------------------- TYPES ----------------------------------------\n" ++
-        "///Summary without leading space.\n" ++
-        "///   \n" ++
-        "///     indented list item\n" ++
-        "///```cx\n" ++
-        "///keep_verbatim_in_fence();\n" ++
-        "///```\n" ++
+        "/|Summary without leading space.\n" ++
+        "/|   \n" ++
+        "/|     indented list item\n" ++
+        "/|```cx\n" ++
+        "/|keep_verbatim_in_fence();\n" ++
+        "/|```\n" ++
         "pub struct RingBuf {\n" ++
-        "    ///Field doc\n" ++
+        "    /|Field doc\n" ++
         "    pub cap: usize,\n" ++
         "}\n";
 
@@ -9913,18 +10815,18 @@ test "test_dr23_doc_comment_normalization_mod_header_blank_line_and_fmt_fix" {
     try std.testing.expect(pass1.is_changed);
 
     const expected_doc =
-        "//! Module Header\n" ++
-        "//!\n" ++
-        "//!     indented detail\n\n" ++
+        "/# Module Header\n" ++
+        "/#\n" ++
+        "/#     indented detail\n\n" ++
         "// ---------------------------------------- TYPES ----------------------------------------\n" ++
-        "/// Summary without leading space.\n" ++
-        "///\n" ++
-        "///     indented list item\n" ++
-        "/// ```cx\n" ++
-        "///keep_verbatim_in_fence();\n" ++
-        "/// ```\n" ++
+        "/| Summary without leading space.\n" ++
+        "/|\n" ++
+        "/|     indented list item\n" ++
+        "/| ```cx\n" ++
+        "/|keep_verbatim_in_fence();\n" ++
+        "/| ```\n" ++
         "pub struct RingBuf {\n" ++
-        "    /// Field doc\n" ++
+        "    /| Field doc\n" ++
         "    pub cap: usize,\n" ++
         "}\n";
     try std.testing.expectEqualStrings(expected_doc, pass1.formatted_text);
@@ -9934,23 +10836,19 @@ test "test_dr23_doc_comment_normalization_mod_header_blank_line_and_fmt_fix" {
     try std.testing.expect(!pass2.is_changed);
     try std.testing.expectEqualStrings(expected_doc, pass2.formatted_text);
 
-    // [2] `//!` immediately followed by `.eof` emits zero trailing blank lines:
-    const eof_mod_src = "//!Solo Header   \n";
+    // [2] `/#` immediately followed by `.eof` emits zero trailing blank lines:
+    const eof_mod_src = "/#Solo Header   \n";
     var eof_res = try formatSource(std.testing.allocator, eof_mod_src, FileId.fromInt(1));
     defer eof_res.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("//! Solo Header\n", eof_res.formatted_text);
+    try std.testing.expectEqualStrings("/# Solo Header\n", eof_res.formatted_text);
     var eof_idem = try formatSource(std.testing.allocator, eof_res.formatted_text, FileId.fromInt(1));
     defer eof_idem.deinit(std.testing.allocator);
     try std.testing.expect(!eof_idem.is_changed);
 
     // [3] `corex fmt --fix` heals `E0118`, `E0230`, `E0234`, and `E0235`:
     const fix_src =
-        "/*!\n" ++
-        " * Module Doc From Block\n" ++
-        " */\n" ++
-        "/**\n" ++
-        " * Computes tuple sum.\n" ++
-        " */\n\n" ++
+        "//! Module Doc From Legacy\n\n" ++
+        "/// Computes tuple sum.\n" ++
         "pub fn check_discards(pair: (u32, u32)) {\n" ++
         "    let _ = 1_u32;\n" ++
         "    var _ = 2_u32;\n" ++
@@ -9966,8 +10864,8 @@ test "test_dr23_doc_comment_normalization_mod_header_blank_line_and_fmt_fix" {
     defer fix_res.deinit(std.testing.allocator);
     try std.testing.expect(!fix_res.has_syntax_errors);
     const expected_fixed =
-        "//! Module Doc From Block\n\n" ++
-        "/// Computes tuple sum.\n" ++
+        "/# Module Doc From Legacy\n\n" ++
+        "/| Computes tuple sum.\n" ++
         "pub fn check_discards(pair: (u32, u32)) {\n" ++
         "    _ = 1_u32;\n" ++
         "    _ = 2_u32;\n" ++
@@ -9975,4 +10873,84 @@ test "test_dr23_doc_comment_normalization_mod_header_blank_line_and_fmt_fix" {
         "    _ = pair;\n" ++
         "}\n";
     try std.testing.expectEqualStrings(expected_fixed, fix_res.formatted_text);
+}
+
+test "test_dr24_attributes_inline_if_fmt_strings_and_showcases" {
+    const raw_src =
+        "/# DR-24 canonical formatter showcase.\n" ++
+        "@derive(Copy, Debug)\n" ++
+        "@repr(zero_pad: true, align: .CacheLine, C)\n" ++
+        "@cfg(target_os: \"linux\")\n" ++
+        "pub struct SlabHeader {\n" ++
+        "    /| Address payload.\n" ++
+        "    pub addr: u64,\n" ++
+        "}\n\n" ++
+        "@must_use\n" ++
+        "@no_panic\n" ++
+        "@no_alloc\n" ++
+        "@link(section: \".text.hot\", name: \"classify_tier\")\n" ++
+        "@cfg(target_os: \"linux\")\n" ++
+        "@allow(W0202)\n" ++
+        "pub fn classify(byte_len: u32, flags: u16, healthy: bool) -> u16 =\n" ++
+        "    if byte_len == 0_u32 => 0_u16 else if (flags & 1_u16) != 0_u16 => 2_u16 else 1_u16;\n\n" ++
+        "pub fn format_diag(port: u16, mask: u32, healthy: bool) -> str {\n" ++
+        "    if healthy => touch_a() else touch_b();\n" ++
+        "    let tag = if healthy => 1_u16 else 0_u16;\n" ++
+        "    let tier = if port == 0_u16 => 0_u16 else if port < 1024_u16 => 1_u16 else 2_u16;\n" ++
+        "    return f\"diag: { port = } mask={mask:#010x} st={if healthy =>  \"UP\"  else  \"DEGRADED\"} t={tag + tier}\";\n" ++
+        "}\n";
+
+    var pass1 = try formatSource(std.testing.allocator, raw_src, FileId.fromInt(0));
+    defer pass1.deinit(std.testing.allocator);
+    try std.testing.expect(!pass1.has_syntax_errors);
+    try std.testing.expect(pass1.is_changed);
+
+    // `<= 100`-col attribute sequence (`87` cols) packs onto 1 single line with canonical `@repr` key order:
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        pass1.formatted_text,
+        "@cfg(target_os: \"linux\") @repr(C, align: .CacheLine, zero_pad: true) @derive(Copy, Debug)\n" ++
+            "pub struct SlabHeader",
+    ) != null);
+    // Let's check exact `> 100`-col stacking + `@link` key order + trailing Tier-4 marker packing:
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        pass1.formatted_text,
+        "@cfg(target_os: \"linux\")\n" ++
+            "@allow(W0202)\n" ++
+            "@link(name: \"classify_tier\", section: \".text.hot\")\n" ++
+            "@no_alloc @no_panic @must_use\n" ++
+            "pub fn classify(",
+    ) != null);
+    // Chained fat-arrow `if` under `fn … =` aligns `if` / `else if` / `else` vertically at `+4`:
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        pass1.formatted_text,
+        "pub fn classify(byte_len: u32, flags: u16, healthy: bool) -> u16 =\n" ++
+            "    if byte_len == 0_u32 => 0_u16\n" ++
+            "    else if (flags & 1_u16) != 0_u16 => 2_u16\n" ++
+            "    else 1_u16;\n",
+    ) != null);
+    // Statement-level `if c => a else b;` preserves `;`, binary `if` stays 1-line, chained `let` indents `+4`:
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "    if healthy => touch_a() else touch_b();\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "    let tag = if healthy => 1_u16 else 0_u16;\n") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        pass1.formatted_text,
+        "    let tier = if port == 0_u16 => 0_u16\n" ++
+            "        else if port < 1024_u16 => 1_u16\n" ++
+            "        else 2_u16;\n",
+    ) != null);
+    // Inner `{Expr[=][:Spec]}` holes format canonically while keeping `:Spec` verbatim:
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        pass1.formatted_text,
+        "f\"diag: {port=} mask={mask:#010x} st={if healthy => \"UP\" else \"DEGRADED\"} t={tag + tier}\"",
+    ) != null);
+
+    var pass2 = try formatSource(std.testing.allocator, pass1.formatted_text, FileId.fromInt(0));
+    defer pass2.deinit(std.testing.allocator);
+    try std.testing.expect(!pass2.has_syntax_errors);
+    try std.testing.expect(!pass2.is_changed);
+    try std.testing.expectEqualStrings(pass1.formatted_text, pass2.formatted_text);
 }

@@ -110,7 +110,7 @@ const PHASE6_SEED_ITEMS = [_][]const u8{
         "    let active_alloc: Allocator = context.allocator;\n" ++
         "    return OwnedHeapBuf { raw_handle: active_alloc._handle, byte_len: size_n };\n" ++
         "}\n",
-    "@no_alloc\n@no_panic\n@no_block\n@max_stack(512)\n" ++
+    "@no_alloc @no_panic @no_block @max_stack(512)\n" ++
         "pub fn strict_pentagon_probe(data: &[u8], raw_idx: usize, clamped_val: i32) -> u8 {\n" ++
         "    if data.len() > 0 and clamped_val >= 0 and clamped_val <= 200 {\n" ++
         "        let elem_byte = data[raw_idx % data.len()];\n" ++
@@ -318,7 +318,7 @@ const INCREMENTAL_CALLER_VARIANTS = [_][]const u8{
         "        return leaf_helper(view[$ - 1] + view[$ - 2] + (sub_trim.len() as i64));\n" ++
         "    }\n" ++
         "    return SCALE_FACTOR;\n",
-    "    let opt_in: i64? = if (probe_idx & 1) == 0 { .Some(input_val) } else { .None };\n" ++
+    "    let opt_in: i64? = if (probe_idx & 1) == 0 => .Some(input_val) else .None;\n" ++
         "    let resolved_in: i64 = opt_in orelse SCALE_FACTOR;\n" ++
         "    return with context.cancel_token = (CancelToken { _handle: probe_idx & 15 }) {\n" ++
         "        leaf_helper(resolved_in + (context.cancel_token._handle as i64))\n" ++
@@ -418,8 +418,7 @@ fn generateWellTypedPhase6Program(
         allocator,
         try std.fmt.bufPrint(
             &helper_buf,
-            "@inline\n" ++
-                "pub fn mix_lane(val: i64, delta: i64 = 3) -> i64 = (val ^ delta) + 3;\n" ++
+            "pub fn mix_lane(val: i64, delta: i64 = 3) -> i64 = (val ^ delta) + 3;\n" ++
                 "pub fn slice_and_narrow_step(items: &[i64], raw_idx: usize, raw_byte: i32) -> i64 {{\n" ++
                 "    let scoped_helper_guard = TrackedGuard {{ id: {d} }};\n" ++
                 "    var total: i64 = scoped_helper_guard.id & 15;\n" ++
@@ -483,7 +482,7 @@ fn generateWellTypedPhase6Program(
                 "    }}\n" ++
                 "    var local_arena = Arena {{ bump_tag: 64 }};\n" ++
                 "    let arena_bonus: i64 = with context.allocator = &mut local_arena {{\n" ++
-                "        if context.allocator._handle != 0 {{ 9 }} else {{ 1 }}\n" ++
+                "        if context.allocator._handle != 0 => 9 else 1\n" ++
                 "    }};\n" ++
                 "    close_arena(own local_arena);\n" ++
                 "    acc = acc + arena_bonus;\n" ++
@@ -589,7 +588,7 @@ fn buildIncrementalPhase6Module(
     errdefer builder.deinit(allocator);
 
     if (has_banner_comment) {
-        try builder.appendSlice(allocator, "//! Incremental Phase 6 SAST 34-byte summary cutoff banner\n\n");
+        try builder.appendSlice(allocator, "/# Incremental Phase 6 SAST 34-byte summary cutoff banner\n\n");
     }
     try builder.appendSlice(allocator, INCREMENTAL_CONST_VARIANTS[const_choice]);
 

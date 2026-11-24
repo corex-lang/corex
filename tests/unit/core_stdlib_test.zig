@@ -1,7 +1,7 @@
 //! Unit & Differential Execution Tests for Stage-1 `core` (`tests/unit/core_stdlib_test.zig`)
 //!
-//! Verifies all Phase 7.6 (`DR-22`) & Phase 8 (`DR-08`, `DR-10`) Stage-1 `core` library invariants:
-//! - All 14 `core/**/*.cx` files satisfy 3-part `//!` headers, `< 150` column line limits,
+//! Verifies all Phase 7.6 (`DR-22`), Phase 8 (`DR-08`, `DR-10`), & Phase 11.1b (`DR-24`) Stage-1 `core` invariants:
+//! - All 14 `core/**/*.cx` files satisfy 3-part `/#` headers, `< 150` column line limits,
 //!   canonical 90-char / 65-char section dividers, and `formatSourceWithOptions` idempotency
 //!   (`is_changed == false`, zero parse errors).
 //! - Full multi-file `core` hierarchy resolves, typechecks, lowers to `HIR`/`MIR`, and passes
@@ -64,9 +64,9 @@ fn normalizeLfAlloc(allocator: std.mem.Allocator, raw_bytes: []const u8) ![]u8 {
     return out_buf.toOwnedSlice(allocator);
 }
 
-/// Validates `< 150` column width, `//!` module header, and 90/65-char dividers in `cx_path`.
+/// Validates `< 150` column width, `/#` module header, and 90/65-char dividers in `cx_path`.
 fn verifyCxStyleAndDividers(cx_path: []const u8, normalized_source: []const u8) !void {
-    try std.testing.expect(std.mem.startsWith(u8, normalized_source, "//! "));
+    try std.testing.expect(std.mem.startsWith(u8, normalized_source, "/# "));
 
     var line_iter = std.mem.splitScalar(u8, normalized_source, '\n');
     var line_num: usize = 1;
@@ -332,7 +332,7 @@ test "test_core_stdlib_cross_target_tier_a_and_tier_b_compilation" {
     const io = std.testing.io;
 
     const harness_src =
-        "//! Cross-Target Stage-1 `core` Smoke Consumer (`DR-22`)\n" ++
+        "/# Cross-Target Stage-1 `core` Smoke Consumer (`DR-22`)\n" ++
         "use cx.primitives.clamp_i32;\n" ++
         "use cx.mem.{align_up, init_slot, size_of_type, swap};\n" ++
         "use cx.atomic.{AtomicU32, Ordering, fence};\n" ++
@@ -439,7 +439,7 @@ test "test_core_stdlib_four_tier_differential_oracle_end_to_end" {
     const io = std.testing.io;
 
     const app_source =
-        "//! End-to-End 4-Tier Differential `core` Verification Program (`DR-22`)\n" ++
+        "/# End-to-End 4-Tier Differential `core` Verification Program (`DR-22`)\n" ++
         "use cx.primitives.{abs_diff_u32, clamp_i32, max_i64, min_i32};\n" ++
         "use cx.mem.{\n" ++
         "    CachePadded, align_of_type, align_up, align_up_usize, cache_padded_new,\n" ++
@@ -568,7 +568,7 @@ test "test_regression_core_sys_externs_dedup_and_compile_to_object" {
     const io = std.testing.io;
 
     const posix_src =
-        "//! Regression probe for `core.sys.{linux,macos}` `@link_name(\"write\"/\"_exit\")` dedup\n" ++
+        "/# Regression probe for `core.sys.{linux,macos}` `@link(name: \"write\"/\"_exit\")` dedup\n" ++
         "use core.sys.linux.{linux_posix_exit, linux_posix_write};\n" ++
         "use core.sys.macos.{darwin_exit, darwin_write};\n\n" ++
         "pub fn exercise_posix_externs(flag: i32) -> isize {\n" ++
@@ -584,7 +584,7 @@ test "test_regression_core_sys_externs_dedup_and_compile_to_object" {
         "}\n";
 
     const win32_src =
-        "//! Regression probe for `core.sys.windows` `*mut opaque` `HANDLE` / `LPOVERLAPPED` prototypes\n" ++
+        "/# Regression probe for `core.sys.windows` `*mut opaque` `HANDLE` / `LPOVERLAPPED` prototypes\n" ++
         "use core.sys.windows.{\n" ++
         "    STD_OUTPUT_HANDLE, win32_exit_process, win32_get_std_handle, win32_write_file,\n" ++
         "};\n\n" ++
@@ -604,7 +604,7 @@ test "test_regression_core_sys_externs_dedup_and_compile_to_object" {
         "}\n";
 
     const wasi_src =
-        "//! Regression probe for `core.sys.wasi` `wasi_snapshot_preview1` imports\n" ++
+        "/# Regression probe for `core.sys.wasi` `wasi_snapshot_preview1` imports\n" ++
         "use core.sys.wasi.{WasiCiovec, wasi_fd_write, wasi_proc_exit};\n\n" ++
         "pub fn exercise_wasi_externs(flag: i32) -> u16 {\n" ++
         "    if flag == -999 {\n" ++
@@ -722,7 +722,7 @@ test "test_core_ffi_and_async_cross_target_layouts_and_object_emission" {
     const io = std.testing.io;
 
     const cross_probe_src =
-        "//! Cross-Target `cx.ffi` + `cx.async` Layout & Object Compilation Probe\n" ++
+        "/# Cross-Target `cx.ffi` + `cx.async` Layout & Object Compilation Probe\n" ++
         "use cx.ffi.{CStr, VaList, c_char, c_long};\n" ++
         "use cx.async.{CancelSource, Poll, TaskHeader};\n\n" ++
         "pub fn probe_c_long(val: c_long) -> c_long = val;\n" ++
@@ -872,7 +872,7 @@ test "test_core_ffi_cstr_and_async_nursery_four_tier_differential_oracle" {
     const io = std.testing.io;
 
     const app_source =
-        "//! End-to-End 4-Tier Differential `cx.ffi` + `cx.async` Verification Program\n" ++
+        "/# End-to-End 4-Tier Differential `cx.ffi` + `cx.async` Verification Program\n" ++
         "use cx.ffi.CStr;\n" ++
         "use cx.async.{CancelSource, Poll, Waker, block_on, task_group, yield_now};\n" ++
         "use cx.panic.assert_true;\n" ++

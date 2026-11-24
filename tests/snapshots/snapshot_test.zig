@@ -290,11 +290,13 @@ test "test_snapshot_cli_unknown_flag_typo_suggestion" {
 test "test_snapshot_lexer_token_stream_and_trivia" {
     const sample_source =
         "#!/usr/bin/env corex\n" ++
-        "//! Lexer snapshot module\n" ++
+        "/# Lexer snapshot module\n" ++
         "const MAX_STEPS: usize = 0x10_00;\n" ++
+        "/| Computes bounded steps.\n" ++
         "pub fn step_count(val: i32) -> i32!IoError {\n" ++
         "    for i in 0..10 {\n" ++
-        "        let msg = \"step={val.max(1)} {r#\"ok\"#}\\n\";\n" ++
+        "        let raw_tag = if i > 0 => \"{ok}\" else \"idle\";\n" ++
+        "        let msg = f\"step={val.max(1)} {raw_tag} {r#\"ok\"#}\\n\";\n" ++
         "    }\n" ++
         "    return .Ok(val +% 1);\n" ++
         "}\n";
@@ -364,9 +366,13 @@ test "test_snapshot_diag_lexer_errors_e0101_to_e0104" {
     defer source_map.deinit(std.testing.io);
 
     const err_source =
+        "/// retired doc\n" ++
         "let bad_esc = \"\\xGG\";\n" ++
         "let bad_chr = 'ab';\n" ++
         "let bad_num = 0x_1F;\n" ++
+        "let bad_ind = \"\n" ++
+        "  under\n" ++
+        "    \";\n" ++
         "let overflow = 99;\n";
     const file_id = try source_map.setOverlay("src\\lexer\\errors.cx", err_source, .root);
 
@@ -381,7 +387,7 @@ test "test_snapshot_diag_lexer_errors_e0101_to_e0104" {
         &token_buf,
         &sink,
         &interner,
-        .{ .max_tokens = 16 },
+        .{ .max_tokens = 21 },
     );
     try lexer_instance.tokenize();
 
@@ -406,7 +412,8 @@ test "test_snapshot_diag_lexer_warnings_w0101_w0201" {
     const warn_source =
         "let badCamel = \"hello \\'world\";\n" ++
         "struct Bad_Type {}\n" ++
-        "const MAX__LIMIT: u32 = 10;\n";
+        "const MAX__LIMIT: u32 = 10;\n" ++
+        "let no_holes = f\"plain {{ok}}\";\n";
     const file_id = try source_map.setOverlay("src\\lexer\\warnings.cx", warn_source, .root);
 
     var token_buf = TokenBuffer.init(std.testing.allocator);
@@ -430,9 +437,14 @@ test "test_snapshot_diag_lexer_warnings_w0101_w0201" {
 
 test "test_snapshot_parser_cst_and_ast_tree" {
     const sample_source =
+        "/# Parser CST & AST snapshot showcase.\n\n" ++
+        "/| Aligned generic metric wrapper.\n" ++
+        "@repr(C, align: 8)\n" ++
         "pub struct Metric[T] {\n" ++
+        "    /| Wrapped metric payload.\n" ++
         "    pub val: T,\n" ++
         "}\n" ++
+        "/| Renders an optional metric card.\n" ++
         "pub fn render[T](opt: T?) -> View {\n" ++
         "    let .Some(item) = opt else {\n" ++
         "        return Empty;\n" ++
@@ -440,9 +452,9 @@ test "test_snapshot_parser_cst_and_ast_tree" {
         "    let score = item |> compute() catch 0;\n" ++
         "    let label = match score {\n" ++
         "        0 => \"idle\",\n" ++
-        "        _ => \"active\",\n" ++
+        "        _ => f\"active:{score}\",\n" ++
         "    };\n" ++
-        "    Card(padding: 8) {\n" ++
+        "    Card(padding: if score > 0 => 16 else 8) {\n" ++
         "        Text(value: label);\n" ++
         "    }\n" ++
         "}\n";
@@ -518,6 +530,9 @@ test "test_snapshot_diag_parser_errors_e0201_to_e0203" {
         "fn check_cmp(a: i32, b: i32) -> bool {\n" ++
         "    return a < b < 10;\n" ++
         "}\n" ++
+        "@[derive(Copy)]\n" ++
+        "struct BadAttr {}\n" ++
+        "fn bad_if(flag: bool) -> i32 = if flag => 1;\n" ++
         "fn unclosed_delim(x: i32 {\n" ++
         "    return ((x + 1));\n" ++
         "}\n";
@@ -559,10 +574,15 @@ test "test_snapshot_diag_parser_errors_e0201_to_e0203" {
 
 test "test_snapshot_fmt_showcases" {
     const sample_source =
+        "/#Dashboard formatting showcase.\n" ++
         "use cx.io.{Write, self, Read, BufReader as Br};\n" ++
         "use cx.mem;\n" ++
         "const MIN_PORT: u16 = 80;\n" ++
         "const MAX_PORT: u16 = 65535;\n" ++
+        "const SQL_FILTER: str = \"meta != '{}'\";\n" ++
+        "/| Aligned metric wrapper.\n" ++
+        "@derive(Copy, Debug)\n" ++
+        "@repr(zero_pad: true, align: 8, C)\n" ++
         "pub struct Metric[T] {\n" ++
         "    pub val: T,\n" ++
         "}\n" ++
@@ -583,12 +603,17 @@ test "test_snapshot_fmt_showcases" {
         "        x: score,\n" ++
         "        y: total,\n" ++
         "    };\n" ++
+        "    let query = \"\n" ++
+        "      SELECT id FROM metrics WHERE meta != '{}'\n" ++
+        "      \";\n" ++
+        "    let tier = if (score == 0) => \"idle\" else if (score < 50) => \"warm\" else \"hot\";\n" ++
+        "    let summary = f\"{ score = } tier={tier} sql={query}\";\n" ++
         "    let label = match (score) {\n" ++
         "        0 => \"idle\",\n" ++
         "        _ => \"active\",\n" ++
         "    };\n" ++
-        "    Card(padding: 8) {\n" ++
-        "        Text(value: label);\n" ++
+        "    Card(padding: if (score > 0) => 16 else 8) {\n" ++
+        "        Text(value: label, detail: summary);\n" ++
         "    }\n" ++
         "}\n";
 
@@ -605,9 +630,11 @@ test "test_snapshot_fmt_showcases" {
 
 test "test_snapshot_fmt_comments_and_directives" {
     const sample_source =
-        "//! Module header doc comment\n" ++
+        "/#Module header doc comment   \n" ++
         "// Leading comment on Point\n" ++
+        "/|2D integer point.\n" ++
         "pub struct Point {\n" ++
+        "    /|X coordinate.\n" ++
         "    pub x: i32, // trailing comment on x\n" ++
         "    // leading comment on y\n" ++
         "    pub y: i32\n" ++
@@ -643,12 +670,16 @@ test "test_snapshot_fmt_comments_and_directives" {
 
 test "test_snapshot_fmt_fix_normalization" {
     const unfixed_source =
+        "//! Frame total helper\n" ++
         "const max_retry_limit: u32 = 10\n" ++
+        "/// Wire frame header.\n" ++
         "pub struct frame_header {\n" ++
         "    pub PayloadBytes: u32,\n" ++
         "}\n" ++
         "pub fn ComputeFrameTotal(frame_header: frame_header) -> u32 {\n" ++
         "    ;\n" ++
+        "    /* compute total */\n" ++
+        "    let _ = frame_header.PayloadBytes;\n" ++
         "    let LocalSum = frame_header.PayloadBytes + max_retry_limit\n" ++
         "    if (LocalSum > 0) {\n" ++
         "        return LocalSum\n" ++
@@ -928,7 +959,7 @@ test "test_snapshot_phase5_hir_desugaring" {
         "    var flags = PacketFlags { is_live: false, tag: 2 };\n" ++
         "    flags.is_live = true;\n" ++
         "    flags.tag = 5;\n" ++
-        "    let bonus: i32 = comptime if ENABLE_BONUS { 10 } else { 0 };\n" ++
+        "    let bonus: i32 = comptime if ENABLE_BONUS => 10 else 0;\n" ++
         "    var unrolled_sum: i32 = 0;\n" ++
         "    comptime for step in 0..3 {\n" ++
         "        unrolled_sum += step;\n" ++
@@ -1903,9 +1934,8 @@ test "test_snapshot_phase7_codegen_c_and_llvm_showcase" {
     const io = std.testing.io;
 
     const showcase_src =
-        "//! Phase 7 Tier A (`-ofmt=c`) & Tier B (`LLVM`) Golden Codegen Showcase\n" ++
-        "@repr(C)\n" ++
-        "@zero_pad\n" ++
+        "/# Phase 7 Tier A (`-ofmt=c`) & Tier B (`LLVM`) Golden Codegen Showcase\n" ++
+        "@repr(C, zero_pad: true)\n" ++
         "pub struct PacketHeader {\n" ++
         "    pub kind_tag: u8,\n" ++
         "    pub payload_len: u32,\n" ++

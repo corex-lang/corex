@@ -669,6 +669,8 @@ const CollectedDiagnostic = struct {
 const CursorTarget = struct {
     /// Token index at or immediately preceding the cursor (`TokenIndex.none` when none).
     token_index: TokenIndex = .none,
+    /// Effective sub-token kind when cursor resolves inside a `.fmt_string_lit` interpolation hole (`null` otherwise).
+    resolved_token_kind: ?TokenKind = null,
     /// Source byte span of the focal token.
     token_span: Span = Span.ZERO,
     /// Resolved symbol handle (`SymbolIndex.none` when expression-only or built-in keyword).
@@ -1231,13 +1233,24 @@ const BUILTIN_VARIANT_SET = std.StaticStringMap(void).initComptime(.{
     .{ "Some", {} },
 });
 
-/// $O(1)$ hover documentation catalog for all 57 canonical built-in `@attribute` annotations.
+/// $O(1)$ set of retired standalone layout/linkage `@attribute` names excluded from `@` completions (`ADR-24C`).
+const RETIRED_BUILTIN_ATTR_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "align", {} },
+    .{ "cache_aligned", {} },
+    .{ "link_name", {} },
+    .{ "link_section", {} },
+    .{ "packed", {} },
+    .{ "repr_c", {} },
+    .{ "zero_pad", {} },
+});
+
+/// $O(1)$ hover documentation catalog for all 60 built-in `@attribute` keys in `type_system.BUILTIN_ATTRIBUTE_MAP`.
 const BUILTIN_ATTR_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
     .{
         "align",
         HoverDocSpec{
-            .signature = "@align(bytes: usize)",
-            .summary = "Overrides the minimum byte alignment (power of two) of a `struct`, `union`, or static item.",
+            .signature = "@repr(align: bytes)",
+            .summary = "Retired standalone `@align(N)`; migrate to `@repr(align: N)` (`E0239`, `ADR-24C`).",
         },
     },
     .{
@@ -1292,8 +1305,8 @@ const BUILTIN_ATTR_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
     .{
         "cache_aligned",
         HoverDocSpec{
-            .signature = "@cache_aligned",
-            .summary = "Aligns a `struct` or static item to the target CPU cache-line boundary (`64` or `128` bytes) to prevent false sharing.",
+            .signature = "@repr(align: .CacheLine)",
+            .summary = "Retired standalone `@cache_aligned`; migrate to `@repr(align: .CacheLine)` (`E0239`, `ADR-24C`).",
         },
     },
     .{
@@ -1381,6 +1394,13 @@ const BUILTIN_ATTR_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
         },
     },
     .{
+        "gpu_kernel",
+        HoverDocSpec{
+            .signature = "@gpu_kernel",
+            .summary = "Marks a device compute kernel entry point, enforcing `@no_alloc` / `@no_panic` device safety contracts (`DR-24`).",
+        },
+    },
+    .{
         "ifunc",
         HoverDocSpec{
             .signature = "@ifunc(resolver_fn)",
@@ -1390,8 +1410,8 @@ const BUILTIN_ATTR_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
     .{
         "inline",
         HoverDocSpec{
-            .signature = "@inline",
-            .summary = "Instructs the MIR and backend optimizers to inline calls to this function across module boundaries.",
+            .signature = "@inline | @inline(always | never)",
+            .summary = "Configures `.cxi` inlining (`@inline`), forced hot-path inlining (`@inline(always)`), or `@inline(never)`.",
         },
     },
     .{
@@ -1399,6 +1419,13 @@ const BUILTIN_ATTR_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
         HoverDocSpec{
             .signature = "@linear",
             .summary = "Marks a resource type as must-consume (`Tier 3`): values cannot be implicitly dropped or leaked on any path (`E0304`).",
+        },
+    },
+    .{
+        "link",
+        HoverDocSpec{
+            .signature = "@link(name: \"symbol\", section: \".section\")",
+            .summary = "Overrides the linker symbol name and/or object-file section for a function or static item (`ADR-24C`).",
         },
     },
     .{
@@ -1411,15 +1438,15 @@ const BUILTIN_ATTR_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
     .{
         "link_name",
         HoverDocSpec{
-            .signature = "@link_name(\"symbol\")",
-            .summary = "Overrides the exact mangled/unmangled linker symbol name emitted or imported for a function or static.",
+            .signature = "@link(name: \"symbol\")",
+            .summary = "Retired standalone `@link_name(\"…\")`; migrate to `@link(name: \"…\")` (`E0239`, `ADR-24C`).",
         },
     },
     .{
         "link_section",
         HoverDocSpec{
-            .signature = "@link_section(\".section\")",
-            .summary = "Places the compiled function or static data into the specified object-file section.",
+            .signature = "@link(section: \".section\")",
+            .summary = "Retired standalone `@link_section(\"…\")`; migrate to `@link(section: \"…\")` (`E0239`, `ADR-24C`).",
         },
     },
     .{
@@ -1537,15 +1564,22 @@ const BUILTIN_ATTR_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
     .{
         "packed",
         HoverDocSpec{
-            .signature = "@packed",
-            .summary = "Eliminates inter-field alignment padding on a `struct` (`1`-byte field alignment).",
+            .signature = "@repr(packed: 1 | 2 | 4 | 8 | 16)",
+            .summary = "Retired standalone `@packed`; migrate to `@repr(packed: true)` or `@repr(packed: k)` (`E0239`, `ADR-24C`).",
         },
     },
     .{
         "repr",
         HoverDocSpec{
-            .signature = "@repr(C | u8 | i32 | transparent | …)",
-            .summary = "Specifies the deterministic memory and ABI layout representation of a `struct`, `enum`, or `union`.",
+            .signature = "@repr(C | transparent, packed: 1 | 2 | 4 | 8 | 16, align: N | .CacheLine, zero_pad: true)",
+            .summary = "Specifies deterministic memory, alignment, packing, and ABI layout of a `struct`, `enum`, or `union` (`ADR-24C`).",
+        },
+    },
+    .{
+        "repr_c",
+        HoverDocSpec{
+            .signature = "@repr(C)",
+            .summary = "Retired standalone `@repr_c`; migrate to `@repr(C)` (`E0239`, `ADR-24C`).",
         },
     },
     .{
@@ -1628,8 +1662,8 @@ const BUILTIN_ATTR_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
     .{
         "zero_pad",
         HoverDocSpec{
-            .signature = "@zero_pad",
-            .summary = "Guarantees all padding bytes inside a `struct` or `union` are deterministically zero-initialized (`IntoBytes`-safe).",
+            .signature = "@repr(zero_pad: true)",
+            .summary = "Retired standalone `@zero_pad`; migrate to `@repr(zero_pad: true)` (`E0239`, `ADR-24C`).",
         },
     },
 });
@@ -4778,8 +4812,8 @@ fn appendCommentTriviaSemanticSpans(
     if ((piece.flags & syntax_arenas.TRIVIA_FLAG_COALESCED) == 0) {
         switch (piece.kind) {
             .doc_comment, .module_doc_comment => {
-                // Scope only the `///` / `//!` marker so TextMate Markdown scopes inside docstrings stay intact:
-                const marker_end: u32 = @intCast(@min(piece_start + 3, piece_end));
+                // Scope only the 2-byte `/|` / `/#` marker so TextMate Markdown scopes inside docstrings stay intact:
+                const marker_end: u32 = @intCast(@min(piece_start + 2, piece_end));
                 try appendSplitSemanticSpan(
                     arena_alloc,
                     src,
@@ -4793,7 +4827,7 @@ fn appendCommentTriviaSemanticSpans(
                     out_tokens,
                 );
             },
-            .line_comment, .block_comment => {
+            .line_comment => {
                 try appendSplitSemanticSpan(
                     arena_alloc,
                     src,
@@ -4820,14 +4854,12 @@ fn appendCommentTriviaSemanticSpans(
         }
         if (src[cursor] == '/' and cursor + 1 < piece_end) {
             const next_byte = src[cursor + 1];
-            if (next_byte == '/') {
+            if (next_byte == '|' or next_byte == '#' or next_byte == '/') {
                 const com_start = cursor;
-                const is_doc = (cursor + 2 < piece_end) and
-                    (src[cursor + 2] == '!' or
-                        (src[cursor + 2] == '/' and (cursor + 3 >= piece_end or src[cursor + 3] != '/')));
+                const is_doc = (next_byte == '|' or next_byte == '#');
                 cursor += 2;
                 while (cursor < piece_end and src[cursor] != '\n' and src[cursor] != '\r') : (cursor += 1) {}
-                const emit_end: usize = if (is_doc) @min(com_start + 3, cursor) else cursor;
+                const emit_end: usize = if (is_doc) @min(com_start + 2, cursor) else cursor;
                 try appendSplitSemanticSpan(
                     arena_alloc,
                     src,
@@ -4841,38 +4873,296 @@ fn appendCommentTriviaSemanticSpans(
                     out_tokens,
                 );
                 continue;
-            } else if (next_byte == '*') {
-                const blk_start = cursor;
-                cursor += 2;
-                var blk_depth: u32 = 1;
-                while (cursor < piece_end and blk_depth > 0) {
-                    if (src[cursor] == '/' and cursor + 1 < piece_end and src[cursor + 1] == '*') {
-                        blk_depth += 1;
-                        cursor += 2;
-                    } else if (src[cursor] == '*' and cursor + 1 < piece_end and src[cursor + 1] == '/') {
-                        blk_depth -= 1;
-                        cursor += 2;
-                    } else {
-                        cursor += 1;
-                    }
-                }
-                try appendSplitSemanticSpan(
-                    arena_alloc,
-                    src,
-                    line_idx,
-                    encoding,
-                    @intCast(blk_start),
-                    @intCast(cursor),
-                    SEM_TOK_COMMENT,
-                    0,
-                    range_filter,
-                    out_tokens,
-                );
-                continue;
             }
         }
         cursor += 1;
     }
+}
+
+/// Orders `InterpHoleSpec` entries by `(rel_brace_open_byte ASC, rel_brace_close_byte DESC)` so outer holes precede nested inner holes.
+fn isInterpHoleBefore(_: void, lhs_hole: type_system.InterpHoleSpec, rhs_hole: type_system.InterpHoleSpec) bool {
+    if (lhs_hole.rel_brace_open_byte != rhs_hole.rel_brace_open_byte) {
+        return lhs_hole.rel_brace_open_byte < rhs_hole.rel_brace_open_byte;
+    }
+    return lhs_hole.rel_brace_close_byte > rhs_hole.rel_brace_close_byte;
+}
+
+/// Recursively emits non-overlapping semantic spans across `[seg_start, seg_end)` of an `f"…"` literal and its nested holes.
+fn appendFmtSegmentSemanticSpans(
+    session: *LspSession,
+    arena_alloc: std.mem.Allocator,
+    src: []const u8,
+    line_idx: *const LineIndex,
+    fmt_tok_base: u32,
+    seg_start: u32,
+    seg_end: u32,
+    sorted_holes: []const type_system.InterpHoleSpec,
+    range_filter: ?LspRange,
+    out_tokens: *std.ArrayListUnmanaged(RawSemanticToken),
+    depth: u8,
+) anyerror!void {
+    if (seg_start >= seg_end) return;
+    if (sorted_holes.len == 0 or depth >= 16) {
+        try appendSplitSemanticSpan(
+            arena_alloc,
+            src,
+            line_idx,
+            session.position_encoding,
+            seg_start,
+            seg_end,
+            SEM_TOK_STRING,
+            0,
+            range_filter,
+            out_tokens,
+        );
+        return;
+    }
+
+    var str_seg_start: u32 = seg_start;
+    for (sorted_holes) |hole| {
+        const raw_open = fmt_tok_base +| hole.rel_brace_open_byte;
+        const raw_close = fmt_tok_base +| hole.rel_brace_close_byte;
+        if (raw_open < seg_start or raw_open >= seg_end or raw_close >= seg_end) continue;
+        if (raw_open < str_seg_start) continue;
+
+        const open_abs = raw_open;
+        const close_abs = raw_close;
+        const close_inclusive = @min(close_abs +| 1, seg_end);
+
+        // [1] Emit preceding string literal text segment `[str_seg_start .. open_abs]`:
+        if (str_seg_start < open_abs) {
+            try appendSplitSemanticSpan(
+                arena_alloc,
+                src,
+                line_idx,
+                session.position_encoding,
+                str_seg_start,
+                open_abs,
+                SEM_TOK_STRING,
+                0,
+                range_filter,
+                out_tokens,
+            );
+        }
+
+        // [2] Emit opening `{` delimiter as `SEM_TOK_OPERATOR`:
+        try appendSplitSemanticSpan(
+            arena_alloc,
+            src,
+            line_idx,
+            session.position_encoding,
+            open_abs,
+            @min(open_abs +| 1, close_inclusive),
+            SEM_TOK_OPERATOR,
+            0,
+            range_filter,
+            out_tokens,
+        );
+
+        // [3] Emit semantic tokens for resolved sub-AST expression tokens inside `{expr…}`:
+        var hole_prev_at = false;
+        var hole_prev_kind: TokenKind = .eof;
+        var hole_prev_prev_kind: TokenKind = .eof;
+        var prev_htok_end: u32 = @min(open_abs +| 1, close_abs);
+        for (hole.tokens) |htok| {
+            if (htok.byte_len == 0) continue;
+            const htok_start = fmt_tok_base +| htok.rel_byte;
+            const htok_end = @min(htok_start +| @as(u32, htok.byte_len), close_abs);
+            if (htok_start < prev_htok_end or htok_start >= htok_end) continue;
+            prev_htok_end = htok_end;
+
+            if (htok.kind == .fmt_string_lit) {
+                hole_prev_at = false;
+                try appendFmtSegmentSemanticSpans(
+                    session,
+                    arena_alloc,
+                    src,
+                    line_idx,
+                    fmt_tok_base,
+                    htok_start,
+                    htok_end,
+                    sorted_holes,
+                    range_filter,
+                    out_tokens,
+                    depth + 1,
+                );
+                hole_prev_prev_kind = hole_prev_kind;
+                hole_prev_kind = htok.kind;
+                continue;
+            }
+
+            const htok_lex = src[@min(@as(usize, htok_start), src.len)..@min(@as(usize, htok_end), src.len)];
+
+            if (htok.kind == .at) {
+                hole_prev_at = true;
+                try appendSplitSemanticSpan(
+                    arena_alloc,
+                    src,
+                    line_idx,
+                    session.position_encoding,
+                    htok_start,
+                    htok_end,
+                    SEM_TOK_DECORATOR,
+                    SEM_MOD_ATTRIBUTE,
+                    range_filter,
+                    out_tokens,
+                );
+            } else if (hole_prev_at and isIdentifierOrKeywordToken(htok.kind)) {
+                hole_prev_at = false;
+                const intr_type: u32 = if (type_system.INTRINSIC_NAME_MAP.has(htok_lex))
+                    SEM_TOK_MACRO
+                else
+                    SEM_TOK_DECORATOR;
+                try appendSplitSemanticSpan(
+                    arena_alloc,
+                    src,
+                    line_idx,
+                    session.position_encoding,
+                    htok_start,
+                    htok_end,
+                    intr_type,
+                    SEM_MOD_ATTRIBUTE,
+                    range_filter,
+                    out_tokens,
+                );
+            } else if (!htok.symbol_index.isNone()) {
+                hole_prev_at = false;
+                const sym_style = classifySymbolSemanticStyle(session, htok.symbol_index, false);
+                try appendSplitSemanticSpan(
+                    arena_alloc,
+                    src,
+                    line_idx,
+                    session.position_encoding,
+                    htok_start,
+                    htok_end,
+                    sym_style.tok_type,
+                    sym_style.mod_bits,
+                    range_filter,
+                    out_tokens,
+                );
+            } else {
+                hole_prev_at = false;
+                const is_dot_var = htok.kind == .type_ident and hole_prev_kind == .dot and hole_prev_prev_kind != .ident;
+                const htok_class: ?struct { tok_type: u32, mod_bits: u32 } = switch (htok.kind) {
+                    .prim_type => .{ .tok_type = SEM_TOK_TYPE, .mod_bits = SEM_MOD_DEFAULT_LIB },
+                    .type_ident => if (is_dot_var)
+                        .{
+                            .tok_type = SEM_TOK_ENUM_MEMBER,
+                            .mod_bits = if (BUILTIN_VARIANT_SET.has(htok_lex)) SEM_MOD_DEFAULT_LIB else 0,
+                        }
+                    else if (symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.has(htok_lex))
+                        .{ .tok_type = SEM_TOK_TYPE, .mod_bits = SEM_MOD_DEFAULT_LIB }
+                    else
+                        .{ .tok_type = SEM_TOK_TYPE, .mod_bits = 0 },
+                    .const_ident => .{ .tok_type = SEM_TOK_VARIABLE, .mod_bits = SEM_MOD_READONLY | SEM_MOD_STATIC },
+                    .ident => if (BUILTIN_ROOT_NAMESPACE_SET.has(htok_lex))
+                        .{ .tok_type = SEM_TOK_NAMESPACE, .mod_bits = SEM_MOD_DEFAULT_LIB }
+                    else
+                        .{ .tok_type = SEM_TOK_VARIABLE, .mod_bits = 0 },
+                    .kw_self_val => .{ .tok_type = SEM_TOK_PARAMETER, .mod_bits = 0 },
+                    .kw_self_type => .{ .tok_type = SEM_TOK_TYPE, .mod_bits = 0 },
+                    .kw_own => .{ .tok_type = SEM_TOK_MODIFIER, .mod_bits = SEM_MOD_CONSUMED_MOVE },
+                    .kw_mut, .kw_var => .{ .tok_type = SEM_TOK_MODIFIER, .mod_bits = SEM_MOD_MUTABLE },
+                    .kw_async, .kw_await => .{ .tok_type = SEM_TOK_KEYWORD, .mod_bits = SEM_MOD_ASYNC },
+                    .kw_unsafe, .kw_extern => .{ .tok_type = SEM_TOK_KEYWORD, .mod_bits = SEM_MOD_UNSAFE },
+                    .kw_true, .kw_false, .char_lit, .byte_lit => null,
+                    .string_lit, .byte_string_lit, .fmt_string_lit => .{ .tok_type = SEM_TOK_STRING, .mod_bits = 0 },
+                    .int_lit, .float_lit => .{ .tok_type = SEM_TOK_NUMBER, .mod_bits = 0 },
+                    else => if (@backingInt(htok.kind) <= @backingInt(TokenKind.kw_not))
+                        .{ .tok_type = SEM_TOK_KEYWORD, .mod_bits = 0 }
+                    else
+                        null,
+                };
+                if (htok_class) |cls| {
+                    try appendSplitSemanticSpan(
+                        arena_alloc,
+                        src,
+                        line_idx,
+                        session.position_encoding,
+                        htok_start,
+                        htok_end,
+                        cls.tok_type,
+                        cls.mod_bits,
+                        range_filter,
+                        out_tokens,
+                    );
+                }
+            }
+            hole_prev_prev_kind = hole_prev_kind;
+            hole_prev_kind = htok.kind;
+        }
+
+        // [4] Emit `[=][:spec]}` suffix from first non-whitespace byte after `rel_expr_end_byte` through `}`:
+        var suffix_start = @min(@max(fmt_tok_base +| hole.rel_expr_end_byte, prev_htok_end), close_abs);
+        while (suffix_start < close_abs and @as(usize, suffix_start) < src.len) : (suffix_start += 1) {
+            const ch_val = src[suffix_start];
+            if (ch_val != ' ' and ch_val != '\t' and ch_val != '\r' and ch_val != '\n') break;
+        }
+        if (suffix_start < close_inclusive) {
+            try appendSplitSemanticSpan(
+                arena_alloc,
+                src,
+                line_idx,
+                session.position_encoding,
+                suffix_start,
+                close_inclusive,
+                SEM_TOK_OPERATOR,
+                0,
+                range_filter,
+                out_tokens,
+            );
+        }
+        str_seg_start = close_inclusive;
+    }
+
+    // [5] Emit trailing string literal text segment `[str_seg_start .. seg_end]`:
+    if (str_seg_start < seg_end) {
+        try appendSplitSemanticSpan(
+            arena_alloc,
+            src,
+            line_idx,
+            session.position_encoding,
+            str_seg_start,
+            seg_end,
+            SEM_TOK_STRING,
+            0,
+            range_filter,
+            out_tokens,
+        );
+    }
+}
+
+/// Emits interleaved `SEM_TOK_STRING`, `{` / `[=][:spec]}` `SEM_TOK_OPERATOR`, and inner expression semantic tokens for `f"…"`.
+fn appendFmtStringSemanticSpans(
+    session: *LspSession,
+    arena_alloc: std.mem.Allocator,
+    src: []const u8,
+    line_idx: *const LineIndex,
+    fmt_tok_base: u32,
+    fmt_tok_end: u32,
+    holes: []const type_system.InterpHoleSpec,
+    range_filter: ?LspRange,
+    out_tokens: *std.ArrayListUnmanaged(RawSemanticToken),
+) !void {
+    var sorted_holes: []const type_system.InterpHoleSpec = holes;
+    if (holes.len > 1) {
+        const duped_holes = try arena_alloc.dupe(type_system.InterpHoleSpec, holes);
+        std.mem.sort(type_system.InterpHoleSpec, duped_holes, {}, isInterpHoleBefore);
+        sorted_holes = duped_holes;
+    }
+    try appendFmtSegmentSemanticSpans(
+        session,
+        arena_alloc,
+        src,
+        line_idx,
+        fmt_tok_base,
+        fmt_tok_base,
+        fmt_tok_end,
+        sorted_holes,
+        range_filter,
+        out_tokens,
+        0,
+    );
 }
 
 /// Computes the 5-`u32`-per-token delta-encoded semantic token stream for `file_id` (optionally clipped to `range_opt`).
@@ -4901,6 +5191,7 @@ fn computeSemanticTokensData(
     @memset(tok_is_decl, false);
     var tok_variant_tier = try arena_alloc.alloc(u8, tok_count);
     @memset(tok_variant_tier, 0);
+    var fmt_interps_by_tok: std.AutoHashMapUnmanaged(u32, []const type_system.InterpHoleSpec) = .empty;
 
     // Map AST nodes and MVS move/mutation sites from per-`DefId` `BodySemanticSideTables`:
     for (entries) |entry| {
@@ -4911,8 +5202,29 @@ fn computeSemanticTokensData(
         }
         const side_tables = (try session.db.getDefSideTables(entry.def_id)) orelse continue;
         parsed_art = session.db.parsed_artifacts.getPtr(file_id.asInt()) orelse return &.{};
-        var ast_raw = side_tables.ast_start;
         const ast_limit = @min(side_tables.ast_end, @as(u32, @intCast(parsed_art.ast_arena.countNodes())));
+
+        var interp_it = side_tables.string_interps.iterator();
+        while (interp_it.next()) |interp_kv| {
+            const fmt_ast_raw = side_tables.ast_start + interp_kv.key_ptr.*;
+            if (fmt_ast_raw >= ast_limit) continue;
+            const fmt_main_tok = parsed_art.ast_arena.getNode(NodeIndex.fromInt(fmt_ast_raw)).main_token;
+            if (!fmt_main_tok.isNone() and fmt_main_tok.asInt() < tok_count) {
+                if (fmt_interps_by_tok.get(fmt_main_tok.asInt())) |existing_holes| {
+                    const merged_holes = try arena_alloc.alloc(
+                        type_system.InterpHoleSpec,
+                        existing_holes.len + interp_kv.value_ptr.holes.len,
+                    );
+                    @memcpy(merged_holes[0..existing_holes.len], existing_holes);
+                    @memcpy(merged_holes[existing_holes.len..], interp_kv.value_ptr.holes);
+                    try fmt_interps_by_tok.put(arena_alloc, fmt_main_tok.asInt(), merged_holes);
+                } else {
+                    try fmt_interps_by_tok.put(arena_alloc, fmt_main_tok.asInt(), interp_kv.value_ptr.holes);
+                }
+            }
+        }
+
+        var ast_raw = side_tables.ast_start;
         while (ast_raw < ast_limit) : (ast_raw += 1) {
             const ast_id = NodeIndex.fromInt(ast_raw);
             const ast_node = parsed_art.ast_arena.getNode(ast_id);
@@ -5018,6 +5330,41 @@ fn computeSemanticTokensData(
         const tok_start = tok_rec.byte_offset;
         const tok_end = tok_rec.byte_offset +| tok_rec.byte_len;
         const lexeme = src[tok_start..@min(@as(usize, tok_end), src.len)];
+
+        if (tok_rec.kind == .fmt_string_lit) {
+            is_prev_at = false;
+            const fmt_holes = fmt_interps_by_tok.get(@intCast(tok_i)) orelse &.{};
+            try appendFmtStringSemanticSpans(
+                session,
+                arena_alloc,
+                src,
+                line_idx,
+                tok_start,
+                tok_end,
+                fmt_holes,
+                range_opt,
+                &raw_tokens,
+            );
+            continue;
+        }
+        if ((tok_rec.kind == .string_lit or tok_rec.kind == .byte_string_lit) and
+            std.mem.indexOfScalar(u8, lexeme, '\n') != null)
+        {
+            is_prev_at = false;
+            try appendSplitSemanticSpan(
+                arena_alloc,
+                src,
+                line_idx,
+                session.position_encoding,
+                tok_start,
+                tok_end,
+                SEM_TOK_STRING,
+                0,
+                range_opt,
+                &raw_tokens,
+            );
+            continue;
+        }
 
         if (tok_rec.kind == .at) {
             is_prev_at = true;
@@ -5553,6 +5900,82 @@ fn tryResolveExplicitFieldTokenInDef(
     return .none;
 }
 
+/// Sub-token hit resolved inside an `f"…"` / `f#"…"#` interpolation hole (`ADR-24B`).
+const InterpHoleCursorHit = struct {
+    /// Enclosing `.fmt_string_lit` token live start byte (`fmt_tok_base`).
+    fmt_tok_base: u32,
+    /// Matched `InterpHoleSpec` containing the cursor.
+    hole: type_system.InterpHoleSpec,
+    /// Index of `token_info` inside `hole.tokens`.
+    token_idx_in_hole: usize,
+    /// Matched sub-AST token metadata.
+    token_info: type_system.InterpHoleTokenInfo,
+};
+
+/// Resolves the innermost sub-AST token at `cursor_byte` inside `.fmt_string_lit` token `fmt_tok_idx`.
+fn findInterpHoleTokenAtByte(
+    side_tables: *const BodySemanticSideTables,
+    parsed_art: *const query_db.ParsedCstArtifact,
+    fmt_tok_idx: TokenIndex,
+    cursor_byte: u32,
+) ?InterpHoleCursorHit {
+    if (fmt_tok_idx.isNone() or fmt_tok_idx.asInt() >= parsed_art.token_buffer.countTokens()) return null;
+    const ast_limit = @min(side_tables.ast_end, @as(u32, @intCast(parsed_art.ast_arena.countNodes())));
+
+    var best_hit: ?InterpHoleCursorHit = null;
+    var best_hole_span: u32 = std.math.maxInt(u32);
+
+    var interp_it = side_tables.string_interps.iterator();
+    while (interp_it.next()) |interp_kv| {
+        const fmt_ast_raw = side_tables.ast_start + interp_kv.key_ptr.*;
+        if (fmt_ast_raw >= ast_limit) continue;
+        const fmt_main_tok = parsed_art.ast_arena.getNode(NodeIndex.fromInt(fmt_ast_raw)).main_token;
+        if (fmt_main_tok != fmt_tok_idx) continue;
+
+        const fmt_tok_base = parsed_art.token_buffer.getToken(fmt_main_tok).byte_offset;
+        for (interp_kv.value_ptr.holes) |hole| {
+            const open_abs = fmt_tok_base +| hole.rel_brace_open_byte;
+            const close_abs = fmt_tok_base +| hole.rel_brace_close_byte;
+            const expr_end_abs = @min(fmt_tok_base +| hole.rel_expr_end_byte, close_abs);
+            if (cursor_byte <= open_abs or cursor_byte > expr_end_abs) continue;
+            const hole_span_len = expr_end_abs -| open_abs;
+            if (best_hit != null and hole_span_len >= best_hole_span) continue;
+
+            for (hole.tokens, 0..) |htok, idx_in_hole| {
+                if (htok.byte_len == 0 or htok.kind == .fmt_string_lit) continue;
+                const htok_start = fmt_tok_base +| htok.rel_byte;
+                const htok_end = htok_start +| @as(u32, htok.byte_len);
+                if (cursor_byte >= htok_start and cursor_byte < htok_end) {
+                    best_hit = .{
+                        .fmt_tok_base = fmt_tok_base,
+                        .hole = hole,
+                        .token_idx_in_hole = idx_in_hole,
+                        .token_info = htok,
+                    };
+                    best_hole_span = hole_span_len;
+                    break;
+                }
+                if (cursor_byte == htok_end and isIdentifierOrKeywordToken(htok.kind)) {
+                    const has_next_ident_at_cursor = idx_in_hole + 1 < hole.tokens.len and
+                        (fmt_tok_base +| hole.tokens[idx_in_hole + 1].rel_byte) == cursor_byte and
+                        isIdentifierOrKeywordToken(hole.tokens[idx_in_hole + 1].kind);
+                    if (!has_next_ident_at_cursor) {
+                        best_hit = .{
+                            .fmt_tok_base = fmt_tok_base,
+                            .hole = hole,
+                            .token_idx_in_hole = idx_in_hole,
+                            .token_info = htok,
+                        };
+                        best_hole_span = hole_span_len;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return best_hit;
+}
+
 /// Resolves the semantic symbol and type at `(file_id, pos)` across AST side tables, `use` trees, and declarations.
 fn resolveCursorTarget(
     session: *LspSession,
@@ -5628,6 +6051,31 @@ fn resolveCursorTarget(
             {
                 if (try session.db.getDefSideTables(result.enclosing_def_id)) |side_tables| {
                     parsed_art = session.db.parsed_artifacts.getPtr(file_id.asInt()) orelse return result;
+                    if (tok_rec.kind == .fmt_string_lit) {
+                        if (findInterpHoleTokenAtByte(
+                            side_tables,
+                            parsed_art,
+                            tok_idx,
+                            @intCast(@min(cursor_byte, std.math.maxInt(u32))),
+                        )) |hole_hit| {
+                            const htok_start = hole_hit.fmt_tok_base +| hole_hit.token_info.rel_byte;
+                            const htok_end = htok_start +| @as(u32, hole_hit.token_info.byte_len);
+                            result.token_span = Span.init(file_id, htok_start, htok_end);
+                            result.resolved_token_kind = hole_hit.token_info.kind;
+                            result.symbol_index = hole_hit.token_info.symbol_index;
+                            if (!hole_hit.token_info.type_id.isError()) {
+                                result.type_id = hole_hit.token_info.type_id;
+                            } else if (!hole_hit.token_info.symbol_index.isNone()) {
+                                result.type_id = session.db.symbol_table.getSymbol(
+                                    hole_hit.token_info.symbol_index,
+                                ).type_id;
+                            }
+                        } else {
+                            result.token_index = .none;
+                        }
+                        return result;
+                    }
+
                     var ast_raw = side_tables.ast_start;
                     const ast_limit = @min(
                         side_tables.ast_end,
@@ -5879,7 +6327,7 @@ fn joinDocLines(arena_alloc: std.mem.Allocator, lines: []const []const u8) ![]co
     return joined.items;
 }
 
-/// Advances `start_offset` past an optional UTF-8 BOM (`0xEF 0xBB 0xBF`) and `#!` shebang line at byte `0`.
+/// Advances `start_offset` past an optional UTF-8 BOM (`0xEF 0xBB 0xBF`), `#!` shebang, and `---` script frontmatter.
 fn skipLeadingBomAndShebang(src: []const u8) usize {
     var cursor: usize = 0;
     if (src.len >= 3 and src[0] == 0xEF and src[1] == 0xBB and src[2] == 0xBF) {
@@ -5889,10 +6337,30 @@ fn skipLeadingBomAndShebang(src: []const u8) usize {
         while (cursor < src.len and src[cursor] != '\n') : (cursor += 1) {}
         if (cursor < src.len and src[cursor] == '\n') cursor += 1;
     }
+    // Skip optional `---` script frontmatter block before top-of-file `/#` module docs:
+    var probe = cursor;
+    while (probe < src.len and (src[probe] == ' ' or src[probe] == '\t' or src[probe] == '\r' or src[probe] == '\n')) : (probe += 1) {}
+    if (probe + 3 <= src.len and std.mem.eql(u8, src[probe .. probe + 3], "---")) {
+        var fm_line_end = probe + 3;
+        while (fm_line_end < src.len and (src[fm_line_end] == ' ' or src[fm_line_end] == '\t' or src[fm_line_end] == '\r')) : (fm_line_end += 1) {}
+        if (fm_line_end == src.len or src[fm_line_end] == '\n') {
+            var scan = if (fm_line_end < src.len) fm_line_end + 1 else src.len;
+            while (scan < src.len) {
+                var close_end = scan;
+                while (close_end < src.len and src[close_end] != '\n') : (close_end += 1) {}
+                const trimmed_close = std.mem.trim(u8, src[scan..close_end], " \t\r");
+                scan = if (close_end < src.len) close_end + 1 else src.len;
+                if (std.mem.eql(u8, trimmed_close, "---")) {
+                    cursor = scan;
+                    break;
+                }
+            }
+        }
+    }
     return cursor;
 }
 
-/// Extracts contiguous top-of-file `//!` module doc comments from `mod_fid` (or `""` if none exist at the top).
+/// Extracts contiguous top-of-file `/#` module doc comments from `mod_fid` (or `""` if none exist at the top).
 fn extractFileModuleDocComments(
     session: *LspSession,
     arena_alloc: std.mem.Allocator,
@@ -5908,9 +6376,13 @@ fn extractFileModuleDocComments(
         while (line_end < src.len and src[line_end] != '\n') : (line_end += 1) {}
         const raw_line = std.mem.trimEnd(u8, src[cursor..line_end], "\r");
         const trimmed_start = std.mem.trimStart(u8, raw_line, " \t");
-        if (!std.mem.startsWith(u8, trimmed_start, "//!")) break;
+        if (trimmed_start.len == 0 and doc_lines.items.len == 0) {
+            cursor = if (line_end < src.len) line_end + 1 else src.len;
+            continue;
+        }
+        if (!std.mem.startsWith(u8, trimmed_start, "/#")) break;
 
-        var content_slice = trimmed_start[3..];
+        var content_slice = trimmed_start[2..];
         if (content_slice.len > 0 and content_slice[0] == ' ') {
             content_slice = content_slice[1..];
         }
@@ -6095,7 +6567,7 @@ fn extractDeclarationDocComments(
         }
     }
 
-    // Advance `region_start` past any trailing trivia on `prev_real_tok`'s closing line (including `/* … */`):
+    // Advance `region_start` past any trailing trivia on `prev_real_tok`'s closing line:
     const region_start: usize = if (prev_real_end) |prev_end| blk_start: {
         var skip_cur = prev_end;
         while (skip_cur < region_end) {
@@ -6104,25 +6576,10 @@ fn extractDeclarationDocComments(
                 break;
             }
             if (src[skip_cur] == '/' and skip_cur + 1 < region_end) {
-                if (src[skip_cur + 1] == '/') {
+                if (src[skip_cur + 1] == '/' or src[skip_cur + 1] == '|' or src[skip_cur + 1] == '#') {
                     while (skip_cur < region_end and src[skip_cur] != '\n') : (skip_cur += 1) {}
                     if (skip_cur < region_end and src[skip_cur] == '\n') skip_cur += 1;
                     break;
-                } else if (src[skip_cur + 1] == '*') {
-                    skip_cur += 2;
-                    var blk_depth: u32 = 1;
-                    while (skip_cur < region_end and blk_depth > 0) {
-                        if (src[skip_cur] == '/' and skip_cur + 1 < region_end and src[skip_cur + 1] == '*') {
-                            blk_depth += 1;
-                            skip_cur += 2;
-                        } else if (src[skip_cur] == '*' and skip_cur + 1 < region_end and src[skip_cur + 1] == '/') {
-                            blk_depth -= 1;
-                            skip_cur += 2;
-                        } else {
-                            skip_cur += 1;
-                        }
-                    }
-                    continue;
                 }
             }
             skip_cur += 1;
@@ -6132,7 +6589,7 @@ fn extractDeclarationDocComments(
 
     if (region_start >= region_end) return "";
 
-    // Scan `[region_start, region_end)` directly: keep only the contiguous `///` block attached to `first_tok`.
+    // Scan `[region_start, region_end)` directly: keep only the contiguous `/|` block attached to `first_tok`.
     var doc_lines: std.ArrayListUnmanaged([]const u8) = .empty;
     var consecutive_newlines: u32 = 0;
     var cursor: usize = region_start;
@@ -6146,40 +6603,24 @@ fn extractDeclarationDocComments(
                 doc_lines.clearRetainingCapacity();
             }
             cursor += 1;
-        } else if (byte_val == '/' and cursor + 1 < region_end and src[cursor + 1] == '/') {
+        } else if (byte_val == '/' and cursor + 1 < region_end and
+            (src[cursor + 1] == '|' or src[cursor + 1] == '/' or src[cursor + 1] == '#'))
+        {
             const com_start = cursor;
             while (cursor < region_end and src[cursor] != '\n') : (cursor += 1) {}
             const raw_comment = std.mem.trimEnd(u8, src[com_start..cursor], "\r\n");
-            const is_outer_doc = std.mem.startsWith(u8, raw_comment, "///") and
-                !std.mem.startsWith(u8, raw_comment, "////");
-            if (is_outer_doc) {
+            if (std.mem.startsWith(u8, raw_comment, "/|")) {
                 consecutive_newlines = 0;
-                var content_slice = raw_comment[3..];
+                var content_slice = raw_comment[2..];
                 if (content_slice.len > 0 and content_slice[0] == ' ') {
                     content_slice = content_slice[1..];
                 }
                 try doc_lines.append(arena_alloc, content_slice);
             } else {
-                // `//!` module header or `//` / `////` separator comment breaks any earlier doc block:
+                // `/#` module header or `//` / `////` separator comment breaks any earlier doc block:
                 doc_lines.clearRetainingCapacity();
                 consecutive_newlines = 0;
             }
-        } else if (byte_val == '/' and cursor + 1 < region_end and src[cursor + 1] == '*') {
-            cursor += 2;
-            var blk_depth: u32 = 1;
-            while (cursor < region_end and blk_depth > 0) {
-                if (src[cursor] == '/' and cursor + 1 < region_end and src[cursor + 1] == '*') {
-                    blk_depth += 1;
-                    cursor += 2;
-                } else if (src[cursor] == '*' and cursor + 1 < region_end and src[cursor + 1] == '/') {
-                    blk_depth -= 1;
-                    cursor += 2;
-                } else {
-                    cursor += 1;
-                }
-            }
-            doc_lines.clearRetainingCapacity();
-            consecutive_newlines = 0;
         } else {
             cursor += 1;
         }
@@ -6551,6 +6992,114 @@ fn handleHoverRequest(
                         return writeMarkdownHoverFrame(session, fid, prim_span, prim_md, out_writer, rpc_id);
                     }
                 },
+                .fmt_string_lit => {
+                    _ = try session.db.resolveSignatures(fid);
+                    const item_tree = try session.db.extractItemTree(fid);
+                    const fmt_span = parsed_cst.token_buffer.getTokenSpan(fid, raw_tok);
+                    for (item_tree.entries) |entry| {
+                        if (entry.kind == .mod_decl or entry.kind == .use_decl or entry.kind == .ffi_extern_block) {
+                            continue;
+                        }
+                        const live_art = session.db.parsed_artifacts.getPtr(fid.asInt()) orelse break;
+                        const entry_span = computeCstSubtreeByteSpan(
+                            fid,
+                            &live_art.token_buffer,
+                            &live_art.cst_arena,
+                            entry.cst_node,
+                        ) orelse continue;
+                        if (fmt_span.start_byte < entry_span.start_byte or fmt_span.start_byte > entry_span.end_byte) {
+                            continue;
+                        }
+                        if (try session.db.getDefSideTables(entry.def_id)) |side_tables| {
+                            const refreshed_art = session.db.parsed_artifacts.getPtr(fid.asInt()) orelse break;
+                            const hole_hit = findInterpHoleTokenAtByte(
+                                side_tables,
+                                refreshed_art,
+                                raw_tok,
+                                @intCast(@min(cursor_byte, std.math.maxInt(u32))),
+                            ) orelse return writeNullResultFrame(session, out_writer, rpc_id);
+                            const htok = hole_hit.token_info;
+                            const htok_start = hole_hit.fmt_tok_base +| htok.rel_byte;
+                            const htok_end = htok_start +| @as(u32, htok.byte_len);
+                            const clamped_start = @min(@as(usize, htok_start), live_src.len);
+                            const clamped_end = @min(@max(@as(usize, htok_end), clamped_start), live_src.len);
+                            const htok_lex = live_src[clamped_start..clamped_end];
+                            switch (htok.kind) {
+                                .int_lit,
+                                .float_lit,
+                                .string_lit,
+                                .char_lit,
+                                .byte_lit,
+                                .byte_string_lit,
+                                .kw_true,
+                                .kw_false,
+                                => return writeNullResultFrame(session, out_writer, rpc_id),
+                                .prim_type => {
+                                    if (BUILTIN_PRIM_HOVER_MAP.get(htok_lex)) |prim_spec| {
+                                        const prim_md = try std.fmt.allocPrint(
+                                            arena_alloc,
+                                            "```corex\n{s}\n```\n\n{s}",
+                                            .{ prim_spec.signature, prim_spec.summary },
+                                        );
+                                        return writeMarkdownHoverFrame(
+                                            session,
+                                            fid,
+                                            Span.init(fid, htok_start, htok_end),
+                                            prim_md,
+                                            out_writer,
+                                            rpc_id,
+                                        );
+                                    }
+                                },
+                                else => {},
+                            }
+                            var intr_at_idx: ?usize = null;
+                            var intr_name_idx: ?usize = null;
+                            if (htok.kind == .at and hole_hit.token_idx_in_hole + 1 < hole_hit.hole.tokens.len and
+                                isIdentifierOrKeywordToken(hole_hit.hole.tokens[hole_hit.token_idx_in_hole + 1].kind))
+                            {
+                                intr_at_idx = hole_hit.token_idx_in_hole;
+                                intr_name_idx = hole_hit.token_idx_in_hole + 1;
+                            } else if (hole_hit.token_idx_in_hole > 0 and
+                                isIdentifierOrKeywordToken(htok.kind) and
+                                hole_hit.hole.tokens[hole_hit.token_idx_in_hole - 1].kind == .at)
+                            {
+                                intr_at_idx = hole_hit.token_idx_in_hole - 1;
+                                intr_name_idx = hole_hit.token_idx_in_hole;
+                            }
+                            if (intr_at_idx != null and intr_name_idx != null) {
+                                const at_info = hole_hit.hole.tokens[intr_at_idx.?];
+                                const nm_info = hole_hit.hole.tokens[intr_name_idx.?];
+                                const nm_start = hole_hit.fmt_tok_base +| nm_info.rel_byte;
+                                const nm_end = nm_start +| @as(u32, nm_info.byte_len);
+                                const nm_clamped_start = @min(@as(usize, nm_start), live_src.len);
+                                const nm_clamped_end = @min(@max(@as(usize, nm_end), nm_clamped_start), live_src.len);
+                                const nm_lex = live_src[nm_clamped_start..nm_clamped_end];
+                                if (INTRINSIC_HOVER_MAP.get(nm_lex)) |intr_spec| {
+                                    const intr_md = try std.fmt.allocPrint(
+                                        arena_alloc,
+                                        "```corex\n{s}\n```\n\n{s}",
+                                        .{ intr_spec.signature, intr_spec.summary },
+                                    );
+                                    const full_intr_span = Span.init(
+                                        fid,
+                                        hole_hit.fmt_tok_base +| at_info.rel_byte,
+                                        nm_end,
+                                    );
+                                    return writeMarkdownHoverFrame(
+                                        session,
+                                        fid,
+                                        full_intr_span,
+                                        intr_md,
+                                        out_writer,
+                                        rpc_id,
+                                    );
+                                }
+                            }
+                        }
+                        break;
+                    }
+                },
                 else => {},
             }
 
@@ -6667,14 +7216,24 @@ fn handleHoverRequest(
         if (getLiveDocumentSource(session, fid)) |live_src| {
             if (session.db.parsed_artifacts.getPtr(fid.asInt())) |parsed_art| {
                 const tok_raw = target.token_index.asInt();
-                if (tok_raw > 0 and tok_raw < parsed_art.token_buffer.countTokens() and
-                    parsed_art.token_buffer.getToken(TokenIndex.fromInt(tok_raw - 1)).kind == .dot)
-                {
-                    const var_lex = symbol_resolver.extractTokenSlice(
-                        live_src,
-                        &parsed_art.token_buffer,
-                        target.token_index,
-                    );
+                const is_preceded_by_dot = if (target.resolved_token_kind != null)
+                    (target.token_span.start_byte > 0 and
+                        @as(usize, target.token_span.start_byte) <= live_src.len and
+                        live_src[target.token_span.start_byte - 1] == '.')
+                else
+                    (tok_raw > 0 and tok_raw < parsed_art.token_buffer.countTokens() and
+                        parsed_art.token_buffer.getToken(TokenIndex.fromInt(tok_raw - 1)).kind == .dot);
+                if (is_preceded_by_dot) {
+                    const sp_start = @min(@as(usize, target.token_span.start_byte), live_src.len);
+                    const sp_end = @min(@max(@as(usize, target.token_span.end_byte), sp_start), live_src.len);
+                    const var_lex = if (target.resolved_token_kind != null)
+                        live_src[sp_start..sp_end]
+                    else
+                        symbol_resolver.extractTokenSlice(
+                            live_src,
+                            &parsed_art.token_buffer,
+                            target.token_index,
+                        );
                     if (BUILTIN_VARIANT_SET.has(var_lex)) {
                         var inner_buf_a: [256]u8 = undefined;
                         var inner_buf_b: [256]u8 = undefined;
@@ -6842,7 +7401,7 @@ fn handleHoverRequest(
             .local_var_sym => {
                 const eff_ty = if (!target.type_id.isError()) target.type_id else sym.type_id;
                 const ty_str = session.db.type_pool.formatType(eff_ty, &session.db.symbol_table, &type_buf);
-                try mw.print("var {s}: {s}", .{ sym.name_text, ty_str });
+                try mw.print("{s} {s}: {s}", .{ if (sym.flags.is_mut) "var" else "let", sym.name_text, ty_str });
             },
             .param_sym => {
                 const eff_ty = if (!target.type_id.isError()) target.type_id else sym.type_id;
@@ -7471,6 +8030,91 @@ fn collectSymbolOccurrencesInFile(
                             max_cap,
                             out_hits,
                         );
+                    }
+                }
+            }
+        }
+
+        // Also collect occurrences inside `f"…"` / `f#"…"#` interpolation holes via live `fmt_tok_base`:
+        var interp_it = side_tables.string_interps.iterator();
+        while (interp_it.next()) |interp_kv| {
+            const fmt_ast_raw = side_tables.ast_start + interp_kv.key_ptr.*;
+            if (fmt_ast_raw >= ast_limit) continue;
+            const fmt_main_tok = parsed_art.ast_arena.getNode(NodeIndex.fromInt(fmt_ast_raw)).main_token;
+            if (fmt_main_tok.isNone() or fmt_main_tok.asInt() >= parsed_art.token_buffer.countTokens()) continue;
+            const fmt_tok_base = parsed_art.token_buffer.getToken(fmt_main_tok).byte_offset;
+
+            for (interp_kv.value_ptr.holes) |hole| {
+                for (hole.tokens, 0..) |htok, htok_idx| {
+                    if (htok.byte_len == 0) continue;
+                    const htok_start = fmt_tok_base +| htok.rel_byte;
+                    const htok_end = htok_start +| @as(u32, htok.byte_len);
+
+                    if (!htok.symbol_index.isNone()) {
+                        const is_matched = if (is_explicit_local_alias)
+                            (resolveLiveExplicitAliasSymbol(session, scan_fid, htok.symbol_index) == canonical_sym)
+                        else
+                            (resolveLiveCanonicalSymbol(session, htok.symbol_index) == canonical_sym);
+                        if (is_matched) {
+                            const cand_sp = Span.init(scan_fid, htok_start, htok_end);
+                            if (!is_including_declaration and sym.decl_span.file_id == scan_fid) {
+                                const live_decl = session.db.resolveLiveSymbolDeclSpan(canonical_sym) catch sym.decl_span;
+                                parsed_art = session.db.parsed_artifacts.getPtr(scan_fid.asInt()) orelse return;
+                                if (cand_sp.start_byte == live_decl.start_byte and cand_sp.end_byte == live_decl.end_byte) {
+                                    continue;
+                                }
+                            }
+                            const is_field_init_label = sym.kind == .field_sym and
+                                htok_idx + 1 < hole.tokens.len and hole.tokens[htok_idx + 1].kind == .colon;
+                            try appendUniqueRefHit(arena_alloc, out_hits, .{
+                                .span = cand_sp,
+                                .is_write_access = is_field_init_label,
+                                .ref_scope = mod_scope,
+                            }, max_cap);
+                            continue;
+                        }
+                    }
+
+                    // Also match shorthand `Point { x }` inside `hole.tokens` when searching for `.field_sym`:
+                    if (sym.kind == .field_sym and isUserIdentifierToken(htok.kind) and
+                        htok_idx >= 2 and htok_idx + 1 < hole.tokens.len and
+                        (hole.tokens[htok_idx - 1].kind == .lbrace or hole.tokens[htok_idx - 1].kind == .comma) and
+                        (hole.tokens[htok_idx + 1].kind == .comma or hole.tokens[htok_idx + 1].kind == .rbrace))
+                    {
+                        const htok_lex = src[@min(@as(usize, htok_start), src.len)..@min(@as(usize, htok_end), src.len)];
+                        if (std.mem.eql(u8, htok_lex, sym.name_text)) {
+                            var brace_scan = htok_idx - 1;
+                            var depth_count: u32 = 0;
+                            var struct_open_idx: ?usize = null;
+                            while (true) {
+                                const prev_k = hole.tokens[brace_scan].kind;
+                                if (prev_k == .rbrace) {
+                                    depth_count += 1;
+                                } else if (prev_k == .lbrace) {
+                                    if (depth_count == 0) {
+                                        struct_open_idx = brace_scan;
+                                        break;
+                                    }
+                                    depth_count -= 1;
+                                }
+                                if (brace_scan == 0) break;
+                                brace_scan -= 1;
+                            }
+                            if (struct_open_idx) |open_pos| {
+                                if (open_pos > 0 and !hole.tokens[open_pos - 1].symbol_index.isNone()) {
+                                    const head_sym = resolveLiveCanonicalSymbol(session, hole.tokens[open_pos - 1].symbol_index);
+                                    if (!head_sym.isNone() and
+                                        session.db.symbol_table.getSymbol(head_sym).target_scope == sym.scope_id)
+                                    {
+                                        try appendUniqueRefHit(arena_alloc, out_hits, .{
+                                            .span = Span.init(scan_fid, htok_start, htok_end),
+                                            .is_write_access = true,
+                                            .ref_scope = mod_scope,
+                                        }, max_cap);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -8224,6 +8868,19 @@ fn isCompletionDotReceiverMutable(
     if (dot_byte_offset > 0) {
         const recv_tok = findTokenAtCursorByte(&parsed_art.token_buffer, dot_byte_offset - 1);
         if (!recv_tok.isNone()) {
+            if (parsed_art.token_buffer.getToken(recv_tok).kind == .fmt_string_lit) {
+                if (side_tables_opt) |side_tables| {
+                    if (findInterpHoleTokenAtByte(side_tables, parsed_art, recv_tok, dot_byte_offset - 1)) |recv_hit| {
+                        const recv_sym = recv_hit.token_info.symbol_index;
+                        if (!recv_sym.isNone() and recv_sym.asInt() < session.db.symbol_table.countSymbols()) {
+                            return session.db.symbol_table.getSymbol(
+                                session.db.symbol_table.unwrapAliasSymbolIdx(recv_sym),
+                            ).flags.is_mut;
+                        }
+                    }
+                }
+                return false;
+            }
             if (side_tables_opt) |side_tables| {
                 var ast_raw = side_tables.ast_start;
                 const ast_limit = @min(side_tables.ast_end, @as(u32, @intCast(parsed_art.ast_arena.countNodes())));
@@ -8738,6 +9395,242 @@ fn collectEntryLiveScopeParamSymbols(
     }
 }
 
+/// Emits an empty completion list `{"isIncomplete":false,"items":[]}` JSON-RPC frame.
+fn writeEmptyCompletionListFrame(
+    session: *LspSession,
+    out_writer: *std.Io.Writer,
+    rpc_id: JsonRpcId,
+) !void {
+    session.outbound_buf.clearRetainingCapacity();
+    const body_writer = &session.outbound_buf.writer;
+    try body_writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+    try writeJsonRpcId(body_writer, rpc_id);
+    try body_writer.writeAll(",\"result\":{\"isIncomplete\":false,\"items\":[]}}");
+    try flushOutboundJsonFrame(out_writer, session.outbound_buf.written());
+}
+
+/// Returns whether `slice[start_idx..]` begins with at least `expected_hashes` `'#'` bytes.
+inline fn hasFmtHashRunAt(slice: []const u8, start_idx: usize, expected_hashes: usize) bool {
+    if (start_idx + expected_hashes > slice.len) return false;
+    var hash_idx: usize = 0;
+    while (hash_idx < expected_hashes) : (hash_idx += 1) {
+        if (slice[start_idx + hash_idx] != '#') return false;
+    }
+    return true;
+}
+
+/// Returns whether `byte_val` can continue an ASCII identifier (`[A-Za-z0-9_]`).
+inline fn isFmtIdentContinueByte(byte_val: u8) bool {
+    return std.ascii.isAlphanumeric(byte_val) or byte_val == '_';
+}
+
+/// Skips a non-interpolated `'…'`, `b'…'`, `"…"`, or `b"…"` literal starting right after its opening quote.
+fn skipPlainQuotedInFmtHole(slice: []const u8, after_open_idx: usize, quote_byte: u8) usize {
+    var cursor = after_open_idx;
+    while (cursor < slice.len) {
+        if (slice[cursor] == '\\') {
+            cursor = @min(cursor + 2, slice.len);
+            continue;
+        }
+        if (slice[cursor] == quote_byte) return cursor + 1;
+        cursor += 1;
+    }
+    return slice.len;
+}
+
+/// Skips a raw `r"…"`, `r#"…"#`, `br"…"`, or `br#"…"#` literal starting right after `'r'`.
+fn skipRawQuotedInFmtHole(slice: []const u8, after_r_idx: usize) ?struct { body_open: usize, lit_end: usize } {
+    var cursor = after_r_idx;
+    var hash_count: usize = 0;
+    while (cursor < slice.len and slice[cursor] == '#') : (cursor += 1) {
+        hash_count += 1;
+    }
+    if (cursor >= slice.len or slice[cursor] != '"') return null;
+    const body_open = cursor;
+    cursor += 1;
+    while (cursor < slice.len) : (cursor += 1) {
+        if (slice[cursor] == '"' and hasFmtHashRunAt(slice, cursor + 1, hash_count)) {
+            return .{ .body_open = body_open, .lit_end = cursor + 1 + hash_count };
+        }
+    }
+    return .{ .body_open = body_open, .lit_end = slice.len };
+}
+
+/// Scans to the closing `"#*` of a nested `f"…"` / `f#"…"#` literal starting at `'f'` (`f_idx`).
+fn findNestedFmtStringEndInHole(slice: []const u8, f_idx: usize, depth: u8) ?usize {
+    if (depth >= 16 or f_idx + 1 >= slice.len or slice[f_idx] != 'f') return null;
+    var cursor = f_idx + 1;
+    var hash_count: usize = 0;
+    while (cursor < slice.len and slice[cursor] == '#') : (cursor += 1) {
+        hash_count += 1;
+    }
+    if (cursor >= slice.len or slice[cursor] != '"') return null;
+    cursor += 1;
+
+    while (cursor < slice.len) {
+        const cur_byte = slice[cursor];
+        if (hash_count == 0 and cur_byte == '\\') {
+            cursor = @min(cursor + 2, slice.len);
+            continue;
+        }
+        if (cur_byte == '"' and hasFmtHashRunAt(slice, cursor + 1, hash_count)) {
+            return cursor + 1 + hash_count;
+        }
+        if (cur_byte == '{') {
+            if (cursor + 1 < slice.len and slice[cursor + 1] == '{') {
+                cursor += 2;
+                continue;
+            }
+            cursor += 1;
+            var inner_braces: u32 = 1;
+            while (cursor < slice.len and inner_braces > 0) {
+                const hole_ch = slice[cursor];
+                if (hole_ch == '{') {
+                    inner_braces += 1;
+                    cursor += 1;
+                } else if (hole_ch == '}') {
+                    inner_braces -= 1;
+                    cursor += 1;
+                } else if (hole_ch == 'f' and
+                    (cursor == 0 or !isFmtIdentContinueByte(slice[cursor - 1])) and
+                    cursor + 1 < slice.len and (slice[cursor + 1] == '"' or slice[cursor + 1] == '#'))
+                {
+                    if (findNestedFmtStringEndInHole(slice, cursor, depth + 1)) |nested_end| {
+                        cursor = nested_end;
+                    } else {
+                        cursor += 1;
+                    }
+                } else if (hole_ch == 'r' and
+                    (cursor == 0 or !isFmtIdentContinueByte(slice[cursor - 1])) and
+                    cursor + 1 < slice.len and (slice[cursor + 1] == '"' or slice[cursor + 1] == '#'))
+                {
+                    if (skipRawQuotedInFmtHole(slice, cursor + 1)) |raw_span| {
+                        cursor = raw_span.lit_end;
+                    } else {
+                        cursor += 1;
+                    }
+                } else if (hole_ch == 'b' and
+                    (cursor == 0 or !isFmtIdentContinueByte(slice[cursor - 1])) and
+                    cursor + 1 < slice.len)
+                {
+                    if (slice[cursor + 1] == '\'' or slice[cursor + 1] == '"') {
+                        cursor = skipPlainQuotedInFmtHole(slice, cursor + 2, slice[cursor + 1]);
+                    } else if (slice[cursor + 1] == 'r') {
+                        if (skipRawQuotedInFmtHole(slice, cursor + 2)) |raw_span| {
+                            cursor = raw_span.lit_end;
+                        } else {
+                            cursor += 1;
+                        }
+                    } else {
+                        cursor += 1;
+                    }
+                } else if (hole_ch == '"' or hole_ch == '\'') {
+                    cursor = skipPlainQuotedInFmtHole(slice, cursor + 1, hole_ch);
+                } else if (hole_ch == '/' and cursor + 1 < slice.len and slice[cursor + 1] == '/') {
+                    cursor += 2;
+                    while (cursor < slice.len and slice[cursor] != '\n' and slice[cursor] != '\r') : (cursor += 1) {}
+                } else {
+                    cursor += 1;
+                }
+            }
+            continue;
+        }
+        cursor += 1;
+    }
+    return slice.len;
+}
+
+/// Bounded recursive worker checking whether `rel_cursor` sits inside an active `{…}` hole of `fmt_lexeme`.
+fn isCursorInsideFmtStringHoleDepth(fmt_lexeme: []const u8, rel_cursor: usize, depth: u8) bool {
+    if (depth >= 16) return false;
+    const body_info = lexer.extractStringBodyInfo(.fmt_string_lit, fmt_lexeme);
+    const body_start: usize = @min(@as(usize, body_info.body_start), fmt_lexeme.len);
+    const body_end: usize = @min(@as(usize, body_info.body_end), fmt_lexeme.len);
+    if (rel_cursor < body_start or rel_cursor > body_end) return false;
+
+    const body_limit_slice = fmt_lexeme[0..body_end];
+    const scan_limit = @min(rel_cursor, body_end);
+    var brace_depth: u32 = 0;
+    var idx: usize = body_start;
+    while (idx < scan_limit) {
+        const ch_val = fmt_lexeme[idx];
+        if (brace_depth == 0) {
+            if (!body_info.is_raw and ch_val == '\\') {
+                idx = @min(idx + 2, scan_limit);
+                continue;
+            }
+            if (ch_val == '{') {
+                if (idx + 1 < body_end and fmt_lexeme[idx + 1] == '{') {
+                    idx = @min(idx + 2, scan_limit);
+                    continue;
+                }
+                brace_depth = 1;
+            } else if (ch_val == '}' and idx + 1 < body_end and fmt_lexeme[idx + 1] == '}') {
+                idx = @min(idx + 2, scan_limit);
+                continue;
+            }
+            idx += 1;
+        } else {
+            if (ch_val == 'f' and
+                (idx == body_start or !isFmtIdentContinueByte(fmt_lexeme[idx - 1])) and
+                idx + 1 < body_end and (fmt_lexeme[idx + 1] == '"' or fmt_lexeme[idx + 1] == '#'))
+            {
+                if (findNestedFmtStringEndInHole(body_limit_slice, idx, depth + 1)) |nested_end| {
+                    if (rel_cursor < nested_end) {
+                        return isCursorInsideFmtStringHoleDepth(fmt_lexeme[idx..nested_end], rel_cursor - idx, depth + 1);
+                    }
+                    idx = @min(nested_end, scan_limit);
+                    continue;
+                }
+            } else if (ch_val == 'r' and
+                (idx == body_start or !isFmtIdentContinueByte(fmt_lexeme[idx - 1])) and
+                idx + 1 < body_end and (fmt_lexeme[idx + 1] == '"' or fmt_lexeme[idx + 1] == '#'))
+            {
+                if (skipRawQuotedInFmtHole(body_limit_slice, idx + 1)) |raw_span| {
+                    if (rel_cursor > raw_span.body_open and rel_cursor < raw_span.lit_end) return false;
+                    idx = @min(raw_span.lit_end, scan_limit);
+                    continue;
+                }
+            } else if (ch_val == 'b' and
+                (idx == body_start or !isFmtIdentContinueByte(fmt_lexeme[idx - 1])) and
+                idx + 1 < body_end)
+            {
+                if (fmt_lexeme[idx + 1] == '\'' or fmt_lexeme[idx + 1] == '"') {
+                    const lit_end = skipPlainQuotedInFmtHole(body_limit_slice, idx + 2, fmt_lexeme[idx + 1]);
+                    if (rel_cursor > idx + 1 and rel_cursor < lit_end) return false;
+                    idx = @min(lit_end, scan_limit);
+                    continue;
+                } else if (fmt_lexeme[idx + 1] == 'r') {
+                    if (skipRawQuotedInFmtHole(body_limit_slice, idx + 2)) |raw_span| {
+                        if (rel_cursor > raw_span.body_open and rel_cursor < raw_span.lit_end) return false;
+                        idx = @min(raw_span.lit_end, scan_limit);
+                        continue;
+                    }
+                }
+            } else if (ch_val == '"' or ch_val == '\'') {
+                const lit_end = skipPlainQuotedInFmtHole(body_limit_slice, idx + 1, ch_val);
+                if (rel_cursor > idx and rel_cursor < lit_end) return false;
+                idx = @min(lit_end, scan_limit);
+                continue;
+            } else if (ch_val == '/' and idx + 1 < body_end and fmt_lexeme[idx + 1] == '/') {
+                var cmt_end = idx + 2;
+                while (cmt_end < body_end and fmt_lexeme[cmt_end] != '\n' and fmt_lexeme[cmt_end] != '\r') : (cmt_end += 1) {}
+                if (rel_cursor <= cmt_end) return false;
+                idx = @min(cmt_end, scan_limit);
+                continue;
+            }
+
+            if (ch_val == '{') {
+                brace_depth += 1;
+            } else if (ch_val == '}') {
+                brace_depth -= 1;
+            }
+            idx += 1;
+        }
+    }
+    return brace_depth > 0;
+}
+
 /// Handles `textDocument/completion`: dot-completion (`IncompleteDotTarget`), `@` attributes, and lexical scope (`<= 256`).
 fn handleCompletionRequest(
     session: *LspSession,
@@ -8789,14 +9682,46 @@ fn handleCompletionRequest(
     var items: std.ArrayListUnmanaged(CompletionCandidate) = .empty;
     var seen_labels: std.StringHashMapUnmanaged(void) = .empty;
 
+    // Suppress completions inside non-interpolated string/char literals or outside `{…}` inside `.fmt_string_lit`:
+    var is_inside_fmt_hole = false;
+    {
+        const container_tok = findTokenAtCursorByte(&parsed_art.token_buffer, cursor_byte);
+        if (!container_tok.isNone() and container_tok.asInt() < parsed_art.token_buffer.countTokens()) {
+            const container_rec = parsed_art.token_buffer.getToken(container_tok);
+            const tok_start_u: usize = container_rec.byte_offset;
+            const tok_end_u: usize = container_rec.byte_offset +| container_rec.byte_len;
+            if (cursor_byte > tok_start_u and cursor_byte < tok_end_u) {
+                switch (container_rec.kind) {
+                    .string_lit, .byte_string_lit, .char_lit, .byte_lit => {
+                        return writeEmptyCompletionListFrame(session, out_writer, rpc_id);
+                    },
+                    .fmt_string_lit => {
+                        is_inside_fmt_hole = isCursorInsideFmtStringHoleDepth(
+                            src[tok_start_u..@min(tok_end_u, src.len)],
+                            cursor_byte - tok_start_u,
+                            0,
+                        );
+                        if (!is_inside_fmt_hole) {
+                            return writeEmptyCompletionListFrame(session, out_writer, rpc_id);
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+
     if (is_after_at) {
-        for (type_system.BUILTIN_ATTRIBUTE_MAP.keys()) |attr_name| {
-            try appendUniqueCompletion(arena_alloc, &seen_labels, &items, prefix, .{
-                .label = attr_name,
-                .kind = 24,
-                .detail = "@attribute",
-                .sort_tier = 0,
-            });
+        if (!is_inside_fmt_hole) {
+            for (type_system.BUILTIN_ATTRIBUTE_MAP.keys()) |attr_name| {
+                if (RETIRED_BUILTIN_ATTR_SET.has(attr_name)) continue;
+                try appendUniqueCompletion(arena_alloc, &seen_labels, &items, prefix, .{
+                    .label = attr_name,
+                    .kind = 24,
+                    .detail = "@attribute",
+                    .sort_tier = 0,
+                });
+            }
         }
         for (type_system.INTRINSIC_NAME_MAP.keys()) |intr_name| {
             try appendUniqueCompletion(arena_alloc, &seen_labels, &items, prefix, .{
@@ -8881,15 +9806,110 @@ fn handleCompletionRequest(
                         }
                     }
                 }
+
+                // Also inspect `side_tables.string_interps` (`incomplete_dots` + `hole.tokens`) via live `fmt_tok_base`:
+                if (resolved_dot_target == null) {
+                    var best_dot_hole_span: u32 = std.math.maxInt(u32);
+                    var interp_it = side_tables.string_interps.iterator();
+                    while (interp_it.next()) |interp_kv| {
+                        const fmt_ast_raw = side_tables.ast_start + interp_kv.key_ptr.*;
+                        if (fmt_ast_raw >= ast_limit) continue;
+                        const fmt_main_tok = parsed_art.ast_arena.getNode(NodeIndex.fromInt(fmt_ast_raw)).main_token;
+                        if (fmt_main_tok.isNone() or fmt_main_tok.asInt() >= parsed_art.token_buffer.countTokens()) {
+                            continue;
+                        }
+                        const fmt_rec = parsed_art.token_buffer.getToken(fmt_main_tok);
+                        const fmt_tok_base = fmt_rec.byte_offset;
+                        const fmt_tok_end = fmt_tok_base +| fmt_rec.byte_len;
+                        if (dot_byte_offset < fmt_tok_base or dot_byte_offset >= fmt_tok_end) continue;
+
+                        for (interp_kv.value_ptr.holes) |hole| {
+                            const open_abs = fmt_tok_base +| hole.rel_brace_open_byte;
+                            const close_abs = fmt_tok_base +| hole.rel_brace_close_byte;
+                            if (dot_byte_offset <= open_abs or dot_byte_offset >= close_abs) continue;
+                            const cand_hole_span = close_abs -| open_abs;
+                            if (resolved_dot_target != null and cand_hole_span >= best_dot_hole_span) continue;
+
+                            var hole_dot_target: ?IncompleteDotTarget = null;
+                            for (hole.incomplete_dots) |dot_info| {
+                                if (fmt_tok_base +| dot_info.rel_trigger_end_byte == dot_byte_offset +| 1 and
+                                    !dot_info.receiver_type_id.isError())
+                                {
+                                    var is_type_ns_recv = false;
+                                    for (hole.tokens) |cand_htok| {
+                                        const cand_end = fmt_tok_base +| cand_htok.rel_byte +| @as(u32, cand_htok.byte_len);
+                                        if (cand_end == dot_byte_offset and !cand_htok.symbol_index.isNone()) {
+                                            const unwrapped_cand = session.db.symbol_table.unwrapAliasSymbolIdx(
+                                                cand_htok.symbol_index,
+                                            );
+                                            if (session.db.symbol_table.getSymbol(unwrapped_cand).namespace == .type_ns) {
+                                                is_type_ns_recv = true;
+                                            }
+                                            break;
+                                        }
+                                    }
+                                    hole_dot_target = if (is_type_ns_recv)
+                                        .{ .type_ns = dot_info.receiver_type_id }
+                                    else
+                                        .{ .value_expr = dot_info.receiver_type_id };
+                                    break;
+                                }
+                            }
+
+                            if (hole_dot_target == null) {
+                                for (hole.tokens, 0..) |htok, htok_i| {
+                                    if (htok.kind != .dot or fmt_tok_base +| htok.rel_byte != dot_byte_offset) continue;
+                                    if (htok_i == 0) break;
+                                    const recv_htok = hole.tokens[htok_i - 1];
+                                    if (!recv_htok.symbol_index.isNone()) {
+                                        const recv_rec = session.db.symbol_table.getSymbol(
+                                            session.db.symbol_table.unwrapAliasSymbolIdx(recv_htok.symbol_index),
+                                        ).*;
+                                        if (recv_rec.kind == .module_sym) {
+                                            hole_dot_target = .{ .module_ns = recv_rec.target_scope };
+                                        } else if (recv_rec.namespace == .type_ns) {
+                                            hole_dot_target = .{ .type_ns = recv_rec.type_id };
+                                        } else if (!recv_htok.type_id.isError()) {
+                                            hole_dot_target = .{ .value_expr = recv_htok.type_id };
+                                        } else if (!recv_rec.type_id.isError()) {
+                                            hole_dot_target = .{ .value_expr = recv_rec.type_id };
+                                        }
+                                    } else if (!recv_htok.type_id.isError()) {
+                                        hole_dot_target = .{ .value_expr = recv_htok.type_id };
+                                    }
+                                    break;
+                                }
+                            }
+
+                            if (hole_dot_target) |matched_target| {
+                                resolved_dot_target = matched_target;
+                                best_dot_hole_span = cand_hole_span;
+                            }
+                        }
+                    }
+                }
             }
             break;
         }
 
-        // Fallback token-before-dot lookup (`cx.`, `pkg.`, `ModName.`, `EnumName.`):
+        // Fallback token-before-dot lookup (`cx.`, `pkg.`, `ModName.`, `EnumName.`, including inside `f"…"` holes):
         if (resolved_dot_target == null and dot_byte_offset > 0) {
             const recv_tok = findTokenAtCursorByte(&parsed_art.token_buffer, dot_byte_offset - 1);
+            var recv_lex: []const u8 = "";
             if (!recv_tok.isNone()) {
-                const recv_lex = symbol_resolver.extractTokenSlice(src, &parsed_art.token_buffer, recv_tok);
+                if (parsed_art.token_buffer.getToken(recv_tok).kind == .fmt_string_lit) {
+                    var scan_end: usize = @min(@as(usize, dot_byte_offset), src.len);
+                    while (scan_end > 0 and (src[scan_end - 1] == ' ' or src[scan_end - 1] == '\t')) : (scan_end -= 1) {}
+                    var scan_start = scan_end;
+                    while (scan_start > 0 and
+                        (std.ascii.isAlphanumeric(src[scan_start - 1]) or src[scan_start - 1] == '_')) : (scan_start -= 1)
+                    {}
+                    recv_lex = src[scan_start..scan_end];
+                } else {
+                    recv_lex = symbol_resolver.extractTokenSlice(src, &parsed_art.token_buffer, recv_tok);
+                }
+            }
+            if (recv_lex.len > 0) {
                 if (std.mem.eql(u8, recv_lex, "cx") or
                     (session.options.is_internal_core and std.mem.eql(u8, recv_lex, "core")))
                 {
@@ -9908,8 +10928,14 @@ fn validateRenamableSymbolAtCursor(
     const parsed_art = try session.db.parseCst(file_id);
 
     const tok_rec = parsed_art.token_buffer.getToken(target.token_index);
-    if (!isUserIdentifierToken(tok_rec.kind)) return null;
-    const cursor_lexeme = symbol_resolver.extractTokenSlice(src, &parsed_art.token_buffer, target.token_index);
+    const effective_tok_kind = target.resolved_token_kind orelse tok_rec.kind;
+    if (!isUserIdentifierToken(effective_tok_kind)) return null;
+    const span_start = @min(@as(usize, target.token_span.start_byte), src.len);
+    const span_end = @min(@max(@as(usize, target.token_span.end_byte), span_start), src.len);
+    const cursor_lexeme = if (target.resolved_token_kind != null)
+        src[span_start..span_end]
+    else
+        symbol_resolver.extractTokenSlice(src, &parsed_art.token_buffer, target.token_index);
     if (cursor_lexeme.len == 0 or NON_RENAMABLE_IDENT_SET.has(cursor_lexeme)) return null;
 
     // Distinguish explicit `use pkg.foo.{bar as alias}` (cursor on `alias`) vs `bar`:
@@ -10031,6 +11057,7 @@ fn isValidDr03RenameIdentifier(sym: SymbolRecord, new_name: []const u8) bool {
 
 /// Checks whether `(file_id, ident_span)` sits inside a shorthand `.field_init` or `SE-15` `.field_pat`, returning expanded edit.
 fn tryBuildShorthandExpansionEdit(
+    session: *LspSession,
     arena_alloc: std.mem.Allocator,
     file_id: FileId,
     src: []const u8,
@@ -10109,6 +11136,79 @@ fn tryBuildShorthandExpansionEdit(
                 .end_byte = tok_sp.end_byte,
                 .replacement = expanded,
             };
+        }
+    }
+
+    // Also inspect `f"…"` interpolation hole tokens for struct-init shorthands (`f"{Point { x }}"`):
+    const container_tok = findTokenAtCursorByte(&parsed_art.token_buffer, ident_span.start_byte);
+    if (!container_tok.isNone() and container_tok.asInt() < parsed_art.token_buffer.countTokens() and
+        parsed_art.token_buffer.getToken(container_tok).kind == .fmt_string_lit)
+    {
+        const entries = try arena_alloc.dupe(
+            query_db.ItemTreeEntry,
+            (try session.db.extractItemTree(file_id)).entries,
+        );
+        for (entries) |entry| {
+            if (entry.kind == .mod_decl or entry.kind == .use_decl or entry.kind == .ffi_extern_block) continue;
+            const side_tables = (try session.db.getDefSideTables(entry.def_id)) orelse continue;
+            const live_parsed = session.db.parsed_artifacts.getPtr(file_id.asInt()) orelse break;
+            const ast_limit = @min(side_tables.ast_end, @as(u32, @intCast(live_parsed.ast_arena.countNodes())));
+
+            var interp_it = side_tables.string_interps.iterator();
+            while (interp_it.next()) |interp_kv| {
+                const fmt_ast_raw = side_tables.ast_start + interp_kv.key_ptr.*;
+                if (fmt_ast_raw >= ast_limit) continue;
+                const fmt_main_tok = live_parsed.ast_arena.getNode(NodeIndex.fromInt(fmt_ast_raw)).main_token;
+                if (fmt_main_tok.isNone() or fmt_main_tok.asInt() >= live_parsed.token_buffer.countTokens()) continue;
+                const fmt_tok_base = live_parsed.token_buffer.getToken(fmt_main_tok).byte_offset;
+
+                for (interp_kv.value_ptr.holes) |hole| {
+                    for (hole.tokens, 0..) |htok, htok_idx| {
+                        const htok_start = fmt_tok_base +| htok.rel_byte;
+                        const htok_end = htok_start +| @as(u32, htok.byte_len);
+                        if (htok_start != ident_span.start_byte or htok_end != ident_span.end_byte) continue;
+                        if (htok_idx < 2 or htok_idx + 1 >= hole.tokens.len) continue;
+                        const prev_kind = hole.tokens[htok_idx - 1].kind;
+                        const next_kind = hole.tokens[htok_idx + 1].kind;
+                        if ((prev_kind != .lbrace and prev_kind != .comma) or
+                            (next_kind != .comma and next_kind != .rbrace))
+                        {
+                            continue;
+                        }
+                        var scan_idx = htok_idx - 1;
+                        var brace_depth: u32 = 0;
+                        var open_brace_pos: ?usize = null;
+                        while (true) {
+                            const cur_kind = hole.tokens[scan_idx].kind;
+                            if (cur_kind == .rbrace) {
+                                brace_depth += 1;
+                            } else if (cur_kind == .lbrace) {
+                                if (brace_depth == 0) {
+                                    open_brace_pos = scan_idx;
+                                    break;
+                                }
+                                brace_depth -= 1;
+                            }
+                            if (scan_idx == 0) break;
+                            scan_idx -= 1;
+                        }
+                        if (open_brace_pos) |open_pos| {
+                            if (open_pos > 0 and hole.tokens[open_pos - 1].kind == .type_ident) {
+                                const expanded = if (is_renaming_field)
+                                    try std.fmt.allocPrint(arena_alloc, "{s}: {s}", .{ new_name, old_name })
+                                else
+                                    try std.fmt.allocPrint(arena_alloc, "{s}: {s}", .{ old_name, new_name });
+                                return .{
+                                    .file_id = file_id,
+                                    .start_byte = ident_span.start_byte,
+                                    .end_byte = ident_span.end_byte,
+                                    .replacement = expanded,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     return null;
@@ -10234,6 +11334,45 @@ fn hasRenameCollisionOrShadowingHazard(
                             }
                         }
                     }
+
+                    // Also check symbol references inside `f"…"` interpolation holes in `side_tables`:
+                    var interp_it = side_tables.string_interps.iterator();
+                    while (interp_it.next()) |interp_kv| {
+                        const fmt_ast_raw = side_tables.ast_start + interp_kv.key_ptr.*;
+                        if (fmt_ast_raw >= ast_limit) continue;
+                        const fmt_main_tok = parsed_art.ast_arena.getNode(NodeIndex.fromInt(fmt_ast_raw)).main_token;
+                        if (fmt_main_tok.isNone() or fmt_main_tok.asInt() >= parsed_art.token_buffer.countTokens()) {
+                            continue;
+                        }
+                        const fmt_tok_base = parsed_art.token_buffer.getToken(fmt_main_tok).byte_offset;
+                        for (interp_kv.value_ptr.holes) |hole| {
+                            for (hole.tokens) |htok| {
+                                if (htok.symbol_index.isNone() or htok.symbol_index == validated.target_sym_idx) continue;
+                                const unwrapped_htok = resolveLiveCanonicalSymbol(session, htok.symbol_index);
+                                if (unwrapped_htok.isNone() or unwrapped_htok == validated.target_sym_idx) continue;
+                                const other_sym = session.db.symbol_table.getSymbol(unwrapped_htok).*;
+                                if (other_sym.namespace != target_sym.namespace or
+                                    !std.mem.eql(u8, other_sym.name_text, new_name))
+                                {
+                                    continue;
+                                }
+                                if (isScopeAncestorOrEqual(
+                                    &session.db.symbol_table.scope_arena,
+                                    other_sym.scope_id,
+                                    target_sym.scope_id,
+                                ) or isScopeAncestorOrEqual(
+                                    &session.db.symbol_table.scope_arena,
+                                    target_sym.scope_id,
+                                    other_sym.scope_id,
+                                )) {
+                                    const abs_off = fmt_tok_base +| htok.rel_byte;
+                                    if (abs_off >= def_span.start_byte and abs_off <= def_span.end_byte) {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -10319,6 +11458,32 @@ fn hasRenameCollisionOrShadowingHazard(
                                 std.mem.eql(u8, loc_sym.name_text, new_name))
                             {
                                 return true;
+                            }
+                        }
+                        var entry_interp_it = entry_side_tables.string_interps.valueIterator();
+                        while (entry_interp_it.next()) |interp_ptr| {
+                            for (interp_ptr.holes) |hole| {
+                                for (hole.tokens) |htok| {
+                                    if (htok.symbol_index.isNone() or htok.symbol_index == validated.target_sym_idx) {
+                                        continue;
+                                    }
+                                    if (htok.symbol_index.asInt() >= session.db.symbol_table.countSymbols()) continue;
+                                    const loc_sym = session.db.symbol_table.getSymbol(htok.symbol_index).*;
+                                    const is_inner_local = switch (loc_sym.kind) {
+                                        .local_let_sym,
+                                        .local_var_sym,
+                                        .param_sym,
+                                        .type_param_sym,
+                                        .const_param_sym,
+                                        => true,
+                                        else => false,
+                                    };
+                                    if (is_inner_local and loc_sym.namespace == target_sym.namespace and
+                                        std.mem.eql(u8, loc_sym.name_text, new_name))
+                                    {
+                                        return true;
+                                    }
+                                }
                             }
                         }
                     }
@@ -10520,6 +11685,7 @@ fn handleRenameRequest(
             target_sym.kind == .local_let_sym or target_sym.kind == .local_var_sym))
         {
             if (try tryBuildShorthandExpansionEdit(
+                session,
                 arena_alloc,
                 h_fid,
                 h_src,
@@ -11193,6 +12359,11 @@ pub fn runServerStream(
     return session.feedStream(reader, writer);
 }
 
+/// Returns `true` when `rel_cursor` sits strictly inside an active `{…}` interpolation hole of `fmt_lexeme`.
+pub fn isCursorInsideFmtStringHole(fmt_lexeme: []const u8, rel_cursor: usize) bool {
+    return isCursorInsideFmtStringHoleDepth(fmt_lexeme, rel_cursor, 0);
+}
+
 // ---------------------------------------- MAIN -----------------------------------------
 
 test "test_lsp_framing_json_security_caps_surrogates_uri_codec_and_lifecycle" {
@@ -11447,8 +12618,8 @@ test "test_lsp_hover_dr17_bullets_doc_trivia_and_dot_completion" {
     );
 
     const sample_cx =
-        "pub const PREV_ITEM: i32 = 1; /// trailing comment on previous item\n" ++
-        "/// Computes doubled coordinate sum.\n" ++
+        "pub const PREV_ITEM: i32 = 1; /| trailing comment on previous item\n" ++
+        "/| Computes doubled coordinate sum.\n" ++
         "pub fn sum_point(pt: Point) -> i32 {\n" ++
         "    return pt.x_val + pt.y_val;\n" ++
         "}\n" ++
@@ -11823,7 +12994,7 @@ test "test_lsp_redteam_early_cutoff_shrunk_fn_stale_cst_references_rename_hover"
         "    }\n" ++
         "}\n" ++
         "use sub_ns.{target_op as op_alias};\n" ++
-        "/// Doc on trailing struct after shrink.\n" ++
+        "/| Doc on trailing struct after shrink.\n" ++
         "pub struct AfterStruct {\n" ++
         "    pub val: i32,\n" ++
         "}\n" ++
@@ -12371,11 +13542,11 @@ test "test_lsp_hover_attrs_variants_semantic_tokens_inlay_and_internal_rename" {
     const io = std.testing.io;
 
     const sample_src =
-        "/// Async poll status.\n" ++
+        "/| Async poll status.\n" ++
         "pub enum Poll[T] {\n" ++
-        "    /// Completed with output value.\n" ++
+        "    /| Completed with output value.\n" ++
         "    Ready(T),\n" ++
-        "    /// Still pending wakeup.\n" ++
+        "    /| Still pending wakeup.\n" ++
         "    Pending,\n" ++
         "}\n" ++
         "@inline @no_alloc @no_panic\n" ++
@@ -12540,36 +13711,36 @@ test "test_lsp_module_hover_file_docstring_and_coalesced_trivia_isolation" {
     defer out_alloc.deinit();
     var exit_opt: ?u8 = null;
 
-    // `core/async.cx`: > 15 leading trivia pieces (`TRIVIA_FLAG_COALESCED`) + section divider + `///` on `Poll`:
+    // `core/async.cx`: > 15 leading trivia pieces (`TRIVIA_FLAG_COALESCED`) + section divider + `/|` on `Poll`:
     const async_src =
-        "//! Structured Cooperative Async Concurrency (`core.async`)\n" ++
-        "//!\n" ++
-        "//! Defines stackless coroutine polling (`Poll[T]`), cancellation tokens,\n" ++
-        "//! and bounded `16 KiB` inline task frames across all execution tiers.\n" ++
-        "//!\n" ++
-        "//! Paragraph three line one.\n" ++
-        "//! Paragraph three line two.\n" ++
-        "//! Paragraph three line three.\n" ++
-        "//! Paragraph three line four.\n" ++
+        "/# Structured Cooperative Async Concurrency (`core.async`)\n" ++
+        "/#\n" ++
+        "/# Defines stackless coroutine polling (`Poll[T]`), cancellation tokens,\n" ++
+        "/# and bounded `16 KiB` inline task frames across all execution tiers.\n" ++
+        "/#\n" ++
+        "/# Paragraph three line one.\n" ++
+        "/# Paragraph three line two.\n" ++
+        "/# Paragraph three line three.\n" ++
+        "/# Paragraph three line four.\n" ++
         "// ---------------------------------------- TYPES ----------------------------------------\n" ++
-        "/// Cooperative step outcome returned when polling an asynchronous state machine.\n" ++
+        "/| Cooperative step outcome returned when polling an asynchronous state machine.\n" ++
         "pub enum Poll[T] {\n" ++
         "    Ready(T),\n" ++
         "    Pending,\n" ++
         "}\n";
 
-    // `core/bare.cx`: NO top-of-file `//!` docstring, starts with `///` on its first item:
+    // `core/bare.cx`: NO top-of-file `/#` docstring, starts with `/|` on its first item:
     const bare_src =
-        "/// First item doc that must never leak onto `mod bare`.\n" ++
+        "/| First item doc that must never leak onto `mod bare`.\n" ++
         "pub struct BareItem {\n" ++
         "    pub count: u32,\n" ++
         "}\n";
 
     const root_src =
-        "//! Core Root Module Header (`core`)\n" ++
-        "/// One-liner summary on `pub mod async;` in `root.cx`.\n" ++
+        "/# Core Root Module Header (`core`)\n" ++
+        "/| One-liner summary on `pub mod async;` in `root.cx`.\n" ++
         "pub mod async;\n" ++
-        "/// One-liner summary on `pub mod bare;` in `root.cx`.\n" ++
+        "/| One-liner summary on `pub mod bare;` in `root.cx`.\n" ++
         "pub mod bare;\n";
 
     const client_src =
@@ -12661,12 +13832,200 @@ test "test_lsp_module_hover_file_docstring_and_coalesced_trivia_isolation" {
     try std.testing.expect(std.mem.indexOf(u8, frames[1], "First item doc") == null);
     try std.testing.expect(std.mem.indexOf(u8, frames[1], "One-liner summary") == null);
 
-    // [4] `Poll` hover shows ONLY `Poll`'s outer `///` docstring, with zero `//!` or `// ----` leakage:
+    // [4] `Poll` hover shows ONLY `Poll`'s outer `/|` docstring, with zero `/#` or `// ----` leakage:
     try std.testing.expect(std.mem.indexOf(u8, frames[4], "pub enum Poll") != null);
     try std.testing.expect(
         std.mem.indexOf(u8, frames[4], "Cooperative step outcome returned when polling") != null,
     );
     try std.testing.expect(std.mem.indexOf(u8, frames[4], "Structured Cooperative Async Concurrency") == null);
     try std.testing.expect(std.mem.indexOf(u8, frames[4], "TYPES") == null);
-    try std.testing.expect(std.mem.indexOf(u8, frames[4], "//!") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[4], "/#") == null);
+}
+
+test "test_lsp_dr24_fmt_string_holes_doc_prefixes_and_repr_hover" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var inbound: std.ArrayListUnmanaged(u8) = .empty;
+    defer inbound.deinit(allocator);
+
+    try appendTestLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{" ++
+            "\"general\":{\"positionEncodings\":[\"utf-8\"]},\"textDocument\":{\"diagnostic\":{}}}}}",
+    );
+
+    const dr24_src =
+        "/# Module Doc Header (`dr24_lsp`)\n" ++
+        "/#   - Indented bullet preserved\n" ++
+        "\n" ++
+        "/| Cache-aligned coordinate pair.\n" ++
+        "@repr(C, align: .CacheLine, zero_pad: true)\n" ++
+        "pub struct Pair {\n" ++
+        "    pub x_val: i32,\n" ++
+        "    pub y_val: i32,\n" ++
+        "}\n" ++
+        "pub fn pad_top() -> i32 {\n" ++
+        "    return 1;\n" ++
+        "}\n" ++
+        "/| Formats pair summary.\n" ++
+        "pub fn describe_pair(pt: Pair, scale: i32) -> str {\n" ++
+        "    let total = pt.x_val * scale;\n" ++
+        "    return f\"pair({total=}, {pt.x_val:04})\";\n" ++
+        "}\n" ++
+        "pub fn dot_in_hole(pt: Pair) -> str {\n" ++
+        "    return f\"val={pt.}\";\n" ++
+        "}\n";
+
+    var open_buf = std.Io.Writer.Allocating.init(allocator);
+    defer open_buf.deinit();
+    try open_buf.writer.writeAll(
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":" ++
+            "{\"uri\":\"file:///virt/dr24_lsp.cx\",\"languageId\":\"corex\",\"version\":1,\"text\":",
+    );
+    try writeJsonString(&open_buf.writer, dr24_src);
+    try open_buf.writer.writeAll("}}}");
+    try appendTestLspFrame(allocator, &inbound, open_buf.written());
+
+    // [1] Hover `@repr` (`line 4, col 2`) BEFORE Early Cutoff edit (populates initial side tables via `id: 3` too):
+    try appendTestLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/hover\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///virt/dr24_lsp.cx\"},\"position\":{\"line\":4,\"character\":2}}}",
+    );
+    try appendTestLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/hover\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///virt/dr24_lsp.cx\"},\"position\":{\"line\":15,\"character\":20}}}",
+    );
+
+    // [2] Expand `pad_top` body (`line 10..11`) by +2 lines to trigger Early Cutoff (`rebaseWindow`) above `describe_pair`:
+    try appendTestLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///virt/dr24_lsp.cx\",\"version\":2}," ++
+            "\"contentChanges\":[{\"range\":{\"start\":{\"line\":10,\"character\":0}," ++
+            "\"end\":{\"line\":11,\"character\":0}}," ++
+            "\"text\":\"    let alpha = 100;\\n    let beta = 200;\\n    return alpha + beta;\\n\"}]}}",
+    );
+
+    // [3] After Early Cutoff (+2 lines): hover `total` (`line 17, col 20`) vs `:04` (`line 17, col 38` -> `null`):
+    try appendTestLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/hover\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///virt/dr24_lsp.cx\"},\"position\":{\"line\":17,\"character\":20}}}",
+    );
+    try appendTestLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/hover\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///virt/dr24_lsp.cx\"},\"position\":{\"line\":17,\"character\":38}}}",
+    );
+    // [4] `definition` on `x_val` inside `{pt.x_val:04}` (`line 17, col 33` -> `line 6, col 8`):
+    try appendTestLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"textDocument/definition\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///virt/dr24_lsp.cx\"},\"position\":{\"line\":17,\"character\":33}}}",
+    );
+    // [5] `references` on `total` inside `{total=}` (`line 17, col 20` -> `line 16` + `line 17`):
+    try appendTestLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/references\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///virt/dr24_lsp.cx\"}," ++
+            "\"position\":{\"line\":17,\"character\":20},\"context\":{\"includeDeclaration\":true}}}",
+    );
+    // [6] `prepareRename` & `rename` on `total` inside `{total=}` -> `sum_val` (preserves trailing `=`):
+    try appendTestLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"textDocument/prepareRename\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///virt/dr24_lsp.cx\"},\"position\":{\"line\":17,\"character\":20}}}",
+    );
+    try appendTestLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"textDocument/rename\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///virt/dr24_lsp.cx\"}," ++
+            "\"position\":{\"line\":17,\"character\":20},\"newName\":\"sum_val\"}}",
+    );
+    // [7] Dot-completion inside `f"val={pt.}"` (`line 20, col 21`) vs outside hole (`line 20, col 15`) vs `@` attrs (`line 4, col 1`):
+    try appendTestLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"textDocument/completion\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///virt/dr24_lsp.cx\"},\"position\":{\"line\":20,\"character\":21}}}",
+    );
+    try appendTestLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"textDocument/completion\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///virt/dr24_lsp.cx\"},\"position\":{\"line\":20,\"character\":15}}}",
+    );
+    try appendTestLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"textDocument/completion\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///virt/dr24_lsp.cx\"},\"position\":{\"line\":4,\"character\":1}}}",
+    );
+    // [8] Semantic tokens full (`id: 13`):
+    try appendTestLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"textDocument/semanticTokens/full\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///virt/dr24_lsp.cx\"}}}",
+    );
+    try appendTestLspFrame(allocator, &inbound, "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"shutdown\",\"params\":null}");
+    try appendTestLspFrame(allocator, &inbound, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}");
+
+    var fixed_reader = std.Io.Reader.fixed(inbound.items);
+    var out_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer out_alloc.deinit();
+
+    const exit_code = try runServerStream(allocator, io, null, &fixed_reader, &out_alloc.writer, null, .{});
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+
+    const frames = try extractTestOutboundPayloads(allocator, out_alloc.written());
+    defer allocator.free(frames);
+    try std.testing.expect(frames.len >= 14);
+
+    // `@repr` hover includes `.CacheLine` (`frames[1]`):
+    try std.testing.expect(std.mem.indexOf(u8, frames[1], ".CacheLine") != null);
+    // Hover on `total` inside `{total=}` before (`frames[2]`) and after Early Cutoff (`frames[3]`):
+    try std.testing.expect(std.mem.indexOf(u8, frames[2], "let total: i32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[3], "let total: i32") != null);
+    // Hover on `:04` outside expression (`frames[4]`) returns `null`:
+    try std.testing.expect(std.mem.indexOf(u8, frames[4], "\"result\":null") != null);
+    // `definition` on `x_val` inside `{pt.x_val:04}` (`frames[5]`) jumps to `line 6, character 8`:
+    try std.testing.expect(std.mem.indexOf(u8, frames[5], "\"line\":6,\"character\":8") != null);
+    // `references` on `total` (`frames[6]`) hits `line 16` (`let total`) and `line 17, character 19..24` (`{total=}`):
+    try std.testing.expect(std.mem.indexOf(u8, frames[6], "\"line\":16,\"character\":8") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, frames[6], "\"start\":{\"line\":17,\"character\":19},\"end\":{\"line\":17,\"character\":24}") != null,
+    );
+    // `prepareRename` (`frames[7]`) & `rename` (`frames[8]`) replace `19..24`, keeping trailing `=` at col 24:
+    try std.testing.expect(std.mem.indexOf(u8, frames[7], "\"placeholder\":\"total\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[8], "\"newText\":\"sum_val\"") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, frames[8], "\"start\":{\"line\":17,\"character\":19},\"end\":{\"line\":17,\"character\":24}") != null,
+    );
+    // Dot-completion inside `f"val={pt.}"` (`frames[9]`) finds `x_val` & `y_val`; outside hole (`frames[10]`) is empty:
+    try std.testing.expect(std.mem.indexOf(u8, frames[9], "\"label\":\"x_val\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[9], "\"label\":\"y_val\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[10], "\"items\":[]") != null);
+    // `@` completion (`frames[11]`) offers `repr` & `link`, excluding retired `repr_c`, `cache_aligned`, `packed`, `link_name`:
+    try std.testing.expect(std.mem.indexOf(u8, frames[11], "\"label\":\"repr\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[11], "\"label\":\"link\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[11], "\"label\":\"repr_c\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[11], "\"label\":\"cache_aligned\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[11], "\"label\":\"packed\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[11], "\"label\":\"link_name\"") == null);
+    // Semantic tokens (`frames[12]`) are non-empty:
+    try std.testing.expect(std.mem.indexOf(u8, frames[12], "\"data\":[0,0,2,15,256") != null);
 }

@@ -1,7 +1,9 @@
-//! Module header doc comment
+/# Module header doc comment
 
 // Leading comment on Point
+/| 2D integer point.
 pub struct Point {
+    /| X coordinate.
     pub x: i32, // trailing comment on x
     // leading comment on y
     pub y: i32,

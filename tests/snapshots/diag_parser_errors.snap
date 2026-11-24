@@ -6,19 +6,38 @@
   │
   ╰───────
 
-✗ error[E0202]: unclosed block, group, or generic delimiter
-  ╭─▸ src/parser/errors.cx:4:26
+✗ error[E0239]: grouped `@[…]` attribute lists are not valid in CoreX (`ADR-24C`); write `@attr` annotations directly
+  ╭─▸ src/parser/errors.cx:4:1
   │
-4 │ fn unclosed_delim(x: i32 {
+4 │ @[derive(Copy)]
+  │ ^^^^^^^^^^^^^^^ remove outer brackets and prefix each attribute with `@`
+  │
+  ├╴ help: unwrap grouped attributes into `@attr` annotations
+4 - @[derive(Copy)]
+4 + @derive(Copy)
+  ╰───────
+
+✗ error[E0237]: inline `if cond => expr` requires an `else expr` branch (`ADR-24D`); use `if cond { … }` for statements without `else`
+  ╭─▸ src/parser/errors.cx:6:32
+  │
+6 │ fn bad_if(flag: bool) -> i32 = if flag => 1;
+  │                                ^^^^^^^^^^^^ missing `else <expr>` branch after `=>`
+  │
+  ╰───────
+
+✗ error[E0202]: unclosed block, group, or generic delimiter
+  ╭─▸ src/parser/errors.cx:7:26
+  │
+7 │ fn unclosed_delim(x: i32 {
   │                  ─ unclosed delimiter opened here
   │                          ^ expected `)` to close parameter list
   │
   ╰───────
 
 ✗ error[E0203]: parser recursion depth limit exceeded
-  ╭─▸ src/parser/errors.cx:5:14
+  ╭─▸ src/parser/errors.cx:8:14
   │
-5 │     return ((x + 1));
+8 │     return ((x + 1));
   │              ^ maximum parser recursion depth exceeded here
   │
   ╰───────

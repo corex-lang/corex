@@ -198,7 +198,7 @@ const INCREMENTAL_WORKER_VARIANTS = [_][]const u8{
         "        if item_val > 10 { break :search item_val + (item_idx as i64); }\n" ++
         "    } orelse 3;\n" ++
         "    return mix_generic(total, hit_val);\n",
-    "    let opt_num: i64? = if input_val > 0 { .Some(input_val) } else { .None };\n" ++
+    "    let opt_num: i64? = if input_val > 0 => .Some(input_val) else .None;\n" ++
         "    if (cand_opt := opt_num) is .Some(unwrapped) and (shifted := unwrapped + 2) > 4 {\n" ++
         "        let _keep = cand_opt;\n" ++
         "        return add_offset(offset: SCALE_FACTOR, val: shifted);\n" ++
@@ -266,7 +266,7 @@ fn generateWellTypedDifferentialProgram(
             "}\n",
     );
 
-    // [1] Emit `= expr;` single-expression `@inline` helper & dependent-default function:
+    // [1] Emit `= expr;` single-expression helper & dependent-default function:
     const inline_expr = switch (inline_op_choice) {
         0 => "(val + delta) ^ 5",
         1 => "(val - delta) | 3",
@@ -280,7 +280,7 @@ fn generateWellTypedDifferentialProgram(
         allocator,
         try std.fmt.bufPrint(
             &helper_buf,
-            "@inline\npub fn inline_step(val: i64, delta: i64 = 3) -> i64 = {s};\n" ++
+            "pub fn inline_step(val: i64, delta: i64 = 3) -> i64 = {s};\n" ++
                 "pub fn affine_window(lhs_val: i64, mid_val: i64 = lhs_val + {d}, scale_val: i64 = 2) -> i64 =\n" ++
                 "    (lhs_val & 63) * scale_val + mid_val;\n",
             .{ inline_expr, default_bias },
@@ -352,13 +352,13 @@ fn generateWellTypedDifferentialProgram(
                 "        _ => generic_combine(pair.left, two_i64),\n" ++
                 "    }};\n" ++
                 "    var audit_acc: i64 = 0;\n" ++
-                "    let chosen_mode: StepMode = if (safe_seed & 2) == 0 {{ .Shift(safe_seed) }} else {{ .Scale(safe_seed) }};\n" ++
+                "    let chosen_mode: StepMode = if (safe_seed & 2) == 0 => .Shift(safe_seed) else .Scale(safe_seed);\n" ++
                 "    let mode_val = run_mode_worker(chosen_mode, &mut audit_acc);\n" ++
                 "    let small_lhs: i32 = (safe_seed as i32) & 15;\n" ++
                 "    let small_rhs: i32 = 6;\n" ++
                 "    let small_sum: i32 = generic_combine(small_lhs, small_rhs);\n" ++
                 "    let first_opt: i64? = opt_probe(safe_seed, {d});\n" ++
-                "    let is_val: i64 = if first_opt is .Some(inner_v) {{ inner_v + 2 }} else {{ 1 }};\n" ++
+                "    let is_val: i64 = if first_opt is .Some(inner_v) => inner_v + 2 else 1;\n" ++
                 "    let walrus_val: i64 = if (cand_opt := opt_probe(safe_seed + 3, {d})) is .Some(got_v) and\n" ++
                 "        (shifted_v := got_v + 3) > 6\n" ++
                 "    {{\n" ++
@@ -455,7 +455,7 @@ fn buildIncrementalPhase5Module(
     errdefer builder.deinit(allocator);
 
     if (has_banner_comment) {
-        try builder.appendSlice(allocator, "//! Incremental Phase 5 + DR-21 HIR/MIR/Comptime/Opt parity banner\n\n");
+        try builder.appendSlice(allocator, "/# Incremental Phase 5 + DR-24 HIR/MIR/Comptime/Opt parity banner\n\n");
     }
     try builder.appendSlice(allocator, INCREMENTAL_CONST_VARIANTS[const_choice]);
     try builder.appendSlice(

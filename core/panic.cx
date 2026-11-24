@@ -1,26 +1,26 @@
-//! Hardware Traps, Unrecoverable Panics, and Invariant Assertions (`core.panic`)
-//!
-//! Exposes cold, non-returning (`never`) failure entrypoints (`trap` and `panic`) together with
-//! `assert_true` for runtime and compile-time invariant enforcement (`DR-07`, `DR-22` `SE-17`).
-//!
-//! Under `COREX_ORACLE_TRACE_FILE` and `MirVm` oracle execution, both `trap` and `panic` record
-//! deterministic trap markers (`exit_code = 101`) with identical `stderr` output across all tiers.
+/# Hardware Traps, Unrecoverable Panics, and Invariant Assertions (`core.panic`)
+/#
+/# Exposes cold, non-returning (`never`) failure entrypoints (`trap` and `panic`) together with
+/# `assert_true` for runtime and compile-time invariant enforcement (`DR-07`, `DR-22` `SE-17`).
+/#
+/# Under `COREX_ORACLE_TRACE_FILE` and `MirVm` oracle execution, both `trap` and `panic` record
+/# deterministic trap markers (`exit_code = 101`) with identical `stderr` output across all tiers.
 
 // ------------------------------------- PUBLIC API --------------------------------------
-/// Triggers an immediate hardware trap (`@trap()`) without writing diagnostic text.
-@cold @no_alloc @noinline
+/| Triggers an immediate hardware trap (`@trap()`) without writing diagnostic text.
+@noinline @cold @no_alloc
 pub fn trap() -> never {
     @trap();
 }
 
-/// Writes `panic: <message>\n` to standard error and aborts execution (`@panic(message)`).
-@cold @no_alloc @noinline
+/| Writes `panic: <message>\n` to standard error and aborts execution (`@panic(message)`).
+@noinline @cold @no_alloc
 pub fn panic(message: FmtArgs = "", *, loc: SourceLoc = @caller_location()) -> never {
     _ = loc;
     @panic(message);
 }
 
-/// Verifies that `is_valid` holds, aborting via `@panic(message)` when `is_valid` is `false`.
+/| Verifies that `is_valid` holds, aborting via `@panic(message)` when `is_valid` is `false`.
 @inline @no_alloc
 pub fn assert_true(is_valid: bool, message: FmtArgs = "", *, loc: SourceLoc = @caller_location()) {
     _ = loc;

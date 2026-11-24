@@ -24,7 +24,7 @@ Keeping web assets, editor grammars, and starter templates in dedicated reposito
 To prevent manual documentation drift between `corex-lang/corex` and `corex-lang/website`, release tags (`v*`) and local build scripts export four deterministic machine-readable artifacts directly into `corex-lang/website`:
 
 1.  **`corex-playground.wasm`:** The self-hosted CoreX frontend, SAST verifier, `corex fmt`, and `MirVm` compiled to `wasm32-unknown-freestanding` (compressed with Brotli/Zstd for instant browser loading).
-2.  **`cx-api-docs.json`:** Structured module, type, trait, function, contract (`@no_alloc`, `@no_panic`, `@max_stack`), and inferred capability (`EffectCapabilityMask`) metadata extracted directly from `//!` and `///` docstrings in `core/` and `stdlib/cx/` via `corex doc --format=json --out <path>`.
+2.  **`cx-api-docs.json`:** Structured module, type, trait, function, contract (`@no_alloc`, `@no_panic`, `@max_stack`), and inferred capability (`EffectCapabilityMask`) metadata extracted directly from `/#` and `/|` docstrings in `core/` and `stdlib/cx/` via `corex doc --format=json --out <path>`.
 3.  **`benchmarks.json`:** Reproducible compilation speed, cold-start latency, stripped binary size, and runtime execution timings against C (`clang -O3`), Rust (`rustc -O`), Zig (`ReleaseFast`), and Go.
 4.  **Curated Showcases (`docs/COMPARISONS.md`):** Canonical side-by-side `.cx` comparison snippets synced into the website landing page and playground preset dropdowns.
 
@@ -53,11 +53,11 @@ Immediately after `Phase 12.8` completes the 5-slice holistic codebase simplific
 The core extension (`syntaxes/corex.tmLanguage.json`, `language-configuration.json`, and the `corex lsp` / `corex fmt` client inside sibling workspace `../vscode-ext-corex`, modeled strictly after `xulbux/vscode-theme-isolux` and `xulbux/vscode-ext-color-tracr` and their `.agents/` rules/skills) is built and dogfooded locally starting in [`PLAN.md`](../PLAN.md) **`Phase 10.5`** so `Phase 11` (`stdlib/cx/*.cx`) and `Phase 12` (`compiler/*.cx`) are authored with full IDE support. Because GitHub's web code viewer (**PrettyLights**) highlights `.cx` files and ```` ```cx ```` Markdown blocks purely via static **TextMate regular expressions** without running `corex lsp`, Stage `L1` performs final grammar verification, branding polish, and public Marketplace release:
 
 1.  **v1.0 TextMate Grammar & Release Binary Audit (`corex.tmLanguage.json` & `src/extension.ts`):**
-    -   Verify complete scope coverage across all 120 `TokenKind`s and 70 keywords/primitives locked in `DR-22` (plus any standard-library attributes finalized in `Phase 11`–`12`):
+    -   Verify complete scope coverage across all 121 `TokenKind`s and 70 keywords/primitives locked in `DR-22`–`DR-24` (plus any standard-library attributes finalized in `Phase 11`–`12`):
         -   Control, declaration, ownership, and boolean keywords (`fn`, `struct`, `enum`, `bit_field`, `trait`, `impl`, `subscript`, `yield`, `use`, `pub`, `own`, `with`, `context`, `orelse`, `is`, `and`, `or`, `not`, `async`, `await`, `test`, `bench`, `unsafe`, `comptime`).
         -   All 20 built-in primitives (`i8`–`i128`, `u8`–`u128`, `isize`, `usize`, `f32`, `f64`, `bool`, `char`, `str`, `unit`, `never`, `opaque`) and built-in Constrained Type Groups (`Number`, `Integer`, `Signed`, `Unsigned`, `Float`, `Scalar`, `Bytes`).
         -   `PascalCase` nominal types/variants (`entity.name.type.corex`), `SCREAMING_SNAKE_CASE` constants (`constant.other.caps.corex`), `@attribute` annotations (`punctuation.definition.annotation.corex` + `storage.type.annotation.corex`), and `:label` / `label:` loop and `match` labels (`entity.name.label.corex`).
-        -   Single-line `"…"`, indent-stripped multiline `"""…"""`, raw `r#"…"#` / `r#"""…"""#`, byte `b'x'` / `b"…"` / `br#"…"#`, nested `{expr=:#06x}` string interpolation holes, `{{` / `}}` brace escapes, and `_`-separated numeric suffixes (`0x4358_u32`, `0.5_f32`).
+        -   Single-line `"…"` (with `{placeholder}` template spans), indent-stripped multiline `"<newline> … "`, interpolated `f"…"` / `f#"…"#`, raw `r#"…"#`, byte `b'x'` / `b"…"` / `br#"…"#`, nested `{expr=:#06x}` string interpolation holes, `{{` / `}}` brace escapes, and `_`-separated numeric suffixes (`0x4358_u32`, `0.5_f32`).
     -   Update default `corex` binary discovery to prioritize the installed `v0.0.1` toolchain (`PATH` and `~/.corex/bin/corex`) while keeping workspace `build/` overrides for compiler contributors.
 2.  **Local PrettyLights Verification (`@wooorm/starry-night`):**
     -   Render `core/**/*.cx`, `stdlib/cx/**/*.cx`, `compiler/**/*.cx`, and all [`docs/COMPARISONS.md`](COMPARISONS.md) showcase snippets through `@wooorm/starry-night` locally across GitHub Light, Dark, and High-Contrast palettes to verify crisp highlighting before publishing.
@@ -125,8 +125,8 @@ Decide explicitly at the `v0.0.1` release boundary how internal engineering docu
 
 -   **Archive Pre-Squash History Locally (Off Public Remote):** Save an offline Git bundle (`../corex-pre-v0.0.1-archive.bundle`, supplementing the `Phase 12.7` `../corex-stage0-zig-archive.bundle`) on local/private storage before force-pushing `clean-main` so the entire Stage-0 Zig bootstrap history remains privately inspectable forever without appearing in public GitHub commit graphs.
 -   **Keep in `corex-lang/corex`:** Self-hosted source code (`compiler/`, `stdlib/`, `core/`, `tests/`, `bench/`), zero-Zig C99 offline bootstrap seed (`bootstrap.c` and `stage1/`), `README.md`, `CHANGELOG.md`, `LICENSE*`, `.markdownlint.json`, and `.agents/` (rules and skills intentionally retained).
--   **Decide at `v0.0.1` Gate (`PLAN.md`, `docs/LAUNCH.md`, `docs/COMPARISONS.md`, `docs/research/DR-01.md`–`DR-22.md`):**
-    -   *Option A (Keep in `docs/`):* Systems programmers on Hacker News and Lobste.rs strongly respect deep architectural RFCs (`DR-01`–`DR-22`); keeping them in `docs/research/` proves serious compiler engineering rigor.
+-   **Decide at `v0.0.1` Gate (`PLAN.md`, `docs/LAUNCH.md`, `docs/COMPARISONS.md`, `docs/research/DR-01.md`–`DR-25.md`):**
+    -   *Option A (Keep in `docs/`):* Systems programmers on Hacker News and Lobste.rs strongly respect deep architectural RFCs (`DR-01`–`DR-25`); keeping them in `docs/research/` proves serious compiler engineering rigor.
     -   *Option B (Move to `corex-lang/rfcs`):* Move completed design/planning docs into a dedicated `corex-lang/rfcs` repository if you want the main `corex` tree focused exclusively on code and user docs.
 
 ### Step 2: Clean Orphan-Branch Squash Procedure
@@ -185,7 +185,7 @@ GitHub Linguist requires a language extension to have **at least 200 unique publ
 1.  **Tracking the 200-Repo Threshold:**
     -   Monitor public GitHub code search (`path:*.cx "pub fn"` or `path:*.cx "use cx."` excluding forks) until unique repository count comfortably exceeds `220–250` repositories (providing margin above Linguist's 200-repo floor during review).
 2.  **Disambiguating `.cx` in Linguist Heuristics:**
-    -   Check whether any legacy language in Linguist's `languages.yml` claims `.cx`; add deterministic `heuristics.yml` rules matching CoreX signatures (`^\s*(pub(\((pkg|super)\))?\s+)?(fn|struct|enum|bit_field|trait|impl|subscript|use|mod|test|bench)\b`, `:=`, `->`, `@(cfg|derive|no_alloc|no_panic|inline)\b`).
+    -   Check whether any legacy language in Linguist's `languages.yml` claims `.cx`; add deterministic `heuristics.yml` rules matching CoreX signatures (`^\s*(/#|/\|)\s`, `^\s*(pub(\((pkg|super)\))?\s+)?(fn|struct|enum|bit_field|trait|impl|subscript|use|mod|test|bench)\b`, `:=`, `->`, `@(cfg|derive|no_alloc|no_panic|inline|repr|link)\b`).
 3.  **Submitting the `github-linguist/linguist` Pull Request:**
     -   Add `CoreX` to `lib/linguist/languages.yml` using CoreX's official primary brand indigo **`#6352FF`** (`type: programming`, `color: "#6352ff"`, `extensions: [".cx"]`, `tm_scope: "source.corex"`, `ace_mode: "text"`, `codemirror_mode: "clike"`).
     -   Run `script/add-grammar https://github.com/corex-lang/vscode-ext-corex` to vendor the MIT-licensed grammar submodule into `vendor/grammars/`.

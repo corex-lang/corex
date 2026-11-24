@@ -3,8 +3,9 @@
 //! Aggregates and executes all Phase 0, Phase 1, Phase 2, Phase 3, Phase 4, Phase 5, Phase 6,
 //! Phase 7, Phase 7.5 (`DR-21`), Phase 7.6 (`DR-22`), Phase 8 (`DR-08`, `DR-10`, `DR-18`),
 //! Phase 9 (`DR-11`, `DR-16`, `DR-17`), Phase 10 (`DR-12`, `DR-14`, `DR-17`), Phase 10.6 (`DR-23`),
-//! and Phase 11.1 (`STD-01`) isolated unit tests (`tests/unit/`), golden snapshot tests
-//! (`tests/snapshots/`), deterministic PRNG fuzzers (`tests/fuzz/`), and drift guards (`tests/drift/`).
+//! Phase 11.1 (`STD-01`), and Phase 11.1b (`DR-24`) isolated unit tests (`tests/unit/`), golden
+//! snapshot tests (`tests/snapshots/`), deterministic PRNG fuzzers (`tests/fuzz/`), and drift
+//! guards (`tests/drift/`).
 //!
 //! Invoked automatically by `zig build test` alongside internal `stage0/src/` module tests.
 
@@ -18,7 +19,7 @@ pub const mem_foundation_test = @import("unit/mem_foundation_test.zig");
 pub const vfs_sourcemap_test = @import("unit/vfs_sourcemap_test.zig");
 /// Unit tests for `syntax_arenas.zig` (`TokenBuffer`, `LosslessCstArena`, `AstArena`).
 pub const syntax_arenas_test = @import("unit/syntax_arenas_test.zig");
-/// Unit tests for `lexer.zig` (120 `TokenKind`s, 10 `TriviaKind`s, casing, literals, lossless CST).
+/// Unit tests for `lexer.zig` (121 `TokenKind`s, 9 `TriviaKind`s, casing, literals, lossless CST).
 pub const lexer_test = @import("unit/lexer_test.zig");
 /// Unit tests for `parser.zig` (lossless CST/AST, 15 Pratt tiers, showcases, recovery, incremental).
 pub const parser_test = @import("unit/parser_test.zig");
@@ -44,7 +45,7 @@ pub const mir_opt_test = @import("unit/mir_opt_test.zig");
 pub const codegen_abi_test = @import("unit/codegen_abi_test.zig");
 /// Unit tests for `codegen_dev_seam.zig` (`< 200` LOC seam, `.cx_dev_meta`, `FieldHash64`, `D-10A` cache invalidation).
 pub const codegen_dev_seam_test = @import("unit/codegen_dev_seam_test.zig");
-/// Unit tests for `codegen_c.zig` (Tier A ISO C99 emitter, `@zero_pad`, `#soa`, `--dev` GOT, native execution).
+/// Unit tests for `codegen_c.zig` (Tier A ISO C99 emitter, `zero_pad: true`, `#soa`, `--dev` GOT, native execution).
 pub const codegen_c_test = @import("unit/codegen_c_test.zig");
 /// Unit tests for `codegen_llvm.zig` (Tier B LLVM 20–23 IR emitter, `swifterror`, MVS, Pentagon, `--fuzz`).
 pub const codegen_llvm_test = @import("unit/codegen_llvm_test.zig");

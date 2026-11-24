@@ -466,3 +466,102 @@ test "test_symbol_resolver_dr22_four_tier_visibility_pub_super_and_pub_pkg" {
             hasDiagnosticCode(&bad_res.diagnostics, .e0409_private_symbol_access),
     );
 }
+
+// ----------- DR-24 Consolidated @repr/@link & E0239 -----------
+
+test "test_symbol_resolver_dr24_repr_link_allow_masks_and_retired_e0239" {
+    try std.testing.expect(
+        symbol_resolver.AllowLintMask.fromLintName("W0119").?.isCodeAllowed(.w0119_useless_format_string),
+    );
+    try std.testing.expect(
+        symbol_resolver.AllowLintMask.fromLintName("W0120").?.isCodeAllowed(.w0120_uninterpolated_fmt_placeholder),
+    );
+    try std.testing.expect(
+        symbol_resolver.AllowLintMask.fromLintName("W0333").?.isCodeAllowed(.w0333_redundant_private_contract),
+    );
+
+    // [1] Positive `@repr` (`C`, `packed`, `.CacheLine`, `zero_pad`, `transparent`) and `@link(name: …, section: …)`:
+    const valid_dr24_attrs_src =
+        \\@repr(C, packed: 4, align: .CacheLine, zero_pad: true)
+        \\pub struct SlabDescriptor {
+        \\    pub dma_addr: u64,
+        \\}
+        \\@repr(transparent)
+        \\pub struct RawHandle {
+        \\    pub raw_bits: u32,
+        \\}
+        \\@inline(always) @link(name: "cx_fast_dispatch", section: ".text.hot")
+        \\pub fn fast_dispatch() -> i32 {
+        \\    return 1;
+        \\}
+    ;
+    var ok_res = try runResolveAndTypecheck(std.testing.allocator, valid_dr24_attrs_src);
+    defer ok_res.deinit();
+    try std.testing.expect(!ok_res.diagnostics.hasErrors());
+
+    const mod_scope = ok_res.symbol_table.file_module_scopes.get(1).?;
+    const slab_sym = ok_res.symbol_table.getSymbol(
+        ok_res.symbol_table.lookupInScopeDirect(
+            mod_scope,
+            try ok_res.interner.intern("SlabDescriptor"),
+            NamespaceMask.TYPE_ONLY,
+        ),
+    );
+    try std.testing.expect(slab_sym.contract_flags.is_repr_c);
+    try std.testing.expect(slab_sym.contract_flags.is_packed);
+    try std.testing.expectEqual(@as(u32, 4), slab_sym.packedCapBytes());
+    try std.testing.expect(slab_sym.contract_flags.is_cache_aligned);
+    try std.testing.expect(slab_sym.contract_flags.is_zero_pad);
+
+    const wrap_sym = ok_res.symbol_table.getSymbol(
+        ok_res.symbol_table.lookupInScopeDirect(
+            mod_scope,
+            try ok_res.interner.intern("RawHandle"),
+            NamespaceMask.TYPE_ONLY,
+        ),
+    );
+    try std.testing.expect(wrap_sym.isReprTransparent());
+
+    const dispatch_sym = ok_res.symbol_table.getSymbol(
+        ok_res.symbol_table.lookupInScopeDirect(
+            mod_scope,
+            try ok_res.interner.intern("fast_dispatch"),
+            NamespaceMask.VALUE_ONLY,
+        ),
+    );
+    try std.testing.expectEqual(symbol_resolver.InlineAttrMode.always, dispatch_sym.inlineMode());
+    try std.testing.expectEqualStrings("cx_fast_dispatch", dispatch_sym.link_name_text);
+    try std.testing.expectEqualStrings(".text.hot", dispatch_sym.link_section_name);
+
+    // [2] Retired `@repr_c`, `@packed`, `@align(N)`, `@cache_aligned`, `@zero_pad`, `@link_name`, `@link_section` -> `E0239`:
+    const retired_attrs_src =
+        \\@repr_c
+        \\@packed
+        \\@align(16)
+        \\@zero_pad
+        \\pub struct LegacyWire {
+        \\    pub tag: u8,
+        \\}
+        \\@cache_aligned
+        \\pub struct LegacyCache {
+        \\    pub slot: u64,
+        \\}
+        \\@link_name("cx_legacy_fn")
+        \\@link_section(".text.legacy")
+        \\pub fn legacy_hook() -> i32 {
+        \\    return 0;
+        \\}
+    ;
+    var retired_res = try runResolveAndTypecheck(std.testing.allocator, retired_attrs_src);
+    defer retired_res.deinit();
+    try std.testing.expect(hasDiagnosticCode(&retired_res.diagnostics, .e0239_retired_layout_or_link_attribute));
+
+    var e0239_hits: usize = 0;
+    for (retired_res.diagnostics.diagnostics.items) |diag_item| {
+        if (diag_item.code == .e0239_retired_layout_or_link_attribute) {
+            e0239_hits += 1;
+            try std.testing.expect(diag_item.suggestions.len >= 1);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), e0239_hits);
+}

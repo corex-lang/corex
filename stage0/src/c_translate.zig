@@ -35,7 +35,7 @@ const MacroConstValue = c_frontend.MacroConstValue;
 pub const TranslateOptions = struct {
     /// Emits `use core.ffi.{…};` instead of `use cx.ffi.{…};` when bootstrapping `core` internals.
     is_internal_core: bool = false,
-    /// Emits a 3-part `//!` module header comment at the top of the translated `.cx` buffer.
+    /// Emits a 3-part `/#` module header comment at the top of the translated `.cx` buffer.
     has_header_comment: bool = false,
     /// Preserves original C nominal/symbol identifiers (adding `@allow(non_canonical_case)` where needed).
     is_preserving_c_names: bool = true,
@@ -829,22 +829,44 @@ const CTranslator = struct {
 
         // [3] Check whether this struct contains any bitfields or custom `#pragma pack` overrides:
         var has_bitfields = false;
-        var has_sub_natural_pack = false;
+        var has_field_override = false;
         const pack_cap: u32 = if (rec.layout_attrs.pragma_pack > 0) rec.layout_attrs.pragma_pack else 0;
+        const is_supported_pack_cap = pack_cap == 0 or
+            pack_cap == 1 or
+            pack_cap == 2 or
+            pack_cap == 4 or
+            pack_cap == 8 or
+            pack_cap == 16;
+        const is_align_compatible_with_pack = pack_cap <= 1 or
+            rec.layout_attrs.explicit_align == 0 or
+            rec.layout_attrs.explicit_align >= pack_cap;
         for (fields) |fld| {
             if (fld.bit_width != null) has_bitfields = true;
-            if (fld.is_packed_field or fld.explicit_align > 0) has_sub_natural_pack = true;
-            if (pack_cap > 1 and self.computeCTypeNaturalAlign(fld.type_id, 0) > pack_cap) {
-                has_sub_natural_pack = true;
-            }
+            if (fld.is_packed_field or fld.explicit_align > 0) has_field_override = true;
         }
 
-        if (!has_bitfields and !has_sub_natural_pack) {
+        if (!has_bitfields and !has_field_override and is_supported_pack_cap and is_align_compatible_with_pack) {
             try self.emitPlainStructBody(cx_name, fields, rec.layout_attrs);
             return;
         }
 
         try self.emitBitfieldOrPackedStructBody(rec_id, cx_name, fields, rec.layout_attrs);
+    }
+
+    /// Emits a consolidated `@repr(C[, packed: …][, align: …])` attribute line (`ADR-24C`).
+    fn emitReprCAttr(writer: ByteWriter, packed_cap: u32, align_bytes: u64) !void {
+        try writer.writeAll("@repr(C");
+        if (packed_cap == 1) {
+            try writer.writeAll(", packed: true");
+        } else if (packed_cap > 1) {
+            try writer.writeAll(", packed: ");
+            try writer.writeUnsigned(packed_cap);
+        }
+        if (align_bytes > 1) {
+            try writer.writeAll(", align: ");
+            try writer.writeUnsigned(align_bytes);
+        }
+        try writer.writeAll(")\n");
     }
 
     /// Emits a C `union` declaration, synthesizing `_raw_bytes` + masked bitfield accessors when needed.
@@ -881,15 +903,13 @@ const CTranslator = struct {
         if (!isCanonicalPascalTypeIdent(cx_name)) {
             try writer.writeAll("@allow(non_canonical_case)\n");
         }
-        if (layout_attrs.explicit_align > 1 or (has_raw_bytes_layout and summary.align_bytes > 1)) {
-            try writer.writeAll("@align(");
-            try writer.writeUnsigned(summary.align_bytes);
-            try writer.writeAll(")\n");
-        }
-        if (is_packed_union) {
-            try writer.writeAll("@packed\n");
-        }
-        try writer.writeSlices(&.{ "@repr(C)\npub union ", cx_name, " {\n" });
+        const union_align: u64 = if (layout_attrs.explicit_align > 1 or
+            (has_raw_bytes_layout and summary.align_bytes > 1))
+            summary.align_bytes
+        else
+            0;
+        try emitReprCAttr(writer, 0, union_align);
+        try writer.writeSlices(&.{ "pub union ", cx_name, " {\n" });
 
         if (fields.len == 0 or summary.size_bytes == 0) {
             try writer.writeAll("    _empty: [u8; 0],\n}\n\n");
@@ -965,15 +985,18 @@ const CTranslator = struct {
         if (!isCanonicalPascalTypeIdent(cx_name)) {
             try writer.writeAll("@allow(non_canonical_case)\n");
         }
-        if (layout_attrs.explicit_align > 1) {
-            try writer.writeAll("@align(");
-            try writer.writeUnsigned(layout_attrs.explicit_align);
-            try writer.writeAll(")\n");
-        }
-        if (layout_attrs.is_packed or layout_attrs.pragma_pack == 1) {
-            try writer.writeAll("@packed\n");
-        }
-        try writer.writeSlices(&.{ "@repr(C)\npub struct ", cx_name, " {\n" });
+        const eff_packed_cap: u32 = if (layout_attrs.is_packed or layout_attrs.pragma_pack == 1)
+            1
+        else if (layout_attrs.pragma_pack == 2 or
+            layout_attrs.pragma_pack == 4 or
+            layout_attrs.pragma_pack == 8 or
+            layout_attrs.pragma_pack == 16)
+            layout_attrs.pragma_pack
+        else
+            0;
+        const eff_explicit_align: u64 = if (layout_attrs.explicit_align > 1) layout_attrs.explicit_align else 0;
+        try emitReprCAttr(writer, eff_packed_cap, eff_explicit_align);
+        try writer.writeSlices(&.{ "pub struct ", cx_name, " {\n" });
 
         if (fields.len == 0) {
             try writer.writeAll("    _empty: [u8; 0],\n}\n\n");
@@ -1158,15 +1181,8 @@ const CTranslator = struct {
         if (!isCanonicalPascalTypeIdent(cx_name)) {
             try writer.writeAll("@allow(non_canonical_case)\n");
         }
-        if (max_align > 1) {
-            try writer.writeAll("@align(");
-            try writer.writeUnsigned(max_align);
-            try writer.writeAll(")\n");
-        }
-        if (is_packed_struct_needed) {
-            try writer.writeAll("@packed\n");
-        }
-        try writer.writeSlices(&.{ "@repr(C)\npub struct ", cx_name, " {\n" });
+        try emitReprCAttr(writer, if (is_packed_struct_needed) 1 else 0, if (max_align > 1) max_align else 0);
+        try writer.writeSlices(&.{ "pub struct ", cx_name, " {\n" });
 
         var accessors: std.ArrayListUnmanaged(BitfieldAccessorSpec) = .empty;
         defer accessors.deinit(self.allocator);
@@ -1657,7 +1673,7 @@ const CTranslator = struct {
         try self.emitted_top_names.put(self.allocator, sym_info.cx_name, {});
         const writer = self.bodyWriter();
 
-        // Emit stacked return-level FFI contract and `@link_name` attributes:
+        // Emit stacked return-level FFI contract and `@link(name: …)` attributes:
         if (fd.ret_contract.free_with_fn.len > 0) {
             try writer.writeSlices(&.{
                 "@free_with(",
@@ -1670,7 +1686,7 @@ const CTranslator = struct {
             });
         }
         if (sym_info.has_link_name_override) {
-            try writer.writeAll("@link_name(");
+            try writer.writeAll("@link(name: ");
             try appendEscapedCxStringLiteral(self.allocator, &self.body_buf, fd.name);
             try writer.writeAll(")\n");
         }
@@ -1784,7 +1800,7 @@ const CTranslator = struct {
 
         const writer = self.bodyWriter();
         if (sym_info.has_link_name_override) {
-            try writer.writeAll("@link_name(");
+            try writer.writeAll("@link(name: ");
             try appendEscapedCxStringLiteral(self.allocator, &self.body_buf, vd.name);
             try writer.writeAll(")\n");
         }
@@ -1844,11 +1860,11 @@ const CTranslator = struct {
 
         if (self.options.has_header_comment) {
             try writer.writeAll(
-                "//! Auto-Translated C11/C23 Foreign Function Interface Bindings\n" ++
-                    "//!\n" ++
-                    "//! Generated by the CoreX zero-`libclang` C header translator (`DR-10`, `DR-20` `Prune-06`).\n" ++
-                    "//!\n" ++
-                    "//! Target-calibrated C primitive widths, bitfield byte arrays, and FFI boundary contracts.\n\n",
+                "/# Auto-Translated C11/C23 Foreign Function Interface Bindings\n" ++
+                    "/#\n" ++
+                    "/# Generated by the CoreX zero-`libclang` C header translator (`DR-10`, `DR-20` `Prune-06`).\n" ++
+                    "/#\n" ++
+                    "/# Target-calibrated C primitive widths, bitfield byte arrays, and FFI boundary contracts.\n\n",
             );
         }
 
@@ -2005,7 +2021,7 @@ fn sanitizeTypeIdent(
     return base_name;
 }
 
-/// Escapes UTF-8 bytes into a valid CoreX double-quoted string literal (`"` / `\` / `\n` / `{` / `}`).
+/// Escapes UTF-8 bytes into a valid CoreX double-quoted plain string literal (`"` / `\` / `\n`).
 fn appendEscapedCxStringLiteral(
     allocator: std.mem.Allocator,
     out_buf: *std.ArrayListUnmanaged(u8),
@@ -2020,8 +2036,6 @@ fn appendEscapedCxStringLiteral(
             '\r' => try out_buf.appendSlice(allocator, "\\r"),
             '\t' => try out_buf.appendSlice(allocator, "\\t"),
             0 => try out_buf.appendSlice(allocator, "\\0"),
-            '{' => try out_buf.appendSlice(allocator, "{{"),
-            '}' => try out_buf.appendSlice(allocator, "}}"),
             else => {
                 if (byte_val >= 0x20 and byte_val <= 0x7E) {
                     try out_buf.append(allocator, byte_val);
@@ -2434,10 +2448,10 @@ test "test_c_translate_pointers_opaque_structs_sal_contracts_and_fmt_idempotency
     try std.testing.expect(std.mem.indexOf(u8, cx_out, "args: VaListParam") != null);
     try std.testing.expect(std.mem.indexOf(u8, cx_out, "c_ulong") == null);
 
-    // [3] Verify opaque `sqlite3`, deduplicated `Packet`, keyword escape `type_` & `@link_name("match")`:
+    // [3] Verify opaque `sqlite3`, deduplicated `Packet`, keyword escape `type_` & `@link(name: "match")`:
     try std.testing.expect(std.mem.indexOf(u8, cx_out, "_opaque: [u8; 0]") != null);
     try std.testing.expect(std.mem.indexOf(u8, cx_out, "pub type_: c_int") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cx_out, "@link_name(\"match\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cx_out, "@link(name: \"match\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, cx_out, "pub extern \"C\" fn match_(") != null);
 
     // [4] Verify `ADR-22F` pointer & callback lowering + SAL / `malloc` contracts:
@@ -2488,9 +2502,9 @@ test "test_c_translate_c23_enums_duplicate_discriminants_nested_unions_and_core_
     defer allocator.free(cx_out);
     try std.testing.expectEqual(@as(u32, 0), sink.error_count);
 
-    // Verify `use core.ffi.` and `@link_name("SDL_Init")` on normalized `sdl_init`:
+    // Verify `use core.ffi.` and `@link(name: "SDL_Init")` on normalized `sdl_init`:
     try std.testing.expect(std.mem.indexOf(u8, cx_out, "use core.ffi.{c_int, c_uint};") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cx_out, "@link_name(\"SDL_Init\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cx_out, "@link(name: \"SDL_Init\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, cx_out, "pub extern \"C\" fn sdl_init(") != null);
 
     // Verify the emitted enum + duplicate-discriminant constant alias + nested union typecheck cleanly:
@@ -2934,4 +2948,59 @@ test "test_c_translate_mixed_sign_i128_enum_min_int_variants_and_syntax_error_gu
         error.InvalidTranslatedSyntax,
         translateUnit(allocator, &malformed_unit, .{ .is_formatted = true }),
     );
+}
+
+test "test_dr24_c_translate_consolidated_repr_link_doc_header_and_literal_braces" {
+    const allocator = std.testing.allocator;
+    const type_system = @import("type_system.zig");
+
+    const dr24_hdr =
+        \\#include <stdint.h>
+        \\#define JSON_TEMPLATE "{\"ok\":1}"
+        \\#pragma pack(push, 2)
+        \\struct __attribute__((aligned(8))) PackedHdr {
+        \\    uint8_t tag;
+        \\    uint32_t word;
+        \\};
+        \\#pragma pack(pop)
+        \\int fn(int val);
+    ;
+
+    var sink = DiagnosticSink.init(allocator);
+    defer sink.deinit();
+    const cx_out = try translateHeaderSource(
+        allocator,
+        dr24_hdr,
+        "dr24.h",
+        .none,
+        .{ .target = TargetSpec.X86_64_LINUX_GNU },
+        .{ .has_header_comment = true },
+        &sink,
+    );
+    defer allocator.free(cx_out);
+    try std.testing.expectEqual(@as(u32, 0), sink.error_count);
+
+    try std.testing.expect(std.mem.startsWith(u8, cx_out, "/# Auto-Translated"));
+    try std.testing.expect(std.mem.indexOf(u8, cx_out, "//!") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cx_out, "@repr(C, packed: 2, align: 8)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cx_out, "@link(name: \"fn\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cx_out, "pub const JSON_TEMPLATE: str = \"{\\\"ok\\\":1}\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cx_out, "{{") == null);
+
+    const body_after_use = cx_out[std.mem.indexOf(u8, cx_out, "use cx.ffi").?..];
+    const after_semi = body_after_use[std.mem.indexOfScalar(u8, body_after_use, ';').? + 1 ..];
+    const tc_harness = try std.fmt.allocPrint(
+        allocator,
+        "pub type c_int = i32;\n{s}\npub fn check_hdr() {{\n" ++
+            "    @compile_assert(@size_of[PackedHdr]() == 8, \"8B\");\n" ++
+            "    @compile_assert(@align_of[PackedHdr]() == 8, \"8B align\");\n" ++
+            "    @compile_assert(JSON_TEMPLATE.len() == 8, \"8B literal braces\");\n" ++
+            "}}\n",
+        .{after_semi},
+    );
+    defer allocator.free(tc_harness);
+
+    var tc_res = try type_system.typecheckSource(allocator, FileId.fromInt(32), tc_harness);
+    defer tc_res.deinit();
+    try std.testing.expectEqual(@as(usize, 0), tc_res.diagnostics.countDiagnostics());
 }

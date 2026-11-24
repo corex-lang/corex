@@ -41,3 +41,14 @@
 3 - const MAX__LIMIT: u32 = 10;
 3 + const MAX_LIMIT: u32 = 10;
   ╰───────
+
+⚠︎ warning[W0119]: interpolated format string contains no `{…}` holes (`useless-format-string`)
+  ╭─▸ src/lexer/warnings.cx:4:16
+  │
+4 │ let no_holes = f"plain {{ok}}";
+  │                ^^^^^^^^^^^^^^^ format string contains zero `{…}` interpolation holes; remove `f` prefix
+  │
+  ├╴ help: remove `f` prefix from static string literal
+4 - let no_holes = f"plain {{ok}}";
+4 + let no_holes = "plain {ok}";
+  ╰───────

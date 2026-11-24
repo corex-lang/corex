@@ -702,7 +702,7 @@ test "test_lsp_semantic_tokens_delta_hover_and_dr17_contracts" {
     const sem_uri = "file:///D%3A/virt/sem_contracts.cx";
     const contracts_cx =
         "pub const HEADER_SEED: i32 = 7; // trailing comment on previous constant\n" ++
-        "/// Clamps telemetry sample within real-time bounds.\n" ++
+        "/| Clamps telemetry sample within real-time bounds.\n" ++
         "@no_alloc\n" ++
         "@no_panic\n" ++
         "@max_stack(256)\n" ++
@@ -712,7 +712,7 @@ test "test_lsp_semantic_tokens_delta_hover_and_dr17_contracts" {
         "    }\n" ++
         "    return sample;\n" ++
         "}\n" ++
-        "/// Reads raw MMIO status word.\n" ++
+        "/| Reads raw MMIO status word.\n" ++
         "pub fn read_mmio_word(reg_addr: *i32) -> i32 {\n" ++
         "    return unsafe { reg_addr.* };\n" ++
         "}\n";
@@ -805,6 +805,27 @@ test "test_lsp_semantic_tokens_delta_hover_and_dr17_contracts" {
     try std.testing.expect(full_v1_data.len >= 25);
     try std.testing.expectEqual(@as(usize, 0), full_v1_data.len % 5);
 
+    // Verify `/|` outer doc comment marker on line 1 (`character == 0`) emits `length == 2` (`comment` + `documentation`):
+    var v1_line: u32 = 0;
+    var v1_col: u32 = 0;
+    var saw_slash_pipe_len2 = false;
+    var v1_idx: usize = 0;
+    while (v1_idx + 5 <= full_v1_data.len) : (v1_idx += 5) {
+        if (full_v1_data[v1_idx] > 0) {
+            v1_line += full_v1_data[v1_idx];
+            v1_col = full_v1_data[v1_idx + 1];
+        } else {
+            v1_col += full_v1_data[v1_idx + 1];
+        }
+        if (v1_line == 1 and v1_col == 0) {
+            try std.testing.expectEqual(@as(u32, 2), full_v1_data[v1_idx + 2]);
+            try std.testing.expectEqual(@as(u32, 15), full_v1_data[v1_idx + 3]);
+            try std.testing.expect((full_v1_data[v1_idx + 4] & (1 << 8)) != 0);
+            saw_slash_pipe_len2 = true;
+        }
+    }
+    try std.testing.expect(saw_slash_pipe_len2);
+
     try std.testing.expect(
         std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":3").?, "\"edits\":[]") != null,
     );
@@ -839,7 +860,7 @@ test "test_lsp_semantic_tokens_delta_hover_and_dr17_contracts" {
     try patched_tokens.appendSlice(allocator, full_v1_data[sem_edit.start + sem_edit.delete_count ..]);
     try std.testing.expectEqualSlices(u32, full_v2_data, patched_tokens.items);
 
-    // [3] Verify `DR-17` contract verification, stack budget, pure vs `[unsafe_op]` capabilities, and `///` docs:
+    // [3] Verify `DR-17` contract verification, stack budget, pure vs `[unsafe_op]` capabilities, and `/|` docs:
     const clamp_hover = findFrameByIdFragment(outcome.frames, "\"id\":7").?;
     try std.testing.expect(
         std.mem.indexOf(u8, clamp_hover, "pub fn clamp_sample(sample: i32, ceiling: i32) -> i32") != null,
@@ -1812,10 +1833,10 @@ test "test_lsp_windows_large_mounted_disk_file_remains_writable_and_replaceable"
 
     var large_buf = std.Io.Writer.Allocating.init(allocator);
     defer large_buf.deinit();
-    try large_buf.writer.writeAll("//! Large Workspace Module\n//!\n//! Exercises >= 16 KiB disk mounts inside LspSession.\n\n");
+    try large_buf.writer.writeAll("/# Large Workspace Module\n/#\n/# Exercises >= 16 KiB disk mounts inside LspSession.\n\n");
     var idx: usize = 0;
     while (large_buf.written().len < 20 * 1024) : (idx += 1) {
-        try large_buf.writer.print("/// Helper {d}.\npub fn helper_{d}() -> i32 = {d};\n", .{ idx, idx, idx });
+        try large_buf.writer.print("/| Helper {d}.\npub fn helper_{d}() -> i32 = {d};\n", .{ idx, idx, idx });
     }
     try writeWorkspaceFile(allocator, io, ws_dir, "large_mod.cx", large_buf.written());
 
@@ -1830,7 +1851,7 @@ test "test_lsp_windows_large_mounted_disk_file_remains_writable_and_replaceable"
     try std.testing.expectEqual(large_buf.written().len, session.vfs.getFileSource(fid).?.len);
 
     // Verify in-place truncating editor saves succeed while `LspSession` holds `fid` mounted on Windows:
-    const updated_src = "//! Updated Module\n//!\n//! Saved in-place by editor.\n\npub fn saved_ok() -> i32 = 42;\n";
+    const updated_src = "/# Updated Module\n/#\n/# Saved in-place by editor.\n\npub fn saved_ok() -> i32 = 42;\n";
     const truncated_file = try std.Io.Dir.cwd().createFile(io, full_large_path, .{ .truncate = true });
     defer truncated_file.close(io);
     try truncated_file.writeStreamingAll(io, updated_src);
@@ -1847,14 +1868,14 @@ test "test_lsp_std_core_tab_switch_epoch_stability_hovers_semantic_tokens_and_sp
     }
 
     const core_src =
-        "//! Core Slice Utilities\n\n" ++
-        "/// UTF-8 byte buffer wrapper.\n" ++
+        "/# Core Slice Utilities\n\n" ++
+        "/| UTF-8 byte buffer wrapper.\n" ++
         "pub struct ByteBuf {\n" ++
         "    pub ptr: *opaque,\n" ++
         "    pub len: usize,\n" ++
         "}\n" ++
         "impl ByteBuf {\n" ++
-        "    /// Returns current byte length.\n" ++
+        "    /| Returns current byte length.\n" ++
         "    @no_alloc @no_panic\n" ++
         "    pub fn byte_len(&self) -> usize {\n" ++
         "        let mask = 27_usize;\n" ++
@@ -1970,9 +1991,14 @@ test "test_lsp_std_core_tab_switch_epoch_stability_hovers_semantic_tokens_and_sp
     }
     try std.testing.expect(sem_frame_idx > 0 and diag_frame_idx > sem_frame_idx);
 
-    // Check `let mask` semantic token on line 11 (`character == 12`, `length == 4`): zero `readonly` (`1<<2`) or `defaultLibrary` (`1<<9`):
+    // Check `/#` marker (`length == 2` at `0:0`) and `let mask` semantic token on line 11 (`character == 12`, `length == 4`):
     const sem_data = try extractJsonU32Array(allocator, out_1.frames[sem_frame_idx], "\"data\":[");
     defer allocator.free(sem_data);
+    try std.testing.expectEqual(@as(u32, 0), sem_data[0]);
+    try std.testing.expectEqual(@as(u32, 0), sem_data[1]);
+    try std.testing.expectEqual(@as(u32, 2), sem_data[2]);
+    try std.testing.expectEqual(@as(u32, 15), sem_data[3]);
+    try std.testing.expect((sem_data[4] & (1 << 8)) != 0);
     var cur_line: u32 = 0;
     var cur_col: u32 = 0;
     var saw_mask_local = false;
@@ -2057,5 +2083,347 @@ test "test_lsp_std_core_tab_switch_epoch_stability_hovers_semantic_tokens_and_sp
             broken_diag_frame.?,
             "\"start\":{\"line\":4,\"character\":19},\"end\":{\"line\":4,\"character\":46}",
         ) != null,
+    );
+}
+
+test "test_lsp_dr24_doc_markers_fmt_string_holes_rename_and_attr_completion" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const dr24_uri = "file:///D%3A/virt/dr24_fmt_lsp.cx";
+    const dr24_src =
+        "/# Module Doc Header (`dr24_fmt_lsp`)\n" ++
+        "/#   - Preserves indented list item\n" ++
+        "\n" ++
+        "/| Cache-aligned coordinate pair.\n" ++
+        "@repr(C, align: .CacheLine, zero_pad: true)\n" ++
+        "pub struct Pair {\n" ++
+        "    pub x_val: i32,\n" ++
+        "    pub y_val: i32,\n" ++
+        "}\n" ++
+        "pub fn format_pair(pt: Pair, x: i32) -> str {\n" ++
+        "    let scaled = pt.x_val * x;\n" ++
+        "    _ = scaled;\n" ++
+        "    return f\"pair({x=}, {pt.x_val:04})\";\n" ++
+        "}\n" ++
+        "pub fn complete_in_hole(pt: Pair) -> str {\n" ++
+        "    return f\"val={pt.}\";\n" ++
+        "}\n";
+
+    var inbound: std.ArrayListUnmanaged(u8) = .empty;
+    defer inbound.deinit(allocator);
+
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{" ++
+            "\"general\":{\"positionEncodings\":[\"utf-8\"]},\"textDocument\":{\"diagnostic\":{}}}}}",
+    );
+    try appendDidOpenFrame(allocator, &inbound, dr24_uri, 1, dr24_src);
+
+    // `#2` `semanticTokens/full` (`/#` & `/|` length == 2 + `f"…"` hole token splitting):
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/semanticTokens/full\"," ++
+            "\"params\":{\"textDocument\":{\"uri\":\"file:///D%3A/virt/dr24_fmt_lsp.cx\"}}}",
+    );
+    // `#3` Hover on `@repr` (`line 4, character 2`) & `#4` hover on `x` inside `{x=}` (`line 12, character 19`):
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/hover\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///D%3A/virt/dr24_fmt_lsp.cx\"},\"position\":{\"line\":4,\"character\":2}}}",
+    );
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/hover\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///D%3A/virt/dr24_fmt_lsp.cx\"},\"position\":{\"line\":12,\"character\":19}}}",
+    );
+    // `#5` `definition` on `x_val` inside `{pt.x_val:04}` (`line 12, character 29` -> `line 6, character 8`):
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/definition\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///D%3A/virt/dr24_fmt_lsp.cx\"},\"position\":{\"line\":12,\"character\":29}}}",
+    );
+    // `#6` `references` on `x` inside `{x=}` (`line 12, character 19` -> param `line 9`, use `line 10`, hole `line 12`):
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"textDocument/references\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///D%3A/virt/dr24_fmt_lsp.cx\"}," ++
+            "\"position\":{\"line\":12,\"character\":19},\"context\":{\"includeDeclaration\":true}}}",
+    );
+    // `#7` `prepareRename` & `#8` `rename` on `{x=}` -> `y` (replaces `19..20`, leaving `=}` intact -> `{y=}`):
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/prepareRename\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///D%3A/virt/dr24_fmt_lsp.cx\"},\"position\":{\"line\":12,\"character\":19}}}",
+    );
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"textDocument/rename\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///D%3A/virt/dr24_fmt_lsp.cx\"}," ++
+            "\"position\":{\"line\":12,\"character\":19},\"newName\":\"y\"}}",
+    );
+    // `#9` Dot-completion inside `f"val={pt.}"` (`line 15, character 21`), `#10` outside `{…}` (`line 15, character 15`),
+    // and `#11` `@` attribute completion (`line 4, character 1`):
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"textDocument/completion\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///D%3A/virt/dr24_fmt_lsp.cx\"},\"position\":{\"line\":15,\"character\":21}}}",
+    );
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"textDocument/completion\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///D%3A/virt/dr24_fmt_lsp.cx\"},\"position\":{\"line\":15,\"character\":15}}}",
+    );
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"textDocument/completion\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///D%3A/virt/dr24_fmt_lsp.cx\"},\"position\":{\"line\":4,\"character\":1}}}",
+    );
+    try appendLspFrame(allocator, &inbound, "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"shutdown\",\"params\":null}");
+    try appendLspFrame(allocator, &inbound, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}");
+
+    var outcome = try executeLspTranscript(allocator, io, inbound.items, null, .{});
+    defer outcome.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), outcome.exit_code);
+
+    const sem_tokens = try extractJsonU32Array(
+        allocator,
+        findFrameByIdFragment(outcome.frames, "\"id\":2").?,
+        "\"data\":[",
+    );
+    defer allocator.free(sem_tokens);
+    // Line 0 `/#` (`0,0,2,15,256`), Line 1 `/#` (`1,0,2,15,256`), Line 3 `/|` (`2,0,2,15,256`):
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 0, 0, 2, 15, 256, 1, 0, 2, 15, 256, 2, 0, 2, 15, 256 }, sem_tokens[0..15]);
+
+    try std.testing.expect(std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":3").?, ".CacheLine") != null);
+    try std.testing.expect(std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":4").?, "x: i32") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":5").?, "\"line\":6,\"character\":8") != null,
+    );
+
+    const refs_frame = findFrameByIdFragment(outcome.frames, "\"id\":6").?;
+    try std.testing.expect(std.mem.indexOf(u8, refs_frame, "\"line\":9,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refs_frame, "\"line\":10,") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, refs_frame, "\"start\":{\"line\":12,\"character\":19},\"end\":{\"line\":12,\"character\":20}") != null,
+    );
+
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":7").?, "\"placeholder\":\"x\"") != null,
+    );
+    const rename_frame = findFrameByIdFragment(outcome.frames, "\"id\":8").?;
+    try std.testing.expect(std.mem.indexOf(u8, rename_frame, "\"newText\":\"y\"") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, rename_frame, "\"start\":{\"line\":12,\"character\":19},\"end\":{\"line\":12,\"character\":20}") != null,
+    );
+
+    const hole_comp = findFrameByIdFragment(outcome.frames, "\"id\":9").?;
+    try std.testing.expect(std.mem.indexOf(u8, hole_comp, "\"label\":\"x_val\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hole_comp, "\"label\":\"y_val\"") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":10").?, "\"items\":[]") != null,
+    );
+
+    const attr_comp = findFrameByIdFragment(outcome.frames, "\"id\":11").?;
+    try std.testing.expect(std.mem.indexOf(u8, attr_comp, "\"label\":\"repr\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attr_comp, "\"label\":\"link\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attr_comp, "\"label\":\"inline\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attr_comp, "\"label\":\"align\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, attr_comp, "\"label\":\"cache_aligned\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, attr_comp, "\"label\":\"link_name\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, attr_comp, "\"label\":\"link_section\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, attr_comp, "\"label\":\"packed\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, attr_comp, "\"label\":\"repr_c\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, attr_comp, "\"label\":\"zero_pad\"") == null);
+}
+
+test "test_lsp_nested_fmt_string_holes_cursor_guard_semantic_monotonicity_and_struct_field_refs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // [1] Direct `isCursorInsideFmtStringHole` boundary assertions across nested `f"…"` and struct-literal holes:
+    const nested_lex = "f\"outer {f\"inner {pt.}\"}\"";
+    try std.testing.expect(!lsp_server.isCursorInsideFmtStringHole(nested_lex, 4));
+    try std.testing.expect(!lsp_server.isCursorInsideFmtStringHole(nested_lex, 8));
+    try std.testing.expect(lsp_server.isCursorInsideFmtStringHole(nested_lex, 9));
+    try std.testing.expect(!lsp_server.isCursorInsideFmtStringHole(nested_lex, 13));
+    try std.testing.expect(!lsp_server.isCursorInsideFmtStringHole(nested_lex, 17));
+    try std.testing.expect(lsp_server.isCursorInsideFmtStringHole(nested_lex, 18));
+    try std.testing.expect(lsp_server.isCursorInsideFmtStringHole(nested_lex, 21));
+    try std.testing.expect(!lsp_server.isCursorInsideFmtStringHole(nested_lex, 22));
+    try std.testing.expect(lsp_server.isCursorInsideFmtStringHole(nested_lex, 23));
+    try std.testing.expect(!lsp_server.isCursorInsideFmtStringHole(nested_lex, 24));
+
+    const plain_in_hole_lex = "f\"a {call(\"plain.\")}\"";
+    try std.testing.expect(lsp_server.isCursorInsideFmtStringHole(plain_in_hole_lex, 6));
+    try std.testing.expect(!lsp_server.isCursorInsideFmtStringHole(plain_in_hole_lex, 14));
+
+    const struct_hole_lex = "f\"{Point { x: 1 }.}\"";
+    try std.testing.expect(lsp_server.isCursorInsideFmtStringHole(struct_hole_lex, 18));
+
+    // [2] End-to-end LSP verification for nested `f"outer {f"inner {val}"}"` & `f"{Point { x: 1, y: 2 }.x}"`:
+    const nested_uri = "file:///D%3A/virt/dr24_nested_fmt.cx";
+    const nested_src =
+        "pub struct Point {\n" ++
+        "    pub x: i32,\n" ++
+        "    pub y: i32,\n" ++
+        "}\n" ++
+        "pub fn format_nested(pt: Point, val: i32) -> str {\n" ++
+        "    _ = pt;\n" ++
+        "    let field_msg = f\"{Point { x: 1, y: 2 }.x}\";\n" ++
+        "    _ = field_msg;\n" ++
+        "    return f\"outer {f\"inner {val}\"}\";\n" ++
+        "}\n" ++
+        "pub fn complete_nested(pt: Point) -> str {\n" ++
+        "    return f\"outer {f\"inner {pt.}\"}\";\n" ++
+        "}\n";
+
+    var inbound: std.ArrayListUnmanaged(u8) = .empty;
+    defer inbound.deinit(allocator);
+
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{" ++
+            "\"general\":{\"positionEncodings\":[\"utf-8\"]},\"textDocument\":{\"diagnostic\":{}}}}}",
+    );
+    try appendDidOpenFrame(allocator, &inbound, nested_uri, 1, nested_src);
+
+    // `#2` `semanticTokens/full`:
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/semanticTokens/full\"," ++
+            "\"params\":{\"textDocument\":{\"uri\":\"file:///D%3A/virt/dr24_nested_fmt.cx\"}}}",
+    );
+    // `#3` Hover on `val` inside `f"outer {f"inner {val}"}"` (`line 8, character 30`) & `#4` hover on `"inner"` (`line 8, character 24`):
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/hover\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///D%3A/virt/dr24_nested_fmt.cx\"},\"position\":{\"line\":8,\"character\":30}}}",
+    );
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/hover\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///D%3A/virt/dr24_nested_fmt.cx\"},\"position\":{\"line\":8,\"character\":24}}}",
+    );
+    // `#5` `definition` on `.struct_field_init` label `x` in `f"{Point { x: 1, y: 2 }.x}"` (`line 6, character 31` -> `line 1, character 8`):
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/definition\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///D%3A/virt/dr24_nested_fmt.cx\"},\"position\":{\"line\":6,\"character\":31}}}",
+    );
+    // `#6` `rename` on `Point.x` from `x: 1` inside hole (`line 6, character 31` -> `x_coord`):
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"textDocument/rename\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///D%3A/virt/dr24_nested_fmt.cx\"}," ++
+            "\"position\":{\"line\":6,\"character\":31},\"newName\":\"x_coord\"}}",
+    );
+    // `#7` `rename` on `val` inside nested hole (`line 8, character 30` -> `inner_val`, zero duplicate edits):
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/rename\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///D%3A/virt/dr24_nested_fmt.cx\"}," ++
+            "\"position\":{\"line\":8,\"character\":30},\"newName\":\"inner_val\"}}",
+    );
+    // `#8` Completion inside nested `{pt.}` (`line 11, character 32`) vs `#9` inside `"inner"` text (`line 11, character 24`):
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"textDocument/completion\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///D%3A/virt/dr24_nested_fmt.cx\"},\"position\":{\"line\":11,\"character\":32}}}",
+    );
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"textDocument/completion\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///D%3A/virt/dr24_nested_fmt.cx\"},\"position\":{\"line\":11,\"character\":24}}}",
+    );
+    try appendLspFrame(allocator, &inbound, "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"shutdown\",\"params\":null}");
+    try appendLspFrame(allocator, &inbound, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}");
+
+    var outcome = try executeLspTranscript(allocator, io, inbound.items, null, .{});
+    defer outcome.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), outcome.exit_code);
+
+    // Assert strictly monotonic, non-overlapping semantic token spans across the entire file & `val` token on line 8 (`29..32`):
+    const sem_tokens = try extractJsonU32Array(
+        allocator,
+        findFrameByIdFragment(outcome.frames, "\"id\":2").?,
+        "\"data\":[",
+    );
+    defer allocator.free(sem_tokens);
+    var abs_line: u32 = 0;
+    var abs_col: u32 = 0;
+    var prev_line_end: u32 = 0;
+    var has_prev_tok = false;
+    var saw_nested_val_tok = false;
+    var tok_cursor: usize = 0;
+    while (tok_cursor + 5 <= sem_tokens.len) : (tok_cursor += 5) {
+        const delta_line = sem_tokens[tok_cursor];
+        const delta_col = sem_tokens[tok_cursor + 1];
+        const tok_len = sem_tokens[tok_cursor + 2];
+        if (delta_line > 0) {
+            abs_line += delta_line;
+            abs_col = delta_col;
+        } else {
+            if (has_prev_tok) {
+                try std.testing.expect(abs_col + delta_col >= prev_line_end);
+            }
+            abs_col += delta_col;
+        }
+        prev_line_end = abs_col + tok_len;
+        has_prev_tok = true;
+        if (abs_line == 8 and abs_col == 29 and tok_len == 3) {
+            saw_nested_val_tok = true;
+        }
+    }
+    try std.testing.expect(saw_nested_val_tok);
+
+    try std.testing.expect(std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":3").?, "val: i32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":4").?, "\"result\":null") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":5").?, "\"line\":1,\"character\":8") != null,
+    );
+
+    const field_rename = findFrameByIdFragment(outcome.frames, "\"id\":6").?;
+    try std.testing.expect(
+        std.mem.indexOf(u8, field_rename, "\"start\":{\"line\":1,\"character\":8},\"end\":{\"line\":1,\"character\":9}") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, field_rename, "\"start\":{\"line\":6,\"character\":31},\"end\":{\"line\":6,\"character\":32}") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, field_rename, "\"start\":{\"line\":6,\"character\":44},\"end\":{\"line\":6,\"character\":45}") != null,
+    );
+
+    const nested_val_rename = findFrameByIdFragment(outcome.frames, "\"id\":7").?;
+    const needle_edit = "\"start\":{\"line\":8,\"character\":29},\"end\":{\"line\":8,\"character\":32}";
+    const first_occ = std.mem.indexOf(u8, nested_val_rename, needle_edit);
+    try std.testing.expect(first_occ != null);
+    try std.testing.expect(std.mem.indexOfPos(u8, nested_val_rename, first_occ.? + needle_edit.len, needle_edit) == null);
+
+    const nested_comp = findFrameByIdFragment(outcome.frames, "\"id\":8").?;
+    try std.testing.expect(std.mem.indexOf(u8, nested_comp, "\"label\":\"x\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nested_comp, "\"label\":\"y\"") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":9").?, "\"items\":[]") != null,
     );
 }

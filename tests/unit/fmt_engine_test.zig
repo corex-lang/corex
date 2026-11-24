@@ -364,7 +364,7 @@ test "test_fmt_advanced_declarations_function_types_unary_ops_and_patterns" {
 
 test "test_fmt_comment_preservation_empty_containers_and_fmt_off_directives" {
     const src =
-        "//! Module-level doc comment\n\n" ++
+        "/# Module-level doc comment\n\n" ++
         "// Leading file comment\n" ++
         "pub struct EmptyStruct {\n" ++
         "    // Dangling comment inside empty struct braces\n" ++
@@ -645,31 +645,31 @@ test "test_fmt_struct_payload_variant_cond_parens_and_columnar_grid_idempotency"
 
 test "test_fmt_preserves_comments_across_slot14_coalesced_trivia" {
     const coalesced_header_src =
-        "//! Line 1 of module header\n" ++
-        "//! Line 2 of module header\n" ++
-        "//! Line 3 of module header\n" ++
-        "//! Line 4 of module header\n" ++
-        "//! Line 5 of module header\n" ++
-        "//! Line 6 of module header\n" ++
-        "//! Line 7 of module header\n" ++
+        "/# Line 1 of module header\n" ++
+        "/# Line 2 of module header\n" ++
+        "/# Line 3 of module header\n" ++
+        "/# Line 4 of module header\n" ++
+        "/# Line 5 of module header\n" ++
+        "/# Line 6 of module header\n" ++
+        "/# Line 7 of module header\n" ++
         "\n" ++
         "// ------------------------------------- PUBLIC API --------------------------------------\n" ++
         "\n" ++
-        "/// Triggers an immediate hardware trap without losing slot-14 coalesced comments.\n" ++
+        "/| Triggers an immediate hardware trap without losing slot-14 coalesced comments.\n" ++
         "@cold\n" ++
         "pub fn trap() -> never {\n" ++
         "    @trap();\n" ++
         "}\n";
     const expected_canonical_src =
-        "//! Line 1 of module header\n" ++
-        "//! Line 2 of module header\n" ++
-        "//! Line 3 of module header\n" ++
-        "//! Line 4 of module header\n" ++
-        "//! Line 5 of module header\n" ++
-        "//! Line 6 of module header\n" ++
-        "//! Line 7 of module header\n\n" ++
+        "/# Line 1 of module header\n" ++
+        "/# Line 2 of module header\n" ++
+        "/# Line 3 of module header\n" ++
+        "/# Line 4 of module header\n" ++
+        "/# Line 5 of module header\n" ++
+        "/# Line 6 of module header\n" ++
+        "/# Line 7 of module header\n\n" ++
         "// ------------------------------------- PUBLIC API --------------------------------------\n" ++
-        "/// Triggers an immediate hardware trap without losing slot-14 coalesced comments.\n" ++
+        "/| Triggers an immediate hardware trap without losing slot-14 coalesced comments.\n" ++
         "@cold\n" ++
         "pub fn trap() -> never {\n" ++
         "    @trap();\n" ++
@@ -696,10 +696,10 @@ test "test_fmt_dr22_type_canonicalization_multiline_strings_and_attributes" {
         "    let raw_p = &raw mut out_slot;\n" ++
         "    out_slot.* = raw_p.* + count + (ratio as u64);\n" ++
         "    let updated = Config { enabled: true, ..own base_cfg };\n" ++
-        "  let msg = \"\"\"\n" ++
+        "  let msg = \"\n" ++
         "  line one\n" ++
         "    line two\n" ++
-        "  \"\"\";\n" ++
+        "  \";\n" ++
         "    _ = (opt_val, res_val, updated, msg);\n" ++
         "    fsm: match state {\n" ++
         "        0 => continue :fsm 1,\n" ++
@@ -711,7 +711,9 @@ test "test_fmt_dr22_type_canonicalization_multiline_strings_and_attributes" {
     defer pass1.deinit(std.testing.allocator);
     try std.testing.expect(!pass1.has_syntax_errors);
     try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "pub(pkg) extern \"C\" fn printf(fmt: *u8, ...) -> i32;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "@inline @no_alloc @no_panic\npub(super) fn normalize(") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, pass1.formatted_text, "@cfg(os == \"windows\") @inline @no_alloc @no_panic\npub(super) fn normalize(") != null,
+    );
     try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "opt_val: u32?,") != null);
     try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "res_val: u32!IoError,") != null);
     try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "out_slot: &out u64,\n) {\n") != null);
@@ -721,7 +723,7 @@ test "test_fmt_dr22_type_canonicalization_multiline_strings_and_attributes" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         pass1.formatted_text,
-        "    let msg = \"\"\"\n    line one\n      line two\n    \"\"\";\n",
+        "    let msg = \"\n    line one\n      line two\n    \";\n",
     ) != null);
 
     try expectCanonicalFormat(pass1.formatted_text, pass1.formatted_text, .{});
@@ -759,39 +761,39 @@ test "test_fmt_dr22_type_canonicalization_multiline_strings_and_attributes" {
 }
 
 test "test_fmt_dr23_doc_spacing_fenced_blocks_and_fix_healing" {
-    // [1] `corex fmt` normalizes `///Summary` -> `/// Summary`, preserves indented & fenced ```` ```cx ```` blocks,
-    // strips trailing spaces on empty `///` / `//!` lines, and inserts 1 blank line after `//!`:
+    // [1] `corex fmt` normalizes `/|Summary` -> `/| Summary`, preserves indented & fenced ```` ```cx ```` blocks,
+    // strips trailing spaces on empty `/|` / `/#` lines, and inserts 1 blank line after `/#`:
     const unspaced_doc_src =
-        "//!Tight module header\n" ++
-        "//!   \n" ++
-        "//!Second header line\n" ++
-        "///Summary without leading space.\n" ++
-        "///   \n" ++
-        "///     indented list item stays aligned\n" ++
-        "/// ```cx\n" ++
-        "/// let raw = \"\"\"\n" ++
-        "///     kept verbatim\n" ++
-        "///     \"\"\";\n" ++
-        "/// _ = raw;\n" ++
-        "/// ```\n" ++
+        "/#Tight module header\n" ++
+        "/#   \n" ++
+        "/#Second header line\n" ++
+        "/|Summary without leading space.\n" ++
+        "/|   \n" ++
+        "/|     indented list item stays aligned\n" ++
+        "/| ```cx\n" ++
+        "/| let raw = \"\n" ++
+        "/|     kept verbatim\n" ++
+        "/|     \";\n" ++
+        "/| _ = raw;\n" ++
+        "/| ```\n" ++
         "pub fn documented_api(seed: u32) -> u32 {\n" ++
         "    _ = seed;\n" ++
         "    return 42_u32;\n" ++
         "}\n";
 
     const expected_doc_src =
-        "//! Tight module header\n" ++
-        "//!\n" ++
-        "//! Second header line\n\n" ++
-        "/// Summary without leading space.\n" ++
-        "///\n" ++
-        "///     indented list item stays aligned\n" ++
-        "/// ```cx\n" ++
-        "/// let raw = \"\"\"\n" ++
-        "///     kept verbatim\n" ++
-        "///     \"\"\";\n" ++
-        "/// _ = raw;\n" ++
-        "/// ```\n" ++
+        "/# Tight module header\n" ++
+        "/#\n" ++
+        "/# Second header line\n\n" ++
+        "/| Summary without leading space.\n" ++
+        "/|\n" ++
+        "/|     indented list item stays aligned\n" ++
+        "/| ```cx\n" ++
+        "/| let raw = \"\n" ++
+        "/|     kept verbatim\n" ++
+        "/|     \";\n" ++
+        "/| _ = raw;\n" ++
+        "/| ```\n" ++
         "pub fn documented_api(seed: u32) -> u32 {\n" ++
         "    _ = seed;\n" ++
         "    return 42_u32;\n" ++
@@ -799,15 +801,16 @@ test "test_fmt_dr23_doc_spacing_fenced_blocks_and_fix_healing" {
 
     try expectCanonicalFormat(unspaced_doc_src, expected_doc_src, .{});
 
-    // [2] `corex fmt --fix` heals `/** … */` (`E0118`), detached `///` (`E0230`), and `let _ = expr;` (`E0234`):
+    // [2] `corex fmt --fix` heals `/** … */` / `//!` / `///` (`E0118`), detached `/|` (`E0230`), and `let _ =` (`E0234`):
     const unhealed_src =
+        "//! Legacy module header.\n\n" ++
         "/**\n" ++
-        " * Block doc comment healed to line doc.\n" ++
+        " * Block comment healed to line comment.\n" ++
         " */\n" ++
         "pub struct Counter {\n" ++
         "    pub count: u32,\n" ++
         "}\n\n" ++
-        "/// Detached doc comment healed by removing blank line.\n\n" ++
+        "/| Detached doc comment healed by removing blank line.\n\n" ++
         "pub fn reset_counter(val: u32) -> u32 {\n" ++
         "    let _ = val;\n" ++
         "    return 0_u32;\n" ++
@@ -822,12 +825,13 @@ test "test_fmt_dr23_doc_spacing_fenced_blocks_and_fix_healing" {
     defer healed_pass1.deinit(std.testing.allocator);
     try std.testing.expect(healed_pass1.is_changed);
     try std.testing.expect(std.mem.indexOf(u8, healed_pass1.formatted_text, "/**") == null);
-    try std.testing.expect(std.mem.indexOf(u8, healed_pass1.formatted_text, "/// Block doc comment healed to line doc.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, healed_pass1.formatted_text, "/# Legacy module header.\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, healed_pass1.formatted_text, "// Block comment healed to line comment.") != null);
     try std.testing.expect(
         std.mem.indexOf(
             u8,
             healed_pass1.formatted_text,
-            "/// Detached doc comment healed by removing blank line.\npub fn reset_counter",
+            "/| Detached doc comment healed by removing blank line.\npub fn reset_counter",
         ) != null,
     );
     try std.testing.expect(std.mem.indexOf(u8, healed_pass1.formatted_text, "let _ =") == null);
@@ -843,4 +847,128 @@ test "test_fmt_dr23_doc_spacing_fenced_blocks_and_fix_healing" {
     try std.testing.expect(!healed_pass2.has_syntax_errors);
     try std.testing.expect(!healed_pass2.is_changed);
     try std.testing.expectEqualStrings(healed_pass1.formatted_text, healed_pass2.formatted_text);
+}
+
+// ----------- DR-24 Packing, Inline If & Fmt Strings -----------
+
+test "test_fmt_dr24_horizontal_attr_packing_repr_link_inline_if_and_fmt_holes" {
+    const raw_dr24_src =
+        "/# DR-24 formatter verification.\n" ++
+        "@derive(Copy, Debug)\n" ++
+        "@repr(zero_pad: true, align: .CacheLine, C)\n" ++
+        "@cfg(target_os: \"linux\")\n" ++
+        "pub struct SlabHeader {\n" ++
+        "    /| Cache-aligned DMA pointer.\n" ++
+        "    pub dma_addr: u64,\n" ++
+        "}\n\n" ++
+        "@must_use\n" ++
+        "@no_panic\n" ++
+        "@no_alloc\n" ++
+        "@link(section: \".text.hot\", name: \"cx_classify_tier\")\n" ++
+        "@cfg(target_os: \"linux\")\n" ++
+        "@allow(W0202)\n" ++
+        "pub fn classify(byte_len: u32, flags: u16, healthy: bool) -> str {\n" ++
+        "    let tier = if byte_len == 0_u32 => 0_u16 else if (flags & 1_u16) != 0_u16 => 2_u16 else 1_u16;\n" ++
+        "    return f\"st={if healthy =>  \"UP\"  else  \"DOWN\"} tier={ tier = :#06x}\";\n" ++
+        "}\n";
+
+    var pass1 = try fmt_engine.formatSource(std.testing.allocator, raw_dr24_src, FileId.fromInt(0));
+    defer pass1.deinit(std.testing.allocator);
+    try std.testing.expect(!pass1.has_syntax_errors);
+    try std.testing.expect(pass1.is_changed);
+
+    // Comment-free `@attr` group with `indent + flat_width <= 100` packs on 1 line in canonical Tier 1->4 order:
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        pass1.formatted_text,
+        "@cfg(target_os: \"linux\") @repr(C, align: .CacheLine, zero_pad: true) @derive(Copy, Debug)\n" ++
+            "pub struct SlabHeader",
+    ) != null);
+    // `> 100`-col `@attr` stack breaks parameterized attributes per line while packing Tier-4 markers on the final line:
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        pass1.formatted_text,
+        "@cfg(target_os: \"linux\")\n" ++
+            "@allow(W0202)\n" ++
+            "@link(name: \"cx_classify_tier\", section: \".text.hot\")\n" ++
+            "@no_alloc @no_panic @must_use\n" ++
+            "pub fn classify(",
+    ) != null);
+    // Chained `if … => … else if … => … else …` indents `+4` and `f"…"` inner holes format canonically:
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        pass1.formatted_text,
+        "    let tier = if byte_len == 0_u32 => 0_u16\n" ++
+            "        else if (flags & 1_u16) != 0_u16 => 2_u16\n" ++
+            "        else 1_u16;\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        pass1.formatted_text,
+        "    return f\"st={if healthy => \"UP\" else \"DOWN\"} tier={tier=:#06x}\";\n",
+    ) != null);
+
+    try expectCanonicalFormat(pass1.formatted_text, pass1.formatted_text, .{});
+}
+
+test "test_fmt_multiline_string_spaces_only_blank_lines_dedent_and_line_budget_guard" {
+    // [1] Over-indented multiline string (`12`-space closing `"`) with a `2`-space blank middle line dedents to col `4` with `""`:
+    const overindented_multiline_src =
+        "pub fn build_banner() -> str {\n" ++
+        "            let banner = \"\n" ++
+        "            header line\n" ++
+        "  \n" ++
+        "              indented detail\n" ++
+        "      \r\n" ++
+        "            \";\n" ++
+        "            return banner;\n" ++
+        "}\n";
+
+    const expected_multiline_src =
+        "pub fn build_banner() -> str {\n" ++
+        "    let banner = \"\n" ++
+        "    header line\n" ++
+        "\n" ++
+        "      indented detail\n" ++
+        "\n" ++
+        "    \";\n" ++
+        "    return banner;\n" ++
+        "}\n";
+
+    try expectCanonicalFormat(overindented_multiline_src, expected_multiline_src, .{});
+
+    // [2] `fitsInlineFatArrowIfLineBudget` rejects `> 100`-col inline arms (`4 + 11 + 86 == 101`) while allowing `<= 100`:
+    const long_if_src =
+        "pub fn calc(flag: bool) -> i32 {\n" ++
+        "    if flag {\n" ++
+        "        compute_weighted_metric_value(alpha_factor, beta_factor, gamma_factor, delta_weight_0)\n" ++
+        "    } else {\n" ++
+        "        0\n" ++
+        "    }\n" ++
+        "}\n";
+    const if_offset: u32 = @intCast(std.mem.indexOf(u8, long_if_src, "if flag").?);
+    const if_end: u32 = @intCast(std.mem.lastIndexOfScalar(u8, long_if_src[0 .. long_if_src.len - 2], '}').? + 1);
+    const long_arm = "compute_weighted_metric_value(alpha_factor, beta_factor, gamma_factor, delta_weight_0)";
+    try std.testing.expectEqual(@as(usize, 86), long_arm.len);
+
+    try std.testing.expect(!(try fmt_engine.fitsInlineFatArrowIfLineBudget(
+        std.testing.allocator,
+        long_if_src,
+        if_offset,
+        if_end,
+        &.{"flag"},
+        &.{ long_arm, "0" },
+        false,
+        false,
+    )));
+    try std.testing.expect(try fmt_engine.fitsInlineFatArrowIfLineBudget(
+        std.testing.allocator,
+        long_if_src,
+        if_offset,
+        if_end,
+        &.{"flag"},
+        &.{ "compute_weighted_metric_value(alpha_factor, beta_factor)", "0" },
+        false,
+        false,
+    ));
 }

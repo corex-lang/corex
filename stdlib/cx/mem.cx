@@ -1,54 +1,53 @@
-//! Zero-`libc` Arenas, Pools, System Page Allocators, and Safe Wire Views (`cx.mem`)
-//!
-//! Implements CoreX's unified `AllocatorHandle` tag-bit dispatch (`0 = GeneralAllocator`,
-//! `1 = BumpArenaNoFree`, `2 = StaticRoData`), `64 KiB` slab `Arena`, 2-slot `with_scratch`
-//! ping-pong helpers, `@linear OwnPtr[T]`, `O(1)` `Pool[T]`, `FixedBuffer`, `System`, and `Span16`.
-//!
-//! All thread-local scratch and size-class allocator states (`16 B .. 32 KiB`) initialize from
-//! zeroed `.tbss`/`.bss` memory (`@tls_scratch_ptr`, `@tls_alloc_state`) with zero pre-`main` code.
+/# Zero-`libc` Arenas, Pools, System Page Allocators, and Safe Wire Views (`cx.mem`)
+/#
+/# Implements CoreX's unified `AllocatorHandle` tag-bit dispatch (`0 = GeneralAllocator`,
+/# `1 = BumpArenaNoFree`, `2 = StaticRoData`), `64 KiB` slab `Arena`, 2-slot `with_scratch`
+/# ping-pong helpers, `@linear OwnPtr[T]`, `O(1)` `Pool[T]`, `FixedBuffer`, `System`, and `Span16`.
+/#
+/# All thread-local scratch and size-class allocator states (`16 B .. 32 KiB`) initialize from
+/# zeroed `.tbss`/`.bss` memory (`@tls_scratch_ptr`, `@tls_alloc_state`) with zero pre-`main` code.
 
 // ---------------------------------------- TYPES ----------------------------------------
 // ---------------- Layouts & Allocator Handles -----------------
-/// Validated byte size and power-of-two alignment descriptor (`16 B` on 64-bit, `8 B` on `wasm32`).
-@repr(C)
-@derive(Copy, Equatable, Clone, Debug)
+/| Validated byte size and power-of-two alignment descriptor (`16 B` on 64-bit, `8 B` on `wasm32`).
+@repr(C) @derive(Copy, Equatable, Clone, Debug)
 pub struct Layout {
-    /// Requested payload size in bytes (`<= isize.MAX as usize`).
+    /| Requested payload size in bytes (`<= isize.MAX as usize`).
     pub size: usize,
-    /// Requested byte alignment (non-zero power of two).
+    /| Requested byte alignment (non-zero power of two).
     pub alignment: usize,
 }
 
-/// Fallible memory allocation failure code (`STD-01` §1.2).
+/| Fallible memory allocation failure code (`STD-01` §1.2).
 @derive(Copy, Equatable, Clone, Debug)
 pub enum AllocError: u8 {
-    /// Backing slab, fixed buffer, or OS virtual memory exhausted (`1`).
+    /| Backing slab, fixed buffer, or OS virtual memory exhausted (`1`).
     OutOfMemory = 1,
-    /// Alignment is not a power of two or rounded size exceeds `isize.MAX` (`2`).
+    /| Alignment is not a power of two or rounded size exceeds `isize.MAX` (`2`).
     InvalidLayout = 2,
 }
 
-/// 3-bit low-address allocator kind tag encoded in `AllocatorHandle.raw_tagged_ptr` (`STD-01` §1.2).
+/| 3-bit low-address allocator kind tag encoded in `AllocatorHandle.raw_tagged_ptr` (`STD-01` §1.2).
 @derive(Copy, Equatable, Clone, Debug)
 pub enum AllocTag: u8 {
-    /// General heap or vtable-backed allocator invoking `dealloc` on drop (`0`).
+    /| General heap or vtable-backed allocator invoking `dealloc` on drop (`0`).
     GeneralAllocator = 0,
-    /// Slab bump arena (`Arena`) eliding individual `dealloc` calls (`1`).
+    /| Slab bump arena (`Arena`) eliding individual `dealloc` calls (`1`).
     BumpArenaNoFree = 1,
-    /// Static `.rodata` or `comptime`-promoted read-only buffer (`2`).
+    /| Static `.rodata` or `comptime`-promoted read-only buffer (`2`).
     StaticRoData = 2,
 }
 
-/// Low-level dynamic memory allocator contract (`STD-01` §1.2).
+/| Low-level dynamic memory allocator contract (`STD-01` §1.2).
 pub trait Allocator {
-    /// Allocates at least `layout.size` bytes aligned to `layout.alignment`.
+    /| Allocates at least `layout.size` bytes aligned to `layout.alignment`.
     fn alloc(&mut self, layout: Layout, /) -> *mut u8!AllocError;
 
-    /// Attempts to grow or shrink `ptr` to `new_size` in place without moving bytes.
+    /| Attempts to grow or shrink `ptr` to `new_size` in place without moving bytes.
     @no_alloc @no_panic
     fn resize(&mut self, ptr: *mut u8, old_layout: Layout, new_size: usize, /) -> bool;
 
-    /// Grows or shrinks `ptr` to `new_size`, relocating and copying bytes when required.
+    /| Grows or shrinks `ptr` to `new_size`, relocating and copying bytes when required.
     fn realloc(
         &mut self,
         ptr: *mut u8,
@@ -57,263 +56,246 @@ pub trait Allocator {
         /,
     ) -> *mut u8!AllocError;
 
-    /// Releases `ptr` previously allocated with `layout`.
+    /| Releases `ptr` previously allocated with `layout`.
     @no_alloc @no_panic
     fn dealloc(&mut self, ptr: *mut u8, layout: Layout, /);
 }
 
-/// Intrusive 4-callback vtable referenced at offset `0` of any custom `GeneralAllocator` (`align(8)`).
-@repr(C)
-@align(8)
-@derive(Copy)
+/| Intrusive 4-callback vtable referenced at offset `0` of any custom `GeneralAllocator` (`align(8)`).
+@repr(C, align: 8) @derive(Copy)
 pub struct AllocatorHeader {
-    /// Type-erased allocation callback receiving allocator state pointer at offset `0`.
+    /| Type-erased allocation callback receiving allocator state pointer at offset `0`.
     pub alloc_fn: fn(*mut opaque, Layout) -> *mut u8!AllocError,
-    /// Type-erased `@no_alloc @no_panic` in-place resize callback.
+    /| Type-erased `@no_alloc @no_panic` in-place resize callback.
     pub resize_fn: @no_alloc @no_panic fn(*mut opaque, *mut u8, Layout, usize) -> bool,
-    /// Type-erased reallocation callback.
+    /| Type-erased reallocation callback.
     pub realloc_fn: fn(*mut opaque, *mut u8, Layout, usize) -> *mut u8!AllocError,
-    /// Type-erased `@no_alloc @no_panic` deallocation callback.
+    /| Type-erased `@no_alloc @no_panic` deallocation callback.
     pub dealloc_fn: @no_alloc @no_panic fn(*mut opaque, *mut u8, Layout),
 }
 
-/// 8-byte aligned LSB-tagged allocator pointer (`0 = System`, `1 = Arena`, `2 = StaticRoData`).
-@repr(C)
-@derive(Copy, Equatable, Clone, Debug)
+/| 8-byte aligned LSB-tagged allocator pointer (`0 = System`, `1 = Arena`, `2 = StaticRoData`).
+@repr(C) @derive(Copy, Equatable, Clone, Debug)
 pub struct AllocatorHandle {
-    /// Tagged allocator address (`bits 0..2` store `AllocTag`).
+    /| Tagged allocator address (`bits 0..2` store `AllocTag`).
     pub raw_tagged_ptr: usize,
 }
 
 // ----------------- Slab Arena & Scratch Ring ------------------
-/// Doubly linked `64 KiB` page-slab header at offset `0` of each `Arena` slab (`32 B` on 64-bit).
-@repr(C)
-@align(16)
+/| Doubly linked `64 KiB` page-slab header at offset `0` of each `Arena` slab (`32 B` on 64-bit).
+@repr(C, align: 16)
 pub(pkg) struct SlabHeader {
-    /// Next allocated slab retained for zero-syscall reuse across `restore`/`reset`.
+    /| Next allocated slab retained for zero-syscall reuse across `restore`/`reset`.
     pub next: *mut SlabHeader,
-    /// Previous slab on the active `Arena` spine.
+    /| Previous slab on the active `Arena` spine.
     pub prev: *mut SlabHeader,
-    /// Total mapped byte capacity of this slab (including `SlabHeader`).
+    /| Total mapped byte capacity of this slab (including `SlabHeader`).
     pub cap: u32,
-    /// Reserved alignment padding (`0`).
+    /| Reserved alignment padding (`0`).
     pub _pad: u32 = 0,
 }
 
-/// Singly linked header for `> 32 KiB` or over-aligned dedicated OS page mappings.
-@repr(C)
-@align(16)
+/| Singly linked header for `> 32 KiB` or over-aligned dedicated OS page mappings.
+@repr(C, align: 16)
 pub(pkg) struct BypassHeader {
-    /// Previous dedicated bypass mapping in LIFO allocation order.
+    /| Previous dedicated bypass mapping in LIFO allocation order.
     pub prev: *mut BypassHeader,
-    /// Total page-rounded byte length passed to `System.alloc_pages`.
+    /| Total page-rounded byte length passed to `System.alloc_pages`.
     pub map_bytes: usize,
 }
 
-/// `O(1)` `Arena` rewind snapshot (`24 B` on 64-bit, `12 B` on `wasm32`).
-@repr(C)
-@derive(Copy, Equatable, Clone, Debug)
+/| `O(1)` `Arena` rewind snapshot (`24 B` on 64-bit, `12 B` on `wasm32`).
+@repr(C) @derive(Copy, Equatable, Clone, Debug)
 pub struct ArenaCheckpoint {
-    /// Active slab pointer at checkpoint creation (`0` if unallocated).
+    /| Active slab pointer at checkpoint creation (`0` if unallocated).
     pub(pkg) slab_ptr: *mut SlabHeader,
-    /// Head of dedicated bypass mappings at checkpoint creation.
+    /| Head of dedicated bypass mappings at checkpoint creation.
     pub(pkg) bypass_head: *mut BypassHeader,
-    /// Bump byte offset within `slab_ptr` at checkpoint creation.
+    /| Bump byte offset within `slab_ptr` at checkpoint creation.
     pub(pkg) used_offset: u32,
 }
 
-/// Tier-3 `@linear` `64 KiB` page-slab bump arena (`32 B` on 64-bit; `align(8)` steals bit `0`).
-@repr(C)
-@align(8)
-@linear
+/| Tier-3 `@linear` `64 KiB` page-slab bump arena (`32 B` on 64-bit; `align(8)` steals bit `0`).
+@repr(C, align: 8) @linear
 pub struct Arena {
-    /// Currently active bump slab (`0` until first allocation).
+    /| Currently active bump slab (`0` until first allocation).
     pub(pkg) current_slab: *mut SlabHeader,
-    /// First slab on the arena spine retained across `reset` and `restore`.
+    /| First slab on the arena spine retained across `reset` and `restore`.
     pub(pkg) first_slab: *mut SlabHeader,
-    /// LIFO list of dedicated `> 32 KiB` or `> 4096`-aligned bypass mappings.
+    /| LIFO list of dedicated `> 32 KiB` or `> 4096`-aligned bypass mappings.
     pub(pkg) bypass_head: *mut BypassHeader,
-    /// Current bump cursor within `current_slab`.
+    /| Current bump cursor within `current_slab`.
     pub(pkg) used_offset: u32,
-    /// Default slab mapping size in bytes (`0` lazy-defaults to `DEFAULT_SLAB_BYTES`).
+    /| Default slab mapping size in bytes (`0` lazy-defaults to `DEFAULT_SLAB_BYTES`).
     pub(pkg) default_cap: u32,
 }
 
-/// Canonical alias for `Arena` (`cx.mem.BumpArena`).
+/| Canonical alias for `Arena` (`cx.mem.BumpArena`).
 pub type BumpArena = Arena;
 
-/// Streaming `FmtWriter` sink state writing directly into an `Arena`'s active slab tip.
+/| Streaming `FmtWriter` sink state writing directly into an `Arena`'s active slab tip.
 struct ArenaFmtSink {
-    /// Target arena receiving formatted UTF-8 bytes.
+    /| Target arena receiving formatted UTF-8 bytes.
     arena: *mut Arena,
-    /// Start of the contiguous formatted byte buffer.
+    /| Start of the contiguous formatted byte buffer.
     ptr: *mut u8,
-    /// Number of formatted bytes written so far.
+    /| Number of formatted bytes written so far.
     len: usize,
-    /// Allocated capacity of `ptr` in bytes.
+    /| Allocated capacity of `ptr` in bytes.
     cap: usize,
 }
 
 // -------------- Owned Pointers, Pools & Buffers ---------------
-/// `@linear` non-null unique heap/pool pointer (`0x0` niche -> `sizeof(OwnPtr[T]?) == sizeof(*mut T)`).
-@repr(C)
-@linear
+/| `@linear` non-null unique heap/pool pointer (`0x0` niche -> `sizeof(OwnPtr[T]?) == sizeof(*mut T)`).
+@repr(C) @linear
 pub struct OwnPtr[T] {
-    /// Non-null unique allocation pointer.
+    /| Non-null unique allocation pointer.
     @non_null
     ptr: *mut T,
 }
 
-/// Backing page-slab header linked into `Pool[T].slab_head` and thread-local `pool_slab_head`.
-@repr(C)
-@align(16)
+/| Backing page-slab header linked into `Pool[T].slab_head` and thread-local `pool_slab_head`.
+@repr(C, align: 16)
 pub(pkg) struct PoolSlabHeader {
-    /// Previous slab in this `Pool[T]` instance's LIFO allocation order.
+    /| Previous slab in this `Pool[T]` instance's LIFO allocation order.
     pub prev: *mut PoolSlabHeader,
-    /// Next active `Pool` slab registered on this thread (`0` at tail).
+    /| Next active `Pool` slab registered on this thread (`0` at tail).
     pub tls_next: *mut PoolSlabHeader,
-    /// Previous active `Pool` slab registered on this thread (`0` at head).
+    /| Previous active `Pool` slab registered on this thread (`0` at head).
     pub tls_prev: *mut PoolSlabHeader,
-    /// Total page-rounded byte length passed to `System.alloc_pages`.
+    /| Total page-rounded byte length passed to `System.alloc_pages`.
     pub map_bytes: usize,
-    /// Byte offset from slab base to slot `0` (`hdr_off`).
+    /| Byte offset from slab base to slot `0` (`hdr_off`).
     pub data_off: usize,
-    /// Exclusive byte offset past the final slot (`hdr_off + items_n * stride`).
+    /| Exclusive byte offset past the final slot (`hdr_off + items_n * stride`).
     pub slots_end: usize,
 }
 
-/// Intrusive freelist link stored at offset `0` of vacant `Pool[T]` and `System` slots.
+/| Intrusive freelist link stored at offset `0` of vacant `Pool[T]` and `System` slots.
 @repr(C)
 pub(pkg) struct PoolFreeNode {
-    /// Next vacant slot in the intrusive freelist (`0` when empty).
+    /| Next vacant slot in the intrusive freelist (`0` when empty).
     pub next: *mut PoolFreeNode,
 }
 
-/// `@linear` typed slab pool (`24 B` on 64-bit, `16 B` on `wasm32`; `O(1)` alloc and free).
-@repr(C)
-@align(8)
-@linear
+/| `@linear` typed slab pool (`24 B` on 64-bit, `16 B` on `wasm32`; `O(1)` alloc and free).
+@repr(C, align: 8) @linear
 pub struct Pool[T] {
-    /// Linked list of backing `64 KiB`+ OS page slabs.
+    /| Linked list of backing `64 KiB`+ OS page slabs.
     slab_head: *mut PoolSlabHeader,
-    /// Intrusive LIFO list of vacant `T` slots.
+    /| Intrusive LIFO list of vacant `T` slots.
     free_head: *mut PoolFreeNode,
-    /// Target number of `T` slots per newly mapped slab (`>= 1`).
+    /| Target number of `T` slots per newly mapped slab (`>= 1`).
     slab_items: u32,
-    /// Count of currently live checked-out `OwnPtr[T]` handles.
+    /| Count of currently live checked-out `OwnPtr[T]` handles.
     live_count: u32,
 }
 
-/// Stack or static slice bump allocator usable inside `@no_alloc` functions (`32 B` on 64-bit, `Copy`).
-@repr(C)
-@align(8)
-@derive(Copy)
+/| Stack or static slice bump allocator usable inside `@no_alloc` functions (`32 B` on 64-bit, `Copy`).
+@repr(C, align: 8) @derive(Copy)
 pub struct FixedBuffer {
-    /// Non-null `FIXED_BUFFER_HDR_SENTINEL` (`0x1`) tag at offset `0` enabling `as_handle()`.
+    /| Non-null `FIXED_BUFFER_HDR_SENTINEL` (`0x1`) tag at offset `0` enabling `as_handle()`.
     header: *AllocatorHeader,
-    /// Base pointer of caller-provided backing byte slice.
+    /| Base pointer of caller-provided backing byte slice.
     buf: *mut u8,
-    /// Total capacity of `buf` in bytes.
+    /| Total capacity of `buf` in bytes.
     cap: usize,
-    /// Current bump cursor within `0..=cap`.
+    /| Current bump cursor within `0..=cap`.
     used: usize,
 }
 
-/// Zero-`libc` OS / freestanding WebAssembly page & size-class heap (`mmap` / `VirtualAlloc` / `memory.grow`).
+/| Zero-`libc` OS / freestanding WebAssembly page & size-class heap (`mmap` / `VirtualAlloc` / `memory.grow`).
 pub struct System {}
 
-/// Prefix metadata stored immediately below over-aligned (`> 4 KiB`) `System` allocations.
+/| Prefix metadata stored immediately below over-aligned (`> 4 KiB`) `System` allocations.
 @repr(C)
 struct OverAlignedHeader {
-    /// Original base address returned by `os_alloc_pages`.
+    /| Original base address returned by `os_alloc_pages`.
     raw_base: *mut u8,
-    /// Exact page-rounded byte length passed to `os_alloc_pages`.
+    /| Exact page-rounded byte length passed to `os_alloc_pages`.
     map_bytes: usize,
 }
 
-/// Zero-initialized thread-local size-class and active-pool state (`224 B` on 64-bit, `124 B` on `wasm32`).
+/| Zero-initialized thread-local size-class and active-pool state (`224 B` on 64-bit, `124 B` on `wasm32`).
 @repr(C)
 struct SystemTlsState {
-    /// Intrusive LIFO heads for `16 B .. 32 KiB` (`12` power-of-two bins).
+    /| Intrusive LIFO heads for `16 B .. 32 KiB` (`12` power-of-two bins).
     free_heads: [*mut PoolFreeNode; 12],
-    /// Active page bump cursors per size class.
+    /| Active page bump cursors per size class.
     bump_cur: [*mut u8; 12],
-    /// Remaining uncarved bytes (`<= 65,520`) in each class's active `64 KiB` slab.
+    /| Remaining uncarved bytes (`<= 65,520`) in each class's active `64 KiB` slab.
     bump_rem: [u16; 12],
-    /// Intrusive doubly linked list head of all live `PoolSlabHeader` slabs on this thread.
+    /| Intrusive doubly linked list head of all live `PoolSlabHeader` slabs on this thread.
     pool_slab_head: *mut PoolSlabHeader,
 }
 
 // ----------------- Wire Views & Byte Cursors ------------------
-/// Unboxed 4-byte `< 64 KiB` slice descriptor (`FromBytes` + `IntoBytes` via `@zero_pad`).
-@repr(C)
-@derive(Copy, Equatable, Comparable, Clone, Debug, Default)
-@zero_pad
+/| Unboxed 4-byte `< 64 KiB` slice descriptor (`FromBytes` + `IntoBytes` via `@zero_pad`).
+@repr(C, zero_pad: true) @derive(Copy, Equatable, Comparable, Clone, Debug, Default)
 pub struct Span16 {
-    /// Byte start offset within the parent buffer (`0..65535`).
+    /| Byte start offset within the parent buffer (`0..65535`).
     pub off: u16 = 0,
-    /// Byte length of the slice view (`0..65535`).
+    /| Byte length of the slice view (`0..65535`).
     pub len: u16 = 0,
 }
 
-/// Bounds, alignment, or size validation error for zero-`unsafe` wire transmutation (`D-01`).
+/| Bounds, alignment, or size validation error for zero-`unsafe` wire transmutation (`D-01`).
 @derive(Copy, Equatable, Clone, Debug)
 pub enum WireError: u8 {
-    /// Input buffer ended before supplying the required byte count (`1`).
+    /| Input buffer ended before supplying the required byte count (`1`).
     UnexpectedEof = 1,
-    /// Input buffer address does not satisfy `@align_of[T]()` (`2`).
+    /| Input buffer address does not satisfy `@align_of[T]()` (`2`).
     MisalignedPtr = 2,
-    /// Requested element count overflows `usize` or violates exact buffer size (`3`).
+    /| Requested element count overflows `usize` or violates exact buffer size (`3`).
     SizeMismatch = 3,
 }
 
-/// Bounds-checked sequential wire reader over an immutable byte slice (`STD-01` §1.2).
+/| Bounds-checked sequential wire reader over an immutable byte slice (`STD-01` §1.2).
 @derive(Copy, Clone, Debug)
 pub struct ByteCursor {
-    /// Underlying read-only byte buffer.
+    /| Underlying read-only byte buffer.
     pub buf: &[u8],
-    /// Current byte read offset (`0..=buf.len()`).
+    /| Current byte read offset (`0..=buf.len()`).
     pub pos: usize = 0,
 }
 
 // --------------------------------------- CONSTS ----------------------------------------
-/// Byte size of `SlabHeader` at the start of every `Arena` slab.
+/| Byte size of `SlabHeader` at the start of every `Arena` slab.
 const SLAB_HDR_SIZE: usize = @size_of[SlabHeader]();
 
-/// Byte size of `BypassHeader` at the start of every dedicated bypass mapping.
+/| Byte size of `BypassHeader` at the start of every dedicated bypass mapping.
 const BYPASS_HDR_SIZE: usize = @size_of[BypassHeader]();
 
-/// Standard `64 KiB` virtual memory allocation granularity across Windows, Wasm, and `Arena` slabs.
+/| Standard `64 KiB` virtual memory allocation granularity across Windows, Wasm, and `Arena` slabs.
 const PAGE_GRANULARITY: usize = 65_536_usize;
 
-/// Default `Arena` slab size (`64 KiB`) shared by internal constructors and `Arena.DEFAULT_SLAB_BYTES`.
+/| Default `Arena` slab size (`64 KiB`) shared by internal constructors and `Arena.DEFAULT_SLAB_BYTES`.
 const ARENA_DEFAULT_SLAB_BYTES: usize = 65_536_usize;
 
-/// Canonical `System` `AllocatorHandle` sentinel (`0x0`).
+/| Canonical `System` `AllocatorHandle` sentinel (`0x0`).
 const HANDLE_SYSTEM: AllocatorHandle = AllocatorHandle { raw_tagged_ptr: 0_usize };
 
-/// Canonical static `.rodata` `AllocatorHandle` sentinel (`0x2`).
+/| Canonical static `.rodata` `AllocatorHandle` sentinel (`0x2`).
 const HANDLE_STATIC_RODATA: AllocatorHandle = AllocatorHandle { raw_tagged_ptr: 2_usize };
 
-/// Minimum `System` size-class bin (`16 B = 1 << 4`).
+/| Minimum `System` size-class bin (`16 B = 1 << 4`).
 const SYS_MIN_BIN_LOG2: u32 = 4_u32;
 
-/// Number of `System` thread-local small/medium bins (`16 B .. 32 KiB`).
+/| Number of `System` thread-local small/medium bins (`16 B .. 32 KiB`).
 const SYS_BIN_COUNT: usize = 12_usize;
 
-/// Maximum allocation size (`32 KiB`) served from `System` thread-local bins.
+/| Maximum allocation size (`32 KiB`) served from `System` thread-local bins.
 const SYS_MAX_BIN_BYTES: usize = 32_768_usize;
 
-/// Maximum alignment (`4 KiB`) guaranteed directly by OS `mmap` without over-aligned prefix padding.
+/| Maximum alignment (`4 KiB`) guaranteed directly by OS `mmap` without over-aligned prefix padding.
 const SYS_OS_MIN_PAGE_ALIGN: usize = 4_096_usize;
 
-/// Non-null odd sentinel (`0x1`, unreachable by `@align(8) AllocatorHeader`) identifying `FixedBuffer`.
+/| Non-null odd sentinel (`0x1`, unreachable by `@align(8) AllocatorHeader`) identifying `FixedBuffer`.
 const FIXED_BUFFER_HDR_SENTINEL: usize = 1_usize;
 
 // -------------------------------------- INTERNALS --------------------------------------
 // --------------- System Size-Class & Page Heap ----------------
-/// Computes `ceil(log2(val))` for `val >= 2`, or `0` when `val <= 1`.
-@inline @no_alloc @no_panic
+/| Computes `ceil(log2(val))` for `val >= 2`, or `0` when `val <= 1`.
 fn ceil_log2_usize(val: usize, /) -> u32 {
     if val <= 1_usize {
         return 0_u32;
@@ -321,22 +303,15 @@ fn ceil_log2_usize(val: usize, /) -> u32 {
     return usize.BITS -% (val -% 1_usize).leading_zeros();
 }
 
-/// Computes the `0..11` `System` size-class index for `needed in 1..=32_768`.
-@std_cap_boundary(clears: [may_panic])
-@inline @no_alloc @no_panic
+/| Computes the `0..11` `System` size-class index for `needed in 1..=32_768`.
+@std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
 fn system_bin_index(needed: usize, /) -> usize {
-    let clamped: usize = if needed <= 16_usize {
-        16_usize
-    } else {
-        needed
-    };
+    let clamped: usize = if needed <= 16_usize => 16_usize else needed;
     return (ceil_log2_usize(clamped) -% SYS_MIN_BIN_LOG2) as usize;
 }
 
-/// Allocates zero-filled `64 KiB`-granularity OS virtual pages on native / WASI targets.
-@cfg(not (target.arch == "wasm32"))
-@std_cap_boundary(clears: [unsafe_op])
-@no_panic
+/| Allocates zero-filled `64 KiB`-granularity OS virtual pages on native / WASI targets.
+@cfg(not (target.arch == "wasm32")) @std_cap_boundary(clears: [unsafe_op]) @no_panic
 fn os_alloc_pages(byte_len: usize, /) -> *mut u8!AllocError {
     if byte_len == 0_usize or byte_len > (isize.MAX as usize) {
         return .Err(.InvalidLayout);
@@ -349,10 +324,8 @@ fn os_alloc_pages(byte_len: usize, /) -> *mut u8!AllocError {
     return .Ok(raw_ptr);
 }
 
-/// Releases `64 KiB`-granularity OS virtual pages on native / WASI targets.
-@cfg(not (target.arch == "wasm32"))
-@std_cap_boundary(clears: [unsafe_op])
-@no_alloc @no_panic
+/| Releases `64 KiB`-granularity OS virtual pages on native / WASI targets.
+@cfg(not (target.arch == "wasm32")) @std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
 fn os_free_pages(ptr: *mut u8, byte_len: usize, /) {
     if ptr.is_null() or byte_len == 0_usize {
         return;
@@ -362,10 +335,8 @@ fn os_free_pages(ptr: *mut u8, byte_len: usize, /) {
     }
 }
 
-/// Allocates zero-filled `64 KiB` linear-memory bigpages on `wasm32` (`@wasm_memory_grow` + freelist).
-@cfg(target.arch == "wasm32")
-@std_cap_boundary(clears: [unsafe_op, may_panic])
-@no_panic
+/| Allocates zero-filled `64 KiB` linear-memory bigpages on `wasm32` (`@wasm_memory_grow` + freelist).
+@cfg(target.arch == "wasm32") @std_cap_boundary(clears: [unsafe_op, may_panic]) @no_panic
 fn os_alloc_pages(byte_len: usize, /) -> *mut u8!AllocError {
     if byte_len == 0_usize or byte_len > (isize.MAX as usize) {
         return .Err(.InvalidLayout);
@@ -403,10 +374,8 @@ fn os_alloc_pages(byte_len: usize, /) -> *mut u8!AllocError {
     return .Ok((prev_pages * PAGE_GRANULARITY) as *mut u8);
 }
 
-/// Pushes freed `64 KiB` bigpages onto `wasm32`'s power-of-two bigpage freelist (`offset 144..208` in TLS).
-@cfg(target.arch == "wasm32")
-@std_cap_boundary(clears: [unsafe_op, may_panic])
-@no_alloc @no_panic
+/| Pushes freed `64 KiB` bigpages onto `wasm32`'s power-of-two bigpage freelist (`offset 144..208` in TLS).
+@cfg(target.arch == "wasm32") @std_cap_boundary(clears: [unsafe_op, may_panic]) @no_alloc @no_panic
 fn os_free_pages(ptr: *mut u8, byte_len: usize, /) {
     if ptr.is_null() or byte_len == 0_usize {
         return;
@@ -434,9 +403,8 @@ fn os_free_pages(ptr: *mut u8, byte_len: usize, /) {
     }
 }
 
-/// Allocates `layout` from `System`'s 12 thread-local power-of-two bins (`16 B .. 32 KiB`) or OS pages.
-@std_cap_boundary(clears: [unsafe_op, may_panic])
-@no_panic
+/| Allocates `layout` from `System`'s 12 thread-local power-of-two bins (`16 B .. 32 KiB`) or OS pages.
+@std_cap_boundary(clears: [unsafe_op, may_panic]) @no_panic
 fn system_alloc(layout: Layout, /) -> *mut u8!AllocError {
     if layout.alignment > SYS_OS_MIN_PAGE_ALIGN {
         let hdr_sz: usize = @size_of[OverAlignedHeader]();
@@ -465,11 +433,7 @@ fn system_alloc(layout: Layout, /) -> *mut u8!AllocError {
         }
         return .Ok(aligned_addr as *mut u8);
     }
-    let needed: usize = if layout.size > layout.alignment {
-        layout.size
-    } else {
-        layout.alignment
-    };
+    let needed: usize = if layout.size > layout.alignment => layout.size else layout.alignment;
     if needed <= SYS_MAX_BIN_BYTES {
         let cls: usize = system_bin_index(needed);
         let slot_sz: usize = 16_usize << (cls & 15_usize);
@@ -505,9 +469,8 @@ fn system_alloc(layout: Layout, /) -> *mut u8!AllocError {
     return os_alloc_pages(layout.size);
 }
 
-/// Checks whether `ptr` in `System` can resize in place from `old_layout` to `new_size`.
-@std_cap_boundary(clears: [unsafe_op, may_panic])
-@inline @no_alloc @no_panic
+/| Checks whether `ptr` in `System` can resize in place from `old_layout` to `new_size`.
+@std_cap_boundary(clears: [unsafe_op, may_panic]) @inline @no_alloc @no_panic
 fn system_resize(ptr: *mut u8, old_layout: Layout, new_size: usize, /) -> bool {
     if ptr.is_null() or new_size == 0_usize {
         return false;
@@ -528,16 +491,9 @@ fn system_resize(ptr: *mut u8, old_layout: Layout, new_size: usize, /) -> bool {
             orelse return false;
         return needed_map == hdr.map_bytes;
     }
-    let old_needed: usize = if old_layout.size > old_layout.alignment {
-        old_layout.size
-    } else {
-        old_layout.alignment
-    };
-    let new_needed: usize = if new_size > old_layout.alignment {
-        new_size
-    } else {
-        old_layout.alignment
-    };
+    let old_needed: usize = if old_layout.size > old_layout.alignment => old_layout.size
+        else old_layout.alignment;
+    let new_needed: usize = if new_size > old_layout.alignment => new_size else old_layout.alignment;
     if old_needed <= SYS_MAX_BIN_BYTES {
         if new_needed > SYS_MAX_BIN_BYTES {
             return false;
@@ -552,9 +508,8 @@ fn system_resize(ptr: *mut u8, old_layout: Layout, new_size: usize, /) -> bool {
     return new_pages == old_pages;
 }
 
-/// Returns `ptr` to `System`'s `16 B .. 32 KiB` thread-local bin or unmaps OS pages.
-@std_cap_boundary(clears: [unsafe_op, may_panic])
-@no_alloc @no_panic
+/| Returns `ptr` to `System`'s `16 B .. 32 KiB` thread-local bin or unmaps OS pages.
+@std_cap_boundary(clears: [unsafe_op, may_panic]) @no_alloc @no_panic
 fn system_dealloc(ptr: *mut u8, layout: Layout, /) {
     if ptr.is_null() or layout.size == 0_usize {
         return;
@@ -570,11 +525,7 @@ fn system_dealloc(ptr: *mut u8, layout: Layout, /) {
         os_free_pages(hdr.raw_base, hdr.map_bytes);
         return;
     }
-    let needed: usize = if layout.size > layout.alignment {
-        layout.size
-    } else {
-        layout.alignment
-    };
+    let needed: usize = if layout.size > layout.alignment => layout.size else layout.alignment;
     if needed <= SYS_MAX_BIN_BYTES {
         let cls: usize = system_bin_index(needed);
         let state_ptr: *mut SystemTlsState = @tls_alloc_state() as *mut SystemTlsState;
@@ -597,9 +548,8 @@ fn system_dealloc(ptr: *mut u8, layout: Layout, /) {
     os_free_pages(ptr, layout.size);
 }
 
-/// Links newly mapped `slab_hdr` at the head of this thread's active `PoolSlabHeader` list.
-@std_cap_boundary(clears: [unsafe_op])
-@inline @no_alloc @no_panic
+/| Links newly mapped `slab_hdr` at the head of this thread's active `PoolSlabHeader` list.
+@std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
 fn tls_register_pool_slab(slab_hdr: *mut PoolSlabHeader, /) {
     let state_ptr: *mut SystemTlsState = @tls_alloc_state() as *mut SystemTlsState;
     if state_ptr.is_null() {
@@ -622,9 +572,8 @@ fn tls_register_pool_slab(slab_hdr: *mut PoolSlabHeader, /) {
     state.pool_slab_head = slab_hdr;
 }
 
-/// Unlinks `slab_hdr` from this thread's active `PoolSlabHeader` list in `O(1)` before unmapping.
-@std_cap_boundary(clears: [unsafe_op])
-@inline @no_alloc @no_panic
+/| Unlinks `slab_hdr` from this thread's active `PoolSlabHeader` list in `O(1)` before unmapping.
+@std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
 fn tls_unregister_pool_slab(slab_hdr: *mut PoolSlabHeader, /) {
     let state_ptr: *mut SystemTlsState = @tls_alloc_state() as *mut SystemTlsState;
     if state_ptr.is_null() {
@@ -656,9 +605,8 @@ fn tls_unregister_pool_slab(slab_hdr: *mut PoolSlabHeader, /) {
     }
 }
 
-/// Returns `true` if `addr` lies inside any active `Pool` slab mapped on the current thread.
-@std_cap_boundary(clears: [unsafe_op])
-@no_alloc @no_panic
+/| Returns `true` if `addr` lies inside any active `Pool` slab mapped on the current thread.
+@std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
 fn is_in_any_tls_pool_slab(addr: usize, /) -> bool {
     let state_ptr: *mut SystemTlsState = @tls_alloc_state() as *mut SystemTlsState;
     if state_ptr.is_null() {
@@ -682,21 +630,13 @@ fn is_in_any_tls_pool_slab(addr: usize, /) -> bool {
     return false;
 }
 
-/// Computes `(slot_align, slot_stride)` for non-ZST `Pool[T]` slots.
-@inline @no_alloc @no_panic
+/| Computes `(slot_align, slot_stride)` for non-ZST `Pool[T]` slots.
+@no_alloc @no_panic
 fn pool_slot_geometry[T]() -> (usize, usize)? {
     let min_align: usize = @align_of[*mut PoolFreeNode]();
-    let slot_align: usize = if @align_of[T]() > min_align {
-        @align_of[T]()
-    } else {
-        min_align
-    };
+    let slot_align: usize = if @align_of[T]() > min_align => @align_of[T]() else min_align;
     let min_sz: usize = @size_of[*mut PoolFreeNode]();
-    let raw_sz: usize = if @size_of[T]() > min_sz {
-        @size_of[T]()
-    } else {
-        min_sz
-    };
+    let raw_sz: usize = if @size_of[T]() > min_sz => @size_of[T]() else min_sz;
     if align_up(raw_sz, slot_align) is .Some(stride) {
         return .Some((slot_align, stride));
     }
@@ -704,9 +644,8 @@ fn pool_slot_geometry[T]() -> (usize, usize)? {
 }
 
 // ----------------- Slab Arena & Fixed Helpers -----------------
-/// Attempts to grow or shrink the active tip allocation of `arena` in `O(1)` without copying.
-@std_cap_boundary(clears: [unsafe_op, may_panic])
-@inline @no_alloc @no_panic
+/| Attempts to grow or shrink the active tip allocation of `arena` in `O(1)` without copying.
+@std_cap_boundary(clears: [unsafe_op, may_panic]) @inline @no_alloc @no_panic
 fn arena_resize_in_place(
     arena: &mut Arena,
     ptr: *mut u8,
@@ -738,7 +677,7 @@ fn arena_resize_in_place(
     return new_size <= old_layout.size;
 }
 
-/// Appends formatted `chunk` bytes into an `ArenaFmtSink`, growing in place at the slab tip when possible.
+/| Appends formatted `chunk` bytes into an `ArenaFmtSink`, growing in place at the slab tip when possible.
 @std_cap_boundary(clears: [unsafe_op, may_panic])
 fn arena_fmt_write_cb(ctx: *mut opaque, chunk: &[u8]) -> unit!FmtError {
     if chunk.is_empty() {
@@ -763,16 +702,8 @@ fn arena_fmt_write_cb(ctx: *mut opaque, chunk: &[u8]) -> unit!FmtError {
         let arena_ref: &mut Arena = unsafe {
             &mut arena_ptr.*
         };
-        let doubled: usize = if sink.cap == 0_usize {
-            64_usize
-        } else {
-            sink.cap *| 2_usize
-        };
-        let new_cap: usize = if doubled >= needed {
-            doubled
-        } else {
-            needed
-        };
+        let doubled: usize = if sink.cap == 0_usize => 64_usize else sink.cap *| 2_usize;
+        let new_cap: usize = if doubled >= needed => doubled else needed;
         if sink.cap == 0_usize {
             sink.ptr = arena_ref.alloc_raw(Layout { size: new_cap, alignment: 1_usize }) catch {
                 return .Err(.BufferFull);
@@ -805,9 +736,8 @@ fn arena_fmt_write_cb(ctx: *mut opaque, chunk: &[u8]) -> unit!FmtError {
     return .Ok(());
 }
 
-/// Validates `bytes` as well-formed UTF-8 without depending on `cx.str` (8-byte SWAR + scalar).
-@std_cap_boundary(clears: [unsafe_op, may_panic])
-@no_alloc @no_panic
+/| Validates `bytes` as well-formed UTF-8 without depending on `cx.str` (8-byte SWAR + scalar).
+@std_cap_boundary(clears: [unsafe_op, may_panic]) @no_alloc @no_panic
 fn is_valid_utf8_bytes(bytes: &[u8], /) -> bool {
     let n: usize = bytes.len();
     let ptr: *u8 = bytes.as_ptr();
@@ -863,9 +793,8 @@ fn is_valid_utf8_bytes(bytes: &[u8], /) -> bool {
     return true;
 }
 
-/// Type-erased `AllocatorHeader.alloc_fn` shim for `FixedBuffer`.
-@std_cap_boundary(clears: [unsafe_op])
-@no_alloc @no_panic
+/| Type-erased `AllocatorHeader.alloc_fn` shim for `FixedBuffer`.
+@std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
 fn fixed_buffer_alloc_cb(ctx: *mut opaque, layout: Layout) -> *mut u8!AllocError {
     let fb_ptr: *mut FixedBuffer = ctx as *mut FixedBuffer;
     if fb_ptr.is_null() {
@@ -877,9 +806,8 @@ fn fixed_buffer_alloc_cb(ctx: *mut opaque, layout: Layout) -> *mut u8!AllocError
     return fb_ref.alloc(layout);
 }
 
-/// Type-erased `AllocatorHeader.resize_fn` shim for `FixedBuffer`.
-@std_cap_boundary(clears: [unsafe_op])
-@no_alloc @no_panic
+/| Type-erased `AllocatorHeader.resize_fn` shim for `FixedBuffer`.
+@std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
 fn fixed_buffer_resize_cb(
     ctx: *mut opaque,
     ptr: *mut u8,
@@ -896,9 +824,8 @@ fn fixed_buffer_resize_cb(
     return fb_ref.resize(ptr, old_layout, new_size);
 }
 
-/// Type-erased `AllocatorHeader.realloc_fn` shim for `FixedBuffer`.
-@std_cap_boundary(clears: [unsafe_op])
-@no_alloc @no_panic
+/| Type-erased `AllocatorHeader.realloc_fn` shim for `FixedBuffer`.
+@std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
 fn fixed_buffer_realloc_cb(
     ctx: *mut opaque,
     ptr: *mut u8,
@@ -915,9 +842,8 @@ fn fixed_buffer_realloc_cb(
     return fb_ref.realloc(ptr, old_layout, new_size);
 }
 
-/// Type-erased `AllocatorHeader.dealloc_fn` shim for `FixedBuffer`.
-@std_cap_boundary(clears: [unsafe_op])
-@no_alloc @no_panic
+/| Type-erased `AllocatorHeader.dealloc_fn` shim for `FixedBuffer`.
+@std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
 fn fixed_buffer_dealloc_cb(ctx: *mut opaque, ptr: *mut u8, layout: Layout) {
     let fb_ptr: *mut FixedBuffer = ctx as *mut FixedBuffer;
     if fb_ptr.is_null() {
@@ -932,7 +858,7 @@ fn fixed_buffer_dealloc_cb(ctx: *mut opaque, ptr: *mut u8, layout: Layout) {
 // ------------------------------------- PUBLIC API --------------------------------------
 // ---------------- Layouts & Allocator Handles -----------------
 impl Layout {
-    /// Validates `size <= isize.MAX` (including alignment rounding) and non-zero power-of-two `alignment`.
+    /| Validates `size <= isize.MAX` (including alignment rounding) and non-zero power-of-two `alignment`.
     @inline @no_alloc @no_panic
     pub fn new(size: usize, alignment: usize, /) -> Layout!AllocError {
         if alignment == 0_usize or (alignment & (alignment -% 1_usize)) != 0_usize {
@@ -945,8 +871,8 @@ impl Layout {
         return .Ok(Layout { size: size, alignment: alignment });
     }
 
-    /// Returns the exact compile-time/runtime `Layout` of `T`.
-    @inline @no_alloc @no_panic
+    /| Returns the exact compile-time/runtime `Layout` of `T`.
+    @no_alloc @no_panic
     pub fn of[T]() -> Layout {
         return Layout {
             size: @size_of[T](),
@@ -954,9 +880,8 @@ impl Layout {
         };
     }
 
-    /// Computes the contiguous `Layout` for `[T; count]`, guarding `count * @size_of[T]()` overflow.
-    @std_cap_boundary(clears: [may_panic])
-    @inline @no_alloc @no_panic
+    /| Computes the contiguous `Layout` for `[T; count]`, guarding `count * @size_of[T]()` overflow.
+    @std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
     pub fn array[T](count: usize, /) -> Layout!AllocError {
         let elem_sz: usize = @size_of[T]();
         let align_val: usize = @align_of[T]();
@@ -972,7 +897,7 @@ impl Layout {
         );
     }
 
-    /// Rounds `self.size` upward to the nearest multiple of `self.alignment`.
+    /| Rounds `self.size` upward to the nearest multiple of `self.alignment`.
     @inline @no_alloc @no_panic
     pub fn pad_to_align(self) -> Layout {
         let mask: usize = self.alignment -% 1_usize;
@@ -984,13 +909,13 @@ impl Layout {
 }
 
 impl AllocatorHandle {
-    /// Default process/thread-local `System` allocator sentinel (`0x0`).
+    /| Default process/thread-local `System` allocator sentinel (`0x0`).
     pub const SYSTEM: AllocatorHandle = AllocatorHandle { raw_tagged_ptr: 0_usize };
 
-    /// Immutable `.rodata` / `comptime`-promoted buffer handle (`0x2`; never freed).
+    /| Immutable `.rodata` / `comptime`-promoted buffer handle (`0x2`; never freed).
     pub const STATIC_RODATA: AllocatorHandle = AllocatorHandle { raw_tagged_ptr: 2_usize };
 
-    /// Extracts the 3-bit `AllocTag` encoded in `self.raw_tagged_ptr`.
+    /| Extracts the 3-bit `AllocTag` encoded in `self.raw_tagged_ptr`.
     @inline @no_alloc @no_panic
     pub fn tag(self) -> AllocTag {
         return match self.raw_tagged_ptr & 0x7_usize {
@@ -1000,11 +925,11 @@ impl AllocatorHandle {
         };
     }
 
-    /// Returns `true` when individual `dealloc` calls are no-ops (`BumpArenaNoFree` or `StaticRoData`).
+    /| Returns `true` when individual `dealloc` calls are no-ops (`BumpArenaNoFree` or `StaticRoData`).
     @inline @no_alloc @no_panic
     pub fn is_arena_or_static(self) -> bool = (self.raw_tagged_ptr & 0x7_usize) != 0_usize;
 
-    /// Allocates `layout` from the tagged `System`, `Arena`, or custom `AllocatorHeader` target.
+    /| Allocates `layout` from the tagged `System`, `Arena`, or custom `AllocatorHeader` target.
     @std_cap_boundary(clears: [unsafe_op, may_panic, blocking_sync])
     pub fn alloc(self, layout: Layout, /) -> *mut u8!AllocError {
         let valid_layout: Layout = Layout.new(layout.size, layout.alignment)?;
@@ -1046,9 +971,8 @@ impl AllocatorHandle {
         return alloc_cb(self.raw_tagged_ptr as *mut opaque, valid_layout);
     }
 
-    /// Attempts to grow or shrink `ptr` to `new_size` in place (`@no_alloc @no_panic`).
-    @std_cap_boundary(clears: [unsafe_op, alloc, may_panic, blocking_sync])
-    @no_alloc @no_panic
+    /| Attempts to grow or shrink `ptr` to `new_size` in place (`@no_alloc @no_panic`).
+    @std_cap_boundary(clears: [unsafe_op, alloc, may_panic, blocking_sync]) @no_alloc @no_panic
     pub fn resize_in_place(
         self,
         ptr: *mut u8,
@@ -1109,7 +1033,7 @@ impl AllocatorHandle {
         };
     }
 
-    /// Reallocates `ptr` from `old_layout` to `new_size`, preserving `min(old_layout.size, new_size)` bytes.
+    /| Reallocates `ptr` from `old_layout` to `new_size`, preserving `min(old_layout.size, new_size)` bytes.
     @std_cap_boundary(clears: [unsafe_op, may_panic, blocking_sync])
     pub fn realloc(
         self,
@@ -1159,11 +1083,7 @@ impl AllocatorHandle {
             );
         }
         let next_ptr: *mut u8 = self.alloc(new_layout)?;
-        let copy_len: usize = if old_layout.size < new_size {
-            old_layout.size
-        } else {
-            new_size
-        };
+        let copy_len: usize = if old_layout.size < new_size => old_layout.size else new_size;
         if copy_len > 0_usize {
             unsafe {
                 @memcpy(next_ptr as *mut opaque, ptr as *opaque, copy_len);
@@ -1173,9 +1093,8 @@ impl AllocatorHandle {
         return .Ok(next_ptr);
     }
 
-    /// Releases `ptr` when backed by a `GeneralAllocator`; zero-cost no-op on arenas and `.rodata`.
-    @std_cap_boundary(clears: [unsafe_op, alloc, may_panic, blocking_sync])
-    @no_alloc @no_panic
+    /| Releases `ptr` when backed by a `GeneralAllocator`; zero-cost no-op on arenas and `.rodata`.
+    @std_cap_boundary(clears: [unsafe_op, alloc, may_panic, blocking_sync]) @no_alloc @no_panic
     pub fn dealloc(self, ptr: *mut u8, layout: Layout, /) {
         if ptr.is_null() or layout.size == 0_usize {
             return;
@@ -1210,28 +1129,20 @@ impl AllocatorHandle {
 
 // ----------------- Slab Arena & Scratch Ring ------------------
 impl Arena {
-    /// Default `64 KiB` virtual page slab size (`65,536 B`).
+    /| Default `64 KiB` virtual page slab size (`65,536 B`).
     pub const DEFAULT_SLAB_BYTES: usize = 65_536_usize;
 
-    /// Threshold (`32 KiB`) above which allocations receive dedicated `BypassHeader` page mappings.
+    /| Threshold (`32 KiB`) above which allocations receive dedicated `BypassHeader` page mappings.
     pub const BYPASS_THRESHOLD: usize = 32_768_usize;
 
-    /// Constructs a lazy `@linear Arena` mapping `slab_bytes` slabs on first allocation (`0` syscalls upfront).
+    /| Constructs a lazy `@linear Arena` mapping `slab_bytes` slabs on first allocation (`0` syscalls upfront).
     @inline @no_alloc @no_panic
     pub fn new(*, slab_bytes: usize = 65_536_usize) -> Self {
         let aligned_cap: usize = match align_up(
-            if slab_bytes < 4_096_usize {
-                4_096_usize
-            } else {
-                slab_bytes
-            },
+            (if slab_bytes < 4_096_usize => 4_096_usize else slab_bytes),
             PAGE_GRANULARITY,
         ) {
-            .Some(rounded) => if rounded > 0x4000_0000_usize {
-                0x4000_0000_usize
-            } else {
-                rounded
-            },
+            .Some(rounded) => if rounded > 0x4000_0000_usize => 0x4000_0000_usize else rounded,
             .None => 65_536_usize,
         };
         return Self {
@@ -1243,18 +1154,17 @@ impl Arena {
         };
     }
 
-    /// Constructs an `Arena` with an eagerly mapped initial slab holding at least `min_bytes`.
+    /| Constructs an `Arena` with an eagerly mapped initial slab holding at least `min_bytes`.
     @std_cap_boundary(clears: [unsafe_op, may_panic])
     pub fn with_capacity(min_bytes: usize, /) -> Self!AllocError {
         if min_bytes > 0x3FFF_0000_usize {
             return .Err(.InvalidLayout);
         }
         let needed_slab: usize = align_up(
-            if min_bytes + SLAB_HDR_SIZE > ARENA_DEFAULT_SLAB_BYTES {
-                min_bytes + SLAB_HDR_SIZE
-            } else {
-                ARENA_DEFAULT_SLAB_BYTES
-            },
+            (
+                if min_bytes + SLAB_HDR_SIZE > ARENA_DEFAULT_SLAB_BYTES => min_bytes + SLAB_HDR_SIZE
+                    else ARENA_DEFAULT_SLAB_BYTES
+            ),
             PAGE_GRANULARITY,
         ) orelse return .Err(.OutOfMemory);
         let raw_slab: *mut u8 = os_alloc_pages(needed_slab)?;
@@ -1281,25 +1191,21 @@ impl Arena {
         );
     }
 
-    /// Returns a bit-0 tagged `AllocatorHandle` (`AllocTag.BumpArenaNoFree`).
+    /| Returns a bit-0 tagged `AllocatorHandle` (`AllocTag.BumpArenaNoFree`).
     @inline @no_alloc @no_panic
     pub fn as_handle(&mut self) -> AllocatorHandle {
         return AllocatorHandle { raw_tagged_ptr: (self as usize) | 0x1_usize };
     }
 
-    /// Fast-path 4-instruction bump allocation inside `current_slab` with cold slab/bypass fallback.
-    @std_cap_boundary(clears: [unsafe_op, may_panic])
-    @inline @no_panic
+    /| Fast-path 4-instruction bump allocation inside `current_slab` with cold slab/bypass fallback.
+    @std_cap_boundary(clears: [unsafe_op, may_panic]) @inline @no_panic
     pub fn alloc_raw(&mut self, layout: Layout, /) -> *mut u8!AllocError {
         let valid: Layout = Layout.new(layout.size, layout.alignment)?;
         if valid.size == 0_usize {
             return .Ok(valid.alignment as *mut u8);
         }
-        let eff_cap: usize = if self.default_cap == 0_u32 {
-            ARENA_DEFAULT_SLAB_BYTES
-        } else {
-            self.default_cap as usize
-        };
+        let eff_cap: usize = if self.default_cap == 0_u32 => ARENA_DEFAULT_SLAB_BYTES
+            else self.default_cap as usize;
         let slab: *mut SlabHeader = self.current_slab;
         if not slab.is_null() and valid.size <= eff_cap / 2_usize and valid.alignment <= 4_096_usize {
             let slab_addr: usize = slab as usize;
@@ -1321,9 +1227,8 @@ impl Arena {
         return self.alloc_slow(valid, eff_cap);
     }
 
-    /// Cold-path slab growth, cached-slab reuse, or dedicated `BypassHeader` mapping.
-    @std_cap_boundary(clears: [unsafe_op, may_panic])
-    @cold @no_panic @noinline
+    /| Cold-path slab growth, cached-slab reuse, or dedicated `BypassHeader` mapping.
+    @std_cap_boundary(clears: [unsafe_op, may_panic]) @noinline @cold @no_panic
     fn alloc_slow(&mut self, layout: Layout, eff_cap: usize, /) -> *mut u8!AllocError {
         if self.default_cap == 0_u32 {
             self.default_cap = eff_cap as u32;
@@ -1416,7 +1321,7 @@ impl Arena {
         return self.alloc_raw(layout);
     }
 
-    /// Captures an `O(1)` `ArenaCheckpoint` snapshot of the current bump and bypass state.
+    /| Captures an `O(1)` `ArenaCheckpoint` snapshot of the current bump and bypass state.
     @inline @no_alloc @no_panic
     pub fn checkpoint(&self) -> ArenaCheckpoint {
         return ArenaCheckpoint {
@@ -1426,9 +1331,8 @@ impl Arena {
         };
     }
 
-    /// Rewinds `self` back to `cp`, unmapping newer bypass blocks and zero-wiping dirtied slab tail bytes.
-    @std_cap_boundary(clears: [unsafe_op, may_panic])
-    @no_alloc @no_panic
+    /| Rewinds `self` back to `cp`, unmapping newer bypass blocks and zero-wiping dirtied slab tail bytes.
+    @std_cap_boundary(clears: [unsafe_op, may_panic]) @no_alloc @no_panic
     pub fn restore(&mut self, cp: ArenaCheckpoint, /) {
         while self.bypass_head != cp.bypass_head and not self.bypass_head.is_null() {
             let node: *mut BypassHeader = self.bypass_head;
@@ -1482,9 +1386,8 @@ impl Arena {
         }
     }
 
-    /// Rewinds `self` to its initial slab while retaining mapped slabs for zero-syscall reuse.
-    @std_cap_boundary(clears: [unsafe_op, may_panic])
-    @no_alloc @no_panic
+    /| Rewinds `self` to its initial slab while retaining mapped slabs for zero-syscall reuse.
+    @std_cap_boundary(clears: [unsafe_op, may_panic]) @no_alloc @no_panic
     pub fn reset(&mut self) {
         self.restore(
             ArenaCheckpoint {
@@ -1495,9 +1398,8 @@ impl Arena {
         );
     }
 
-    /// Consumes `self` and releases all mapped slabs and bypass blocks back to `System`.
-    @std_cap_boundary(clears: [unsafe_op, may_panic])
-    @no_panic
+    /| Consumes `self` and releases all mapped slabs and bypass blocks back to `System`.
+    @std_cap_boundary(clears: [unsafe_op, may_panic]) @no_panic
     pub fn release(var own self) {
         let Arena {
             current_slab,
@@ -1538,7 +1440,7 @@ impl Arena {
         }
     }
 
-    /// Fallibly allocates a single `T` inside `self` and initializes it with `value`.
+    /| Fallibly allocates a single `T` inside `self` and initializes it with `value`.
     @std_cap_boundary(clears: [unsafe_op])
     pub fn try_create[T](&mut self, value: own T, /) -> (&mut T)!AllocError {
         if @size_of[T]() == 0_usize {
@@ -1563,14 +1465,14 @@ impl Arena {
         }
     }
 
-    /// Allocates a single `T` inside `self`, aborting via `panic` on out-of-memory.
+    /| Allocates a single `T` inside `self`, aborting via `panic` on out-of-memory.
     pub fn create[T](&mut self, value: own T, /) -> &mut T {
         return self.try_create[T](own value) catch {
             return panic("Arena.create: out of memory");
         };
     }
 
-    /// Fallibly allocates `&mut [T]` of length `count` inside `self` (`zeroed = true` by default).
+    /| Fallibly allocates `&mut [T]` of length `count` inside `self` (`zeroed = true` by default).
     @std_cap_boundary(clears: [unsafe_op])
     pub fn try_alloc_slice[T: Copy](
         &mut self,
@@ -1600,14 +1502,14 @@ impl Arena {
         );
     }
 
-    /// Allocates `&mut [T]` of length `count` inside `self`, aborting via `panic` on out-of-memory.
+    /| Allocates `&mut [T]` of length `count` inside `self`, aborting via `panic` on out-of-memory.
     pub fn alloc_slice[T: Copy](&mut self, count: usize, /, *, zeroed: bool = true) -> &mut [T] {
         return self.try_alloc_slice[T](count, zeroed: zeroed) catch {
             return panic("Arena.alloc_slice: out of memory");
         };
     }
 
-    /// Duplicates `src` into newly bumped `self` slab storage.
+    /| Duplicates `src` into newly bumped `self` slab storage.
     @std_cap_boundary(clears: [unsafe_op])
     pub fn dupe[T: Copy](&mut self, src: &[T], /) -> &mut [T] {
         let count: usize = src.len();
@@ -1622,7 +1524,7 @@ impl Arena {
         }
     }
 
-    /// Duplicates UTF-8 `text` into `self` and returns the arena-backed `str` view.
+    /| Duplicates UTF-8 `text` into `self` and returns the arena-backed `str` view.
     @std_cap_boundary(clears: [unsafe_op])
     pub fn dupe_str(&mut self, text: str, /) -> str {
         if text.is_empty() {
@@ -1633,7 +1535,7 @@ impl Arena {
         };
     }
 
-    /// Formats `args` directly at `self`'s active slab tip and returns the resulting `str`.
+    /| Formats `args` directly at `self`'s active slab tip and returns the resulting `str`.
     @std_cap_boundary(clears: [unsafe_op])
     pub fn fmt(&mut self, args: FmtArgs, /) -> str {
         var sink = ArenaFmtSink {
@@ -1676,15 +1578,14 @@ impl Arena {
     }
 }
 
-/// Executes `body` on slot `0` of the thread-local ping-pong scratch ring (`DR-20` `D-04`, `E0328`).
-@inline @overload
+/| Executes `body` on slot `0` of the thread-local ping-pong scratch ring (`DR-20` `D-04`, `E0328`).
+@overload
 pub fn with_scratch[R](body: |&mut Arena| -> R, /) -> R {
     return with_scratch[R](HANDLE_STATIC_RODATA, body);
 }
 
-/// Executes `body` with a temporary ping-pong scratch `Arena` disjoint from `conflict` (`DR-20` `D-04`, `E0328`).
-@std_cap_boundary(clears: [unsafe_op])
-@overload
+/| Executes `body` with a temporary ping-pong scratch `Arena` disjoint from `conflict` (`DR-20` `D-04`, `E0328`).
+@overload @std_cap_boundary(clears: [unsafe_op])
 pub fn with_scratch[R](conflict: AllocatorHandle, body: |&mut Arena| -> R, /) -> R {
     let pair_ptr: *mut [Arena; 2] = @tls_scratch_ptr() as *mut [Arena; 2];
     if pair_ptr.is_null() {
@@ -1693,11 +1594,8 @@ pub fn with_scratch[R](conflict: AllocatorHandle, body: |&mut Arena| -> R, /) ->
     let pair: &mut [Arena; 2] = unsafe {
         &mut pair_ptr.*
     };
-    let idx: usize = if conflict.raw_tagged_ptr == (((&mut pair[0]) as usize) | 0x1_usize) {
-        1_usize
-    } else {
-        0_usize
-    };
+    let idx: usize = if conflict.raw_tagged_ptr == (((&mut pair[0]) as usize) | 0x1_usize) => 1_usize
+        else 0_usize;
     let saved_cp: ArenaCheckpoint = pair[idx].checkpoint();
     defer pair[idx].restore(saved_cp);
     return body(&mut pair[idx]);
@@ -1705,7 +1603,7 @@ pub fn with_scratch[R](conflict: AllocatorHandle, body: |&mut Arena| -> R, /) ->
 
 // -------------- Owned Pointers, Pools & Buffers ---------------
 impl[T] OwnPtr[T] {
-    /// Fallibly allocates `value` exclusively on the `System` heap and returns an `@linear OwnPtr[T]`.
+    /| Fallibly allocates `value` exclusively on the `System` heap and returns an `@linear OwnPtr[T]`.
     @std_cap_boundary(clears: [unsafe_op])
     pub fn try_new(value: own T, /) -> Self!AllocError {
         if @size_of[T]() == 0_usize {
@@ -1719,40 +1617,38 @@ impl[T] OwnPtr[T] {
         return .Ok(Self { ptr: raw_ptr });
     }
 
-    /// Allocates `value` on the `System` heap, aborting via `panic` on out-of-memory.
+    /| Allocates `value` on the `System` heap, aborting via `panic` on out-of-memory.
     pub fn new(value: own T, /) -> Self {
         return Self.try_new(own value) catch {
             return panic("OwnPtr.new: out of memory");
         };
     }
 
-    /// Borrows the owned `T` immutably in `O(1)`.
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Borrows the owned `T` immutably in `O(1)`.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn as_ref(&self) -> &T {
         return unsafe {
             &self.ptr.*
         };
     }
 
-    /// Borrows the owned `T` mutably in `O(1)`.
-    @std_cap_boundary(clears: [unsafe_op])
-    @inline @no_alloc @no_panic
+    /| Borrows the owned `T` mutably in `O(1)`.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn as_mut(&mut self) -> &mut T {
         return unsafe {
             &mut self.ptr.*
         };
     }
 
-    /// Returns the underlying non-null read-only `*T` pointer without consuming `self`.
-    @inline @no_alloc @no_panic
+    /| Returns the underlying non-null read-only `*T` pointer without consuming `self`.
+    @no_alloc @no_panic
     pub fn as_ptr(&self) -> *T = self.ptr as *T;
 
-    /// Returns the underlying non-null mutable `*mut T` pointer without consuming `self`.
-    @inline @no_alloc @no_panic
+    /| Returns the underlying non-null mutable `*mut T` pointer without consuming `self`.
+    @no_alloc @no_panic
     pub fn as_mut_ptr(&mut self) -> *mut T = self.ptr;
 
-    /// Moves the inner `T` out onto the caller stack and deallocates the backing `System` allocation.
+    /| Moves the inner `T` out onto the caller stack and deallocates the backing `System` allocation.
     @std_cap_boundary(clears: [unsafe_op])
     pub fn into_inner(own self) -> T {
         let OwnPtr { ptr } = self;
@@ -1770,20 +1666,20 @@ impl[T] OwnPtr[T] {
         return own inner_val;
     }
 
-    /// Consumes `self` and leaks ownership into a raw non-null `*mut T` pointer.
-    @inline @no_alloc @no_panic
+    /| Consumes `self` and leaks ownership into a raw non-null `*mut T` pointer.
+    @no_alloc @no_panic
     pub fn into_raw(own self) -> *mut T {
         let OwnPtr { ptr } = self;
         return ptr;
     }
 
-    /// Reconstructs an `OwnPtr[T]` from a caller-proven non-null, uniquely owned `raw_ptr`.
-    @inline @no_alloc @no_panic
+    /| Reconstructs an `OwnPtr[T]` from a caller-proven non-null, uniquely owned `raw_ptr`.
+    @no_alloc @no_panic
     pub unsafe fn from_raw(raw_ptr: *mut T, /) -> Self {
         return Self { ptr: raw_ptr };
     }
 
-    /// Drops `*self` in place via `@drop_in_place` and deallocates backing memory via `System.handle()`.
+    /| Drops `*self` in place via `@drop_in_place` and deallocates backing memory via `System.handle()`.
     @std_cap_boundary(clears: [unsafe_op])
     pub fn free(own self) {
         let OwnPtr { ptr } = self;
@@ -1800,22 +1696,18 @@ impl[T] OwnPtr[T] {
 }
 
 impl[T] Pool[T] {
-    /// Constructs an empty `@linear Pool[T]` (`0` OS page mappings until first `alloc`/`try_alloc`).
-    @inline @no_alloc @no_panic
+    /| Constructs an empty `@linear Pool[T]` (`0` OS page mappings until first `alloc`/`try_alloc`).
+    @no_alloc @no_panic
     pub fn new(*, items_per_slab: u32 = 1_024_u32) -> Self {
         return Self {
             slab_head: @default_init[*mut PoolSlabHeader](),
             free_head: @default_init[*mut PoolFreeNode](),
-            slab_items: if items_per_slab == 0_u32 {
-                1_u32
-            } else {
-                items_per_slab
-            },
+            slab_items: if items_per_slab == 0_u32 => 1_u32 else items_per_slab,
             live_count: 0_u32,
         };
     }
 
-    /// Fallibly allocates an `O(1)` slot from `self` initialized with `value`.
+    /| Fallibly allocates an `O(1)` slot from `self` initialized with `value`.
     @std_cap_boundary(clears: [unsafe_op, may_panic])
     pub fn try_alloc(&mut self, value: own T, /) -> OwnPtr[T]!AllocError {
         if @size_of[T]() == 0_usize {
@@ -1842,11 +1734,8 @@ impl[T] Pool[T] {
         }
         let hdr_off: usize = align_up(@size_of[PoolSlabHeader](), slot_align)
             orelse return .Err(.InvalidLayout);
-        let items_n: usize = if self.slab_items == 0_u32 {
-            1_024_usize
-        } else {
-            self.slab_items as usize
-        };
+        let items_n: usize = if self.slab_items == 0_u32 => 1_024_usize
+            else self.slab_items as usize;
         if items_n > (usize.MAX - hdr_off) / stride {
             return .Err(.OutOfMemory);
         }
@@ -1895,16 +1784,15 @@ impl[T] Pool[T] {
         return .Ok(OwnPtr[T] { ptr: out_ptr });
     }
 
-    /// Allocates an `O(1)` slot from `self`, aborting via `panic` on out-of-memory.
+    /| Allocates an `O(1)` slot from `self`, aborting via `panic` on out-of-memory.
     pub fn alloc(&mut self, value: own T, /) -> OwnPtr[T] {
         return self.try_alloc(own value) catch {
             return panic("Pool.alloc: out of memory");
         };
     }
 
-    /// Drops `item` in place and pushes its verified slot onto `self.free_head` (`@no_alloc @no_panic`).
-    @std_cap_boundary(clears: [unsafe_op, alloc, may_panic])
-    @no_alloc @no_panic
+    /| Drops `item` in place and pushes its verified slot onto `self.free_head` (`@no_alloc @no_panic`).
+    @std_cap_boundary(clears: [unsafe_op, alloc, may_panic]) @no_alloc @no_panic
     pub fn free(&mut self, item: own OwnPtr[T], /) {
         let raw_ptr: *mut T = item.ptr;
         @forget(own item);
@@ -1959,13 +1847,12 @@ impl[T] Pool[T] {
         self.live_count = self.live_count -% 1_u32;
     }
 
-    /// Returns the number of currently live checked-out `OwnPtr[T]` items.
-    @inline @no_alloc @no_panic
+    /| Returns the number of currently live checked-out `OwnPtr[T]` items.
+    @no_alloc @no_panic
     pub fn live_len(&self) -> usize = self.live_count as usize;
 
-    /// Consumes `self`, unlinks all slabs from TLS, and unmaps backing OS pages.
-    @std_cap_boundary(clears: [unsafe_op])
-    @no_panic
+    /| Consumes `self`, unlinks all slabs from TLS, and unmaps backing OS pages.
+    @std_cap_boundary(clears: [unsafe_op]) @no_panic
     pub fn release(var own self) {
         let Pool {
             slab_head,
@@ -1974,8 +1861,8 @@ impl[T] Pool[T] {
             live_count,
         } = self;
         _ = free_head;
-        _ = slab_items;
-        _ = live_count;
+        slab_items;
+        live_count;
 
         var cur_slab: *mut PoolSlabHeader = slab_head;
         while not cur_slab.is_null() {
@@ -1993,7 +1880,7 @@ impl[T] Pool[T] {
 }
 
 impl FixedBuffer {
-    /// Wraps `backing` in a stack/static bump allocator tagged with `FIXED_BUFFER_HDR_SENTINEL` (`0` TLS writes).
+    /| Wraps `backing` in a stack/static bump allocator tagged with `FIXED_BUFFER_HDR_SENTINEL` (`0` TLS writes).
     @inline @no_alloc @no_panic
     pub fn init(backing: &mut [u8], /) -> Self {
         return Self {
@@ -2004,27 +1891,26 @@ impl FixedBuffer {
         };
     }
 
-    /// Returns a `GeneralAllocator` `AllocatorHandle` pointing to `self`.
+    /| Returns a `GeneralAllocator` `AllocatorHandle` pointing to `self`.
     @inline @no_alloc @no_panic
     pub fn as_handle(&mut self) -> AllocatorHandle {
         return AllocatorHandle { raw_tagged_ptr: self as usize };
     }
 
-    /// Rewinds the bump cursor to `0` in `O(1)`.
+    /| Rewinds the bump cursor to `0` in `O(1)`.
     @inline @no_alloc @no_panic
     pub fn reset(&mut self) {
         self.used = 0_usize;
     }
 
-    /// Returns the unallocated byte count remaining in `self`.
+    /| Returns the unallocated byte count remaining in `self`.
     @inline @no_alloc @no_panic
     pub fn remaining(&self) -> usize = self.cap -| self.used;
 }
 
 impl Allocator for FixedBuffer {
-    /// Bumps `self.used` to satisfy `layout` inside `self.buf` (`@no_alloc @no_panic`).
-    @std_cap_boundary(clears: [may_panic])
-    @no_alloc @no_panic
+    /| Bumps `self.used` to satisfy `layout` inside `self.buf` (`@no_alloc @no_panic`).
+    @std_cap_boundary(clears: [may_panic]) @no_alloc @no_panic
     pub fn alloc(&mut self, layout: Layout, /) -> *mut u8!AllocError {
         let valid: Layout = Layout.new(layout.size, layout.alignment)?;
         if valid.size == 0_usize {
@@ -2041,9 +1927,8 @@ impl Allocator for FixedBuffer {
         return .Ok(aligned_addr as *mut u8);
     }
 
-    /// Resizes the most recent allocation in place in `O(1)` when `ptr` sits at `self.buf + self.used`.
-    @std_cap_boundary(clears: [may_panic])
-    @no_alloc @no_panic
+    /| Resizes the most recent allocation in place in `O(1)` when `ptr` sits at `self.buf + self.used`.
+    @std_cap_boundary(clears: [may_panic]) @no_alloc @no_panic
     pub fn resize(&mut self, ptr: *mut u8, old_layout: Layout, new_size: usize, /) -> bool {
         if ptr.is_null() {
             return false;
@@ -2061,9 +1946,8 @@ impl Allocator for FixedBuffer {
         return true;
     }
 
-    /// Resizes `ptr` in place at the tip or bumps a fresh slice inside `self.buf` (`@no_alloc @no_panic`).
-    @std_cap_boundary(clears: [unsafe_op, may_panic])
-    @no_alloc @no_panic
+    /| Resizes `ptr` in place at the tip or bumps a fresh slice inside `self.buf` (`@no_alloc @no_panic`).
+    @std_cap_boundary(clears: [unsafe_op, may_panic]) @no_alloc @no_panic
     pub fn realloc(
         &mut self,
         ptr: *mut u8,
@@ -2083,11 +1967,7 @@ impl Allocator for FixedBuffer {
             return .Ok(ptr);
         }
         let next_ptr: *mut u8 = self.alloc(new_layout)?;
-        let copy_len: usize = if old_layout.size < new_size {
-            old_layout.size
-        } else {
-            new_size
-        };
+        let copy_len: usize = if old_layout.size < new_size => old_layout.size else new_size;
         if copy_len > 0_usize {
             unsafe {
                 @memcpy(next_ptr as *mut opaque, ptr as *opaque, copy_len);
@@ -2096,7 +1976,7 @@ impl Allocator for FixedBuffer {
         return .Ok(next_ptr);
     }
 
-    /// Reclaims `old_layout.size` in `O(1)` when `ptr` sits at the active bump tip.
+    /| Reclaims `old_layout.size` in `O(1)` when `ptr` sits at the active bump tip.
     @no_alloc @no_panic
     pub fn dealloc(&mut self, ptr: *mut u8, layout: Layout, /) {
         if ptr.is_null() or layout.size == 0_usize {
@@ -2111,16 +1991,16 @@ impl Allocator for FixedBuffer {
 }
 
 impl System {
-    /// Returns the canonical zero-overhead `AllocatorHandle` for `System` (`AllocatorHandle.SYSTEM`).
+    /| Returns the canonical zero-overhead `AllocatorHandle` for `System` (`AllocatorHandle.SYSTEM`).
     @inline @no_alloc @no_panic
     pub fn handle() -> AllocatorHandle = HANDLE_SYSTEM;
 
-    /// Maps zero-initialized `64 KiB`-granularity virtual memory pages directly from the OS / Wasm host.
+    /| Maps zero-initialized `64 KiB`-granularity virtual memory pages directly from the OS / Wasm host.
     pub fn alloc_pages(byte_len: usize, /) -> *mut u8!AllocError {
         return os_alloc_pages(byte_len);
     }
 
-    /// Releases `64 KiB`-granularity virtual memory pages back to the OS / Wasm bigpage freelist.
+    /| Releases `64 KiB`-granularity virtual memory pages back to the OS / Wasm bigpage freelist.
     @no_panic
     pub fn free_pages(ptr: *mut u8, byte_len: usize, /) {
         os_free_pages(ptr, byte_len);
@@ -2129,12 +2009,11 @@ impl System {
 
 // ----------------- Wire Views & Byte Cursors ------------------
 impl Span16 {
-    /// Canonical empty 4-byte `Span16` (`off = 0, len = 0`).
+    /| Canonical empty 4-byte `Span16` (`off = 0, len = 0`).
     pub const EMPTY: Span16 = Span16 { .. };
 
-    /// Projects `self` onto `buf`, returning `.None` if `off + len > buf.len()`.
-    @std_cap_boundary(clears: [may_panic])
-    @inline @no_alloc @no_panic
+    /| Projects `self` onto `buf`, returning `.None` if `off + len > buf.len()`.
+    @std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
     pub fn slice(self, buf: &[u8], /) -> &[u8]? {
         if (end_idx := (self.off as usize) +% (self.len as usize)) <= buf.len() and (
             self.off as usize
@@ -2145,7 +2024,7 @@ impl Span16 {
     }
 }
 
-/// Rounds `addr` upward to power-of-two `alignment`, returning `.None` on invalid alignment or `usize` overflow.
+/| Rounds `addr` upward to power-of-two `alignment`, returning `.None` on invalid alignment or `usize` overflow.
 @inline @no_alloc @no_panic
 pub fn align_up(addr: usize, alignment: usize, /) -> usize? {
     if alignment == 0_usize or (alignment & (alignment -% 1_usize)) != 0_usize {
@@ -2158,23 +2037,22 @@ pub fn align_up(addr: usize, alignment: usize, /) -> usize? {
     return .Some((addr +% mask) & ~mask);
 }
 
-/// Exchanges `*lhs` and `*rhs` in place via safe MVS parallel assignment (`SE-15`).
-@inline @no_alloc @no_panic
+/| Exchanges `*lhs` and `*rhs` in place via safe MVS parallel assignment (`SE-15`).
+@no_alloc @no_panic
 pub fn swap[T](lhs: &mut T, rhs: &mut T, /) {
     (lhs.*, rhs.*) = (rhs.*, lhs.*);
 }
 
-/// Replaces `*dest` with `src` and returns the previous `*dest` value without extra copies.
-@inline @no_alloc @no_panic
+/| Replaces `*dest` with `src` and returns the previous `*dest` value without extra copies.
+@no_alloc @no_panic
 pub fn replace[T](dest: &mut T, src: own T, /) -> T {
     var prev: T = own src;
     swap(dest, &mut prev);
     return own prev;
 }
 
-/// Reinterprets the prefix of `buf` as `&T` (`T: FromBytes`) after verifying size and alignment (`D-01`).
-@std_cap_boundary(clears: [may_panic])
-@inline @no_alloc @no_panic
+/| Reinterprets the prefix of `buf` as `&T` (`T: FromBytes`) after verifying size and alignment (`D-01`).
+@std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
 pub fn view_bytes[T: FromBytes](buf: &[u8], /) -> (&T)!WireError {
     let elem_size: usize = @size_of[T]();
     if buf.len() < elem_size {
@@ -2189,9 +2067,8 @@ pub fn view_bytes[T: FromBytes](buf: &[u8], /) -> (&T)!WireError {
     return .Err(.MisalignedPtr);
 }
 
-/// Reinterprets `buf` prefix as `&[T]` of length `count` (`T: FromBytes`), guarding `count * sizeof(T)` overflow.
-@std_cap_boundary(clears: [unsafe_op, may_panic])
-@inline @no_alloc @no_panic
+/| Reinterprets `buf` prefix as `&[T]` of length `count` (`T: FromBytes`), guarding `count * sizeof(T)` overflow.
+@std_cap_boundary(clears: [unsafe_op, may_panic]) @inline @no_alloc @no_panic
 pub fn view_slice_bytes[T: FromBytes](buf: &[u8], count: usize, /) -> (&[T])!WireError {
     let elem_size: usize = @size_of[T]();
     if elem_size != 0_usize and count > usize.MAX / elem_size {
@@ -2218,24 +2095,22 @@ pub fn view_slice_bytes[T: FromBytes](buf: &[u8], count: usize, /) -> (&[T])!Wir
     );
 }
 
-/// Projects `&value` (`T: IntoBytes`, padding-free or `@zero_pad`) as `&[u8]` in `O(1)` (`D-01`).
-@inline @no_alloc @no_panic
+/| Projects `&value` (`T: IntoBytes`, padding-free or `@zero_pad`) as `&[u8]` in `O(1)` (`D-01`).
+@no_alloc @no_panic
 pub fn as_bytes[T: IntoBytes](value: &T, /) -> &[u8] {
     return @as_bytes(value);
 }
 
-/// Projects `&mut value` (`T: FromBytes + IntoBytes`) as `&mut [u8]` in `O(1)` (`D-01`).
-@std_cap_boundary(clears: [unsafe_op])
-@inline @no_alloc @no_panic
+/| Projects `&mut value` (`T: FromBytes + IntoBytes`) as `&mut [u8]` in `O(1)` (`D-01`).
+@std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
 pub fn as_bytes_mut[T: FromBytes + IntoBytes](value: &mut T, /) -> &mut [u8] {
     return unsafe {
         @slice_from_raw_parts_mut((value as *mut T) as *mut u8, @size_of[T]())
     };
 }
 
-/// Reads an unaligned Little-Endian scalar `T` from `buf` at `offset` (`default = 0`).
-@std_cap_boundary(clears: [may_panic])
-@inline @no_alloc @no_panic
+/| Reads an unaligned Little-Endian scalar `T` from `buf` at `offset` (`default = 0`).
+@std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
 pub fn read_le[T: Integer | Float](buf: &[u8], offset: usize = 0_usize, /) -> T!WireError {
     let elem_size: usize = @size_of[T]();
     if offset > buf.len() or buf.len() -% offset < elem_size {
@@ -2244,9 +2119,8 @@ pub fn read_le[T: Integer | Float](buf: &[u8], offset: usize = 0_usize, /) -> T!
     return .Ok(@from_le_bytes[T](buf[offset..(offset +% elem_size)]));
 }
 
-/// Reads an unaligned Big-Endian scalar `T` from `buf` at `offset` (`default = 0`).
-@std_cap_boundary(clears: [may_panic])
-@inline @no_alloc @no_panic
+/| Reads an unaligned Big-Endian scalar `T` from `buf` at `offset` (`default = 0`).
+@std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
 pub fn read_be[T: Integer | Float](buf: &[u8], offset: usize = 0_usize, /) -> T!WireError {
     let elem_size: usize = @size_of[T]();
     if offset > buf.len() or buf.len() -% offset < elem_size {
@@ -2255,9 +2129,8 @@ pub fn read_be[T: Integer | Float](buf: &[u8], offset: usize = 0_usize, /) -> T!
     return .Ok(@from_be_bytes[T](buf[offset..(offset +% elem_size)]));
 }
 
-/// Writes scalar `value` in Little-Endian byte order into `buf` at `offset`.
-@std_cap_boundary(clears: [unsafe_op, may_panic])
-@inline @no_alloc @no_panic
+/| Writes scalar `value` in Little-Endian byte order into `buf` at `offset`.
+@std_cap_boundary(clears: [unsafe_op, may_panic]) @inline @no_alloc @no_panic
 pub fn write_le[T: Integer | Float](
     buf: &mut [u8],
     offset: usize,
@@ -2275,9 +2148,8 @@ pub fn write_le[T: Integer | Float](
     return .Ok(());
 }
 
-/// Writes scalar `value` in Big-Endian byte order into `buf` at `offset`.
-@std_cap_boundary(clears: [unsafe_op, may_panic])
-@inline @no_alloc @no_panic
+/| Writes scalar `value` in Big-Endian byte order into `buf` at `offset`.
+@std_cap_boundary(clears: [unsafe_op, may_panic]) @inline @no_alloc @no_panic
 pub fn write_be[T: Integer | Float](
     buf: &mut [u8],
     offset: usize,
@@ -2296,23 +2168,22 @@ pub fn write_be[T: Integer | Float](
 }
 
 impl ByteCursor {
-    /// Constructs a `ByteCursor` positioned at byte `0` of `buf`.
+    /| Constructs a `ByteCursor` positioned at byte `0` of `buf`.
     @inline @no_alloc @no_panic
     pub fn new(buf: &[u8], /) -> Self {
         return Self { buf: buf, pos: 0_usize };
     }
 
-    /// Returns the unread byte count remaining in `self.buf`.
+    /| Returns the unread byte count remaining in `self.buf`.
     @inline @no_alloc @no_panic
     pub fn remaining(&self) -> usize = self.buf.len() -| self.pos;
 
-    /// Returns `true` when `self` has reached the end of `self.buf`.
+    /| Returns `true` when `self` has reached the end of `self.buf`.
     @inline @no_alloc @no_panic
     pub fn is_empty(&self) -> bool = self.pos >= self.buf.len();
 
-    /// Advances `self.pos` by `n` bytes and returns the consumed sub-slice.
-    @std_cap_boundary(clears: [may_panic])
-    @inline @no_alloc @no_panic
+    /| Advances `self.pos` by `n` bytes and returns the consumed sub-slice.
+    @std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
     pub fn take(&mut self, n: usize, /) -> (&[u8])!WireError {
         if n > self.remaining() {
             return .Err(.UnexpectedEof);
@@ -2322,9 +2193,8 @@ impl ByteCursor {
         return .Ok(self.buf[start_pos..self.pos]);
     }
 
-    /// Reads a Little-Endian `T` (`Integer | Float`) and advances `self.pos` on success.
-    @std_cap_boundary(clears: [may_panic])
-    @inline @no_alloc @no_panic
+    /| Reads a Little-Endian `T` (`Integer | Float`) and advances `self.pos` on success.
+    @std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
     pub fn read_le[T: Integer | Float](&mut self) -> T!WireError {
         let elem_size: usize = @size_of[T]();
         if elem_size > self.remaining() {
@@ -2335,9 +2205,8 @@ impl ByteCursor {
         return .Ok(@from_le_bytes[T](self.buf[start_pos..self.pos]));
     }
 
-    /// Reads a Big-Endian `T` (`Integer | Float`) and advances `self.pos` on success.
-    @std_cap_boundary(clears: [may_panic])
-    @inline @no_alloc @no_panic
+    /| Reads a Big-Endian `T` (`Integer | Float`) and advances `self.pos` on success.
+    @std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
     pub fn read_be[T: Integer | Float](&mut self) -> T!WireError {
         let elem_size: usize = @size_of[T]();
         if elem_size > self.remaining() {
@@ -2348,9 +2217,8 @@ impl ByteCursor {
         return .Ok(@from_be_bytes[T](self.buf[start_pos..self.pos]));
     }
 
-    /// Views an aligned `&T` (`T: FromBytes`) at `self.pos` and advances `self.pos` on success.
-    @std_cap_boundary(clears: [may_panic])
-    @inline @no_alloc @no_panic
+    /| Views an aligned `&T` (`T: FromBytes`) at `self.pos` and advances `self.pos` on success.
+    @std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
     pub fn view[T: FromBytes](&mut self) -> (&T)!WireError {
         let elem_size: usize = @size_of[T]();
         if elem_size > self.remaining() {

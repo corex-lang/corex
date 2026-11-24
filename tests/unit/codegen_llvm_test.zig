@@ -443,8 +443,7 @@ test "test_codegen_llvm_cross_target_object_verifier_linux_macos_wasm" {
 test "test_codegen_llvm_native_release_execution_and_fuzz_sancov_edge_hits" {
     const host_spec = TargetSpec.host();
     const exec_src =
-        \\@zero_pad
-        \\@repr(C)
+        \\@repr(C, zero_pad: true)
         \\pub struct ZeroPadItem {
         \\    pub marker: u8,
         \\    pub wide: u64,
@@ -493,7 +492,7 @@ test "test_codegen_llvm_native_release_execution_and_fuzz_sancov_edge_hits" {
         \\    target_slot.* = target_slot.* + amount;
         \\}
         \\pub fn main() -> i32 {
-        \\    // [1] `@zero_pad` `0x00` verification:
+        \\    // [1] `zero_pad: true` `0x00` verification:
         \\    let z_item = ZeroPadItem { marker: 5, wide: 777 };
         \\    let raw_b: &[u8] = z_item.as_bytes();
         \\    var pad_acc: u8 = 0;
@@ -743,16 +742,16 @@ test "test_regression_codegen_llvm_wasi_import_module_extern_dedup_and_quoted_id
         \\    pub val: i32,
         \\}
         \\@extern("C")
-        \\@link_name("fd_write")
+        \\@link(name: "fd_write")
         \\pub fn wasi_fd_write_a(fd: i32, iovs: *u8, iovs_len: usize, nwritten: *usize) -> u16;
         \\@extern("C")
-        \\@link_name("fd_write")
+        \\@link(name: "fd_write")
         \\pub fn wasi_fd_write_b(fd: i32, iovs: *u8, iovs_len: usize, nwritten: *usize) -> u16;
         \\@extern("C")
-        \\@link_name("proc_exit")
+        \\@link(name: "proc_exit")
         \\pub fn wasi_proc_exit_a(code: i32) -> never;
         \\@extern("C")
-        \\@link_name("custom$sym-name")
+        \\@link(name: "custom$sym-name")
         \\pub fn ext_dollar_hyphen(val: i32) -> i32;
         \\pub fn invoke_wasi_and_quoted(x_in: i32) -> i32 {
         \\    if x_in == -999 {
@@ -889,4 +888,84 @@ test "test_regression_codegen_llvm_tls_80b_40b_context_and_wasm32_rng_seed_rv2_c
         null,
     );
     defer wasm_obj_art.deinit(std.testing.allocator);
+}
+
+test "test_dr24_codegen_llvm_transparent_packed_cap_inline_fmt_and_inline_if" {
+    const dr24_llvm_src =
+        \\/# DR-24 Tier B LLVM IR Emission & Object Compilation Verification
+        \\@repr(transparent)
+        \\pub struct F64Handle {
+        \\    pub val: f64,
+        \\    pub zst_tag: (),
+        \\}
+        \\@repr(C, packed: 2, align: 16, zero_pad: true)
+        \\pub struct PackedCap16 {
+        \\    pub head: u8,
+        \\    pub word: u32,
+        \\    pub tail: u16,
+        \\}
+        \\@export
+        \\pub extern "C" fn dr24_bounce_transparent(in_h: F64Handle) -> F64Handle {
+        \\    return in_h;
+        \\}
+        \\@inline(always)
+        \\pub fn force_word(hdr: &PackedCap16) -> u32 {
+        \\    return hdr.word;
+        \\}
+        \\@inline(never)
+        \\pub fn eval_dr24_llvm(seed: i32, opt_bonus: i32?) -> i32 {
+        \\    let hdr = PackedCap16 { head: 4, word: 0x0102_0304, tail: 8 };
+        \\    let pad_bytes: &[u8] = hdr.as_bytes();
+        \\    let lit_s: str = "{literal}";
+        \\    let fmt_s: str = f"h={hdr.head}";
+        \\    let fmt_q: str = f#"v="{seed}""#;
+        \\    let multi_s: str = "
+        \\        l1
+        \\        l2
+        \\        ";
+        \\    let chosen = if (doubled := seed * 2) > 4 and opt_bonus is .Some(bonus_v) => doubled + bonus_v else 0;
+        \\    return chosen + (force_word(&hdr) as i32) + (pad_bytes[1] as i32) +
+        \\        (lit_s.len() as i32) + (fmt_s.len() as i32) + (fmt_q.len() as i32) + (multi_s.len() as i32);
+        \\}
+    ;
+
+    var ir_art = try emitLlvmModuleFromSource(
+        std.testing.allocator,
+        dr24_llvm_src,
+        TargetSpec.X86_64_LINUX,
+        .debug_o0,
+        true,
+        false,
+        false,
+        false,
+        .source_text,
+        null,
+        null,
+    );
+    defer ir_art.deinit(std.testing.allocator);
+
+    try std.testing.expect(
+        std.mem.indexOf(u8, ir_art.emitted_text, "define noundef double @dr24_bounce_transparent(double") != null or
+            std.mem.indexOf(u8, ir_art.emitted_text, "define double @dr24_bounce_transparent(double") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, ir_art.emitted_text, " alwaysinline") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ir_art.emitted_text, " noinline") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ir_art.emitted_text, ", align 2") != null);
+
+    const llvm_obj = ".zig-cache/test_tier_b_dr24_attrs.o";
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, llvm_obj) catch {};
+    var obj_art = try emitLlvmModuleFromSource(
+        std.testing.allocator,
+        dr24_llvm_src,
+        TargetSpec.X86_64_LINUX,
+        .release_fast_o2,
+        true,
+        false,
+        false,
+        false,
+        .object_file,
+        llvm_obj,
+        null,
+    );
+    defer obj_art.deinit(std.testing.allocator);
 }

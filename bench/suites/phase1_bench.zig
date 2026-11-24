@@ -3,8 +3,9 @@
 //! Benchmarks deterministic UTF-8 lexing throughput across a 64 KiB (`2,048` LOC) synthetic `.cx`
 //! module (reusing `TokenBuffer` capacity for zero-allocation hot-path scanning), $O(1)$ keyword
 //! and disjoint identifier casing classification across 10,000 identifiers, literal-heavy scanning
-//! (radix integers, floats, nested `{expr}` string interpolations, and `r#"…"#` raw strings), and
-//! lossless byte-for-bit source reconstruction via `LosslessCstArena.reconstructSource`.
+//! (radix integers, floats, nested `f"…"` / `f#"…"#` `{expr}` string interpolations, `"<newline> … "`
+//! multiline strings, and `r#"…"#` raw strings), and lossless byte-for-bit source reconstruction
+//! via `LosslessCstArena.reconstructSource`.
 //!
 //! Executed via `zig build bench`, enforcing 5 warmup iterations and 30 timed iterations per workload
 //! and rendering the canonical monochrome Unicode report table.
@@ -24,7 +25,7 @@ const BenchCase = corex.bench_harness.BenchCase;
 
 /// Representative 16-line `.cx` code block (`~512` bytes) repeated 128 times to form a 64 KiB (`2,048` LOC) module.
 const SYNTHETIC_BLOCK_16_LOC =
-    "/// Computes bounded checksum across a borrowed slice of packet frames.\n" ++
+    "/| Computes bounded checksum across a borrowed slice of packet frames.\n" ++
     "pub fn compute_frame_checksum(frames: &[PacketFrame], seed_val: u64, /) -> u64!FrameError {\n" ++
     "    const PRIME_MULT: u64 = 0x9E37_79B9_7F4A_7C15_u64;\n" ++
     "    var acc_hash: u64 = seed_val +% 1_000_000_u64;\n" ++
@@ -34,8 +35,8 @@ const SYNTHETIC_BLOCK_16_LOC =
     "            acc_hash = (acc_hash *% PRIME_MULT) ^ item.payload_len.max(1);\n" ++
     "        }\n" ++
     "    }\n" ++
-    "    /* Verify non-zero state before returning to caller */\n" ++
-    "    let status_msg = \"hash={acc_hash:#018x} count={frames.len()}\\n\";\n" ++
+    "    // Verify non-zero state before returning to caller:\n" ++
+    "    let status_msg = f\"hash={acc_hash:#018x} count={frames.len()}\\n\";\n" ++
     "    let raw_tag = b\"corex.net.frame_v1\";\n" ++
     "    let sep_char = b':';\n" ++
     "    return .Ok(acc_hash);\n" ++
@@ -58,10 +59,10 @@ const LITERAL_WORKLOAD_CHUNK =
     "const BIN_FLAGS: u32 = 0b1010_0101_1111_0000_u32;\n" ++
     "const OCT_PERMS: u16 = 0o755_u16;\n" ++
     "const FLOAT_TOL: f64 = 3.141_592_653e-12_f64;\n" ++
-    "let msg = \"{{v1}} val={if x > 0 { \"inner {r#\"raw\"#}\" } else { \"zero\" }} \\x7F \\u{03B1}\\n\";\n" ++
+    "let msg = f\"{{v1}} val={if x > 0 => f\\\"inner {r#\\\"raw\\\"#}\\\" else \\\"zero\\\"} \\x7F \\u{03B1}\\n\";\n" ++
     "let wire_bytes = b\"HTTP/1.1 200 OK\\r\\n\";\n" ++
     "let sep_byte = b':';\n" ++
-    "let banner = \"\"\"\n    line {x=}\n    \"\"\";\n" ++
+    "let banner = f\"\n    line {x=}\n    \";\n" ++
     "let regex_pat = r##\"^[a-zA-Z_][a-zA-Z0-9_]*$\"##;\n" ++
     "let glyphs = ['a', 'é', '─', '𐍈', '\\n', '\\t', '\\''];\n";
 

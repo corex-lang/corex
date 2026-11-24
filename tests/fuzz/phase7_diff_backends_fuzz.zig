@@ -76,7 +76,7 @@ fn generateRandomValidCxProgram(allocator: std.mem.Allocator, prng_seed: u64) ![
         allocator,
         try std.fmt.bufPrint(
             &header_buf,
-            "//! Generated Structure-Aware Phase 7–7.6 (`DR-22`) Differential Fuzz Program\n" ++
+            "/# Generated Structure-Aware Phase 7–11.1b (`DR-24`) Differential Fuzz Program\n\n" ++
                 "pub trait Drop {{\n" ++
                 "    fn drop(&mut self);\n" ++
                 "}}\n\n" ++
@@ -101,8 +101,7 @@ fn generateRandomValidCxProgram(allocator: std.mem.Allocator, prng_seed: u64) ![
                 "    Advance = 1,\n" ++
                 "    Finish = 2,\n" ++
                 "}}\n\n" ++
-                "@repr(C)\n" ++
-                "@zero_pad\n" ++
+                "@repr(C, zero_pad: true)\n" ++
                 "pub struct PairPacket {{\n" ++
                 "    pub tag_u8: u8,\n" ++
                 "    pub payload_i32: i32,\n" ++
@@ -218,10 +217,10 @@ fn generateRandomValidCxProgram(allocator: std.mem.Allocator, prng_seed: u64) ![
             "    }};\n" ++
             "    let vec_lanes: [i32; 4] = @simd_add(@simd_splat[[i32; 4]]({d}), [1, 2, 3, 4]);\n" ++
             "    let simd_term: i32 = @simd_reduce_add(vec_lanes);\n" ++
-            "    let banner_str: str = \"\"\"\n" ++
+            "    let banner_str: str = \"\n" ++
             "        fuzz-ok\n" ++
-            "        \"\"\";\n" ++
-            "    _ = @sys_write(1, \"{{banner_str}}\\n\");\n" ++
+            "        \";\n" ++
+            "    _ = @sys_write(1, f\"{{banner_str}}\\n\");\n" ++
             "    return running_acc +% opt_term +% orelse_term +% call_term +% dollar_tail +%\n" ++
             "        search_term +% ctx_term +% res_term +% simd_term;\n" ++
             "}}\n",

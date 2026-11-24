@@ -10558,8 +10558,7 @@ test "test_mir_opt_d1_inliner_guards_max_place_proj_depth_with_e0508" {
 test "test_phase6_mir_opt_place_intrinsics_d3_strip_sroa_dce_icf_and_vrp" {
     const allocator = std.testing.allocator;
     const src =
-        \\@zero_pad
-        \\@repr(C)
+        \\@repr(C, zero_pad: true)
         \\pub struct PadItem {
         \\    pub flag: u8,
         \\    pub word: u32,

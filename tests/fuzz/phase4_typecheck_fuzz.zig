@@ -87,15 +87,26 @@ const PHASE4_SEED_ITEMS = [_][]const u8{
         "    var left_n: i32 = (next_v.x as i32) + (loc.line as i32);\n" ++
         "    var right_n: i32 = (WireOrder.SeqCst as u8 as i32) + (flag as i32);\n" ++
         "    (left_n, right_n) = (right_n, left_n);\n" ++
-        "    let msg = \"\"\"\n" ++
+        "    let msg = f\"\n" ++
         "        {{hdr}} {left_n=} hex={right_n:#06x}\n" ++
-        "        \"\"\";\n" ++
+        "        \";\n" ++
         "    _ = msg;\n" ++
         "    return fsm: match WireOrder.Relaxed {\n" ++
         "        .Relaxed => continue :fsm .SeqCst,\n" ++
         "        .Acquire => left_n,\n" ++
         "        .SeqCst => left_n + right_n,\n" ++
         "    };\n" ++
+        "}\n",
+    "@repr(C, align: .CacheLine, zero_pad: true)\n@derive(Copy, Equatable)\n" ++
+        "pub struct AlignedPacket { pub seq_id: u64, pub tag_id: u32 }\n",
+    "@repr(C, packed: true, align: 8)\npub struct PackedWireHdr { pub tag_b: u8, pub body_len: u32 }\n",
+    "@link(name: \"cx_ext_probe\", section: \".text\")\nextern \"C\" fn ext_probe(val_in: i32) -> i32;\n",
+    "pub fn dr24_inline_if_and_strings(opt_v: i32?, flag_b: bool) -> str {\n" ++
+        "    let picked: i32 = if (cand_v := opt_v) is .Some(num_v) and (doubled := num_v * 2) > 4 => doubled\n" ++
+        "        else if flag_b => 1\n" ++
+        "        else 0;\n" ++
+        "    let _fmt_json = f#\"{\"picked\": {picked:#04x}}\"#;\n" ++
+        "    return if picked > 0 => \"{\\\"ok\\\": true}\" else \"meta != '{}'\";\n" ++
         "}\n",
     "@cfg(target.ptr_width == 64 or target.ptr_width == 32)\n" ++
         "pub fn cfg_guarded_helper() -> i32 = ~0_i32;\n",
@@ -202,7 +213,10 @@ const PHASE4_MUTATION_SNIPPETS = [_][]const u8{
         "}\n",
     "pub bit_field BadBitSum: u8 { pub low_bits: u8 | 3, pub high_bits: u8 | 3 }\n",
     "pub fn bad_zone_call() -> usize = strip_head(data: \"hi\");\n",
-    "pub fn bad_fmt_spec(name: str) -> str = \"{name:#x}\";\n",
+    "pub fn bad_fmt_spec(name: str) -> str = f\"{name:#x}\";\n",
+    "@repr(packed: true)\npub struct BadPackedNoC { pub x_val: u32 }\n",
+    "pub fn bad_packed_borrow(hdr_in: &PackedWireHdr) -> &u32 = &hdr_in.body_len;\n",
+    "pub fn bad_inline_if_no_else(flag_b: bool) -> i32 = if flag_b => 1;\n",
     "pub fn bad_missing_field() -> IoError = IoError {};\n",
     "pub fn bad_par_assign(lhs_v: i32) { var rhs_v: i32 = 0; (lhs_v + 1, rhs_v) = (1, 2); }\n",
     "pub fn bad_fsm_continue(step_v: i32) -> i32 = fsm: match step_v { 0 => continue :fsm, _ => 1 };\n",
@@ -214,7 +228,7 @@ const PHASE4_MUTATION_SNIPPETS = [_][]const u8{
 const PHASE4_BODY_VARIANTS = [_][]const u8{
     "    let step = add_generic(input_val, 10);\n    return .Ok(step);\n",
     "    // Comment edit only:\n    let step = add_generic(input_val, 10);\n\n    return .Ok(step);\n",
-    "    let opt_in: i32? = if input_val > 0 { .Some(input_val) } else { .None };\n" ++
+    "    let opt_in: i32? = if input_val > 0 => .Some(input_val) else .None;\n" ++
         "    if (cand_opt := opt_in) is .Some(inner_val) and (shifted := inner_val + 3) > 5 {\n" ++
         "        let _keep = cand_opt;\n" ++
         "        return .Ok(scale_step(bonus: shifted, base: inner_val));\n" ++
@@ -261,7 +275,7 @@ fn buildIncrementalTypecheckModule(
     errdefer builder.deinit(allocator);
 
     if (has_banner_comment) {
-        try builder.appendSlice(allocator, "//! Incremental Phase 4 + DR-21 fuzz banner\n\n");
+        try builder.appendSlice(allocator, "/# Incremental Phase 4 + DR-24 fuzz banner\n\n");
     }
     try builder.appendSlice(allocator, PHASE4_IMPORT_VARIANTS[import_choice]);
     try builder.appendSlice(

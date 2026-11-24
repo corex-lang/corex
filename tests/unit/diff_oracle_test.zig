@@ -1,7 +1,7 @@
 //! Unit & End-to-End Tests for `diff_oracle.zig` and Phase 7 CLI (`tests/unit/diff_oracle_test.zig`)
 //!
 //! Verifies 4-tier differential parity (`MirVm --dev`, `MirVm --release`, Tier A `-ofmt=c`, and
-//! Tier B `LLVM -O2` per `DR-20` `D-07A`) across native/C structs, `@zero_pad`, `bit_field`, niche
+//! Tier B `LLVM -O2` per `DR-20` `D-07A`) across native/C structs, `zero_pad: true`, `bit_field`, niche
 //! `Option`/`Result` (`str?` `.Some("")` vs `.None`, `cx_result_cc` `?` + `Err(0)`), `defer` /
 //! `errdefer` / `AutoDrop` `@drop_trace`, `#soa` + `@must_vectorize`, `@local` closures, atomics,
 //! SIMD (`[i32; 4]` & `[f32; 4]` in-order horizontal reduction), `@sys_write`, `@sys_exit`, and
@@ -22,17 +22,16 @@ const OracleTierOutcome = corex.OracleTierOutcome;
 
 // --------------------------------------- CONSTS ----------------------------------------
 
-/// Showcase `.cx` source exercising structs, `@repr(C)`, `@zero_pad`, `bit_field`, niche `Option`, and `Result`.
+/// Showcase `.cx` source exercising structs, `@repr(C, zero_pad: true)`, `bit_field`, niche `Option`, and `Result`.
 const LAYOUT_NICHE_RESULT_SRC =
-    "//! 4-Tier Struct Layout, Bitfield, Niche Option, and Result `?` Oracle Case\n" ++
+    "/# 4-Tier Struct Layout, Bitfield, Niche Option, and Result `?` Oracle Case\n" ++
     "pub struct ReorderedNative {\n" ++
     "    pub tag_byte: u8,\n" ++
     "    pub wide_val: i64,\n" ++
     "    pub mid_val: i32,\n" ++
     "}\n" ++
     "\n" ++
-    "@repr(C)\n" ++
-    "@zero_pad\n" ++
+    "@repr(C, zero_pad: true)\n" ++
     "pub struct WireHeader {\n" ++
     "    pub opcode: u8,\n" ++
     "    pub length: u32,\n" ++
@@ -96,7 +95,7 @@ const LAYOUT_NICHE_RESULT_SRC =
 
 /// Showcase `.cx` source exercising `Drop`, conditional moves, `defer`, and `errdefer` LIFO `@drop_trace`.
 const DROP_DEFER_ERRDEFER_SRC =
-    "//! 4-Tier AutoDrop, Conditional Move, `defer`, and `errdefer` LIFO Oracle Case\n" ++
+    "/# 4-Tier AutoDrop, Conditional Move, `defer`, and `errdefer` LIFO Oracle Case\n" ++
     "pub trait Drop {\n" ++
     "    fn drop(&mut self);\n" ++
     "}\n" ++
@@ -145,7 +144,7 @@ const DROP_DEFER_ERRDEFER_SRC =
 
 /// Showcase `.cx` source exercising `#soa`, `@must_vectorize`, `inout` MVS, and `@local` closures.
 const SOA_VECTORIZE_CLOSURE_SRC =
-    "//! 4-Tier `#soa` Column Array, `@must_vectorize`, `inout` MVS, and Closure Oracle Case\n" ++
+    "/# 4-Tier `#soa` Column Array, `@must_vectorize`, `inout` MVS, and Closure Oracle Case\n" ++
     "pub struct Particle {\n" ++
     "    pub pos_x: i32,\n" ++
     "    pub vel_x: i32,\n" ++
@@ -190,7 +189,7 @@ const SOA_VECTORIZE_CLOSURE_SRC =
 
 /// Showcase `.cx` source exercising `@atomic_*`, `@simd_*` (`i32` & `f32`), and `@sys_write`.
 const ATOMICS_SIMD_STREAMS_SRC =
-    "//! 4-Tier Atomics, Integer/Float SIMD, and `@sys_write` Streams Oracle Case\n" ++
+    "/# 4-Tier Atomics, Integer/Float SIMD, and `@sys_write` Streams Oracle Case\n" ++
     "pub fn main() -> i32 {\n" ++
     "    var cell: u32 = 12;\n" ++
     "    @atomic_store(&mut cell, 20, 5);\n" ++
@@ -305,7 +304,7 @@ test "test_diff_oracle_four_tier_sys_exit_and_deliberate_runtime_trap_parity" {
 
     // [1] `@sys_exit(37)` exit-code + pre-exit stream/drop-trace parity:
     const sys_exit_src =
-        "//! `@sys_exit` 4-Tier Parity\n" ++
+        "/# `@sys_exit` 4-Tier Parity\n" ++
         "pub fn main() -> i32 {\n" ++
         "    @drop_trace(55);\n" ++
         "    _ = @sys_write(1, \"bye-37\\n\");\n" ++
@@ -320,7 +319,7 @@ test "test_diff_oracle_four_tier_sys_exit_and_deliberate_runtime_trap_parity" {
 
     // [2] Deliberate `@panic("oracle_boom")` trap parity:
     const panic_src =
-        "//! `@panic` 4-Tier Trap Parity\n" ++
+        "/# `@panic` 4-Tier Trap Parity\n" ++
         "pub fn main() -> i32 {\n" ++
         "    @drop_trace(404);\n" ++
         "    @panic(\"oracle_boom\");\n" ++
@@ -334,8 +333,8 @@ test "test_diff_oracle_four_tier_sys_exit_and_deliberate_runtime_trap_parity" {
 
     // [3] Deliberate checked signed integer overflow trap parity:
     const overflow_src =
-        "//! Checked Overflow 4-Tier Trap Parity\n" ++
-        "@noinline\n" ++
+        "/# Checked Overflow 4-Tier Trap Parity\n" ++
+        "@inline(never)\n" ++
         "pub fn hidden_delta() -> i32 {\n" ++
         "    return 1;\n" ++
         "}\n" ++
@@ -384,7 +383,7 @@ test "test_cli_end_to_end_build_emit_c_emit_llvm_fuzz_run_test_diff_backends_and
     defer allocator.free(cli_fuzz_path);
 
     const cli_app_source =
-        "//! Phase 7 CLI End-to-End Integration Program\n" ++
+        "/# Phase 7 CLI End-to-End Integration Program\n" ++
         "pub fn compute_tag(step: i32) -> i32 {\n" ++
         "    if step > 2 {\n" ++
         "        return step * 4;\n" ++
@@ -565,7 +564,7 @@ test "test_regression_refined_niche_option_packed_align_and_aggregate_insert" {
         \\pub type SmallPos = u32 is 1..=10;
         \\pub type MidPos = u32 is 5..=10;
         \\
-        \\@packed
+        \\@repr(C, packed: true)
         \\pub struct UnalignedFrame {
         \\    pub prefix: u8,
         \\    pub payload: u64,
@@ -732,7 +731,7 @@ test "test_regression_128bit_float_casts_bitfields_c_union_and_closure_pass_mode
         \\    let wide_neg: i128 = -8_000_000_000;
         \\    let as_f64: f64 = wide_neg as f64;
         \\    let back_i128: i128 = as_f64 as i128;
-        \\    let interp_s: str = "v={wide_neg}";
+        \\    let interp_s: str = f"v={wide_neg}";
         \\    let cast_ok: i32 = if back_i128 == wide_neg and interp_s == "v=-8000000000" { 13 } else { 0 };
         \\
         \\    var wbf = WideBits { lo_word: 9, hi_tag: 42, top_rest: 3 };
@@ -1225,10 +1224,10 @@ test "test_phase76_four_tier_parity_dr22_strings_fmt_update_swap_subscript_loc_b
         \\
         \\pub fn main() -> i32 {
         \\    let tag_num: i32 = 7;
-        \\    let banner: str = """
+        \\    let banner: str = f"
         \\        hdr={tag_num}
         \\        ok
-        \\        """;
+        \\        ";
         \\    _ = @sys_write(1, banner);
         \\
         \\    let magic_bytes: &[u8; 4] = b"CX\x2a!";
@@ -1236,7 +1235,7 @@ test "test_phase76_four_tier_parity_dr22_strings_fmt_update_swap_subscript_loc_b
         \\    let bytes_score: i32 = (magic_bytes.*[2] as i32) + (byte_nl as i32);
         \\
         \\    let hex_val: u32 = 0x2a_u32;
-        \\    let fmt_line: str = "\n{{{hex_val:08x}|{hex_val=}}}\n";
+        \\    let fmt_line: str = f"\n{{{hex_val:08x}|{hex_val=}}}\n";
         \\    _ = @sys_write(1, fmt_line);
         \\    let fmt_score: i32 = fmt_line.len() as i32;
         \\
@@ -1376,4 +1375,100 @@ test "test_phase76_four_tier_parity_dr22_strings_fmt_update_swap_subscript_loc_b
     // `bf_score = 1 + 5 + 15 + 1 = 22`; `arr_score = -2 + 1 + -4 = -5`; `spread_score = 9 + 7 + 3 + 10 = 29`;
     // `pkt_score = 11 + 77 - 70 = 18`; `zone_score = 4 + 6 + 5 + 14 = 29` -> `22 - 5 + 29 + 18 + 29 = 93`:
     try std.testing.expectEqual(@as(i64, 93), bf_report.outcomes[0].return_scalar_i64);
+}
+
+test "test_dr24_four_tier_parity_repr_inline_fmt_strings_and_inline_if" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const dr24_oracle_src =
+        \\/# Phase 11.1b (`DR-24`) 4-Tier Differential Parity Showcase
+        \\pub trait Drop {
+        \\    fn drop(&mut self);
+        \\}
+        \\
+        \\pub struct TraceGuard {
+        \\    pub id: i64,
+        \\}
+        \\
+        \\impl Drop for TraceGuard {
+        \\    pub fn drop(&mut self) {
+        \\        @drop_trace(self.id);
+        \\    }
+        \\}
+        \\
+        \\/| Single-field transparent wrapper preserving non-null reference niche and scalar ABI.
+        \\@repr(transparent)
+        \\pub struct RefWrap {
+        \\    pub inner_ref: &i32,
+        \\    pub unit_tag: (),
+        \\}
+        \\
+        \\/| Packed-cap-2 + 16-byte aligned + zero-padded wire header (`size = 16`, `align = 16`).
+        \\@repr(C, packed: 2, align: 16, zero_pad: true)
+        \\pub struct WireHdr16 {
+        \\    pub head: u8,
+        \\    pub seq: u32,
+        \\    pub flags: u16,
+        \\}
+        \\
+        \\@inline(always)
+        \\pub fn fast_add(lhs_val: i32, rhs_val: i32) -> i32 {
+        \\    return lhs_val + rhs_val;
+        \\}
+        \\
+        \\@inline(never)
+        \\pub fn eval_inline_if(seed: i32, maybe_wrap: RefWrap?) -> i32 {
+        \\    let _guard = TraceGuard { id: 401 };
+        \\    return if (scaled := seed * 3) > 6 and maybe_wrap is .Some(wrap_val) => fast_add(scaled, wrap_val.inner_ref.*) else -1;
+        \\}
+        \\
+        \\pub fn main() -> i32 {
+        \\    let target_num: i32 = 11;
+        \\    let some_wrap: RefWrap? = .Some(RefWrap { inner_ref: &target_num, unit_tag: () });
+        \\    let none_wrap: RefWrap? = .None;
+        \\    let hit_score = eval_inline_if(4, some_wrap);
+        \\    let miss_score = eval_inline_if(1, none_wrap);
+        \\
+        \\    let hdr = WireHdr16 { head: 5, seq: 0x0102_0304, flags: 9 };
+        \\    let raw_b: &[u8] = hdr.as_bytes();
+        \\    var pad_or: u8 = raw_b[1];
+        \\    var idx: usize = 8;
+        \\    while idx < 16 {
+        \\        pad_or = pad_or | raw_b[idx];
+        \\        idx += 1;
+        \\    }
+        \\    if pad_or != 0 or @size_of[RefWrap?]() != @size_of[&i32]() or @size_of[WireHdr16]() != 16 {
+        \\        @trap();
+        \\    }
+        \\
+        \\    let plain_json: str = "{\"ok\":true}";
+        \\    let fmt_line: str = f"hdr={hdr.head}:{hdr.flags}\n";
+        \\    let fmt_guarded: str = f#"q="{target_num}"\n"#;
+        \\    let multi_plain: str = "
+        \\        alpha {lit}
+        \\        beta
+        \\        ";
+        \\    _ = @sys_write(1, plain_json);
+        \\    _ = @sys_write(1, "\n");
+        \\    _ = @sys_write(1, fmt_line);
+        \\    _ = @sys_write(1, fmt_guarded);
+        \\    _ = @sys_write(1, multi_plain);
+        \\    _ = @sys_write(1, "\n");
+        \\
+        \\    let tier_label = if hit_score > 20 => 10 else if hit_score > 10 => 5 else 0;
+        \\    return hit_score + miss_score + tier_label + (hdr.head as i32) + (multi_plain.len() as i32);
+        \\}
+    ;
+
+    var report = try expectFourTierParity(allocator, io, dr24_oracle_src);
+    defer report.deinit(allocator);
+    try std.testing.expect(!report.outcomes[0].has_trapped);
+    try std.testing.expectEqualStrings(
+        "{\"ok\":true}\nhdr=5:9\nq=\"11\"\nalpha {lit}\nbeta\n",
+        report.outcomes[0].stdout_bytes,
+    );
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 401, 401 }, report.outcomes[0].drop_trace);
+    // `hit_score = 23`, `miss_score = -1`, `tier_label = 10`, `hdr.head = 5`, `multi_plain.len() = 16` -> `53`:
+    try std.testing.expectEqual(@as(i64, 53), report.outcomes[0].return_scalar_i64);
 }

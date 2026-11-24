@@ -1101,14 +1101,14 @@ fn resolveVariantPayloadType(
     };
 }
 
-/// Returns `true` when `raw_ty` unwraps to a `@packed` `.struct_ty` with 1-byte field alignment.
+/// Returns `true` when `raw_ty` unwraps to a `@repr(C, packed: …)` `.struct_ty` with capped field alignment.
 fn isPackedStructType(pool: *const InternPool, sym_table: *const SymbolTable, raw_ty: TypeId) bool {
     const ty = pool.unwrapUnderlyingType(raw_ty);
     const node = pool.getNode(ty);
     if (node.tag != .struct_ty) return false;
     const sym_idx = SymbolIndex.fromInt(node.rhs);
     if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return false;
-    return sym_table.getSymbol(sym_idx).contract_flags.is_packed;
+    return sym_table.getSymbol(sym_idx).packedCapBytes() > 0;
 }
 
 /// Computes the byte offset and field `TypeId` of `field_ordinal` inside a `.struct_ty`, `.tuple_ty`, or `.union_ty`.
@@ -12781,7 +12781,7 @@ pub const MirVm = struct {
                             const f_slot = try self.loadTypedSlotFromMemoryAligned(
                                 try self.advanceSymbolicPtr(val_slot.sym_ptr, f_info.byte_offset),
                                 f_info.field_ty,
-                                st_sym.contract_flags.is_packed,
+                                st_sym.packedCapBytes() > 0,
                             );
                             try self.appendFormattedValueMode(out, f_info.field_ty, f_slot, is_debug_mode);
                         }
@@ -15364,8 +15364,7 @@ test "test_mir_vm_rodata_promotion_uninit_leaf_e0505_padding_subslice_and_cycle_
 test "test_mir_vm_narrow_wire_zero_pad_drops_subscript_defer_and_e0326" {
     const allocator = std.testing.allocator;
     const source =
-        \\@zero_pad
-        \\@repr(C)
+        \\@repr(C, zero_pad: true)
         \\pub struct WirePacket {
         \\    pub tag: u8,
         \\    pub payload: u32,
@@ -15628,8 +15627,8 @@ test "test_mir_vm_source_loc_fmt_atomics_bytes_and_simd_bit_not" {
         \\pub fn render_specs(num: u32, label: str) -> str {
         \\    let neg: i32 = -1;
         \\    let sk: SignedKind = .Low;
-        \\    let dyn_fa: FmtArgs = "k={num:02x},{sk:?}";
-        \\    return "{num:08x}|{label:>6}|{num=}|{neg:x}|{dyn_fa}";
+        \\    let dyn_fa: FmtArgs = f"k={num:02x},{sk:?}";
+        \\    return f"{num:08x}|{label:>6}|{num=}|{neg:x}|{dyn_fa}";
         \\}
         \\pub fn run_atomic_and_raw_and_bytes() -> u32 {
         \\    let counter = AtomicBox { val: 10 };
@@ -15767,9 +15766,9 @@ test "test_mir_vm_zero_env_own_closure_uaf_cmpxchg_and_float_fmt" {
         \\    let f_nan: f64 = zero_f / zero_f;
         \\    let f_inf: f64 = 1.0 / zero_f;
         \\    let f_ninf: f64 = -1.0 / zero_f;
-        \\    let part_a: str = "{seed_five}|{seed_five:?}|{f_tiny}|{f_small}|{f_big}";
-        \\    let part_b: str = "{f_nan}|{f_nan:+}|{f_nan:E}|{f_inf}|{f_inf:+}|{f_ninf}|{f_inf:E}|{f_ninf:E}";
-        \\    return "{part_a}|{part_b}";
+        \\    let part_a: str = f"{seed_five}|{seed_five:?}|{f_tiny}|{f_small}|{f_big}";
+        \\    let part_b: str = f"{f_nan}|{f_nan:+}|{f_nan:E}|{f_inf}|{f_inf:+}|{f_ninf}|{f_inf:E}|{f_ninf:E}";
+        \\    return f"{part_a}|{part_b}";
         \\}
     ;
 
@@ -15869,4 +15868,66 @@ test "test_mir_vm_zero_env_own_closure_uaf_cmpxchg_and_float_fmt" {
         "5|5|1e-13|1e-5|1e16|nan|nan|NAN|inf|+inf|-inf|INF|-INF",
         flt_str,
     );
+}
+
+test "test_dr24_mir_vm_packed_cap_align_plain_braces_and_inline_if" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\@repr(C, packed: 2, align: 8, zero_pad: true)
+        \\pub struct PackedHeader {
+        \\    pub tag: u8,
+        \\    pub word: u32,
+        \\}
+        \\pub fn eval_packed_and_inline_if(flag: bool, val: u32) -> u32 {
+        \\    let hdr = PackedHeader { tag: 3, word: val };
+        \\    let json_len: u32 = "{\"ok\": true}".len() as u32;
+        \\    let picked: u32 = if flag => hdr.word + (hdr.tag as u32) else 99;
+        \\    return (@size_of[PackedHeader]() as u32) + (@align_of[PackedHeader]() as u32) + json_len + picked;
+        \\}
+    ;
+
+    var bundle = try mir.lowerSourceToMir(
+        allocator,
+        FileId.fromInt(98),
+        source,
+        TargetLayout.NATIVE_64,
+        .{},
+    );
+    defer bundle.deinit();
+    try std.testing.expect(!bundle.hir_bundle.diagnostics.hasErrors());
+
+    var rodata_pool = RodataPool.init(allocator);
+    defer rodata_pool.deinit();
+    var sink = DiagnosticSink.init(allocator);
+    defer sink.deinit();
+
+    var vm = try MirVm.init(
+        allocator,
+        &bundle.hir_bundle.interner,
+        &bundle.hir_bundle.pool,
+        &bundle.hir_bundle.sym_table,
+        &rodata_pool,
+        null,
+        &sink,
+        .{},
+    );
+    defer vm.deinit();
+    for (bundle.mir_bundle.bodies.items) |*body_item| {
+        _ = try vm.registerBody(body_item, body_item.symbol_index);
+    }
+
+    const eval_body = bundle.mir_bundle.findBodyByName(&bundle.hir_bundle.interner, "eval_packed_and_inline_if").?;
+    // `sizeof == 8`, `alignof == 8`, `json_len == 12`, `picked == 10 + 3 == 13` => `41`:
+    const true_res = try vm.evalBody(
+        eval_body,
+        &[_]RegSlot{ .{ .scalar_u64 = 1 }, .{ .scalar_u64 = 10 } },
+    );
+    try std.testing.expectEqual(@as(u64, 41), true_res.slot.scalar_u64);
+
+    // `8 + 8 + 12 + 99 == 127`:
+    const false_res = try vm.evalBody(
+        eval_body,
+        &[_]RegSlot{ .{ .scalar_u64 = 0 }, .{ .scalar_u64 = 10 } },
+    );
+    try std.testing.expectEqual(@as(u64, 127), false_res.slot.scalar_u64);
 }

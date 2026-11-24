@@ -1155,6 +1155,40 @@ fn unwrapScalarOrBackedEnum(pool: *const InternPool, raw_ty: TypeId) TypeId {
     return unwrapped;
 }
 
+/// Unwraps `@repr(transparent)` single-non-ZST-field wrapper structs (`ADR-24C`) for ABI classification.
+fn unwrapTransparentAbiType(resolver: *TypeLayoutResolver, raw_ty: TypeId) !TypeId {
+    var cur_ty = resolver.pool.unwrapUnderlyingType(raw_ty);
+    var depth: u32 = 0;
+    while (depth < 16 and !cur_ty.isPrimitiveOrSentinel() and !isBuiltInRuntimeType(resolver.pool, cur_ty)) : (depth += 1) {
+        const node = resolver.pool.getNode(cur_ty);
+        if (node.tag != .struct_ty) break;
+        const sym_idx = SymbolIndex.fromInt(node.rhs);
+        if (sym_idx.isNone() or sym_idx.asInt() >= resolver.sym_table.symbols.items.len) break;
+        const st_sym = resolver.sym_table.getSymbol(sym_idx).*;
+        if (!st_sym.isReprTransparent()) break;
+        const cur_layout = try resolver.resolveTypeBounded(cur_ty, depth);
+        const start = cur_layout.aux_start;
+        const len = cur_layout.aux_len;
+        var non_zst_ty: ?TypeId = null;
+        var fld_i: u32 = 0;
+        while (fld_i < len) : (fld_i += 1) {
+            const fld = resolver.fields_by_decl.items[start + fld_i];
+            if (fld.size_bytes == 0) continue;
+            if (non_zst_ty != null or fld.byte_offset != 0 or fld.size_bytes != cur_layout.size_bytes) {
+                non_zst_ty = null;
+                break;
+            }
+            non_zst_ty = fld.field_ty;
+        }
+        if (non_zst_ty) |inner_ty| {
+            cur_ty = resolver.pool.unwrapUnderlyingType(inner_ty);
+        } else {
+            break;
+        }
+    }
+    return cur_ty;
+}
+
 /// Returns `true` if `ty` unwraps to a single IEEE-754 floating-point scalar (`f32` or `f64`).
 fn isScalarFloatType(pool: *const InternPool, raw_ty: TypeId) bool {
     const unwrapped = pool.unwrapUnderlyingType(raw_ty);
@@ -1603,7 +1637,7 @@ pub const TypeLayoutResolver = struct {
                     if (!sym_idx.isNone() and sym_idx.asInt() < self.sym_table.symbols.items.len) {
                         const st_sym = self.sym_table.getSymbol(sym_idx).*;
                         repr_flags.is_repr_c = st_sym.contract_flags.is_repr_c;
-                        repr_flags.is_packed = st_sym.contract_flags.is_packed;
+                        repr_flags.is_packed = st_sym.packedCapBytes() > 0;
                         repr_flags.is_cache_aligned = st_sym.contract_flags.is_cache_aligned;
                         repr_flags.is_zero_pad = st_sym.contract_flags.is_zero_pad;
                         try self.populateStructFields(
@@ -1623,7 +1657,7 @@ pub const TypeLayoutResolver = struct {
                     if (!sym_idx.isNone() and sym_idx.asInt() < self.sym_table.symbols.items.len) {
                         const un_sym = self.sym_table.getSymbol(sym_idx).*;
                         repr_flags.is_repr_c = un_sym.contract_flags.is_repr_c;
-                        repr_flags.is_packed = un_sym.contract_flags.is_packed;
+                        repr_flags.is_packed = un_sym.packedCapBytes() > 0;
                         repr_flags.is_cache_aligned = un_sym.contract_flags.is_cache_aligned;
                         repr_flags.is_zero_pad = un_sym.contract_flags.is_zero_pad;
                         try self.populateUnionFields(
@@ -1639,6 +1673,7 @@ pub const TypeLayoutResolver = struct {
                         const sym_idx = SymbolIndex.fromInt(node.rhs);
                         if (!sym_idx.isNone() and sym_idx.asInt() < self.sym_table.symbols.items.len) {
                             const en_sym = self.sym_table.getSymbol(sym_idx).*;
+                            repr_flags.is_repr_c = en_sym.contract_flags.is_repr_c;
                             repr_flags.is_cache_aligned = en_sym.contract_flags.is_cache_aligned;
                             repr_flags.is_zero_pad = en_sym.contract_flags.is_zero_pad;
                         }
@@ -1903,8 +1938,9 @@ pub const TypeLayoutResolver = struct {
         var temp_has_niche = try self.allocator.alloc(bool, field_count);
         defer self.allocator.free(temp_has_niche);
 
-        const is_packed = st_sym.contract_flags.is_packed;
-        const is_decl_order = is_packed or st_sym.contract_flags.is_repr_c;
+        const packed_cap = st_sym.packedCapBytes();
+        const is_packed = packed_cap > 0;
+        const is_decl_order = is_packed or st_sym.contract_flags.is_repr_c or st_sym.isReprTransparent();
 
         var decl_ord: usize = 0;
         var rank_mask: u64 = 0;
@@ -1922,7 +1958,12 @@ pub const TypeLayoutResolver = struct {
                 subst_field_ty,
                 self.target_layout,
             );
-            const eff_log2: u8 = if (is_packed) 0 else fld_layout.align_log2;
+            const natural_align_bytes: u32 = @as(u32, 1) << @intCast(fld_layout.align_log2);
+            const eff_align_bytes: u32 = if (packed_cap > 0)
+                @min(natural_align_bytes, packed_cap)
+            else
+                natural_align_bytes;
+            const eff_log2: u8 = @intCast(std.math.log2_int(u32, eff_align_bytes));
             const has_niche = !is_packed and type_system.computeLeafNiche(
                 self.pool,
                 self.sym_table,
@@ -1950,7 +1991,7 @@ pub const TypeLayoutResolver = struct {
         if (is_decl_order) {
             var i: usize = 0;
             while (i < field_count) : (i += 1) {
-                const align_bytes: u32 = if (is_packed) 1 else (@as(u32, 1) << @intCast(temp_by_decl[i].align_log2));
+                const align_bytes: u32 = @as(u32, 1) << @intCast(temp_by_decl[i].align_log2);
                 const aligned_off = type_system.alignUpU64(cur_offset, align_bytes);
                 if (aligned_off > cur_offset) {
                     try self.padding_pool.append(self.allocator, .{
@@ -1989,7 +2030,7 @@ pub const TypeLayoutResolver = struct {
                 }
             }
         }
-        const aligned_end = type_system.alignUpU64(cur_offset, if (is_packed) 1 else base_align_bytes);
+        const aligned_end = type_system.alignUpU64(cur_offset, base_align_bytes);
         if (aligned_end > total_size_inout.*) {
             total_size_inout.* = aligned_end;
         }
@@ -2039,7 +2080,7 @@ pub const TypeLayoutResolver = struct {
         var temp_phys = try self.allocator.alloc(u32, field_count);
         defer self.allocator.free(temp_phys);
 
-        const is_packed = un_sym.contract_flags.is_packed;
+        const packed_cap = un_sym.packedCapBytes();
         var decl_ord: usize = 0;
         for (members) |mem_idx| {
             const mem_sym = self.sym_table.getSymbol(mem_idx).*;
@@ -2055,13 +2096,18 @@ pub const TypeLayoutResolver = struct {
                 subst_field_ty,
                 self.target_layout,
             );
+            const natural_align_bytes: u32 = @as(u32, 1) << @intCast(fld_layout.align_log2);
+            const eff_align_bytes: u32 = if (packed_cap > 0)
+                @min(natural_align_bytes, packed_cap)
+            else
+                natural_align_bytes;
             temp_by_decl[decl_ord] = .{
                 .decl_ordinal = @intCast(decl_ord),
                 .phys_index = @intCast(decl_ord),
                 .byte_offset = 0,
                 .size_bytes = fld_layout.byte_size,
                 .field_ty = subst_field_ty,
-                .align_log2 = if (is_packed) 0 else fld_layout.align_log2,
+                .align_log2 = @intCast(std.math.log2_int(u32, eff_align_bytes)),
             };
             temp_phys[decl_ord] = @intCast(decl_ord);
             decl_ord += 1;
@@ -2179,7 +2225,8 @@ pub const AbiClassifier = struct {
                             .attr_bits = 0,
                             .piece_count = 1,
                         };
-                        recipe.ret_recipe = classifyPackedSwiftReturn(resolver.pool, ok_ty, ok_layout);
+                        const ok_abi_ty = try unwrapTransparentAbiType(resolver, ok_ty);
+                        recipe.ret_recipe = classifyPackedSwiftReturn(resolver.pool, ok_abi_ty, ok_layout);
                     }
                 }
             }
@@ -2187,9 +2234,10 @@ pub const AbiClassifier = struct {
 
         // [3] Standard `cx_native` return classification (`<= 32B` in up to 4 GPRs, `> 32B` via `sret`):
         if (recipe.calling_conv == .cx_native) {
+            const ret_abi_ty = try unwrapTransparentAbiType(resolver, sig.ret_ty);
             const ret_layout = try resolver.resolveType(sig.ret_ty);
             if (ret_layout.size_bytes <= 32) {
-                recipe.ret_recipe = classifyPackedSwiftReturn(resolver.pool, sig.ret_ty, ret_layout);
+                recipe.ret_recipe = classifyPackedSwiftReturn(resolver.pool, ret_abi_ty, ret_layout);
             } else {
                 const sret_attrs: ParamAttrFlags = .{
                     .is_noalias = true,
@@ -2214,6 +2262,7 @@ pub const AbiClassifier = struct {
 
         // [4] Formal parameter classification (`DR-09` §1.1 & `phase7_spec.md` §2.3):
         for (sig.params, 0..) |param, i| {
+            const param_abi_ty = try unwrapTransparentAbiType(resolver, param.type_id);
             const p_layout = try resolver.resolveType(param.type_id);
             if (p_layout.size_bytes == 0) {
                 param_recipes[i] = .{ .pointee_align_bytes = p_layout.alignBytes(), .pass_mode = .ignore_zst };
@@ -2239,9 +2288,9 @@ pub const AbiClassifier = struct {
                 continue;
             }
             if (p_layout.size_bytes <= 8) {
-                const is_flt = isScalarFloatType(resolver.pool, param.type_id);
+                const is_flt = isScalarFloatType(resolver.pool, param_abi_ty);
                 const val_attrs: ParamAttrFlags = .{
-                    .is_nonnull = isSingleNonNullPointerType(resolver.pool, param.type_id),
+                    .is_nonnull = isSingleNonNullPointerType(resolver.pool, param_abi_ty),
                     .is_noundef = !p_layout.reprFlags().has_padding,
                 };
                 param_recipes[i] = .{
@@ -2348,13 +2397,14 @@ pub const AbiClassifier = struct {
         };
 
         // [1] Classify C return type:
+        const ret_abi_ty = try unwrapTransparentAbiType(resolver, sig.ret_ty);
         const ret_layout = try resolver.resolveType(sig.ret_ty);
         if (ret_layout.size_bytes == 0) {
             recipe.ret_recipe = .{ .pointee_align_bytes = ret_layout.alignBytes(), .pass_mode = .ignore_zst };
         } else if (target.arch == .x86_64 and target.os == .windows) {
             const sz = ret_layout.size_bytes;
             if (sz == 1 or sz == 2 or sz == 4 or sz == 8) {
-                const is_flt = isScalarFloatType(resolver.pool, sig.ret_ty);
+                const is_flt = isScalarFloatType(resolver.pool, ret_abi_ty);
                 recipe.ret_recipe = .{
                     .lowered_size_bytes = @intCast(sz),
                     .pointee_align_bytes = ret_layout.alignBytes(),
@@ -2366,10 +2416,10 @@ pub const AbiClassifier = struct {
                 populateCSret(&recipe, ret_layout);
             }
         } else if (target.arch == .aarch64) {
-            const ret_hfa = if (isScalarFloatType(resolver.pool, sig.ret_ty))
+            const ret_hfa = if (isScalarFloatType(resolver.pool, ret_abi_ty))
                 null
             else
-                try inspectAarch64HfaBounded(resolver, sig.ret_ty, 0);
+                try inspectAarch64HfaBounded(resolver, ret_abi_ty, 0);
             if (ret_hfa) |hfa| {
                 recipe.ret_recipe = .{
                     .lowered_size_bytes = @intCast(ret_layout.size_bytes),
@@ -2381,14 +2431,14 @@ pub const AbiClassifier = struct {
             } else if (ret_layout.size_bytes <= 8) {
                 var ext_attrs: ParamAttrFlags = .{};
                 if (target.isDarwin()) {
-                    ext_attrs.is_zext = isNarrowZeroExtType(resolver.pool, sig.ret_ty);
-                    ext_attrs.is_sext = isNarrowSignExtType(resolver.pool, sig.ret_ty);
+                    ext_attrs.is_zext = isNarrowZeroExtType(resolver.pool, ret_abi_ty);
+                    ext_attrs.is_sext = isNarrowSignExtType(resolver.pool, ret_abi_ty);
                 }
                 recipe.ret_recipe = .{
                     .lowered_size_bytes = @intCast(ret_layout.size_bytes),
                     .pointee_align_bytes = ret_layout.alignBytes(),
                     .pass_mode = .direct_scalar,
-                    .bank_0 = if (isScalarFloatType(resolver.pool, sig.ret_ty)) .xmm_vec else .gpr,
+                    .bank_0 = if (isScalarFloatType(resolver.pool, ret_abi_ty)) .xmm_vec else .gpr,
                     .attr_bits = @bitCast(ext_attrs),
                     .piece_count = 1,
                 };
@@ -2409,13 +2459,13 @@ pub const AbiClassifier = struct {
             if (ret_layout.size_bytes <= 16) {
                 var classes: [2]RegBank = .{ .none, .none };
                 var has_unaligned = false;
-                try classifySysVAmd64EightbytesBounded(resolver, sig.ret_ty, 0, &classes, &has_unaligned, 0);
+                try classifySysVAmd64EightbytesBounded(resolver, ret_abi_ty, 0, &classes, &has_unaligned, 0);
                 if (has_unaligned) {
                     populateCSret(&recipe, ret_layout);
                 } else {
                     const ext_attrs: ParamAttrFlags = .{
-                        .is_zext = isNarrowZeroExtType(resolver.pool, sig.ret_ty),
-                        .is_sext = isNarrowSignExtType(resolver.pool, sig.ret_ty),
+                        .is_zext = isNarrowZeroExtType(resolver.pool, ret_abi_ty),
+                        .is_sext = isNarrowSignExtType(resolver.pool, ret_abi_ty),
                     };
                     const is_two = ret_layout.size_bytes > 8;
                     recipe.ret_recipe = .{
@@ -2435,6 +2485,7 @@ pub const AbiClassifier = struct {
 
         // [2] Classify C parameters:
         for (sig.params, 0..) |param, i| {
+            const param_abi_ty = try unwrapTransparentAbiType(resolver, param.type_id);
             const p_layout = try resolver.resolveType(param.type_id);
             if (p_layout.size_bytes == 0) {
                 param_recipes[i] = .{ .pointee_align_bytes = p_layout.alignBytes(), .pass_mode = .ignore_zst };
@@ -2460,7 +2511,7 @@ pub const AbiClassifier = struct {
                         .lowered_size_bytes = @intCast(sz),
                         .pointee_align_bytes = p_layout.alignBytes(),
                         .pass_mode = .direct_scalar,
-                        .bank_0 = if (isScalarFloatType(resolver.pool, param.type_id)) .xmm_vec else .gpr,
+                        .bank_0 = if (isScalarFloatType(resolver.pool, param_abi_ty)) .xmm_vec else .gpr,
                         .piece_count = 1,
                     };
                 } else {
@@ -2476,10 +2527,10 @@ pub const AbiClassifier = struct {
                 }
             } else if (target.arch == .aarch64) {
                 const is_win_arm64_variadic = target.isWindows() and sig.is_variadic;
-                const opt_hfa = if (is_win_arm64_variadic or isScalarFloatType(resolver.pool, param.type_id))
+                const opt_hfa = if (is_win_arm64_variadic or isScalarFloatType(resolver.pool, param_abi_ty))
                     null
                 else
-                    try inspectAarch64HfaBounded(resolver, param.type_id, 0);
+                    try inspectAarch64HfaBounded(resolver, param_abi_ty, 0);
                 if (opt_hfa) |hfa| {
                     param_recipes[i] = .{
                         .lowered_size_bytes = clamped_sz,
@@ -2491,14 +2542,14 @@ pub const AbiClassifier = struct {
                 } else if (p_layout.size_bytes <= 8) {
                     var ext_attrs: ParamAttrFlags = .{};
                     if (target.isDarwin()) {
-                        ext_attrs.is_zext = isNarrowZeroExtType(resolver.pool, param.type_id);
-                        ext_attrs.is_sext = isNarrowSignExtType(resolver.pool, param.type_id);
+                        ext_attrs.is_zext = isNarrowZeroExtType(resolver.pool, param_abi_ty);
+                        ext_attrs.is_sext = isNarrowSignExtType(resolver.pool, param_abi_ty);
                     }
                     param_recipes[i] = .{
                         .lowered_size_bytes = clamped_sz,
                         .pointee_align_bytes = p_layout.alignBytes(),
                         .pass_mode = .direct_scalar,
-                        .bank_0 = if (!is_win_arm64_variadic and isScalarFloatType(resolver.pool, param.type_id))
+                        .bank_0 = if (!is_win_arm64_variadic and isScalarFloatType(resolver.pool, param_abi_ty))
                             .xmm_vec
                         else
                             .gpr,
@@ -2530,7 +2581,7 @@ pub const AbiClassifier = struct {
                 if (p_layout.size_bytes <= 16) {
                     var classes: [2]RegBank = .{ .none, .none };
                     var has_unaligned = false;
-                    try classifySysVAmd64EightbytesBounded(resolver, param.type_id, 0, &classes, &has_unaligned, 0);
+                    try classifySysVAmd64EightbytesBounded(resolver, param_abi_ty, 0, &classes, &has_unaligned, 0);
                     if (has_unaligned) {
                         param_recipes[i] = .{
                             .lowered_size_bytes = clamped_sz,
@@ -2540,8 +2591,8 @@ pub const AbiClassifier = struct {
                         };
                     } else {
                         const ext_attrs: ParamAttrFlags = .{
-                            .is_zext = isNarrowZeroExtType(resolver.pool, param.type_id),
-                            .is_sext = isNarrowSignExtType(resolver.pool, param.type_id),
+                            .is_zext = isNarrowZeroExtType(resolver.pool, param_abi_ty),
+                            .is_sext = isNarrowSignExtType(resolver.pool, param_abi_ty),
                         };
                         const is_two = p_layout.size_bytes > 8;
                         param_recipes[i] = .{
@@ -2620,12 +2671,13 @@ pub const AbiClassifier = struct {
             };
         }
 
+        const ret_abi_ty = try unwrapTransparentAbiType(resolver, sig.ret_ty);
         const ret_layout = try resolver.resolveType(sig.ret_ty);
-        const unwrapped_ret = unwrapScalarOrBackedEnum(resolver.pool, sig.ret_ty);
+        const unwrapped_ret = unwrapScalarOrBackedEnum(resolver.pool, ret_abi_ty);
         if (ret_layout.size_bytes == 0) {
             recipe.ret_recipe = .{ .pointee_align_bytes = ret_layout.alignBytes(), .pass_mode = .ignore_zst };
         } else if (sig.is_extern_c) {
-            if (try unwrapWasmCSingleScalar(resolver, sig.ret_ty, 0)) |scalar_ty| {
+            if (try unwrapWasmCSingleScalar(resolver, ret_abi_ty, 0)) |scalar_ty| {
                 const ext_attrs: ParamAttrFlags = .{
                     .is_zext = isNarrowZeroExtType(resolver.pool, scalar_ty),
                     .is_sext = isNarrowSignExtType(resolver.pool, scalar_ty),
@@ -2654,6 +2706,7 @@ pub const AbiClassifier = struct {
         }
 
         for (sig.params, 0..) |param, i| {
+            const param_abi_ty = try unwrapTransparentAbiType(resolver, param.type_id);
             const p_layout = try resolver.resolveType(param.type_id);
             if (p_layout.size_bytes == 0) {
                 param_recipes[i] = .{ .pointee_align_bytes = p_layout.alignBytes(), .pass_mode = .ignore_zst };
@@ -2678,7 +2731,7 @@ pub const AbiClassifier = struct {
                 };
                 continue;
             }
-            const unwrapped_p = unwrapScalarOrBackedEnum(resolver.pool, param.type_id);
+            const unwrapped_p = unwrapScalarOrBackedEnum(resolver.pool, param_abi_ty);
             if (sig.is_extern_c) {
                 if (unwrapped_p == .i128_ty or unwrapped_p == .u128_ty) {
                     param_recipes[i] = .{
@@ -2689,7 +2742,7 @@ pub const AbiClassifier = struct {
                         .bank_1 = .gpr,
                         .piece_count = 2,
                     };
-                } else if (try unwrapWasmCSingleScalar(resolver, param.type_id, 0)) |scalar_ty| {
+                } else if (try unwrapWasmCSingleScalar(resolver, param_abi_ty, 0)) |scalar_ty| {
                     const ext_attrs: ParamAttrFlags = .{
                         .is_zext = isNarrowZeroExtType(resolver.pool, scalar_ty),
                         .is_sext = isNarrowSignExtType(resolver.pool, scalar_ty),
@@ -3150,11 +3203,11 @@ test "test_codegen_abi_wasm32_overaligned_and_win_arm64_variadic" {
     var sym_table = try SymbolTable.init(allocator, &interner);
     defer sym_table.deinit();
 
-    // Verify `@repr(C) @align(8) struct { val: i32 }` (`size == 8 != 4`) uses `.indirect_by_ref` on `wasm32`:
+    // Verify `@repr(C, align: 8) struct { val: i32 }` (`size == 8 != 4`) uses `.indirect_by_ref` on `wasm32`:
     var check_res = try type_system.typecheckSource(
         allocator,
         mem_foundation.FileId.fromInt(90),
-        "@repr(C)\n@align(8)\npub struct OverAlignedI32 { pub val: i32 }\n",
+        "@repr(C, align: 8)\npub struct OverAlignedI32 { pub val: i32 }\n",
     );
     defer check_res.deinit();
     const mod_scope = check_res.symbol_table.file_module_scopes.get(90).?;
@@ -3319,4 +3372,120 @@ test "test_codegen_abi_future_and_context_layouts" {
     try std.testing.expectEqual(AbiPassMode.direct_scalar, rec_arm64.param_recipes[0].pass_mode);
     try std.testing.expectEqual(RegBank.xmm_vec, rec_arm64.param_recipes[0].bank_0);
     try std.testing.expectEqual(AbiPassMode.direct_hfa, rec_arm64.param_recipes[1].pass_mode);
+}
+
+test "test_dr24_codegen_abi_packed_cap_align_enum_repr_c_and_transparent" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\@repr(C, packed: true, align: 64)
+        \\pub struct PackedAligned64 {
+        \\    pub a: u8,
+        \\    pub b: u32,
+        \\}
+        \\@repr(C, packed: 2)
+        \\pub struct PackedCap2 {
+        \\    pub a: u8,
+        \\    pub b: u32,
+        \\}
+        \\@repr(C)
+        \\pub enum CTag {
+        \\    Empty,
+        \\    Word(u32),
+        \\}
+        \\@repr(transparent)
+        \\pub struct F64Handle {
+        \\    pub val: f64,
+        \\    pub marker: (),
+        \\}
+    ;
+
+    var check_res = try type_system.typecheckSource(
+        allocator,
+        mem_foundation.FileId.fromInt(91),
+        source,
+    );
+    defer check_res.deinit();
+    try std.testing.expect(!check_res.diagnostics.hasErrors());
+
+    const mod_scope = check_res.symbol_table.file_module_scopes.get(91).?;
+    const packed64_sym = check_res.symbol_table.lookupInScopeDirect(
+        mod_scope,
+        try check_res.interner.intern("PackedAligned64"),
+        symbol_resolver.NamespaceMask.TYPE_ONLY,
+    );
+    const packed2_sym = check_res.symbol_table.lookupInScopeDirect(
+        mod_scope,
+        try check_res.interner.intern("PackedCap2"),
+        symbol_resolver.NamespaceMask.TYPE_ONLY,
+    );
+    const ctag_sym = check_res.symbol_table.lookupInScopeDirect(
+        mod_scope,
+        try check_res.interner.intern("CTag"),
+        symbol_resolver.NamespaceMask.TYPE_ONLY,
+    );
+    const f64_handle_sym = check_res.symbol_table.lookupInScopeDirect(
+        mod_scope,
+        try check_res.interner.intern("F64Handle"),
+        symbol_resolver.NamespaceMask.TYPE_ONLY,
+    );
+
+    const packed64_ty = check_res.symbol_table.getSymbol(packed64_sym).type_id;
+    const packed2_ty = check_res.symbol_table.getSymbol(packed2_sym).type_id;
+    const ctag_ty = check_res.symbol_table.getSymbol(ctag_sym).type_id;
+    const f64_handle_ty = check_res.symbol_table.getSymbol(f64_handle_sym).type_id;
+
+    var res_win64 = TypeLayoutResolver.init(
+        allocator,
+        &check_res.type_pool,
+        &check_res.symbol_table,
+        TargetSpec.X86_64_WINDOWS_MSVC,
+    );
+    defer res_win64.deinit();
+
+    // [1] `@repr(C, packed: true, align: 64)` rounds `size_bytes` to `64` with 59B tail padding:
+    const lay64 = try res_win64.resolveType(packed64_ty);
+    try std.testing.expectEqual(@as(u64, 64), lay64.size_bytes);
+    try std.testing.expectEqual(@as(u32, 64), lay64.alignBytes());
+    try std.testing.expect(lay64.reprFlags().is_packed);
+    try std.testing.expect(lay64.reprFlags().has_padding);
+    const pads64 = try res_win64.getPaddingSpans(packed64_ty);
+    try std.testing.expectEqual(@as(usize, 1), pads64.len);
+    try std.testing.expectEqual(@as(u64, 5), pads64[0].byte_offset);
+    try std.testing.expectEqual(@as(u64, 59), pads64[0].byte_len);
+
+    // [2] `@repr(C, packed: 2)` aligns `u32` to `2` (`offset == 2`, `sizeof == 6`, 1B inter-field padding):
+    const lay2 = try res_win64.resolveType(packed2_ty);
+    try std.testing.expectEqual(@as(u64, 6), lay2.size_bytes);
+    try std.testing.expectEqual(@as(u32, 2), lay2.alignBytes());
+    const fld_b = (try res_win64.getFieldByDeclOrdinal(packed2_ty, 1)).?;
+    try std.testing.expectEqual(@as(u64, 2), fld_b.byte_offset);
+    const pads2 = try res_win64.getPaddingSpans(packed2_ty);
+    try std.testing.expectEqual(@as(usize, 1), pads2.len);
+    try std.testing.expectEqual(@as(u64, 1), pads2[0].byte_offset);
+    try std.testing.expectEqual(@as(u64, 1), pads2[0].byte_len);
+
+    // [3] `@repr(C)` on `.enum_ty` sets `reprFlags().is_repr_c`:
+    const ctag_lay = try res_win64.resolveType(ctag_ty);
+    try std.testing.expect(ctag_lay.reprFlags().is_repr_c);
+
+    // [4] `@repr(transparent)` wrapper `F64Handle` passes in `.xmm_vec` on Win64 C ABI and native ABI:
+    var win_c_rec = try AbiClassifier.classifyFn(allocator, &res_win64, .{
+        .params = &.{.{ .type_id = f64_handle_ty }},
+        .ret_ty = f64_handle_ty,
+        .is_extern_c = true,
+    });
+    defer win_c_rec.deinit(allocator);
+    try std.testing.expectEqual(AbiPassMode.direct_scalar, win_c_rec.param_recipes[0].pass_mode);
+    try std.testing.expectEqual(RegBank.xmm_vec, win_c_rec.param_recipes[0].bank_0);
+    try std.testing.expectEqual(AbiPassMode.direct_scalar, win_c_rec.ret_recipe.pass_mode);
+    try std.testing.expectEqual(RegBank.xmm_vec, win_c_rec.ret_recipe.bank_0);
+
+    var native_rec = try AbiClassifier.classifyFn(allocator, &res_win64, .{
+        .params = &.{.{ .type_id = f64_handle_ty }},
+        .ret_ty = f64_handle_ty,
+        .is_extern_c = false,
+    });
+    defer native_rec.deinit(allocator);
+    try std.testing.expectEqual(RegBank.xmm_vec, native_rec.param_recipes[0].bank_0);
+    try std.testing.expectEqual(RegBank.xmm_vec, native_rec.ret_recipe.bank_0);
 }

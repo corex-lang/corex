@@ -82,17 +82,16 @@ const BENCH_MEASURED_COUNT: u32 = 30;
 /// Number of generated worker functions in the ~64 KiB codegen workload (`4` preamble + `124` = `128`).
 const SYNTHETIC_WORKER_COUNT: usize = 124;
 
-/// Shared preamble (`4` functions + `@repr(C)` `@zero_pad` struct + `CachePadded` struct) for Cases 1–3.
+/// Shared preamble (`4` functions + `@repr(C, zero_pad: true)` struct + `@repr(align: .CacheLine)` struct) for Cases 1–3.
 const SYNTHETIC_PHASE7_PREAMBLE =
-    "//! Synthetic ~64 KiB Phase 7 Codegen & ABI Benchmark Module\n" ++
-    "@repr(C)\n" ++
-    "@zero_pad\n" ++
+    "/# Synthetic ~64 KiB Phase 7 Codegen & ABI Benchmark Module\n\n" ++
+    "@repr(C, zero_pad: true)\n" ++
     "pub struct BenchFrame {\n" ++
     "    pub opcode: u8,\n" ++
     "    pub payload: i32,\n" ++
     "    pub seq_id: u64,\n" ++
     "}\n\n" ++
-    "@cache_aligned\n" ++
+    "@repr(align: .CacheLine)\n" ++
     "pub struct AlignedCounter {\n" ++
     "    pub ticks: u64,\n" ++
     "}\n\n" ++
@@ -118,14 +117,14 @@ const SYNTHETIC_PHASE7_PREAMBLE =
 
 /// Minimal CoreX cold-start program for Case 4.
 const COLD_START_CX_SOURCE =
-    "//! Minimal Cold-Start Benchmark Program\n" ++
+    "/# Minimal Cold-Start Benchmark Program\n\n" ++
     "pub fn main() -> i32 {\n" ++
     "    return 0;\n" ++
     "}\n";
 
 /// Compute-intensive numeric mixing loop (`4,000,000` rounds) in CoreX for Case 5.
 const COMPUTE_KERNEL_CX_SOURCE =
-    "//! Phase 7 Runtime Compute Kernel (CoreX vs C `-O3` Parity)\n" ++
+    "/# Phase 7 Runtime Compute Kernel (CoreX vs C `-O3` Parity)\n\n" ++
     "pub fn run_mix_rounds(round_count: u64, init_seed: u64) -> u64 {\n" ++
     "    var state_a: u64 = init_seed;\n" ++
     "    var state_b: u64 = 0x9E37_79B9_7F4A_7C15;\n" ++
