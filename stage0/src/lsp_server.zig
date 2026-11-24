@@ -3115,7 +3115,7 @@ fn getLiveDocumentSource(session: *LspSession, file_id: FileId) ?[]const u8 {
                 const vfs_entry = &session.vfs.entries.items[file_id.asInt()];
                 if (!vfs_entry.is_open_in_editor or
                     !session.vfs.overlay_cache.file_to_slot.contains(file_id) or
-                    !std.mem.eql(u8, vfs_entry.content, db_text))
+                    vfs_entry.content.len != db_text.len)
                 {
                     const vfs_path = session.vfs.getFilePath(file_id);
                     if (vfs_path.len > 0 and db_text.len <= vfs_sourcemap.MAX_OPEN_OVERLAY_BYTES) {
@@ -3138,26 +3138,48 @@ fn getLiveDocumentSource(session: *LspSession, file_id: FileId) ?[]const u8 {
     return null;
 }
 
-/// Converts a byte offset in `file_id` into a zero-based `LspPosition` under `session.position_encoding`.
-fn byteOffsetToLspPosition(session: *LspSession, file_id: FileId, byte_offset: u32) LspPosition {
-    const src = getLiveDocumentSource(session, file_id) orelse "";
-    const line_idx = session.vfs.getLineIndex(file_id) catch return .{};
+/// Converts `byte_offset` into a zero-based `LspPosition` using pre-fetched `src` and `line_idx`.
+fn byteOffsetToLspPositionFast(
+    src: []const u8,
+    line_idx: *const LineIndex,
+    encoding: PositionEncoding,
+    byte_offset: u32,
+) LspPosition {
     const clamped_off: u32 = @intCast(@min(@as(usize, byte_offset), src.len));
     const lc = line_idx.resolveLineCol(src, clamped_off);
     return .{
         .line = lc.line -| 1,
-        .character = LineIndex.extractLspCharacter0(lc, session.position_encoding),
+        .character = LineIndex.extractLspCharacter0(lc, encoding),
     };
+}
+
+/// Converts `span` into a half-open `LspRange` using pre-fetched `src` and `line_idx`.
+fn spanToLspRangeFast(
+    src: []const u8,
+    line_idx: *const LineIndex,
+    encoding: PositionEncoding,
+    span: Span,
+) LspRange {
+    const end_byte = @max(span.start_byte, span.end_byte);
+    return .{
+        .start = byteOffsetToLspPositionFast(src, line_idx, encoding, span.start_byte),
+        .end = byteOffsetToLspPositionFast(src, line_idx, encoding, end_byte),
+    };
+}
+
+/// Converts a byte offset in `file_id` into a zero-based `LspPosition` under `session.position_encoding`.
+fn byteOffsetToLspPosition(session: *LspSession, file_id: FileId, byte_offset: u32) LspPosition {
+    const src = getLiveDocumentSource(session, file_id) orelse "";
+    const line_idx = session.vfs.getLineIndex(file_id) catch return .{};
+    return byteOffsetToLspPositionFast(src, line_idx, session.position_encoding, byte_offset);
 }
 
 /// Converts a `Span` into a half-open `LspRange` under `session.position_encoding`.
 fn spanToLspRange(session: *LspSession, fallback_fid: FileId, span: Span) LspRange {
     const target_fid = if (!span.file_id.isNone()) span.file_id else fallback_fid;
-    const end_byte = @max(span.start_byte, span.end_byte);
-    return .{
-        .start = byteOffsetToLspPosition(session, target_fid, span.start_byte),
-        .end = byteOffsetToLspPosition(session, target_fid, end_byte),
-    };
+    const src = getLiveDocumentSource(session, target_fid) orelse "";
+    const line_idx = session.vfs.getLineIndex(target_fid) catch return .{};
+    return spanToLspRangeFast(src, line_idx, session.position_encoding, span);
 }
 
 /// Extracts an `LspPosition` `(line, character)` from a JSON `Position` object.
@@ -5288,7 +5310,13 @@ fn computeSemanticTokensData(
             const sym_idx = SymbolIndex.fromInt(sym_raw);
             const sym = session.db.symbol_table.getSymbol(sym_idx).*;
             if (sym.decl_span.file_id != file_id or sym.flags.is_imported) continue;
-            const live_span = session.db.resolveLiveSymbolDeclSpan(sym_idx) catch continue;
+            const live_span = resolveLiveSymbolDeclSpanFast(
+                session,
+                sym_idx,
+                file_id,
+                src,
+                parsed_art,
+            ) catch continue;
             parsed_art = session.db.parsed_artifacts.getPtr(file_id.asInt()) orelse return &.{};
             if (live_span.file_id != file_id) continue;
             if (findExactTokenAtByteOffset(&parsed_art.token_buffer, live_span.start_byte)) |decl_tok| {
@@ -5679,6 +5707,34 @@ fn findExactTokenAtByteOffset(token_buffer: *const TokenBuffer, start_byte: u32)
         if (!cand_rec.flags.is_synthesized and cand_rec.kind != .eof) return cand_id;
     }
     return null;
+}
+
+/// Resolves the live declaration `Span` of `sym_idx` in $O(\log T)$ against pre-fetched `parsed_art` when unshifted.
+fn resolveLiveSymbolDeclSpanFast(
+    session: *LspSession,
+    sym_idx: SymbolIndex,
+    file_id: FileId,
+    src: []const u8,
+    parsed_art: *const query_db.ParsedCstArtifact,
+) query_db.QueryError!Span {
+    if (sym_idx.isNone() or sym_idx.asInt() >= session.db.symbol_table.countSymbols()) return Span.ZERO;
+    const sym = session.db.symbol_table.getSymbol(sym_idx).*;
+    if (sym.decl_span.file_id == file_id) {
+        if (findExactTokenAtByteOffset(&parsed_art.token_buffer, sym.decl_span.start_byte)) |cand_tok| {
+            const cand_rec = parsed_art.token_buffer.getToken(cand_tok);
+            if (cand_rec.byte_offset + cand_rec.byte_len == sym.decl_span.end_byte and
+                (sym.name_text.len == 0 or
+                    std.mem.eql(
+                        u8,
+                        symbol_resolver.extractTokenSlice(src, &parsed_art.token_buffer, cand_tok),
+                        sym.name_text,
+                    )))
+            {
+                return sym.decl_span;
+            }
+        }
+    }
+    return session.db.resolveLiveSymbolDeclSpan(sym_idx);
 }
 
 /// Finds the focal token at `cursor_byte` (preferring an identifier when `cursor_byte` touches its right edge).
@@ -7835,11 +7891,22 @@ fn collectSymbolOccurrencesInFile(
     var parsed_art = session.db.parsed_artifacts.getPtr(scan_fid.asInt()) orelse return;
     const mod_scope = session.db.symbol_table.file_module_scopes.get(scan_fid.asInt()) orelse ScopeId.none;
 
-    // [1] Include declaration site if `is_including_declaration` and declared in `scan_fid`:
-    if (is_including_declaration and sym.decl_span.file_id == scan_fid) {
-        const live_decl = session.db.resolveLiveSymbolDeclSpan(canonical_sym) catch sym.decl_span;
+    // Pre-resolve canonical declaration span once when declared inside `scan_fid`:
+    const live_canonical_decl: ?Span = if (sym.decl_span.file_id == scan_fid) blk: {
+        const resolved = resolveLiveSymbolDeclSpanFast(
+            session,
+            canonical_sym,
+            scan_fid,
+            src,
+            parsed_art,
+        ) catch sym.decl_span;
         parsed_art = session.db.parsed_artifacts.getPtr(scan_fid.asInt()) orelse return;
-        if (live_decl.file_id == scan_fid) {
+        break :blk if (resolved.file_id == scan_fid) resolved else null;
+    } else null;
+
+    // [1] Include declaration site if `is_including_declaration` and declared in `scan_fid`:
+    if (is_including_declaration) {
+        if (live_canonical_decl) |live_decl| {
             try appendUniqueRefHit(arena_alloc, out_hits, .{
                 .span = live_decl,
                 .is_write_access = true,
@@ -7867,7 +7934,13 @@ fn collectSymbolOccurrencesInFile(
 
                 if (is_explicit_local_alias) {
                     if (cand_idx == canonical_sym and cand_rec.decl_span.file_id == scan_fid) {
-                        const live_sp = session.db.resolveLiveSymbolDeclSpan(cand_idx) catch cand_rec.decl_span;
+                        const live_sp = resolveLiveSymbolDeclSpanFast(
+                            session,
+                            cand_idx,
+                            scan_fid,
+                            src,
+                            parsed_art,
+                        ) catch cand_rec.decl_span;
                         parsed_art = session.db.parsed_artifacts.getPtr(scan_fid.asInt()) orelse return;
                         try appendUniqueRefHit(arena_alloc, out_hits, .{
                             .span = live_sp,
@@ -7880,7 +7953,13 @@ fn collectSymbolOccurrencesInFile(
 
                 // Non-glob `use prefix.bar;` (`cand_rec.name == sym.name` and `decl_span.file_id == scan_fid`):
                 if (cand_rec.decl_span.file_id == scan_fid and cand_rec.name == sym.name) {
-                    const live_sp = session.db.resolveLiveSymbolDeclSpan(cand_idx) catch cand_rec.decl_span;
+                    const live_sp = resolveLiveSymbolDeclSpanFast(
+                        session,
+                        cand_idx,
+                        scan_fid,
+                        src,
+                        parsed_art,
+                    ) catch cand_rec.decl_span;
                     parsed_art = session.db.parsed_artifacts.getPtr(scan_fid.asInt()) orelse return;
                     try appendUniqueRefHit(arena_alloc, out_hits, .{
                         .span = live_sp,
@@ -7993,11 +8072,11 @@ fn collectSymbolOccurrencesInFile(
                     const hit_tok = resolveAstNodeFocalToken(parsed_art, ast_id);
                     if (!hit_tok.isNone() and hit_tok.asInt() < parsed_art.token_buffer.countTokens()) {
                         const cand_sp = parsed_art.token_buffer.getTokenSpan(scan_fid, hit_tok);
-                        if (!is_including_declaration and sym.decl_span.file_id == scan_fid) {
-                            const live_decl = session.db.resolveLiveSymbolDeclSpan(canonical_sym) catch sym.decl_span;
-                            parsed_art = session.db.parsed_artifacts.getPtr(scan_fid.asInt()) orelse return;
-                            if (cand_sp.start_byte == live_decl.start_byte and cand_sp.end_byte == live_decl.end_byte) {
-                                continue;
+                        if (!is_including_declaration) {
+                            if (live_canonical_decl) |live_decl| {
+                                if (cand_sp.start_byte == live_decl.start_byte and cand_sp.end_byte == live_decl.end_byte) {
+                                    continue;
+                                }
                             }
                         }
                         try appendUniqueRefHit(arena_alloc, out_hits, .{
@@ -8057,11 +8136,11 @@ fn collectSymbolOccurrencesInFile(
                             (resolveLiveCanonicalSymbol(session, htok.symbol_index) == canonical_sym);
                         if (is_matched) {
                             const cand_sp = Span.init(scan_fid, htok_start, htok_end);
-                            if (!is_including_declaration and sym.decl_span.file_id == scan_fid) {
-                                const live_decl = session.db.resolveLiveSymbolDeclSpan(canonical_sym) catch sym.decl_span;
-                                parsed_art = session.db.parsed_artifacts.getPtr(scan_fid.asInt()) orelse return;
-                                if (cand_sp.start_byte == live_decl.start_byte and cand_sp.end_byte == live_decl.end_byte) {
-                                    continue;
+                            if (!is_including_declaration) {
+                                if (live_canonical_decl) |live_decl| {
+                                    if (cand_sp.start_byte == live_decl.start_byte and cand_sp.end_byte == live_decl.end_byte) {
+                                        continue;
+                                    }
                                 }
                             }
                             const is_field_init_label = sym.kind == .field_sym and
@@ -8227,8 +8306,13 @@ fn scanSignatureTypeTokensInEntry(
                     const tok_sp = parsed_art.token_buffer.getTokenSpan(file_id, leaf.token);
                     const target_sym_rec = session.db.symbol_table.getSymbol(canonical_sym).*;
                     if (target_sym_rec.decl_span.file_id == file_id) {
-                        const live_decl = session.db.resolveLiveSymbolDeclSpan(canonical_sym) catch
-                            target_sym_rec.decl_span;
+                        const live_decl = resolveLiveSymbolDeclSpanFast(
+                            session,
+                            canonical_sym,
+                            file_id,
+                            src,
+                            parsed_art,
+                        ) catch target_sym_rec.decl_span;
                         if (tok_sp.start_byte == live_decl.start_byte and tok_sp.end_byte == live_decl.end_byte) {
                             continue;
                         }
@@ -8452,6 +8536,8 @@ fn toLspSymbolKind(kind: SymbolKind) u8 {
 fn writeDocumentSymbolJson(
     session: *LspSession,
     file_id: FileId,
+    src: []const u8,
+    line_idx_opt: ?*const LineIndex,
     item: DocumentSymbolItem,
     writer: *std.Io.Writer,
 ) !void {
@@ -8460,6 +8546,14 @@ fn writeDocumentSymbolJson(
         @max(item.full_span.start_byte, @min(item.selection_span.start_byte, item.full_span.end_byte)),
         @max(item.full_span.start_byte, @min(item.selection_span.end_byte, item.full_span.end_byte)),
     );
+    const full_range = if (line_idx_opt) |li|
+        spanToLspRangeFast(src, li, session.position_encoding, item.full_span)
+    else
+        spanToLspRange(session, file_id, item.full_span);
+    const sel_range = if (line_idx_opt) |li|
+        spanToLspRangeFast(src, li, session.position_encoding, clamped_sel)
+    else
+        spanToLspRange(session, file_id, clamped_sel);
     try writer.writeAll("{\"name\":");
     try writeJsonString(writer, if (item.name.len > 0) item.name else "<anonymous>");
     if (item.detail.len > 0) {
@@ -8471,21 +8565,77 @@ fn writeDocumentSymbolJson(
         try writer.writeAll(",\"tags\":[1]");
     }
     try writer.writeAll(",\"range\":");
-    try writeLspRangeJson(writer, spanToLspRange(session, file_id, item.full_span));
+    try writeLspRangeJson(writer, full_range);
     try writer.writeAll(",\"selectionRange\":");
-    try writeLspRangeJson(writer, spanToLspRange(session, file_id, clamped_sel));
+    try writeLspRangeJson(writer, sel_range);
     if (item.children.len > 0) {
         try writer.writeAll(",\"children\":[");
         for (item.children, 0..) |child_sym, i| {
             if (i > 0) try writer.writeByte(',');
-            try writeDocumentSymbolJson(session, file_id, child_sym, writer);
+            try writeDocumentSymbolJson(session, file_id, src, line_idx_opt, child_sym, writer);
         }
         try writer.writeByte(']');
     }
     try writer.writeByte('}');
 }
 
-/// Handles `textDocument/documentSymbol`: builds hierarchical `DocumentSymbol[]` for the active file.
+/// Comparator ordering `DocumentSymbolItem` children monotonically by `(start_byte ASC, end_byte ASC)`.
+fn isDocumentSymbolBefore(_: void, lhs_sym: DocumentSymbolItem, rhs_sym: DocumentSymbolItem) bool {
+    if (lhs_sym.full_span.start_byte != rhs_sym.full_span.start_byte) {
+        return lhs_sym.full_span.start_byte < rhs_sym.full_span.start_byte;
+    }
+    return lhs_sym.full_span.end_byte < rhs_sym.full_span.end_byte;
+}
+
+/// Appends candidate member symbols from `bucket` whose live declaration spans lie inside `full_span`.
+fn appendContainerDocumentSymbolChildren(
+    session: *LspSession,
+    arena_alloc: std.mem.Allocator,
+    fid: FileId,
+    src: []const u8,
+    matched_sym_idx: SymbolIndex,
+    full_span: Span,
+    bucket: []const SymbolIndex,
+    type_buf: *[256]u8,
+    out_children: *std.ArrayListUnmanaged(DocumentSymbolItem),
+) !void {
+    for (bucket) |c_idx| {
+        if (c_idx == matched_sym_idx) continue;
+        const c_sym = session.db.symbol_table.getSymbol(c_idx).*;
+        const parsed_art = session.db.parsed_artifacts.getPtr(fid.asInt()) orelse return;
+        const c_live = resolveLiveSymbolDeclSpanFast(
+            session,
+            c_idx,
+            fid,
+            src,
+            parsed_art,
+        ) catch c_sym.decl_span;
+        if (c_live.file_id != fid or
+            c_live.start_byte < full_span.start_byte or
+            c_live.end_byte > full_span.end_byte)
+        {
+            continue;
+        }
+        const c_detail: []const u8 = if (!c_sym.type_id.isError() and c_sym.type_id != .unit_ty)
+            try arena_alloc.dupe(
+                u8,
+                session.db.type_pool.formatType(c_sym.type_id, &session.db.symbol_table, type_buf),
+            )
+        else
+            "";
+        try out_children.append(arena_alloc, .{
+            .name = c_sym.name_text,
+            .detail = c_detail,
+            .kind = toLspSymbolKind(c_sym.kind),
+            .is_deprecated = c_sym.extra_flags.is_deprecated or
+                session.db.symbol_table.getDeprecatedMeta(c_idx) != null,
+            .full_span = c_live,
+            .selection_span = c_live,
+        });
+    }
+}
+
+/// Handles `textDocument/documentSymbol`: builds hierarchical `DocumentSymbol[]` in $O(E + S)$ time.
 fn handleDocumentSymbolRequest(
     session: *LspSession,
     arena_alloc: std.mem.Allocator,
@@ -8504,13 +8654,41 @@ fn handleDocumentSymbolRequest(
         query_db.ItemTreeEntry,
         (try session.db.extractItemTree(fid)).entries,
     );
+    const src = getLiveDocumentSource(session, fid) orelse "";
     var parsed_art = session.db.parsed_artifacts.getPtr(fid.asInt()) orelse
         return writeNullResultFrame(session, out_writer, rpc_id);
-    const bounds_opt = session.db.getFileLiveSymbolBounds(fid);
+
+    // [1] Partition file-local member symbols into `owner_def_id` and unowned `scope_id` buckets in one $O(S)$ pass:
+    var members_by_owner_def: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(SymbolIndex)) = .empty;
+    var members_by_scope: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(SymbolIndex)) = .empty;
+    if (session.db.getFileLiveSymbolBounds(fid)) |bounds| {
+        var s_raw = bounds.sym_start;
+        while (s_raw < bounds.sym_end and s_raw < session.db.symbol_table.countSymbols()) : (s_raw += 1) {
+            const c_idx = SymbolIndex.fromInt(s_raw);
+            const c_sym = session.db.symbol_table.getSymbol(c_idx).*;
+            if (c_sym.flags.is_imported or c_sym.decl_span.file_id != fid) continue;
+            const is_member_kind = switch (c_sym.kind) {
+                .field_sym, .enum_variant_sym, .fn_sym, .const_sym, .type_alias_sym => true,
+                else => false,
+            };
+            if (!is_member_kind) continue;
+
+            if (!c_sym.owner_def_id.isNone()) {
+                const gop = try members_by_owner_def.getOrPut(arena_alloc, c_sym.owner_def_id.asInt());
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(arena_alloc, c_idx);
+            } else if (!c_sym.scope_id.isNone()) {
+                const gop = try members_by_scope.getOrPut(arena_alloc, c_sym.scope_id.asInt());
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(arena_alloc, c_idx);
+            }
+        }
+    }
 
     var doc_items: std.ArrayListUnmanaged(DocumentSymbolItem) = .empty;
     var type_buf: [256]u8 = undefined;
 
+    // [2] Assemble top-level `DocumentSymbolItem`s with $O(1)$ bucket lookups per `ItemTreeEntry`:
     for (entries) |entry| {
         if (entry.kind == .use_decl or entry.kind == .ffi_extern_block) continue;
         parsed_art = session.db.parsed_artifacts.getPtr(fid.asInt()) orelse
@@ -8523,9 +8701,15 @@ fn handleDocumentSymbolRequest(
         ) orelse continue;
 
         var sel_span = full_span;
-        var matched_sym_idx: SymbolIndex = session.db.symbol_table.def_to_symbol.get(entry.def_id.asInt()) orelse .none;
+        const matched_sym_idx: SymbolIndex = session.db.symbol_table.def_to_symbol.get(entry.def_id.asInt()) orelse .none;
         if (!matched_sym_idx.isNone()) {
-            const live_sp = session.db.resolveLiveSymbolDeclSpan(matched_sym_idx) catch full_span;
+            const live_sp = resolveLiveSymbolDeclSpanFast(
+                session,
+                matched_sym_idx,
+                fid,
+                src,
+                parsed_art,
+            ) catch full_span;
             parsed_art = session.db.parsed_artifacts.getPtr(fid.asInt()) orelse
                 return writeNullResultFrame(session, out_writer, rpc_id);
             if (live_sp.file_id == fid) sel_span = live_sp;
@@ -8536,51 +8720,44 @@ fn handleDocumentSymbolRequest(
             }
         }
 
-        // Collect nested children (`fields`, `variants`, `methods`, or inline `mod` declarations):
         var child_list: std.ArrayListUnmanaged(DocumentSymbolItem) = .empty;
-        if (bounds_opt) |bounds| {
-            var s_raw = bounds.sym_start;
-            while (s_raw < bounds.sym_end and s_raw < session.db.symbol_table.countSymbols()) : (s_raw += 1) {
-                const c_idx = SymbolIndex.fromInt(s_raw);
-                if (c_idx == matched_sym_idx) continue;
-                const c_sym = session.db.symbol_table.getSymbol(c_idx).*;
-                if (c_sym.flags.is_imported or c_sym.decl_span.file_id != fid) continue;
-                const is_member_kind = switch (c_sym.kind) {
-                    .field_sym, .enum_variant_sym, .fn_sym, .const_sym, .type_alias_sym => true,
-                    else => false,
-                };
-                if (!is_member_kind) continue;
-
-                const is_owned_by_entry = (c_sym.owner_def_id == entry.def_id) or
-                    (!matched_sym_idx.isNone() and
-                        !session.db.symbol_table.getSymbol(matched_sym_idx).target_scope.isNone() and
-                        c_sym.scope_id == session.db.symbol_table.getSymbol(matched_sym_idx).target_scope);
-                if (!is_owned_by_entry) continue;
-
-                const c_live = session.db.resolveLiveSymbolDeclSpan(c_idx) catch c_sym.decl_span;
-                if (c_live.file_id != fid or
-                    c_live.start_byte < full_span.start_byte or
-                    c_live.end_byte > full_span.end_byte)
-                {
-                    continue;
-                }
-                const c_detail: []const u8 = if (!c_sym.type_id.isError() and c_sym.type_id != .unit_ty)
-                    try arena_alloc.dupe(
-                        u8,
-                        session.db.type_pool.formatType(c_sym.type_id, &session.db.symbol_table, &type_buf),
-                    )
-                else
-                    "";
-                try child_list.append(arena_alloc, .{
-                    .name = c_sym.name_text,
-                    .detail = c_detail,
-                    .kind = toLspSymbolKind(c_sym.kind),
-                    .is_deprecated = c_sym.extra_flags.is_deprecated or
-                        session.db.symbol_table.getDeprecatedMeta(c_idx) != null,
-                    .full_span = c_live,
-                    .selection_span = c_live,
-                });
+        var has_both_buckets = false;
+        if (!entry.def_id.isNone()) {
+            if (members_by_owner_def.get(entry.def_id.asInt())) |owner_bucket| {
+                try appendContainerDocumentSymbolChildren(
+                    session,
+                    arena_alloc,
+                    fid,
+                    src,
+                    matched_sym_idx,
+                    full_span,
+                    owner_bucket.items,
+                    &type_buf,
+                    &child_list,
+                );
             }
+        }
+        if (!matched_sym_idx.isNone()) {
+            const target_scope = session.db.symbol_table.getSymbol(matched_sym_idx).target_scope;
+            if (!target_scope.isNone()) {
+                if (members_by_scope.get(target_scope.asInt())) |scope_bucket| {
+                    has_both_buckets = child_list.items.len > 0;
+                    try appendContainerDocumentSymbolChildren(
+                        session,
+                        arena_alloc,
+                        fid,
+                        src,
+                        matched_sym_idx,
+                        full_span,
+                        scope_bucket.items,
+                        &type_buf,
+                        &child_list,
+                    );
+                }
+            }
+        }
+        if (has_both_buckets and child_list.items.len > 1) {
+            std.mem.sort(DocumentSymbolItem, child_list.items, {}, isDocumentSymbolBefore);
         }
 
         const lsp_kind: u8 = switch (entry.kind) {
@@ -8612,6 +8789,7 @@ fn handleDocumentSymbolRequest(
         });
     }
 
+    const line_idx_opt: ?*const LineIndex = if (session.vfs.getLineIndex(fid)) |li| li else |_| null;
     session.outbound_buf.clearRetainingCapacity();
     const body_writer = &session.outbound_buf.writer;
     try body_writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
@@ -8619,7 +8797,7 @@ fn handleDocumentSymbolRequest(
     try body_writer.writeAll(",\"result\":[");
     for (doc_items.items, 0..) |doc_sym, i| {
         if (i > 0) try body_writer.writeByte(',');
-        try writeDocumentSymbolJson(session, fid, doc_sym, body_writer);
+        try writeDocumentSymbolJson(session, fid, src, line_idx_opt, doc_sym, body_writer);
     }
     try body_writer.writeAll("]}");
     try flushOutboundJsonFrame(out_writer, session.outbound_buf.written());
@@ -8678,6 +8856,7 @@ fn handleWorkspaceSymbolRequest(
         const bounds = session.db.getFileLiveSymbolBounds(cand_fid) orelse continue;
         const file_path = session.vfs.getFilePath(cand_fid);
         const mod_stem = std.fs.path.stem(file_path);
+        const cand_src = getLiveDocumentSource(session, cand_fid) orelse "";
 
         var sym_raw = bounds.sym_start;
         while (sym_raw < bounds.sym_end and sym_raw < session.db.symbol_table.countSymbols()) : (sym_raw += 1) {
@@ -8697,7 +8876,10 @@ fn handleWorkspaceSymbolRequest(
             }
 
             const rank = scoreWorkspaceSymbolMatch(sym.name_text, query_str) orelse continue;
-            const live_span = session.db.resolveLiveSymbolDeclSpan(sym_idx) catch continue;
+            const live_span = if (session.db.parsed_artifacts.getPtr(cand_fid.asInt())) |cand_parsed|
+                resolveLiveSymbolDeclSpanFast(session, sym_idx, cand_fid, cand_src, cand_parsed) catch continue
+            else
+                session.db.resolveLiveSymbolDeclSpan(sym_idx) catch continue;
             if (live_span.file_id.isNone()) continue;
 
             try candidates.append(arena_alloc, .{

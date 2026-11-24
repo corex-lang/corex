@@ -2427,3 +2427,163 @@ test "test_lsp_nested_fmt_string_holes_cursor_guard_semantic_monotonicity_and_st
         std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":9").?, "\"items\":[]") != null,
     );
 }
+
+test "test_lsp_document_symbol_multi_impl_hierarchy_and_early_cutoff_shift" {
+    const allocator = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var inbound: std.ArrayListUnmanaged(u8) = .empty;
+    defer inbound.deinit(allocator);
+
+    const initial_src =
+        "pub struct Buffer {\n" ++
+        "    pub ptr: usize,\n" ++
+        "    pub cap: usize,\n" ++
+        "}\n" ++
+        "impl Buffer {\n" ++
+        "    pub fn len(self: &Buffer) -> usize { return self.cap; }\n" ++
+        "}\n" ++
+        "impl Buffer {\n" ++
+        "    pub fn clear(self: &mut Buffer) { self.cap = 0; }\n" ++
+        "}\n" ++
+        "pub mod nested {\n" ++
+        "    pub fn helper(seed: i32) -> i32 { return seed + 1; }\n" ++
+        "}\n" ++
+        "pub fn scale_step(val: f64) -> f64 {\n" ++
+        "    let t_val: f64 = 3.0 - val;\n" ++
+        "    return val * t_val;\n" ++
+        "}\n" ++
+        "pub fn run_calc(x: f64) -> f64 {\n" ++
+        "    return scale_step(x);\n" ++
+        "}\n";
+
+    // Prepend 3 comment lines to exercise Early Cutoff shifted declaration spans:
+    const shifted_src =
+        "// Header line 1.\n" ++
+        "// Header line 2.\n" ++
+        "// Header line 3.\n" ++
+        initial_src;
+
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"rootUri\":null,\"capabilities\":{}}}",
+    );
+    try appendLspFrame(allocator, &inbound, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}");
+    const open_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{{\"textDocument\":{{" ++
+            "\"uri\":\"file:///D%3A/virt/multi_impl_sym.cx\",\"languageId\":\"corex\",\"version\":1,\"text\":\"{f}\"}}}}}}",
+        .{std.zig.fmtString(initial_src)},
+    );
+    defer allocator.free(open_body);
+    try appendLspFrame(allocator, &inbound, open_body);
+
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/documentSymbol\"," ++
+            "\"params\":{\"textDocument\":{\"uri\":\"file:///D%3A/virt/multi_impl_sym.cx\"}}}",
+    );
+
+    const change_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{{" ++
+            "\"textDocument\":{{\"uri\":\"file:///D%3A/virt/multi_impl_sym.cx\",\"version\":2}}," ++
+            "\"contentChanges\":[{{\"text\":\"{f}\"}}]}}}}",
+        .{std.zig.fmtString(shifted_src)},
+    );
+    defer allocator.free(change_body);
+    try appendLspFrame(allocator, &inbound, change_body);
+
+    // Query post-shift documentSymbol (3), semanticTokens (4), hover on `t_val` usage line 18 col 17 (5),
+    // definition on `t_val` usage (6), prepareRename on `t_val` usage (7), and definition on `scale_step` call line 21 col 11 (8):
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/documentSymbol\"," ++
+            "\"params\":{\"textDocument\":{\"uri\":\"file:///D%3A/virt/multi_impl_sym.cx\"}}}",
+    );
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/semanticTokens/full\"," ++
+            "\"params\":{\"textDocument\":{\"uri\":\"file:///D%3A/virt/multi_impl_sym.cx\"}}}",
+    );
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/hover\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///D%3A/virt/multi_impl_sym.cx\"},\"position\":{\"line\":18,\"character\":17}}}",
+    );
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"textDocument/definition\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///D%3A/virt/multi_impl_sym.cx\"},\"position\":{\"line\":18,\"character\":17}}}",
+    );
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/prepareRename\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///D%3A/virt/multi_impl_sym.cx\"},\"position\":{\"line\":18,\"character\":17}}}",
+    );
+    try appendLspFrame(
+        allocator,
+        &inbound,
+        "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"textDocument/definition\",\"params\":{" ++
+            "\"textDocument\":{\"uri\":\"file:///D%3A/virt/multi_impl_sym.cx\"},\"position\":{\"line\":21,\"character\":11}}}",
+    );
+    try appendLspFrame(allocator, &inbound, "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"shutdown\",\"params\":null}");
+    try appendLspFrame(allocator, &inbound, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}");
+
+    var outcome = try executeLspTranscript(allocator, io, inbound.items, null, .{});
+    defer outcome.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), outcome.exit_code);
+
+    // Assert exact bucket partitioning in `documentSymbol` (`ptr` & `cap` under `Buffer`, `len` under impl #1, `clear` under impl #2):
+    const doc_sym_initial = findFrameByIdFragment(outcome.frames, "\"id\":2").?;
+    const buf_pos = std.mem.indexOf(u8, doc_sym_initial, "\"kind\":23").?;
+    const impl1_pos = std.mem.indexOfPos(u8, doc_sym_initial, buf_pos + 1, "\"kind\":5").?;
+    const impl2_pos = std.mem.indexOfPos(u8, doc_sym_initial, impl1_pos + 1, "\"kind\":5").?;
+    const nested_pos = std.mem.indexOfPos(u8, doc_sym_initial, impl2_pos + 1, "\"name\":\"nested\"").?;
+    const ptr_pos = std.mem.indexOf(u8, doc_sym_initial, "\"name\":\"ptr\"").?;
+    const len_pos = std.mem.indexOf(u8, doc_sym_initial, "\"name\":\"len\"").?;
+    const clear_pos = std.mem.indexOf(u8, doc_sym_initial, "\"name\":\"clear\"").?;
+    const helper_pos = std.mem.indexOf(u8, doc_sym_initial, "\"name\":\"helper\"").?;
+    try std.testing.expect(ptr_pos < buf_pos or (ptr_pos > buf_pos and ptr_pos < impl1_pos));
+    try std.testing.expect(ptr_pos < impl1_pos);
+    try std.testing.expect(len_pos > impl1_pos and len_pos < impl2_pos);
+    try std.testing.expect(clear_pos > impl2_pos and clear_pos < nested_pos);
+    try std.testing.expect(helper_pos > nested_pos);
+    // Ensure `len` appears exactly once (not duplicated under `struct Buffer` or `impl` #2):
+    try std.testing.expect(std.mem.indexOfPos(u8, doc_sym_initial, len_pos + 1, "\"name\":\"len\"") == null);
+
+    // Assert post-Early-Cutoff shifted coordinates (+3 lines):
+    const doc_sym_shifted = findFrameByIdFragment(outcome.frames, "\"id\":3").?;
+    try std.testing.expect(
+        std.mem.indexOf(u8, doc_sym_shifted, "\"name\":\"scale_step\",\"kind\":12,\"range\":{\"start\":{\"line\":16,") != null,
+    );
+    const sem_shifted = try extractJsonU32Array(
+        allocator,
+        findFrameByIdFragment(outcome.frames, "\"id\":4").?,
+        "\"data\":[",
+    );
+    defer allocator.free(sem_shifted);
+    try std.testing.expect(sem_shifted.len >= 50);
+
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":5").?, "t_val: f64") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":6").?, "\"line\":17,\"character\":8") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":7").?, "\"placeholder\":\"t_val\"") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":8").?, "\"line\":16,\"character\":7") != null,
+    );
+}
