@@ -58,8 +58,9 @@ tests/
 ## 3. Regression, Differential & Drift Guard Mandates
 
 1.  **Mandatory Bug Regression Tests:** Every bug fix in the compiler, linker, runtime, or `cx.*` standard library must include a deterministic regression test reproducing the bug and verifying the fix before the task is complete.
-2.  **4-Tier Differential Parity (`--diff-backends`):** Core language and `stdlib/cx/` execution tests must assert identical outputs across `Pre-Opt MirVm`, `Post-Opt MirVm`, Tier A (`-ofmt=c`), and Tier B (`LLVM`) across `--dev` and `--release`.
-3.  **Drift Guards (`tests/drift/`):** Maintain automated assertions verifying:
+2.  **4-Tier Differential Parity (`--diff-backends`):** Core language and `stdlib/cx/` execution tests must assert identical outputs across `Pre-Opt MirVm`, `Post-Opt MirVm`, Tier A (`-ofmt=c`), and Tier B (`LLVM`) across `--dev` and `--release` in the exact sub-phase each `.cx` module is authored (never deferring backend parity to later phases).
+3.  **Incremental-Edit IDE & LSP Resilience (`didChange` Break-and-Restore):** Every phase modifying syntax, `CompilerDb`, `lsp_server`, or adding `stdlib/cx/*.cx` modules must verify ranged incremental `textDocument/didChange` edits that temporarily break a signature or body across multi-file module graphs – asserting syntax/type diagnostics appear while `semanticTokens/full/delta`, `hover`, `definition`, and `prepareRename` return zero `-32603` internal errors, and that restoring the edit clears diagnostics back to `0`.
+4.  **Drift Guards (`tests/drift/`):** Maintain automated assertions verifying:
     -   Zero colored emojis anywhere in the repository (`AGENTS.md` §5),
     -   Exact 90-character / 65-character section dividers in both UTF-8 bytes and Unicode codepoints,
     -   100% parity across CLI flag tables, `corex --help` snapshots, and `DIAGNOSTIC_CATALOG`,

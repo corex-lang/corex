@@ -370,8 +370,9 @@ Regardless of the specific surface grammar (`RDG-03`) or backend (`RDG-09`) sele
     1.  **`cx.cli` (`stdlib/cx/cli.cx`):** Declarative `comptime`-validated zero-allocation `argv` subcommand/flag parser and the canonical monochrome Unicode + ANSI terminal rendering engine (`╭`, `│`, `╰`, `├`, `─`, `▸`, `•`, `✓`, `✗`, `⚠`, multi-span source snippets, `TextEdit` diff previews, tables, and progress indicators).
     2.  **`cx.serde` (`stdlib/cx/serde.cx`):** Two-stage `simdjson`-style 64-bit `JsonTape` + `comptime` struct serde (powering self-hosted `corex lsp` JSON-RPC) and lossless CST-backed `corex.toml` / `corex.lock` parser and surgical patcher.
     3.  **`cx.test` & `cx.bench` (`stdlib/cx/{test,bench}.cx`):** Unit and golden-snapshot assertions, **single-process deterministic virtual-time/scheduler/`OOM` simulation (`corex test --sim --seed`, `RDG-18`, enforcing `W0332` / `Fix-18A` determinism guards)**, **zero-config coverage-guided native fuzzing & input shrinking (`corex test --fuzz`, `RDG-18`)**, `MirVm` differential oracle integration, and MAD-filtered monotonic wall-clock micro-benchmarking.
--   **Verification Gate (`11.3`):**
+-   **Verification Gate (`11.3`) & Pre-`Phase 12` Syntax Checkpoint:**
     -   100% test coverage across all `Phase 11.1`–`11.3` `stdlib/cx/*.cx` modules, bit-exact `--sim --seed` deterministic replay verification, `--fuzz` crash-discovery & shrinking tests, and tree-shaking verification confirming a minimal `cx.cli` hello-world binary links only referenced symbols (`< 1.5 ms` cold-start, `< 10 KB` freestanding `.wasm`).
+    -   **Pre-`Phase 12` Dogfooding & Syntax Review Checkpoint (`.agents/SYNTAX_WISHLIST.md`):** Before starting `Phase 12.1`, review all accumulated syntax, `/|` docstring (`SW-001`–`SW-002`), tooling, and stdlib ergonomics proposals in `.agents/SYNTAX_WISHLIST.md` with the user so any approved surface refinements and `corex upgrade` rules land across `core/` and `stdlib/cx/` prior to writing `compiler/*.cx`.
 
 ### Phase 12: Modular Self-Hosting Compiler Rewrite (`compiler/*.cx`), Bootstrap Fixed-Point & `v0.0.1` Initial Release
 

@@ -36,11 +36,26 @@ For every compiler subsystem, pass, or standard library module, orchestrate the 
 3.  **Adversarial Soundness & SAST Verifier Subagent (Red Team):**
     -   Spawn an adversarial reviewer subagent whose sole mandate is to find soundness bugs, miscompilations, integer overflows in span math, UTF-8 boundary bugs, use-after-free/lifetime false negatives or false positives, and pathological inputs that could trigger exponential compilation time or unbounded memory growth.
 4.  **Test, Snapshot & Differential Fuzzing Engineer Subagent:**
-    -   Spawn a dedicated verification subagent (following `.agents/skills/test/SKILL.md`) to build comprehensive unit tests, golden CST/AST/IR/diagnostic snapshots, negative `compile_fail` safety tests, `--dev` vs. `--release` differential `run_pass` tests, and structure-aware fuzz targets until **100% line and branch coverage** is achieved across Windows, POSIX, and `wasm32` paths.
-5.  **Standards & Performance Audit Subagent:**
+    -   Spawn a dedicated verification subagent (following `.agents/skills/test/SKILL.md`) to build comprehensive unit tests, golden CST/AST/IR/diagnostic snapshots, negative `compile_fail` safety tests, immediate 4-tier `--diff-backends` (`Pre-Opt MirVm`, `Post-Opt MirVm`, `-ofmt=c`, `LLVM`) `run_pass` execution across `--dev` and `--release` on every new `.cx` module, and structure-aware fuzz targets until **100% line and branch coverage** is achieved across Windows, POSIX, and `wasm32` paths.
+5.  **IDE (`corex lsp` + `vscode-ext-corex`) & Syntax Dogfooding Subagent:**
+    -   Whenever a phase adds or modifies `.cx` files, syntax, `CompilerDb`, `fmt`, `check`, or `lsp`, spawn a dedicated IDE & dogfooding subagent to verify every newly written `.cx` module end-to-end through `corex lsp` and `../vscode-ext-corex`:
+        -   TextMate grammar scopes + semantic token parity (zero unhighlighted escapes, suffixes, attributes, or comment spans),
+        -   Hover tooltips, go-to-definition, find-references, and `F2` rename across locals, parameters, fields, variants, and functions,
+        -   Incremental ranged `didChange` break-and-restore resilience (deleting tokens mid-signature/body, verifying diagnostics appear while `semanticTokens/delta` + `hover` + `definition` stay live, then restoring to `0` diagnostics), and local `.vsix` repackaging/reinstall whenever `../vscode-ext-corex` changes,
+        -   First-principles `.cx` syntax & ergonomics dogfooding (identifying repetitive boilerplate or readability friction with exact `file:line` call-site counts).
+6.  **Standards & Performance Audit Subagent:**
     -   Before marking any milestone or task complete, spawn an audit subagent executing `.agents/skills/audit/SKILL.md` and `.agents/skills/bench/SKILL.md` to verify zero compiler/linter warnings, 100% adherence to every naming/comment/separator rule, zero colored emojis (monochrome Unicode `╭`, `│`, `╰`, `├`, `─`, `▸`, `•`, `✓`, `✗`, `⚠` + ANSI only), and zero benchmark regressions.
 
 Never accept a subagent's output blindly: verify its claims, run the full validation suite, and iterate until every check passes with zero issues.
+
+### Single-Writer 4-Tier Dogfooding & Escalation Triage
+
+To prevent parallel `edit_file` conflicts and context bloat, **only the Lead Orchestrator Agent edits `.agents/SYNTAX_WISHLIST.md` and `.agents/ISSUE_TRACKER.md`**. Every subagent must conclude its report with a `Dogfooding & Escalations` section (or message the Lead Agent immediately on a blocker), triaged strictly into four tiers:
+
+1.  **Tier 1 – Localized Bug (`compiler`, `SAST`, `fmt`, `check`, `lsp`, `vscode-ext-corex`):** Fix immediately in the active session with a deterministic regression test (never contort `.cx` code to dodge a bug, and do not log Tier-1 bugs in `ISSUE_TRACKER.md`).
+2.  **Tier 2 – Cross-Cutting Non-Blocking Bug:** Subagent escalates to Lead Agent; Lead Agent records a minimal reproducer in `.agents/ISSUE_TRACKER.md` and **pauses to ask the user** whether to fix it immediately or schedule a dedicated pass.
+3.  **Tier 3 – Phase-Blocking Bug or Spec Ambiguity:** Subagent contacts Lead Agent immediately; Lead Agent logs it in `.agents/ISSUE_TRACKER.md` and **halts implementation to ask the user**.
+4.  **Tier 4 – Syntax, Docstring, Tooling or Stdlib Wishlist Proposal:** Never self-implemented; Lead Agent deduplicates and records/updates it in `.agents/SYNTAX_WISHLIST.md` with before/after `.cx` snippets and exact `file:line` call-site counts.
 
 ---
 
@@ -57,11 +72,11 @@ Never accept a subagent's output blindly: verify its claims, run the full valida
 
 ## 4. Execution Protocol
 
-1.  Inspect the current workspace state, `PLAN.md`, and existing `docs/research/DR-XX.md` reports.
+1.  Inspect the current workspace state, `PLAN.md`, `.agents/ISSUE_TRACKER.md`, and existing `docs/research/DR-XX.md` reports.
 2.  State clearly which Phase and task you are executing and which `RDG` gates are active.
-3.  Execute the 5-stage subagent quality pipeline (`Specify` → `Critique` → `Implement` → `Red-Team Verify` → `Test/Fuzz/Audit`).
-4.  Run all formatters, linters, type checkers, tests, and benchmarks; fix every error, warning, or coverage gap until the workspace is 100% clean.
-5.  Update `CHANGELOG.md` (and synchronize `docs/COMPARISONS.md` / `docs/LAUNCH.md` when user-facing capabilities or CLI deliverables ship) per `.agents/AGENTS.md` Section 7 and report your verification summary.
+3.  Execute the 6-stage subagent quality pipeline (`Specify` → `Critique` → `Implement` → `Red-Team Verify` → `Test/Fuzz/4-Backend` → `IDE/Dogfooding & Audit`).
+4.  Run all formatters, linters, type checkers, tests (including `../vscode-ext-corex` `pnpm run check` + local `.vsix` reinstall when IDE/syntax/LSP behavior changes), and benchmarks; fix every error, warning, or coverage gap until both workspaces are 100% clean.
+5.  Curate any new Tier-4 findings into `.agents/SYNTAX_WISHLIST.md`, update `CHANGELOG.md` (and synchronize `docs/COMPARISONS.md` / `docs/LAUNCH.md` when user-facing capabilities or CLI deliverables ship) per `.agents/AGENTS.md` Section 7, and include a concise **Dogfooding & Wishlist Digest** in your verification summary.
 
 ---
 
