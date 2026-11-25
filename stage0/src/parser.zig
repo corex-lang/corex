@@ -13895,7 +13895,7 @@ pub fn reparseIncrementalWithOptions(
                                 fn lessThan(_: void, lhs: RawLintCandidate, rhs: RawLintCandidate) bool {
                                     if (lhs.start_byte != rhs.start_byte) return lhs.start_byte < rhs.start_byte;
                                     if (lhs.end_byte != rhs.end_byte) return lhs.end_byte < rhs.end_byte;
-                                    return @intFromEnum(lhs.rule_id) < @intFromEnum(rhs.rule_id);
+                                    return @backingInt(lhs.rule_id) < @backingInt(rhs.rule_id);
                                 }
                             }.lessThan);
                         }

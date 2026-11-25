@@ -170,8 +170,7 @@ const ALL_44_RULE_CASES = [RuleId.COUNT]RuleVerificationCase{
         .expected_slug = "ambiguous-unicode-text",
         .expected_applicability = .maybe_incorrect,
         .negative_src = "// Header \u{2014} summary\npub fn cache_tag() -> str {\n    \"\u{0421}ache\"\n}\n",
-        .positive_src =
-        "// Привет мир – чистый комментарий…\n" ++
+        .positive_src = "// Привет мир – чистый комментарий…\n" ++
             "pub fn banner_text() -> str {\n    \"Привет – ok…\"\n}\n",
     },
     // [7] W0119 / useless-format-string (Auto):
@@ -1345,7 +1344,7 @@ fn runWorkspaceDepCapsCheck(
         \\pub fn main_entry() -> i32 {
         \\    pure_sum(3, 4)
         \\}
-        ++ "\n";
+    ++ "\n";
 
     try db.setFilePackageId(root_fid, .root);
     try db.setFilePath(root_fid, "D:/ws/src/main.cx");
@@ -1678,7 +1677,7 @@ test "test_dr25_cascading_stale_expect_cleanup_after_pass1_warning_fix" {
         \\    };
         \\    .Ok(unwrapped + 1)
         \\}
-        ++ "\n";
+    ++ "\n";
 
     var interner: StringInterner = undefined;
     var vfs_map: VfsSourceMap = undefined;
@@ -1947,7 +1946,7 @@ test "test_dr25_cross_platform_compiled_glob64_paths_and_multi_target_w0413" {
         \\    let sum32 = read_small(&s_val) + read_medium(&m_val);
         \\    (sum32 as u64) + l_ref.first_word + l_ref.second_word + (bytes.len() as u64)
         \\}
-        ++ "\n";
+    ++ "\n";
 
     for (targets) |target_case| {
         var interner: StringInterner = undefined;

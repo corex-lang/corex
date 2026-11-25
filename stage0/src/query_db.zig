@@ -1083,6 +1083,135 @@ pub const PackageLintFilterEntry = struct {
     }
 };
 
+/// Compact cross-file reference bitmask recorded for a symbol owned by `file_id` (`SiblingUsageCache`).
+pub const SiblingSymUsageItem = struct {
+    /// Raw `SymbolIndex` integer in `SymbolTable`.
+    sym_raw: u32,
+    /// Packed cross-file flags (`bit 0`: `is_used`, `bit 1`: `has_pkg_wide_ref`, `bit 2`: `has_parent_mod_ref`).
+    mask: u8,
+};
+
+/// Cached sibling-module symbol usage and inactive `@cfg` snapshot for a single `FileId`.
+pub const SiblingUsageCacheEntry = struct {
+    /// Composite 128-bit digest over `file_id`'s signature layout, `@cfg` state, and sibling file hashes.
+    key_fingerprint: Fingerprint128 = .ZERO,
+    /// Monotonic access tick for bounded LRU eviction.
+    access_tick: u64 = 0,
+    /// Owned slice of non-zero cross-file symbol usage masks on symbols declared in `file_id`.
+    sym_flags: []SiblingSymUsageItem = &.{},
+    /// Owned slice of unique inactive `@cfg` `SymbolId`s collected across sibling files in `pkg_id`.
+    inactive_cfg_ids: []SymbolId = &.{},
+
+    /// Returns total heap byte footprint owned by `self`.
+    pub fn byteSize(self: SiblingUsageCacheEntry) usize {
+        return self.sym_flags.len * @sizeOf(SiblingSymUsageItem) +
+            self.inactive_cfg_ids.len * @sizeOf(SymbolId);
+    }
+
+    /// Releases owned `sym_flags` and `inactive_cfg_ids` slices.
+    pub fn deinit(self: *SiblingUsageCacheEntry, allocator: std.mem.Allocator) void {
+        if (self.sym_flags.len > 0) allocator.free(self.sym_flags);
+        if (self.inactive_cfg_ids.len > 0) allocator.free(self.inactive_cfg_ids);
+        self.* = undefined;
+    }
+};
+
+/// Bounded LRU cache memoizing sibling-file symbol usage per `FileId` (`<= 256` files, `<= 4 MiB`).
+pub const SiblingUsageCache = struct {
+    /// Cached per-`FileId.asInt()` sibling usage snapshots.
+    entries: std.AutoHashMapUnmanaged(u32, SiblingUsageCacheEntry) = .empty,
+    /// Cumulative heap bytes across all retained `SiblingUsageCacheEntry` slices.
+    total_bytes: usize = 0,
+    /// Monotonic LRU clock incremented on every cache hit or insertion.
+    next_tick: u64 = 1,
+
+    /// Releases all retained `SiblingUsageCacheEntry` slices and hash map storage.
+    pub fn deinit(self: *SiblingUsageCache, allocator: std.mem.Allocator) void {
+        var val_it = self.entries.valueIterator();
+        while (val_it.next()) |entry_ptr| {
+            entry_ptr.deinit(allocator);
+        }
+        self.entries.deinit(allocator);
+        self.total_bytes = 0;
+    }
+
+    /// Looks up `file_id` matching `expected_key` and updates its LRU tick on hit.
+    pub fn lookupValid(
+        self: *SiblingUsageCache,
+        file_id: FileId,
+        expected_key: Fingerprint128,
+    ) ?*const SiblingUsageCacheEntry {
+        const ptr = self.entries.getPtr(file_id.asInt()) orelse return null;
+        if (!ptr.key_fingerprint.eql(expected_key)) return null;
+        ptr.access_tick = self.next_tick;
+        self.next_tick +%= 1;
+        return ptr;
+    }
+
+    /// Inserts or replaces `file_id`'s snapshot while enforcing `256`-entry and `4 MiB` LRU bounds.
+    pub fn putSnapshot(
+        self: *SiblingUsageCache,
+        allocator: std.mem.Allocator,
+        file_id: FileId,
+        key_fingerprint: Fingerprint128,
+        sym_flags: []const SiblingSymUsageItem,
+        inactive_cfg_ids: []const SymbolId,
+    ) !void {
+        const new_bytes = sym_flags.len * @sizeOf(SiblingSymUsageItem) +
+            inactive_cfg_ids.len * @sizeOf(SymbolId);
+        if (new_bytes > MAX_SIBLING_USAGE_CACHE_BYTES) return;
+
+        if (self.entries.fetchRemove(file_id.asInt())) |old_kv| {
+            self.total_bytes -|= old_kv.value.byteSize();
+            var old_val = old_kv.value;
+            old_val.deinit(allocator);
+        }
+
+        while (self.entries.count() >= MAX_SIBLING_USAGE_CACHE_ENTRIES or
+            self.total_bytes + new_bytes > MAX_SIBLING_USAGE_CACHE_BYTES)
+        {
+            var victim_key: ?u32 = null;
+            var min_tick: u64 = std.math.maxInt(u64);
+            var it = self.entries.iterator();
+            while (it.next()) |kv| {
+                if (kv.value_ptr.access_tick <= min_tick) {
+                    min_tick = kv.value_ptr.access_tick;
+                    victim_key = kv.key_ptr.*;
+                }
+            }
+            const evict_raw = victim_key orelse break;
+            if (self.entries.fetchRemove(evict_raw)) |ev_kv| {
+                self.total_bytes -|= ev_kv.value.byteSize();
+                var ev_val = ev_kv.value;
+                ev_val.deinit(allocator);
+            } else {
+                break;
+            }
+        }
+
+        const dup_flags: []SiblingSymUsageItem = if (sym_flags.len > 0)
+            try allocator.dupe(SiblingSymUsageItem, sym_flags)
+        else
+            &.{};
+        errdefer if (dup_flags.len > 0) allocator.free(dup_flags);
+        const dup_cfg: []SymbolId = if (inactive_cfg_ids.len > 0)
+            try allocator.dupe(SymbolId, inactive_cfg_ids)
+        else
+            &.{};
+        errdefer if (dup_cfg.len > 0) allocator.free(dup_cfg);
+
+        const tick = self.next_tick;
+        self.next_tick +%= 1;
+        try self.entries.put(allocator, file_id.asInt(), .{
+            .key_fingerprint = key_fingerprint,
+            .access_tick = tick,
+            .sym_flags = dup_flags,
+            .inactive_cfg_ids = dup_cfg,
+        });
+        self.total_bytes += new_bytes;
+    }
+};
+
 /// Directed intra-package `mod <name>;` parent-to-child file edge maintained for $O(V + E)$ subtree traversal.
 pub const ModLink = struct {
     /// Parent module `FileId` containing `mod <name>;`.
@@ -1628,6 +1757,10 @@ pub const MAX_DEPS_PER_MEMO: usize = std.math.maxInt(u16);
 pub const MAX_C_IMPORT_CACHE_ENTRIES: usize = 128;
 /// Maximum total UTF-8 `.cx` byte footprint retained in `CImportCache` (`16 MiB`, `AGENTS.md` §2).
 pub const MAX_C_IMPORT_CACHE_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum number of file entries retained in `SiblingUsageCache` (`256`, `AGENTS.md` §2).
+pub const MAX_SIBLING_USAGE_CACHE_ENTRIES: usize = 256;
+/// Maximum aggregate heap byte footprint retained in `SiblingUsageCache` (`4 MiB`, `AGENTS.md` §2).
+pub const MAX_SIBLING_USAGE_CACHE_BYTES: usize = 4 * 1024 * 1024;
 /// Starting 20-bit virtual `FileId` reserved for cached `@c_import` modules (`983,040`).
 pub const VIRTUAL_C_IMPORT_FILE_ID_BASE: u32 = 0x000F_0000;
 /// Sentinel LRU node index indicating the end of an intrusive `CImportCache` list (`0xFFFF_FFFF`).
@@ -4670,6 +4803,8 @@ pub const CompilerDb = struct {
     suppression_tables: std.AutoHashMapUnmanaged(u32, lint_filter.SuppressionTable) = .empty,
     /// Stage 17 leaf projected `DiagnosticSink`s keyed by `FileId.asInt()`.
     projected_file_diagnostics: std.AutoHashMapUnmanaged(u32, DiagnosticSink) = .empty,
+    /// Bounded LRU cache memoizing cross-file sibling symbol usage for single-file keystroke diagnostics.
+    sibling_usage_cache: SiblingUsageCache = .{},
 
     /// Initializes a new `CompilerDb` instance bound to `allocator`.
     pub fn init(allocator: std.mem.Allocator) !CompilerDb {
@@ -4818,6 +4953,7 @@ pub const CompilerDb = struct {
             sink_ptr.deinit();
         }
         self.projected_file_diagnostics.deinit(self.allocator);
+        self.sibling_usage_cache.deinit(self.allocator);
 
         var lint_sem_iter = self.package_lint_semantics.valueIterator();
         while (lint_sem_iter.next()) |sem_ptr| {
@@ -13173,7 +13309,7 @@ pub const CompilerDb = struct {
             hasher.updateU32(table.ast_spans.items(.start_byte)[idx]);
             hasher.updateU32(table.ast_spans.items(.end_byte)[idx]);
             hasher.updateU64(table.ast_spans.items(.own_mask)[idx]);
-            hasher.updateU8(@intFromEnum(table.ast_spans.items(.mode)[idx]));
+            hasher.updateU8(@backingInt(table.ast_spans.items(.mode)[idx]));
             hasher.updateU32(table.ast_spans.items(.reason_start)[idx]);
             hasher.updateU32(table.ast_spans.items(.reason_end)[idx]);
         }
@@ -15472,14 +15608,43 @@ pub const CompilerDb = struct {
         self.symbol_table.markTargetScopeSymbolUsed(caller_scope, sym_idx);
     }
 
-    /// Deterministically recomputes `is_used`, `has_pkg_wide_ref`, and `has_parent_mod_ref` for `file_id` from live side tables.
-    fn recomputeLiveSymbolUsageForFile(
-        self: *CompilerDb,
+    /// Computes the 128-bit cache key covering `file_id`'s Pass-1 symbol layout and all sibling file hashes.
+    fn computeSiblingUsageCacheKey(
+        self: *const CompilerDb,
         file_id: FileId,
         pkg_id: PackageId,
         pkg_files: []const FileId,
-    ) QueryError!void {
-        // [1] Reset mutable usage/visibility flags on module/type/import symbols owned by `file_id`:
+        file_sig_fp: Fingerprint128,
+    ) Fingerprint128 {
+        var hasher = StructuralHasher.init();
+        hasher.updateU32(0x5349_4255);
+        hasher.updateU32(file_id.asInt());
+        hasher.updateU32(pkg_id.asInt());
+        hasher.updateU8(@intFromBool(self.is_internal_core));
+        hasher.updateU8(@intFromBool(self.is_including_tests));
+        hasher.updateFingerprint(file_sig_fp);
+        if (self.getFileLiveSymbolBounds(file_id)) |bounds| {
+            hasher.updateU32(bounds.sym_start);
+            hasher.updateU32(bounds.sym_end);
+        } else {
+            hasher.updateU32(self.getFilePass1SymStart(file_id));
+            hasher.updateU32(self.symbol_table.countSymbols());
+        }
+        if (self.package_cfg_configs.getPtr(pkg_id)) |cfg_ptr| {
+            hasher.updateFingerprint(cfg_ptr.cfg_fingerprint);
+        }
+        for (pkg_files) |sib_fid| {
+            if (sib_fid == file_id) continue;
+            hasher.updateU32(sib_fid.asInt());
+            if (self.source_inputs.getPtr(sib_fid.asInt())) |src_in| {
+                hasher.updateFingerprint(src_in.content_fingerprint);
+            }
+        }
+        return hasher.final();
+    }
+
+    /// Resets mutable `is_used`, `has_pkg_wide_ref`, and `has_parent_mod_ref` flags on symbols declared in `file_id`.
+    fn resetFileOwnedSymbolUsageFlags(self: *CompilerDb, file_id: FileId) void {
         const sym_total = self.symbol_table.countSymbols();
         var s_i: u32 = 0;
         while (s_i < sym_total) : (s_i += 1) {
@@ -15508,12 +15673,18 @@ pub const CompilerDb = struct {
                 }
             }
         }
+    }
 
-        const single_buf = [1]FileId{file_id};
-        const scan_files: []const FileId = if (pkg_files.len > 0) pkg_files else &single_buf;
-
-        // [2] Replay signature, `use` prefix, `impl` header, and `DefSideTables` references across `scan_files`:
+    /// Replays signature, `use` prefix, `impl` header, and `DefSideTables` symbol references across `scan_files`.
+    fn replaySymbolUsageAcrossFiles(
+        self: *CompilerDb,
+        pkg_id: PackageId,
+        scan_files: []const FileId,
+        skip_fid: ?FileId,
+    ) QueryError!void {
+        const sym_total = self.symbol_table.countSymbols();
         for (scan_files) |scan_fid| {
+            if (skip_fid != null and scan_fid == skip_fid.?) continue;
             if (self.symbol_table.getFilePackageId(scan_fid) != pkg_id) continue;
             try self.ensureFreshSignatureAstAndSideTables(scan_fid);
             const scan_src = self.getSourceText(scan_fid) catch continue;
@@ -15789,6 +15960,88 @@ pub const CompilerDb = struct {
         }
     }
 
+    /// Deterministically recomputes `is_used`, `has_pkg_wide_ref`, and `has_parent_mod_ref` for `file_id` with `SiblingUsageCache`.
+    fn recomputeLiveSymbolUsageForFile(
+        self: *CompilerDb,
+        file_id: FileId,
+        pkg_id: PackageId,
+        pkg_files: []const FileId,
+        sib_cache_key: Fingerprint128,
+    ) QueryError!void {
+        self.resetFileOwnedSymbolUsageFlags(file_id);
+        const self_only = [1]FileId{file_id};
+        if (pkg_files.len <= 1) {
+            return self.replaySymbolUsageAcrossFiles(pkg_id, &self_only, null);
+        }
+
+        if (self.sibling_usage_cache.lookupValid(file_id, sib_cache_key)) |cached| {
+            const sym_total = self.symbol_table.countSymbols();
+            for (cached.sym_flags) |flag_item| {
+                if (flag_item.sym_raw >= sym_total) continue;
+                const sym_mut = self.symbol_table.getSymbolMut(SymbolIndex.fromInt(flag_item.sym_raw));
+                if ((flag_item.mask & 0x01) != 0) sym_mut.flags.is_used = true;
+                if ((flag_item.mask & 0x02) != 0) sym_mut.flags.has_pkg_wide_ref = true;
+                if ((flag_item.mask & 0x04) != 0) sym_mut.flags.has_parent_mod_ref = true;
+            }
+            return self.replaySymbolUsageAcrossFiles(pkg_id, &self_only, null);
+        }
+
+        // Cold sibling sweep: replay `sib_fid != file_id`, snapshot `file_id` flags + sibling inactive `@cfg` IDs, then replay `file_id`:
+        try self.replaySymbolUsageAcrossFiles(pkg_id, pkg_files, file_id);
+
+        var recorded_flags: std.ArrayListUnmanaged(SiblingSymUsageItem) = .empty;
+        defer recorded_flags.deinit(self.allocator);
+        const sym_total = self.symbol_table.countSymbols();
+        var s_i: u32 = 0;
+        while (s_i < sym_total) : (s_i += 1) {
+            const srec = self.symbol_table.getSymbol(SymbolIndex.fromInt(s_i)).*;
+            if (srec.flags.is_builtin or srec.decl_span.file_id != file_id) continue;
+            if (srec.kind == .local_let_sym or srec.kind == .local_var_sym or srec.kind == .param_sym) continue;
+            var mask: u8 = 0;
+            if (srec.flags.is_used) mask |= 0x01;
+            if (srec.flags.has_pkg_wide_ref) mask |= 0x02;
+            if (srec.flags.has_parent_mod_ref) mask |= 0x04;
+            if (mask != 0) {
+                recorded_flags.append(self.allocator, .{ .sym_raw = s_i, .mask = mask }) catch return error.OutOfMemory;
+            }
+        }
+
+        var sib_cfg_map: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
+        defer sib_cfg_map.deinit(self.allocator);
+        for (pkg_files) |sib_fid| {
+            if (sib_fid == file_id) continue;
+            const sib_src = self.getSourceText(sib_fid) catch continue;
+            if (self.parsed_artifacts.getPtr(sib_fid.asInt())) |sib_pp| {
+                symbol_resolver.collectFileInactiveCfgIdents(
+                    self.allocator,
+                    &self.symbol_table,
+                    &self.interner,
+                    sib_fid,
+                    sib_src,
+                    &sib_pp.token_buffer,
+                    &sib_pp.cst_arena,
+                    &sib_cfg_map,
+                ) catch return error.OutOfMemory;
+            }
+        }
+        var sib_cfg_list: std.ArrayListUnmanaged(SymbolId) = .empty;
+        defer sib_cfg_list.deinit(self.allocator);
+        var cfg_it = sib_cfg_map.keyIterator();
+        while (cfg_it.next()) |cfg_id_ptr| {
+            sib_cfg_list.append(self.allocator, cfg_id_ptr.*) catch return error.OutOfMemory;
+        }
+
+        self.sibling_usage_cache.putSnapshot(
+            self.allocator,
+            file_id,
+            sib_cache_key,
+            recorded_flags.items,
+            sib_cfg_list.items,
+        ) catch return error.OutOfMemory;
+
+        return self.replaySymbolUsageAcrossFiles(pkg_id, &self_only, null);
+    }
+
     /// Stage 17 compute routine: filters, rebases, and sorts diagnostics for `file_id` (`DR-25` §3.2, `Ruling 3.4`).
     fn computeProjectFileDiagnostics(self: *CompilerDb, file_id: FileId) QueryError!Fingerprint128 {
         const source = try self.getSourceText(file_id);
@@ -15848,6 +16101,7 @@ pub const CompilerDb = struct {
         // Collect all non-virtual mounted files in `pkg_id` and pre-warm sibling bodies before SAST (`W0333`, `W0406`, `W0201`):
         var pkg_files: std.ArrayListUnmanaged(FileId) = .empty;
         defer pkg_files.deinit(self.allocator);
+        var sib_cache_key: Fingerprint128 = .ZERO;
         var has_w0201_cand = false;
         if (is_lint_target) {
             if (self.parsed_artifacts.getPtr(file_id.asInt())) |pp| {
@@ -15871,12 +16125,22 @@ pub const CompilerDb = struct {
                         return lhs.asInt() < rhs.asInt();
                     }
                 }.lessThan);
-                for (pkg_files.items) |sib_fid| {
-                    if (sib_fid == file_id) continue;
-                    _ = try self.resolveSignatures(sib_fid);
-                    const sib_tree = try self.extractItemTree(sib_fid);
-                    for (sib_tree.entries) |sib_entry| {
-                        _ = try self.typecheckBody(sib_entry.def_id);
+                sib_cache_key = self.computeSiblingUsageCacheKey(
+                    file_id,
+                    pkg_id,
+                    pkg_files.items,
+                    tree_view.tree_fingerprint,
+                );
+                const has_warm_sib_cache = !has_w0201_cand and
+                    self.sibling_usage_cache.lookupValid(file_id, sib_cache_key) != null;
+                if (!has_warm_sib_cache) {
+                    for (pkg_files.items) |sib_fid| {
+                        if (sib_fid == file_id) continue;
+                        _ = try self.resolveSignatures(sib_fid);
+                        const sib_tree = try self.extractItemTree(sib_fid);
+                        for (sib_tree.entries) |sib_entry| {
+                            _ = try self.typecheckBody(sib_entry.def_id);
+                        }
                     }
                 }
             }
@@ -16051,7 +16315,7 @@ pub const CompilerDb = struct {
 
         // Run Step 3A single-pass symbol, import, and package-visibility sweeps (`W0103`, `W0402`, `W0404`, `W0406`):
         if (is_lint_target) {
-            try self.recomputeLiveSymbolUsageForFile(file_id, pkg_id, pkg_files.items);
+            try self.recomputeLiveSymbolUsageForFile(file_id, pkg_id, pkg_files.items, sib_cache_key);
             if (self.parsed_artifacts.getPtr(file_id.asInt())) |parsed_ptr| {
                 const has_any_file_errors = has_parse_errs or (proj_sink.error_count > 0);
                 var file_inactive_cfg_idents: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
@@ -16094,19 +16358,30 @@ pub const CompilerDb = struct {
                 if (eff_rules.isEnabled(.unused_pkg_visibility) and !has_any_file_errors) {
                     var pkg_inactive_cfg_idents: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
                     defer pkg_inactive_cfg_idents.deinit(self.allocator);
-                    for (pkg_files.items) |sib_fid| {
-                        const sib_src = self.getSourceText(sib_fid) catch continue;
-                        if (self.parsed_artifacts.getPtr(sib_fid.asInt())) |sib_pp| {
-                            symbol_resolver.collectFileInactiveCfgIdents(
-                                self.allocator,
-                                &self.symbol_table,
-                                &self.interner,
-                                sib_fid,
-                                sib_src,
-                                &sib_pp.token_buffer,
-                                &sib_pp.cst_arena,
-                                &pkg_inactive_cfg_idents,
-                            ) catch return error.OutOfMemory;
+                    var file_cfg_it = file_inactive_cfg_idents.keyIterator();
+                    while (file_cfg_it.next()) |fid_cfg_ptr| {
+                        pkg_inactive_cfg_idents.put(self.allocator, fid_cfg_ptr.*, {}) catch return error.OutOfMemory;
+                    }
+                    if (self.sibling_usage_cache.lookupValid(file_id, sib_cache_key)) |cached| {
+                        for (cached.inactive_cfg_ids) |inactive_id| {
+                            pkg_inactive_cfg_idents.put(self.allocator, inactive_id, {}) catch return error.OutOfMemory;
+                        }
+                    } else {
+                        for (pkg_files.items) |sib_fid| {
+                            if (sib_fid == file_id) continue;
+                            const sib_src = self.getSourceText(sib_fid) catch continue;
+                            if (self.parsed_artifacts.getPtr(sib_fid.asInt())) |sib_pp| {
+                                symbol_resolver.collectFileInactiveCfgIdents(
+                                    self.allocator,
+                                    &self.symbol_table,
+                                    &self.interner,
+                                    sib_fid,
+                                    sib_src,
+                                    &sib_pp.token_buffer,
+                                    &sib_pp.cst_arena,
+                                    &pkg_inactive_cfg_idents,
+                                ) catch return error.OutOfMemory;
+                            }
                         }
                     }
                     symbol_resolver.emitPackageUnusedVisibilityWarningsForFile(
@@ -20152,4 +20427,3 @@ test "test_query_db_dr25_early_cutoff_firewall_lint_disable_and_overrides" {
     }
     try std.testing.expect(found_shifted_span);
 }
-

@@ -1257,7 +1257,7 @@ pub fn extractFileSuppressionTable(
                         .own_mask = sel_meta.mask,
                         .selector_slice_start = sel_meta.start,
                         .selector_count = sel_meta.count,
-                        .mode = @intFromEnum(mode),
+                        .mode = @backingInt(mode),
                         .allow_kw_offset = 0,
                         .comment_start_offset = @intCast(@min(cmt_abs_start - remove_start, std.math.maxInt(u16))),
                     });
@@ -1301,7 +1301,7 @@ pub fn extractFileSuppressionTable(
                     .own_mask = sel_meta.mask,
                     .selector_slice_start = sel_meta.start,
                     .selector_count = sel_meta.count,
-                    .mode = @intFromEnum(mode),
+                    .mode = @backingInt(mode),
                     .allow_kw_offset = if (mode == .allow)
                         @intCast(@min(allow_kw_abs_start -| rem_start, std.math.maxInt(u16)))
                     else
@@ -1647,7 +1647,7 @@ pub fn collectStaleExpectEdits(
 ) !void {
     // [1] Scope 2 (`file-expect` preamble directives):
     for (table.file_directives) |file_dir| {
-        if (file_dir.mode != @intFromEnum(DirectiveMode.expect)) continue;
+        if (file_dir.mode != @backingInt(DirectiveMode.expect)) continue;
         const own = file_dir.own_mask & active_filter_mask;
         if (own == 0) continue;
         const unfulfilled = own & ~tracker.file_fulfilled_mask;
@@ -1708,7 +1708,7 @@ pub fn collectStaleExpectEdits(
 
     // [3] Scope 4 (`// corex check: expect(…)` trailing line directives):
     for (table.line_spans, 0..) |line_span, idx| {
-        if (line_span.mode != @intFromEnum(DirectiveMode.expect)) continue;
+        if (line_span.mode != @backingInt(DirectiveMode.expect)) continue;
         const own = line_span.own_mask & active_filter_mask;
         if (own == 0) continue;
         const unfulfilled = own & ~tracker.line_fulfilled[idx];
@@ -1992,7 +1992,7 @@ pub fn collectStaleExpectDiagnosticsAndEdits(
                 }
             }
         }
-        if (is_w0004_enabled and line_span.mode == @intFromEnum(DirectiveMode.allow)) {
+        if (is_w0004_enabled and line_span.mode == @backingInt(DirectiveMode.allow)) {
             const kw_start = line_span.directive_remove_start + line_span.allow_kw_offset;
             const kw_end = kw_start + @as(u32, "allow".len);
             if (!isCandidateSuppressed(table, tracker, .{
@@ -2054,7 +2054,7 @@ pub fn collectStaleExpectDiagnosticsAndEdits(
 
     // Scope 2 `file-expect`:
     for (table.file_directives) |file_dir| {
-        if (file_dir.mode != @intFromEnum(DirectiveMode.expect)) continue;
+        if (file_dir.mode != @backingInt(DirectiveMode.expect)) continue;
         const own = file_dir.own_mask & effective_active_mask;
         if (own == 0) continue;
         const unfulfilled = own & ~tracker.file_fulfilled_mask;
@@ -2205,7 +2205,7 @@ pub fn collectStaleExpectDiagnosticsAndEdits(
 
     // Scope 4 trailing `expect(…)`:
     for (table.line_spans, 0..) |line_span, idx| {
-        if (line_span.mode != @intFromEnum(DirectiveMode.expect)) continue;
+        if (line_span.mode != @backingInt(DirectiveMode.expect)) continue;
         const own = line_span.own_mask & effective_active_mask;
         if (own == 0) continue;
         const unfulfilled = own & ~tracker.line_fulfilled[idx];
@@ -3056,8 +3056,8 @@ test "test_lint_filter_100k_randomized_laminar_interval_containment_parity" {
             const end_b = frame.hi - pad_r;
             if (start_b + 4 >= end_b) continue;
 
-            const rule_a: RuleId = @enumFromInt(rng.uintLessThan(u8, 44));
-            const rule_b: RuleId = @enumFromInt(rng.uintLessThan(u8, 44));
+            const rule_a: RuleId = @fromBackingInt(@intCast(rng.uintLessThan(u8, 44)));
+            const rule_b: RuleId = @fromBackingInt(@intCast(rng.uintLessThan(u8, 44)));
             raw_spans[span_count] = .{
                 .target_start_byte = start_b,
                 .target_end_byte = end_b,
@@ -3092,7 +3092,7 @@ test "test_lint_filter_100k_randomized_laminar_interval_containment_parity" {
         var query_i: usize = 0;
         while (query_i < 2_000) : (query_i += 1) {
             const pos = rng.uintLessThan(u32, 4120);
-            const rule: RuleId = @enumFromInt(rng.uintLessThan(u8, 44));
+            const rule: RuleId = @fromBackingInt(@intCast(rng.uintLessThan(u8, 44)));
             const actual = isCandidateSuppressed(&table, &tracker, .{
                 .rule_id = rule,
                 .start_byte = pos,
@@ -3274,4 +3274,3 @@ test "test_lint_filter_settings_defaults_fingerprint_and_cli_filter" {
     try std.testing.expect((eff_disabled & RuleId.deprecated_use.bit()) != 0);
     try std.testing.expectEqual(RuleId.unused_binding.bit(), cli_filter.activeAuditMask());
 }
-

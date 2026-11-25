@@ -30,9 +30,11 @@ pub fn main(init: std.process.Init) !u8 {
     var stdout_file_writer = std.Io.File.stdout().writerStreaming(init.io, &stdout_buf);
     var stderr_file_writer = std.Io.File.stderr().writerStreaming(init.io, &stderr_buf);
 
-    // [3] Dispatch CLI command and flush output streams before exit:
+    // [3] Dispatch CLI command (`smp_allocator` for long-running `lsp` daemon to avoid debug backtrace locks):
+    const is_lsp_daemon = cli_args.items.len > 0 and std.mem.eql(u8, cli_args.items[0], "lsp");
+    const cli_alloc = if (is_lsp_daemon) std.heap.smp_allocator else init.gpa;
     const exit_code = try corex.router.runCli(
-        init.gpa,
+        cli_alloc,
         init.io,
         init.environ_map,
         cli_args.items,

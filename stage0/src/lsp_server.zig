@@ -5613,8 +5613,11 @@ fn computeSemanticTokensData(
             if (live_span.file_id != file_id) continue;
             if (findExactTokenAtByteOffset(&parsed_art.token_buffer, live_span.start_byte)) |decl_tok| {
                 if (decl_tok.asInt() < tok_count) {
-                    tok_symbols[decl_tok.asInt()] = sym_idx;
-                    tok_is_decl[decl_tok.asInt()] = true;
+                    const decl_lex = symbol_resolver.extractTokenSlice(src, &parsed_art.token_buffer, decl_tok);
+                    if (std.mem.eql(u8, sym.name_text, decl_lex)) {
+                        tok_symbols[decl_tok.asInt()] = sym_idx;
+                        tok_is_decl[decl_tok.asInt()] = true;
+                    }
                 }
             }
         }
@@ -7147,23 +7150,18 @@ fn appendFnHoverContractBullets(
     const eff_bits = inferred_eff.asBits();
 
     // [1] Format compact contract & capability badge line:
-    const alloc_status: []const u8 = if (sym.contract_flags.is_no_alloc)
-        "✓ `@no_alloc` (verified)"
-    else if (!inferred_eff.alloc)
+    const alloc_status: []const u8 = if (sym.contract_flags.is_no_alloc or !inferred_eff.alloc)
         "✓ `@no_alloc`"
     else
         "⚠ allocates";
 
-    const panic_status: []const u8 = if (sym.contract_flags.is_no_panic)
-        "✓ `@no_panic` (verified)"
-    else if (!inferred_eff.may_panic)
+    const panic_status: []const u8 = if (sym.contract_flags.is_no_panic or !inferred_eff.may_panic)
         "✓ `@no_panic`"
     else
         "⚠ may panic";
 
-    const block_status: []const u8 = if (sym.contract_flags.is_no_block)
-        "✓ `@no_block` (verified)"
-    else if (!inferred_eff.hasAnyBits(EffectCapabilityMask.BLOCKING_BITS))
+    const block_status: []const u8 = if (sym.contract_flags.is_no_block or
+        !inferred_eff.hasAnyBits(EffectCapabilityMask.BLOCKING_BITS))
         "✓ `@no_block`"
     else
         "⚠ may block";
@@ -7892,6 +7890,24 @@ fn handleHoverRequest(
             try appendFnHoverContractBullets(session, sym_idx, sym, mw);
         }
     } else {
+        const eff_tok_kind: ?TokenKind = target.resolved_token_kind orelse blk_tk: {
+            if (session.db.parsed_artifacts.getPtr(fid.asInt())) |parsed_art| {
+                if (target.token_index.asInt() < parsed_art.token_buffer.countTokens()) {
+                    break :blk_tk parsed_art.token_buffer.getToken(target.token_index).kind;
+                }
+            }
+            break :blk_tk null;
+        };
+        const can_render_bare_type = if (eff_tok_kind) |tok_kind|
+            (symbol_resolver.isIdentifierToken(tok_kind) or
+                tok_kind == .kw_self_val or
+                tok_kind == .kw_self_type or
+                tok_kind == .prim_type)
+        else
+            false;
+        if (!can_render_bare_type) {
+            return writeNullResultFrame(session, out_writer, rpc_id);
+        }
         const ty_str = session.db.type_pool.formatType(target.type_id, &session.db.symbol_table, &type_buf);
         if (BUILTIN_PRIM_HOVER_MAP.get(ty_str)) |prim_spec| {
             try mw.print("```corex\n{s}\n```\n\n{s}", .{ prim_spec.signature, prim_spec.summary });

@@ -865,8 +865,9 @@ test "test_lsp_semantic_tokens_delta_hover_and_dr17_contracts" {
     try std.testing.expect(
         std.mem.indexOf(u8, clamp_hover, "pub fn clamp_sample(sample: i32, ceiling: i32) -> i32") != null,
     );
-    try std.testing.expect(std.mem.indexOf(u8, clamp_hover, "✓ `@no_alloc` (verified)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, clamp_hover, "✓ `@no_panic` (verified)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, clamp_hover, "✓ `@no_alloc`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, clamp_hover, "✓ `@no_panic`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, clamp_hover, "(verified)") == null);
     try std.testing.expect(std.mem.indexOf(u8, clamp_hover, "**caps:** none (pure)") != null);
     try std.testing.expect(std.mem.indexOf(u8, clamp_hover, "(budget: 256 B)") != null);
     try std.testing.expect(
@@ -3567,5 +3568,262 @@ test "test_lsp_dr25_end_to_end_tags_is_preferred_stdlib_nav_rename_and_sub_2ms_m
         std.mem.sort(u64, &edit_samples, {}, std.sort.asc(u64));
         const max_edit_median_ns: u64 = if (builtin.mode == .debug) 15_000_000 else 2_000_000;
         try std.testing.expect(edit_samples[edit_samples.len / 2] < max_edit_median_ns);
+    }
+}
+
+test "test_lsp_dogfood_regressions_default_param_shrink_operator_hover_and_derive_tokens" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const ws_dir = try createTempWorkspaceDir(allocator, io, "dogfood_regressions");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, ws_dir) catch {};
+        allocator.free(ws_dir);
+    }
+
+    try writeWorkspaceFile(
+        allocator,
+        io,
+        ws_dir,
+        "corex.toml",
+        "[package]\nname = \"dogfood-regressions\"\nversion = \"0.1.0\"\nedition = \"2026\"\n",
+    );
+
+    const sibling_cx =
+        "pub(pkg) fn mix_seed(word: u64) -> u64 {\n" ++
+        "    word ^ 0x9E37_79B9_7F4A_7C15_u64\n" ++
+        "}\n";
+    const root_v1_cx =
+        "mod helper;\n\n" ++
+        "@repr(C) @derive(Copy, Equatable, Clone, Debug)\n" ++
+        "pub struct AllocatorHandle {\n" ++
+        "    pub raw_tagged_ptr: usize,\n" ++
+        "}\n\n" ++
+        "pub fn padded_with_defaults(\n" ++
+        "    alpha: u64 = 10_u64 + 20_u64,\n" ++
+        "    beta: u64 = 30_u64 + 40_u64,\n" ++
+        ") -> u64 {\n" ++
+        "    let combined = alpha + beta;\n" ++
+        "    let extra_a = combined ^ 0x1111_u64;\n" ++
+        "    let extra_b = extra_a +% 0x2222_u64;\n" ++
+        "    helper.mix_seed(extra_b)\n" ++
+        "}\n";
+    // Shrinking live edit removing lines so AST node count shrinks well below archived pre-edit default AST nodes:
+    const root_v2_shrunk_cx =
+        "mod helper;\n\n" ++
+        "@repr(C) @derive(Copy, Equatable, Clone, Debug)\n" ++
+        "pub struct AllocatorHandle {\n" ++
+        "    pub raw_tagged_ptr: usize,\n" ++
+        "}\n\n" ++
+        "pub fn padded_with_defaults(word: u64 = 1_u64) -> u64 {\n" ++
+        "    let mixed = word ^ 0x55_u64;\n" ++
+        "    helper.mix_seed(mixed +% 1_u64)\n" ++
+        "}\n";
+
+    try writeWorkspaceFile(allocator, io, ws_dir, "src/helper.cx", sibling_cx);
+    try writeWorkspaceFile(allocator, io, ws_dir, "src/root.cx", root_v1_cx);
+
+    const ws_uri = try resolvePathToFileUri(allocator, io, ws_dir);
+    defer allocator.free(ws_uri);
+    const root_path = try std.fs.path.join(allocator, &.{ ws_dir, "src", "root.cx" });
+    defer allocator.free(root_path);
+    const root_uri = try resolvePathToFileUri(allocator, io, root_path);
+    defer allocator.free(root_uri);
+
+    const PosHelper = struct {
+        fn locate(haystack: []const u8, needle: []const u8) struct { line: u32, col: u32 } {
+            const byte_idx = std.mem.indexOf(u8, haystack, needle).?;
+            var ln: u32 = 0;
+            var col: u32 = 0;
+            var scan_i: usize = 0;
+            while (scan_i < byte_idx) : (scan_i += 1) {
+                if (haystack[scan_i] == '\n') {
+                    ln += 1;
+                    col = 0;
+                } else {
+                    col += 1;
+                }
+            }
+            return .{ .line = ln, .col = col };
+        }
+    };
+    const xor_pos = PosHelper.locate(root_v2_shrunk_cx, "^ 0x55_u64");
+    const wrap_add_pos = PosHelper.locate(root_v2_shrunk_cx, "+% 1_u64");
+    const word_pos = PosHelper.locate(root_v2_shrunk_cx, "word ^");
+    const struct_pos = PosHelper.locate(root_v2_shrunk_cx, "AllocatorHandle");
+
+    var stream_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer stream_buf.deinit(allocator);
+
+    const init_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"rootUri\":\"{s}\"," ++
+            "\"capabilities\":{{\"textDocument\":{{\"diagnostic\":{{}}}}}}}}}}",
+        .{ws_uri},
+    );
+    defer allocator.free(init_json);
+    try appendLspFrame(allocator, &stream_buf, init_json);
+    try appendLspFrame(allocator, &stream_buf, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}");
+    try appendDidOpenFrame(allocator, &stream_buf, root_uri, 1, root_v1_cx);
+
+    const pull_v1 = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/diagnostic\",\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+        .{root_uri},
+    );
+    defer allocator.free(pull_v1);
+    try appendLspFrame(allocator, &stream_buf, pull_v1);
+
+    // Send shrinking `didChange` (`ISS-002` reproducer) + pull diagnostics + operator/identifier hovers (`ISS-003`) + semantic tokens (`ISS-004`):
+    var change_json: std.Io.Writer.Allocating = .init(allocator);
+    defer change_json.deinit();
+    try change_json.writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":");
+    try writeEscapedJsonString(&change_json.writer, root_uri);
+    try change_json.writer.writeAll(",\"version\":2},\"contentChanges\":[{\"text\":");
+    try writeEscapedJsonString(&change_json.writer, root_v2_shrunk_cx);
+    try change_json.writer.writeAll("}]}}");
+    try appendLspFrame(allocator, &stream_buf, change_json.written());
+
+    const pull_v2 = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/diagnostic\",\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+        .{root_uri},
+    );
+    defer allocator.free(pull_v2);
+    try appendLspFrame(allocator, &stream_buf, pull_v2);
+
+    const hover_xor = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/hover\",\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}}," ++
+            "\"position\":{{\"line\":{d},\"character\":{d}}}}}}}",
+        .{ root_uri, xor_pos.line, xor_pos.col },
+    );
+    defer allocator.free(hover_xor);
+    try appendLspFrame(allocator, &stream_buf, hover_xor);
+
+    const hover_wrap_add = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/hover\",\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}}," ++
+            "\"position\":{{\"line\":{d},\"character\":{d}}}}}}}",
+        .{ root_uri, wrap_add_pos.line, wrap_add_pos.col },
+    );
+    defer allocator.free(hover_wrap_add);
+    try appendLspFrame(allocator, &stream_buf, hover_wrap_add);
+
+    const hover_word = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"textDocument/hover\",\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}}," ++
+            "\"position\":{{\"line\":{d},\"character\":{d}}}}}}}",
+        .{ root_uri, word_pos.line, word_pos.col },
+    );
+    defer allocator.free(hover_word);
+    try appendLspFrame(allocator, &stream_buf, hover_word);
+
+    const sem_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/semanticTokens/full\",\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+        .{root_uri},
+    );
+    defer allocator.free(sem_req);
+    try appendLspFrame(allocator, &stream_buf, sem_req);
+
+    try appendLspFrame(allocator, &stream_buf, "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"shutdown\",\"params\":null}");
+    try appendLspFrame(allocator, &stream_buf, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}");
+
+    var outcome = try executeLspTranscript(allocator, io, stream_buf.items, null, .{});
+    defer outcome.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), outcome.exit_code);
+
+    // [1] Shrinking default-param edit (`ISS-002`) completes cleanly with 0 diagnostics:
+    const diag_v2_frame = findFrameByIdFragment(outcome.frames, "\"id\":3").?;
+    try std.testing.expect(std.mem.indexOf(u8, diag_v2_frame, "\"items\":[]") != null);
+
+    // [2] Operator tokens `^` and `+%` return `null` hover (`ISS-003`), while `word` still shows `u64`:
+    const xor_hover_frame = findFrameByIdFragment(outcome.frames, "\"id\":4").?;
+    try std.testing.expect(std.mem.indexOf(u8, xor_hover_frame, "\"result\":null") != null);
+
+    const wrap_hover_frame = findFrameByIdFragment(outcome.frames, "\"id\":5").?;
+    try std.testing.expect(std.mem.indexOf(u8, wrap_hover_frame, "\"result\":null") != null);
+
+    const word_hover_frame = findFrameByIdFragment(outcome.frames, "\"id\":6").?;
+    try std.testing.expect(std.mem.indexOf(u8, word_hover_frame, "word: u64") != null);
+
+    // [3] `@derive(…)` `pub struct AllocatorHandle` highlights as `SEM_TOK_STRUCT` (`2`), never `SEM_TOK_METHOD` (`11`) (`ISS-004`):
+    const sem_frame = findFrameByIdFragment(outcome.frames, "\"id\":7").?;
+    const sem_data = try extractJsonU32Array(allocator, sem_frame, "\"data\":[");
+    defer allocator.free(sem_data);
+    var cur_line: u32 = 0;
+    var cur_col: u32 = 0;
+    var found_struct_tok_type: ?u32 = null;
+    var idx: usize = 0;
+    while (idx + 4 < sem_data.len) : (idx += 5) {
+        const d_line = sem_data[idx];
+        const d_col = sem_data[idx + 1];
+        if (d_line > 0) {
+            cur_line += d_line;
+            cur_col = d_col;
+        } else {
+            cur_col += d_col;
+        }
+        if (cur_line == struct_pos.line and cur_col == struct_pos.col) {
+            found_struct_tok_type = sem_data[idx + 3];
+            break;
+        }
+    }
+    try std.testing.expectEqual(@as(?u32, 2), found_struct_tok_type);
+
+    // [4] `SiblingUsageCache` (`ISS-005`) skips redundant sibling `typecheck_body` sweeps on body-only edits:
+    {
+        var db = try corex.CompilerDb.init(allocator);
+        defer db.deinit();
+        const fid_root = corex.FileId.fromInt(1100);
+        const fid_inner = corex.FileId.fromInt(1101);
+        const fid_col = corex.FileId.fromInt(1102);
+        try db.setFilePackageId(fid_root, .root);
+        try db.setFilePackageId(fid_inner, .root);
+        try db.setFilePackageId(fid_col, .root);
+        try db.package_root_files.put(db.allocator, .root, fid_root);
+        try db.setFilePath(fid_root, "D:/ws/src/root.cx");
+        try db.setFilePath(fid_inner, "D:/ws/src/inner.cx");
+        try db.setFilePath(fid_col, "D:/ws/src/inner/col.cx");
+        try db.bindExternalModule(fid_root, "inner", fid_inner);
+        try db.bindExternalModule(fid_inner, "col", fid_col);
+
+        const root_src =
+            "pub mod inner;\n\n" ++
+            "pub fn entry_hash(val: u64) -> u64 {\n" ++
+            "    inner.col.wy_step(val)\n" ++
+            "}\n";
+        const inner_src = "pub(pkg) mod col;\n";
+        const col_clean =
+            "pub(pkg) fn wy_step(seed: u64) -> u64 {\n" ++
+            "    if seed > 0_u64 and seed < 100_u64 => seed ^ 1_u64 else seed\n" ++
+            "}\n";
+        const col_typo =
+            "pub(pkg) fn wy_step(seed: u64) -> u64 {\n" ++
+            "    if seed > 0_u64 an seed < 100_u64 => seed ^ 1_u64 else seed\n" ++
+            "}\n";
+
+        _ = try db.setInput(fid_root, root_src, .low);
+        _ = try db.setInput(fid_inner, inner_src, .low);
+        _ = try db.setInput(fid_col, col_clean, .low);
+        try db.setPackageLintSemanticSettings(.root, .{}, null);
+        try db.setPackageLintFilterConfig(.root, "D:/ws", .{}, null);
+
+        const initial_sink = try db.projectFileDiagnostics(fid_col);
+        try std.testing.expectEqual(@as(usize, 0), initial_sink.countDiagnostics());
+
+        // Body-only typo edit (`and` -> `an`) and recovery (`an` -> `and`) only typecheck `col.cx` (`+1` each), never siblings:
+        const tc_idx = @backingInt(corex.query_db.QueryStage.typecheck_body);
+        const tc_before = db.telemetry.stage_executions[tc_idx];
+        _ = try db.setInput(fid_col, col_typo, .low);
+        const typo_sink = try db.projectFileDiagnostics(fid_col);
+        try std.testing.expect(typo_sink.hasErrors());
+        try std.testing.expectEqual(tc_before + 1, db.telemetry.stage_executions[tc_idx]);
+
+        _ = try db.setInput(fid_col, col_clean, .low);
+        const recovered_sink = try db.projectFileDiagnostics(fid_col);
+        try std.testing.expectEqual(@as(usize, 0), recovered_sink.countDiagnostics());
+        try std.testing.expectEqual(tc_before + 2, db.telemetry.stage_executions[tc_idx]);
     }
 }

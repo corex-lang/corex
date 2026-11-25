@@ -40,9 +40,9 @@ Immediately after `Phase 12.8` completes the 5-slice holistic codebase simplific
         -   `src/main.cx` (canonical CoreX v1.0 entry point).
         -   `.gitignore` (`build/`, `.corex-cache/`).
         -   `.gitattributes` containing `*.cx linguist-detectable=true` plus a temporary syntax-highlighting fallback (`*.cx linguist-language=Rust`) so early adopters get readable GitHub diffs immediately before `github-linguist/linguist` merges native CoreX support.
-2.  **`corex doc` Structured Documentation Generator:**
+2.  **`corex doc` Structured Documentation Generator & Agent Introspection (`SW-008`):**
     -   Reuses the canonical `CompilerDb` lossless CST/AST + `TypeChecker` + `FnRegionSummary` pipeline so every documented function automatically displays its exact canonical signature, default parameters, `/` and `*` parameter zones, `@no_alloc` / `@no_panic` / `@max_stack` contracts, and inferred capabilities (`fs`, `net`, `alloc`, `ffi`) without manual repetition.
-    -   Supports `--format=json` (consumed by `corex-lang/website` to render searchable static API pages) and `--format=md` (for offline/LLM-friendly package docs).
+    -   Supports `--format=json` (consumed by `corex-lang/website` to render searchable static API pages), `--format=md` (for offline/LLM-friendly package docs), targeted `< 5 ms` CLI symbol queries (`corex doc cx.col.Map`), and a version-exact embedded language/MVS cheat sheet (`corex doc --llm-guide`, paired with `--format=json` compiler diagnostics per [`.agents/SYNTAX_WISHLIST.md`](../.agents/SYNTAX_WISHLIST.md) `SW-008`).
 3.  **Final `v0.0.1` Benchmark & Footprint Audit:**
     -   Execute the full `bench` suite on the self-hosted `v0.0.1` binary across Linux, macOS, Windows, and `wasm32`, recording verified numbers for `benchmarks.json` and confirming the `< 1 MB` compressed toolchain distribution budget.
 
@@ -87,7 +87,7 @@ Most developers discovering a new systems language on Hacker News, Reddit, or Lo
     -   *5-Minute Quickstart* (`install` → `corex init` → `corex run` → `corex test`).
     -   *CoreX Language Tour* (structured walkthrough of types, MVS ownership, `T!E`/`T?`, generics & Type Groups, C FFI, concurrency, and `comptime`).
     -   *5-Minute Cheat Sheets* (*CoreX for Rustaceans*, *CoreX for C/Zig Programmers*, *CoreX for Go/Python Developers*).
-    -   *`cx.*` Standard Library Reference* rendered automatically from `cx-api-docs.json`.
+    -   *`cx.*` Standard Library Reference* rendered automatically from `cx-api-docs.json`, accompanied by `/llms.txt`, `/llms-full.txt`, and clean `.md` URL mirrors (`/api/cx.<mod>.md`) for zero-noise agentic browsing (`SW-008`).
 
 ---
 

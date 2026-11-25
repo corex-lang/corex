@@ -549,7 +549,7 @@ pub const DiagnosticCode = enum(u16) {
     /// Returns the bijective `RuleId` (`0..43`) if this `DiagnosticCode` is one of the 44 built-in lint rules.
     pub inline fn asLintRuleId(self: DiagnosticCode) ?RuleId {
         const mapped = DIAG_CODE_TO_RULE_ID[@backingInt(self)];
-        return if (mapped == 0xFF) null else @enumFromInt(mapped);
+        return if (mapped == 0xFF) null else @fromBackingInt(@intCast(mapped));
     }
 
     /// Resolves a canonical 5-character code string (e.g., `"E0302"`) to its `DiagnosticCode` in $O(1)$ time.
@@ -657,17 +657,17 @@ pub const RuleId = enum(u8) {
 
     /// Returns the dense `0..43` integer index of this `RuleId`.
     pub inline fn asInt(self: RuleId) u8 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     /// Returns the single-bit `RuleMask64` (`1 << rule_id`) for this `RuleId`.
     pub inline fn bit(self: RuleId) RuleMask64 {
-        return @as(RuleMask64, 1) << @intCast(@intFromEnum(self));
+        return @as(RuleMask64, 1) << @intCast(@backingInt(self));
     }
 
     /// Returns the static `LintRuleMeta` catalog entry for this `RuleId` in $O(1)$ time.
     pub inline fn asMeta(self: RuleId) LintRuleMeta {
-        return DIAGNOSTIC_LINT_CATALOG[@intFromEnum(self)];
+        return DIAGNOSTIC_LINT_CATALOG[@backingInt(self)];
     }
 
     /// Returns the corresponding `DiagnosticCode` (`W0xxx`) for this `RuleId`.
@@ -2620,16 +2620,16 @@ comptime {
             .unspecified => diag_only_count += 1,
             .has_placeholders => unreachable,
         }
-        cat_counts[@intFromEnum(meta.category)] += 1;
+        cat_counts[@backingInt(meta.category)] += 1;
     }
     std.debug.assert(auto_count == 26);
     std.debug.assert(unsafe_count == 7);
     std.debug.assert(diag_only_count == 11);
-    std.debug.assert(cat_counts[@intFromEnum(LintCategory.correctness)] == 4);
-    std.debug.assert(cat_counts[@intFromEnum(LintCategory.suspicious)] == 11);
-    std.debug.assert(cat_counts[@intFromEnum(LintCategory.clarity)] == 14);
-    std.debug.assert(cat_counts[@intFromEnum(LintCategory.style)] == 10);
-    std.debug.assert(cat_counts[@intFromEnum(LintCategory.perf)] == 5);
+    std.debug.assert(cat_counts[@backingInt(LintCategory.correctness)] == 4);
+    std.debug.assert(cat_counts[@backingInt(LintCategory.suspicious)] == 11);
+    std.debug.assert(cat_counts[@backingInt(LintCategory.clarity)] == 14);
+    std.debug.assert(cat_counts[@backingInt(LintCategory.style)] == 10);
+    std.debug.assert(cat_counts[@backingInt(LintCategory.perf)] == 5);
     std.debug.assert(DiagnosticCode.w0001_deprecated_cli_option.asLintRuleId() == null);
     std.debug.assert(DiagnosticCode.w0314_unproven_bounds_access.asLintRuleId() == null);
 }
@@ -2989,7 +2989,7 @@ pub fn lookupLintRuleBySelector(text: []const u8) LintSelectorLookup {
         if (text[0] == 'W') {
             if (num < W_NUMBER_TO_RULE_ID.len) {
                 const mapped = W_NUMBER_TO_RULE_ID[num];
-                if (mapped != 0xFF) return .{ .rule = @enumFromInt(mapped) };
+                if (mapped != 0xFF) return .{ .rule = @fromBackingInt(@intCast(mapped)) };
             }
             if (num == 1) return .{ .non_suppressible_subsystem_warning = .w0001_deprecated_cli_option };
             if (num == 314) return .{ .non_suppressible_subsystem_warning = .w0314_unproven_bounds_access };
@@ -3008,7 +3008,7 @@ pub fn lookupLintRuleBySelector(text: []const u8) LintSelectorLookup {
             const rule_idx = LINT_SLUG_HASH_TABLE[slot];
             if (rule_idx == 0xFF) break;
             if (std.mem.eql(u8, DIAGNOSTIC_LINT_CATALOG[rule_idx].slug, text)) {
-                return .{ .rule = @enumFromInt(rule_idx) };
+                return .{ .rule = @fromBackingInt(@intCast(rule_idx)) };
             }
             slot = (slot + 1) & 63;
         }

@@ -8878,4 +8878,3 @@ test "test_pkg_manifest_dr25_script_frontmatter_workspace_inheritance_and_e0018_
         try std.testing.expect(saw_did_you_mean);
     }
 }
-

@@ -10880,6 +10880,7 @@ pub const TypeChecker = struct {
     /// Type-checks `param: T = default_expr` initializers across `scope_id` (`DR-21` `SE-07`).
     fn checkScopeDefaultParamExprsRecursive(self: *TypeChecker, scope_id: ScopeId) anyerror!void {
         if (scope_id.isNone()) return;
+        const sym_start: u32 = if (self.db) |db_ptr| db_ptr.getFilePass1SymStart(self.file_id) else 0;
         const members_copy = try self.allocator.dupe(
             SymbolIndex,
             self.sym_table.getScopeMembers(scope_id),
@@ -10890,6 +10891,7 @@ pub const TypeChecker = struct {
             if (self.isSymbolCfgDisabled(sym_idx)) continue;
             const sym = self.sym_table.getSymbol(sym_idx).*;
             if (sym.flags.is_builtin or sym.flags.is_imported) continue;
+            if (sym.decl_span.file_id == self.file_id and sym_idx.asInt() < sym_start) continue;
             switch (sym.kind) {
                 .fn_sym => {
                     try self.checkFnDefaultParamExprs(sym_idx);
@@ -10918,6 +10920,7 @@ pub const TypeChecker = struct {
         const specs_mut = self.sym_table.getFnParamSpecsMut(fn_sym_idx);
         if (specs_mut.len == 0) return;
         const sig_view = self.pool.getFnSignatureView(fn_sym.type_id) orelse return;
+        const ast_count: u32 = @intCast(self.ast_arena.countNodes());
 
         const saved_scope = self.current_scope;
         const saved_max_ord = self.active_default_param_max_ordinal;
@@ -10934,19 +10937,20 @@ pub const TypeChecker = struct {
             if (!spec.has_default) continue;
             if (spec.decl_file_id != self.file_id) continue;
             const param_ty = sig_view.getParamType(idx);
+            const has_valid_ast = !spec.default_ast_node.isNone() and spec.default_ast_node.asInt() < ast_count;
             if (spec.is_caller_location_default) {
                 spec.default_type_id = .source_loc_ty;
                 if (!param_ty.isError() and param_ty != .source_loc_ty) {
-                    if (!spec.default_ast_node.isNone()) {
+                    if (has_valid_ast) {
                         _ = try self.checkTypeCompatibility(spec.default_ast_node, .source_loc_ty, param_ty);
                     }
                 }
-                if (!spec.default_ast_node.isNone()) {
+                if (has_valid_ast) {
                     _ = self.recordNodeType(spec.default_ast_node, .source_loc_ty);
                 }
                 continue;
             }
-            if (spec.default_ast_node.isNone()) continue;
+            if (!has_valid_ast) continue;
             self.active_default_param_max_ordinal = @intCast(idx);
             const def_tag = self.ast_arena.getNode(spec.default_ast_node).tag;
             const is_concrete_refined_param = !param_ty.isError() and

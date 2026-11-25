@@ -291,8 +291,8 @@ test "test_fuzz_dr25_suppression_glob_and_fixer_no_panic" {
         try db.setPackageLintFilterConfig(.root, "D:/ws", .{}, null);
 
         if (random.uintLessThan(u8, 5) == 0) {
-            const r_a: RuleId = @enumFromInt(random.uintLessThan(u8, 44));
-            const r_b: RuleId = @enumFromInt(random.uintLessThan(u8, 44));
+            const r_a: RuleId = @fromBackingInt(@intCast(random.uintLessThan(u8, 44)));
+            const r_b: RuleId = @fromBackingInt(@intCast(random.uintLessThan(u8, 44)));
             db.setCliLintFilter(.{
                 .has_only = random.boolean(),
                 .only_mask = r_a.bit() | r_b.bit(),

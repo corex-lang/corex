@@ -17,6 +17,8 @@ Canonical dogfooding backlog for **CoreX** (`.cx`) surface syntax proposals, erg
     -   **Candidate CoreX Design(s):** Concise before/after `.cx` snippets (including novel first-principles options alongside any cross-language precedent).
     -   **Compiler & Tooling Impact:** `TokenKind` delta (`121 / 128` budget), `LL(k)` / Pratt ambiguity analysis, `corex fmt` / `corex check` / `corex upgrade` / `corex lsp` / `vscode-ext-corex` impact.
     -   **Real Call-Site Evidence:** Exact count and representative `file:line` locations in `core/`, `stdlib/cx/`, or `compiler/`.
+4.  **Proactive `Deep research` (`DR-XX`) Triage:**
+    -   Whenever a wishlist item, tooling surface, or newly encountered subsystem involves non-trivial grammar, diagnostics, IDE, or ecosystem trade-offs where first-principles synthesis would produce a demonstrably superior implementation, the **Lead Agent** must proactively classify it as **`Dedicated DR Recommended`** and prepare a self-contained `Deep research` prompt before implementation rather than designing ad hoc.
 
 ---
 
@@ -111,19 +113,6 @@ Canonical dogfooding backlog for **CoreX** (`.cx`) surface syntax proposals, erg
     -   `stdlib/cx/str.cx:3661-3744` (`Display` / `Debug` / `Hash` forwarding shared across `String | CowStr`),
     -   Upcoming `Phase 11.3` `stdlib/cx/serde.cx` (`Serialize` & `Deserialize` across `14` primitive scalar types, saving `25+` repeated `impl` blocks).
 
-### `SW-004` – Compact, De-Noised Hover Contract & Capability Footer (`<sub>` Styling & Dropping `(verified)`)
-
--   **Category:** `Docstring & IDE UX` (User-Requested Polish)
--   **Problem & Friction:**
-    -   Function hover tooltips (`stage0/src/lsp_server.zig:7110-7208`) append a two-line `DR-17` contract, capability, and stack footer (`✓ @no_alloc (verified) · ✓ @no_panic (verified) · ✓ @no_block · caps: none (pure)` / `stack: 16 B own · 16 B max`) rendered at full body font size, competing visually with the signature and `/|` docstring while repeating `(verified)` on every annotated contract.
--   **Candidate CoreX Design(s):**
-    -   Drop the noisy `(verified)` parentheticals from `corex lsp` CommonMark output (`✓ @no_alloc · ✓ @no_panic · ✓ @no_block · caps: pure`), and style the trailing contract footer inside `../vscode-ext-corex/src/extension.ts` (`toVsDoc` with `supportHtml = true`) using safe `<sub>…</sub>` paired with theme-adaptive semi-transparent hex (`#00000099` in Light themes, `#ffffffa6` in Dark themes via `window.activeColorTheme.kind`, and un-dimmed in High Contrast themes) so `corex lsp` remains 100% pure CommonMark while blending naturally into every light and dark theme.
--   **Compiler & Tooling Impact:**
-    -   **`TokenKind` Delta:** `0`.
-    -   **`corex lsp` & `vscode-ext-corex`:** Cleaner `appendFnHoverContractBullets` formatting in `lsp_server.zig` paired with `MarkdownString.supportHtml = true` footer wrapping (and optional `corex.hover.contracts` verbosity toggle) in `vscode-ext-corex`.
--   **Real Call-Site Evidence:**
-    -   Affects every `fn` and method hover across `100%` of `.cx` files in `core/`, `stdlib/cx/`, `compiler/`, and user workspaces.
-
 ### `SW-005` – Civil Calendar, Timezone & Zero-Allocation Date/Time Formatting in `cx.time`
 
 -   **Category:** `Stdlib Ergonomics` (User-Requested)
@@ -192,10 +181,31 @@ Canonical dogfooding backlog for **CoreX** (`.cx`) surface syntax proposals, erg
 -   **Real Call-Site Evidence:**
     -   `stdlib/cx/str.cx:3054-3062, 3728-3732` (`CowStr`), plus upcoming `Phase 11.2a`–`11.3` recursive/owned ADTs (`cx.io`, `cx.serde.JsonValue`, `cx.serde.TomlValue`, and `compiler/*.cx` AST/HIR enums).
 
+### `SW-008` – First-Class AI-Agent Toolchain, Structured Diagnostics & Zero-Hallucination Context (`Dedicated DR Recommended`)
+
+-   **Category:** `Docstring & IDE UX` / `CLI & Agent Ergonomics` (User-Requested Priority – **Dedicated `Deep research` Recommended**)
+-   **Problem & Friction:**
+    -   Go and Rust lead AI code-generation benchmarks because Go eliminates syntactic ambiguity while Rust provides a strict, deterministic compiler feedback loop – yet no LLM has CoreX (`.cx`) in its pre-training weights prior to public launch.
+    -   Without compact, machine-readable compiler feedback and zero-token-waste CLI introspection, coding agents must regex-parse ANSI box-drawing diagnostics, read multi-thousand-line `stdlib/cx/*.cx` source files to discover signatures/contracts, or guess Rust/Zig/TS syntax on first attempt.
+-   **Candidate CoreX Design(s) (To Synthesize via Dedicated `DR-XX`):**
+    1.  **Token-Minimal Structured Diagnostics & Patching (`corex check --format=json` / `ndjson`):**
+        -   Emit compact, schema-versioned JSON/NDJSON diagnostics (extending the taxonomy hook in `stage0/src/diag/diagnostic.zig:684`) carrying exact UTF-8 byte & 1-based line/col spans, `E0xxx` / `W0xxx/slug` codes, `DR-17` shortest call-chain capability/contract witnesses, and machine-applicable `SuggestedFix` replacement spans (plus single-command targeted application) so agents converge in 1 iteration without regex scraping.
+    2.  **Sub-5 ms CLI API & Contract Introspection (`corex doc <symbol_or_module>`):**
+        -   Allow agents (and humans) to query exact canonical signatures, `/` & `*` parameter zones, `T!E` error-enum variants, `/|` docstrings, and compiler-inferred `@no_alloc` / `@no_panic` / `@no_block` / `@max_stack` / `EffectCapabilityMask` summaries directly from the terminal (e.g., `corex doc cx.col.Map`, `corex doc --signatures cx.fs`) in `< 5 ms` without loading raw implementation bodies into context.
+    3.  **Self-Contained Language & Ownership Spec Embedded in Binary (`corex doc --llm-guide` & `corex init` Agent Rules):**
+        -   Embed a version-exact, ultra-dense (~150–250 line) CoreX v1.0 grammar, MVS ownership (`&`, `&mut`, `own`, `&out`), error-handling (`T!E`, `?`, `catch`, `orelse`, `is`, `:=`), and anti-hallucination delta cheat sheet directly inside the `< 1 MB` `corex` binary (`corex doc --llm-guide`), and optionally wire `corex init` (`Stage L0`) to emit a minimal pointer/rule snippet so any coding agent in any offline workspace writes idiomatic `.cx` on turn 1.
+    4.  **Agent-Native `corex-lang.org` Endpoints (`Stage L2` Post-`v0.0.1`):**
+        -   Generate `/llms.txt`, `/llms-full.txt`, and deterministic `.md` API mirrors (`corex-lang.org/api/cx.fs.md` from `cx-api-docs.json`) alongside human HTML pages for zero-noise agentic browsing.
+-   **Compiler & Tooling Impact:**
+    -   **`TokenKind` Delta:** `0` (pure CLI/diagnostic renderer, `corex doc`, `corex init`, and `cx-api-docs.json` surfaces).
+    -   **Why a Dedicated `DR` First Pays Off:** A focused `Deep research` report benchmarking how modern coding agents (Claude Code, Antigravity, Codex, Cursor) consume `rustc --message-format=json`, `go doc`, `zig zen`, `oxlint`, MCP/CLI introspection, and `llms.txt` schemas will let us design the highest-signal, lowest-token JSON schema and `--llm-guide` density from first principles before self-hosting the CLI in `Phase 12.7` / `Stage L0`.
+-   **Real Call-Site Evidence:**
+    -   Applies to `100%` of agent-assisted CoreX workflows across `stage0/src/diag/{diagnostic,renderer}.zig`, `stage0/src/cli/router.zig` (`Phase 12.7` `compiler/main.cx`), `Stage L0` (`corex init` & `corex doc`), and `Stage L2` (`corex-lang/website`).
+
 ---
 
 ## 3. Decided & Rejected Ledger
 
 | ID | Proposal Summary | Decision | Rationale / Canonical Reference |
 | :--- | :--- | :--- | :--- |
-| – | *(None yet)* | – | – |
+| `SW-004` | Compact, de-noised hover contract & stack footer (`<sub>` + theme-adaptive alpha hex, dropping `(verified)`) | Approved & Implemented | `stage0/src/lsp_server.zig` (`appendFnHoverContractBullets`) + `../vscode-ext-corex/src/extension.ts` (`toVsDoc` with `supportHtml: true`, `#00000099` Light / `#ffffffa6` Dark / un-dimmed High Contrast). |

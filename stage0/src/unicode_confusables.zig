@@ -72,7 +72,7 @@ pub const ConfusableEntry = extern struct {
 
     /// Returns the `ScriptTag` stored in bits `24..27`.
     pub inline fn scriptTag(self: ConfusableEntry) ScriptTag {
-        return @enumFromInt(@as(u4, @truncate(self.skeleton_and_script >> 24)));
+        return @fromBackingInt(@intCast(@as(u4, @truncate(self.skeleton_and_script >> 24))));
     }
 
     /// Returns `true` when this scalar is an identifier / mixed-word letter or digit homoglyph (`W0103`, `W0104`).
@@ -566,7 +566,7 @@ inline fn packEntry(
         .skeleton_and_script = @as(u32, b0) |
             (@as(u32, b1) << 8) |
             (@as(u32, b2) << 16) |
-            (@as(u32, @intFromEnum(script)) << 24) |
+            (@as(u32, @backingInt(script)) << 24) |
             (if (is_ident) @as(u32, 1) << 28 else 0) |
             (if (is_standalone) @as(u32, 1) << 29 else 0) |
             (if (is_whole_script) @as(u32, 1) << 30 else 0) |
@@ -627,10 +627,10 @@ fn mapMathGreekOffsetToBase(offset_in_run: u32) ?u21 {
 /// Returns `true` when ASCII letter `ascii_byte` has a visual homoglyph in `script_mask` (`cyrillic` / `greek`).
 fn hasCrossScriptAsciiHomoglyph(ascii_byte: u8, chunk_script_mask: u16) bool {
     const has_cyrillic_or_cherokee = (chunk_script_mask &
-        ((@as(u16, 1) << @intFromEnum(ScriptTag.cyrillic)) |
-            (@as(u16, 1) << @intFromEnum(ScriptTag.cherokee)) |
-            (@as(u16, 1) << @intFromEnum(ScriptTag.armenian)))) != 0;
-    const has_greek = (chunk_script_mask & (@as(u16, 1) << @intFromEnum(ScriptTag.greek))) != 0;
+        ((@as(u16, 1) << @backingInt(ScriptTag.cyrillic)) |
+            (@as(u16, 1) << @backingInt(ScriptTag.cherokee)) |
+            (@as(u16, 1) << @backingInt(ScriptTag.armenian)))) != 0;
+    const has_greek = (chunk_script_mask & (@as(u16, 1) << @backingInt(ScriptTag.greek))) != 0;
 
     if (ascii_byte >= 'A' and ascii_byte <= 'Z') {
         const bit = @as(u32, 1) << @intCast(ascii_byte - 'A');
@@ -842,31 +842,31 @@ pub fn classifyLetterScriptBit(codepoint: u21) u16 {
     if (lookupConfusable(codepoint)) |entry| {
         const tag = entry.scriptTag();
         if (tag != .common_punct) {
-            return @as(u16, 1) << @intFromEnum(tag);
+            return @as(u16, 1) << @backingInt(tag);
         }
     }
     if ((codepoint >= 0x00C0 and codepoint <= 0x024F) or (codepoint >= 0x1E00 and codepoint <= 0x1EFF)) {
-        return @as(u16, 1) << @intFromEnum(ScriptTag.latin_ext);
+        return @as(u16, 1) << @backingInt(ScriptTag.latin_ext);
     }
     if ((codepoint >= 0x0370 and codepoint <= 0x03FF) or (codepoint >= 0x1F00 and codepoint <= 0x1FFF)) {
-        return @as(u16, 1) << @intFromEnum(ScriptTag.greek);
+        return @as(u16, 1) << @backingInt(ScriptTag.greek);
     }
     if (codepoint >= 0x0400 and codepoint <= 0x052F) {
-        return @as(u16, 1) << @intFromEnum(ScriptTag.cyrillic);
+        return @as(u16, 1) << @backingInt(ScriptTag.cyrillic);
     }
     if (codepoint >= 0x0530 and codepoint <= 0x058F) {
-        return @as(u16, 1) << @intFromEnum(ScriptTag.armenian);
+        return @as(u16, 1) << @backingInt(ScriptTag.armenian);
     }
     if (codepoint >= 0x0590 and codepoint <= 0x05FF) {
-        return @as(u16, 1) << @intFromEnum(ScriptTag.hebrew);
+        return @as(u16, 1) << @backingInt(ScriptTag.hebrew);
     }
     if ((codepoint >= 0x13A0 and codepoint <= 0x13FF) or (codepoint >= 0xAB70 and codepoint <= 0xABBF)) {
-        return @as(u16, 1) << @intFromEnum(ScriptTag.cherokee);
+        return @as(u16, 1) << @backingInt(ScriptTag.cherokee);
     }
     if (codepoint >= 0x3040 and codepoint <= 0x9FFF) {
-        return @as(u16, 1) << @intFromEnum(ScriptTag.cjk_kana);
+        return @as(u16, 1) << @backingInt(ScriptTag.cjk_kana);
     }
-    return @as(u16, 1) << @intFromEnum(ScriptTag.other_script);
+    return @as(u16, 1) << @backingInt(ScriptTag.other_script);
 }
 
 /// Materializes the `UTS #39` skeleton of `ident_text` into `out_buf` (`0` heap allocations).
@@ -1131,9 +1131,10 @@ test "test_unicode_confusables_rodata_bounds_and_canonical_allowlist" {
     // Canonical CoreX symbols and scientific Greek MUST NEVER be flagged:
     const safe_scalars = [_]u21{
         0x2013, 0x2026, 0x00A7, 0x00D7, 0x2264, 0x2265, 0x2260, 0x2192,
-        0x2500, 0x256D, 0x2570, 0x2502, 0x251C, 0x25B8, 0x2022, 0x2713, 0x2717, 0x26A0,
-        0x0394, 0x0393, 0x0398, 0x039B, 0x03A0, 0x03A3, 0x03A6, 0x03A8, 0x03A9,
-        0x03B4, 0x03B8, 0x03BB, 0x03BC, 0x03C0, 0x03C3, 0x03C6, 0x03C8,
+        0x2500, 0x256D, 0x2570, 0x2502, 0x251C, 0x25B8, 0x2022, 0x2713,
+        0x2717, 0x26A0, 0x0394, 0x0393, 0x0398, 0x039B, 0x03A0, 0x03A3,
+        0x03A6, 0x03A8, 0x03A9, 0x03B4, 0x03B8, 0x03BB, 0x03BC, 0x03C0,
+        0x03C3, 0x03C6, 0x03C8,
     };
     for (safe_scalars) |safe_cp| {
         try std.testing.expect(lookupConfusable(safe_cp) == null);
