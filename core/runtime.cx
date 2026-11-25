@@ -17,7 +17,7 @@ pub fn poll_reload() {
 /| Polls the `DR-19` hot-reload generation counter and returns `true` when a reload patch applied.
 @inline
 pub fn has_pending_reload() -> bool {
-    return @poll_reload();
+    @poll_reload()
 }
 
 /| Appends `trace_id` to the deterministic `@drop_trace` sequence for lifecycle verification.

@@ -19,25 +19,25 @@ pub struct CachePadded[T] {
 /| Returns the byte stride (`sizeof(T)`) of `T` on the active compilation target.
 @no_alloc @no_panic
 pub fn size_of_type[T]() -> usize {
-    return @size_of[T]();
+    @size_of[T]()
 }
 
 /| Returns the byte alignment (`alignof(T)`) of `T` on the active compilation target.
 @no_alloc @no_panic
 pub fn align_of_type[T]() -> usize {
-    return @align_of[T]();
+    @align_of[T]()
 }
 
 /| Constructs the canonical zero/default-initialized value of scalar `T` (`@default_init[T]()`).
 @no_alloc @no_panic
 pub fn zeroed_value[T: Scalar]() -> T {
-    return @default_init[T]();
+    @default_init[T]()
 }
 
 /| Wraps `initial_val` in a `@cache_aligned` `CachePadded[T]` slot.
 @no_alloc @no_panic
 pub fn cache_padded_new[T](initial_val: own T, /) -> CachePadded[T] {
-    return CachePadded[T] { value: own initial_val };
+    CachePadded[T] { value: own initial_val }
 }
 
 /| Returns `true` if `candidate` is a non-zero power of two (`1`, `2`, `4`, `8`, …).
@@ -56,13 +56,13 @@ pub fn align_up(byte_offset: usize, alignment: usize, /) -> usize {
         return byte_offset;
     }
     let mask: usize = alignment -% 1;
-    return (byte_offset +% mask) & ~mask;
+    (byte_offset +% mask) & ~mask
 }
 
 /| Alias of `align_up` rounding `byte_offset` upward to power-of-two `alignment`.
 @inline @no_alloc @no_panic
 pub fn align_up_usize(byte_offset: usize, alignment: usize, /) -> usize {
-    return align_up(byte_offset, alignment);
+    align_up(byte_offset, alignment)
 }
 
 /| Exchanges the values in `left_slot` and `right_slot` via safe MVS parallel assignment (`SE-15`).
@@ -91,7 +91,7 @@ pub fn copy_nonoverlapping[T: Copy](dest_slice: &mut [T], src_slice: &[T], /) ->
         }
         i = i +% 1;
     }
-    return .Ok(copy_len);
+    .Ok(copy_len)
 }
 
 /| Stores `next_val` through non-null raw 64-bit register pointer `reg_ptr` (`*mut u64`).
@@ -108,5 +108,5 @@ pub unsafe fn read_volatile_u64(reg_ptr: *u64, /) -> u64 {
     if reg_ptr != @default_init[*u64]() {
         return reg_ptr.*;
     }
-    return 0;
+    0
 }

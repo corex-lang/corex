@@ -84,7 +84,7 @@ const GATE4_HOT_FUNCTIONS = [_][]const u8{
     "find_raw",
     "partition_lomuto_branchless_cyclic",
     "partition_point",
-    "validate_utf8",
+    "is_valid_utf8",
     "char_width",
     "grapheme_class",
     "schubfach_to_decimal_f64",
@@ -604,12 +604,12 @@ test "test_phase11_std01_red_team_stage4_regressions_and_stage0_seams" {
         "\n" ++
         "comptime fn compute_scalar_const() -> f64 {\n" ++
         "    var total: f64 = 1.25;\n" ++
-        "    var step: usize = 0_usize;\n" ++
+        "    var step = 0_usize;\n" ++
         "    while step < 3_usize {\n" ++
-        "        total = total + 0.25;\n" ++
+        "        total += 0.25;\n" ++
         "        step += 1_usize;\n" ++
         "    }\n" ++
-        "    return total;\n" ++
+        "    total\n" ++
         "}\n" ++
         "\n" ++
         "const GLOBAL_MAGIC_SCALE: f64 = compute_scalar_const();\n" ++
@@ -618,7 +618,7 @@ test "test_phase11_std01_red_team_stage4_regressions_and_stage0_seams" {
         "impl Display for BadRawUtf8 {\n" ++
         "    pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {\n" ++
         "        _ = spec;\n" ++
-        "        return out.write_bytes(&[0xFF_u8]);\n" ++
+        "        out.write_bytes(&[0xFF_u8])\n" ++
         "    }\n" ++
         "}\n" ++
         "\n" ++
@@ -627,7 +627,7 @@ test "test_phase11_std01_red_team_stage4_regressions_and_stage0_seams" {
         "    pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {\n" ++
         "        _ = spec;\n" ++
         "        out.write_bytes(&[0xF0_u8, 0x9F_u8])?;\n" ++
-        "        return out.write_bytes(&[0x98_u8, 0x80_u8]);\n" ++
+        "        out.write_bytes(&[0x98_u8, 0x80_u8])\n" ++
         "    }\n" ++
         "}\n" ++
         "\n" ++
@@ -660,7 +660,7 @@ test "test_phase11_std01_red_team_stage4_regressions_and_stage0_seams" {
         "    var str_arena = Arena.with_capacity(16384_usize) catch { return 7; };\n" ++
         "    var tiny_ctx_bytes: [u8; 8] = [0_u8; 8];\n" ++
         "    var tiny_ctx_fb = FixedBuffer.init(&mut tiny_ctx_bytes);\n" ++
-        "    var arena_str_ok: bool = false;\n" ++
+        "    var arena_str_ok = false;\n" ++
         "    {\n" ++
         "        with context.allocator = tiny_ctx_fb.as_handle() {\n" ++
         "            var arena_text = String.in_arena(&mut str_arena);\n" ++
@@ -685,7 +685,7 @@ test "test_phase11_std01_red_team_stage4_regressions_and_stage0_seams" {
         "    if ok_bytes.len() != 4_usize or ok_bytes[0] != 0xF0_u8 or ok_bytes[3] != 0x80_u8 { return 13; }\n" ++
         "\n" ++
         "    // [6] CRITICAL-01: normal `str.join` and `str.join_in`:\n" ++
-        "    var join_ok: bool = false;\n" ++
+        "    var join_ok = false;\n" ++
         "    var join_arena = Arena.new();\n" ++
         "    {\n" ++
         "        let joined_arena = str.join_in(&mut join_arena, &[\"cx\", \"std\", \"01\"], \"::\");\n" ++
@@ -696,8 +696,8 @@ test "test_phase11_std01_red_team_stage4_regressions_and_stage0_seams" {
         "    if not join_ok { return 14; }\n" ++
         "\n" ++
         "    // [7] HIGH-01..HIGH-05: math & float boundary edge cases + `System` 64K/128K align + `FixedBuffer` TLS:\n" ++
-        "    let max_f64: f64 = @bit_cast[f64](0x7FEF_FFFF_FFFF_FFFF_u64);\n" ++
-        "    let inf_f64: f64 = @bit_cast[f64](0x7FF0_0000_0000_0000_u64);\n" ++
+        "    let max_f64 = @bit_cast[f64](0x7FEF_FFFF_FFFF_FFFF_u64);\n" ++
+        "    let inf_f64 = @bit_cast[f64](0x7FF0_0000_0000_0000_u64);\n" ++
         "    if math.approx_eq_ulp(max_f64, inf_f64) { return 15; }\n" ++
         "    if @bit_cast[u64](math.powf(2.0, 1.0e301)) != 0x7FF0_0000_0000_0000_u64 { return 16; }\n" ++
         "    let neg_zero_rad: f64 = math.degrees_to_radians(-0.0);\n" ++
@@ -717,9 +717,9 @@ test "test_phase11_std01_red_team_stage4_regressions_and_stage0_seams" {
         "    if ((ptr128k as usize) & 131_071_usize) != 0_usize { return 25; }\n" ++
         "    System.handle().dealloc(ptr128k, lay128k);\n" ++
         "\n" ++
-        "    let tls_ptr: *u8 = @tls_alloc_state() as *u8;\n" ++
+        "    let tls_ptr = @tls_alloc_state() as *u8;\n" ++
         "    var tls_before: [u8; 256] = [0_u8; 256];\n" ++
-        "    var byte_i: usize = 0_usize;\n" ++
+        "    var byte_i = 0_usize;\n" ++
         "    while byte_i < 256_usize {\n" ++
         "        tls_before[byte_i] = unsafe { tls_ptr.add(byte_i).read() };\n" ++
         "        byte_i += 1_usize;\n" ++
@@ -736,7 +736,7 @@ test "test_phase11_std01_red_team_stage4_regressions_and_stage0_seams" {
         "        if tls_before[byte_i] != unsafe { tls_ptr.add(byte_i).read() } { return 27; }\n" ++
         "        byte_i += 1_usize;\n" ++
         "    }\n" ++
-        "    return 0;\n" ++
+        "    0\n" ++
         "}\n";
 
     const app_fid = FileId.fromInt(0);
@@ -1208,13 +1208,13 @@ test "test_phase11_std01_gate3_scratch_exclusivity_e0328_and_sim_determinism" {
             "use cx.mem.{Arena, with_scratch};\n" ++
             "\n" ++
             "pub fn ok_nested_complement_slot() -> usize {\n" ++
-            "    return with_scratch(|outer: &mut Arena| -> usize {\n" ++
+            "    with_scratch(|outer: &mut Arena| -> usize {\n" ++
             "        let outer_view = outer.dupe_str(\"outer_live\");\n" ++
             "        let inner_len = with_scratch(outer.as_handle(), |inner: &mut Arena| -> usize {\n" ++
-            "            return inner.dupe_str(\"complement_slot_1\").len();\n" ++
+            "            inner.dupe_str(\"complement_slot_1\").len()\n" ++
             "        });\n" ++
-            "        return outer_view.len() + inner_len;\n" ++
-            "    });\n" ++
+            "        outer_view.len() + inner_len\n" ++
+            "    })\n" ++
             "}\n";
         const fid_ok = FileId.fromInt(2);
         _ = try db.setInput(fid_ok, ok_ping_pong_src, .low);
@@ -1398,7 +1398,7 @@ test "test_phase11_std01_gate4_pentagon_zero_trap_and_ram_budget" {
         "    let parsed = str.parse_float[f64](ftxt) catch { return 2; };\n" ++
         "    var ibuf: [u8; 16] = [0_u8; 16];\n" ++
         "    let itxt = str.format_int(&mut ibuf, 123456_u32) catch { return 3; };\n" ++
-        "    let valid = str.validate_utf8(itxt.as_bytes());\n" ++
+        "    let valid = str.is_valid_utf8(itxt.as_bytes());\n" ++
         "    let width = str.char_width('W');\n" ++
         "    var gcount: usize = 0_usize;\n" ++
         "    for _ in itxt.graphemes() { gcount += 1_usize; }\n" ++
@@ -1482,7 +1482,7 @@ test "test_phase11_std01_gate4_pentagon_zero_trap_and_ram_budget" {
     }
     try std.testing.expect(sast_res.peak_pentagon_bytes < 2 * 1024 * 1024);
 
-    // Verify all 10 hot functions (plus `validate_utf8_fast`!) have 0 residual traps:
+    // Verify all 10 hot functions (plus `is_valid_utf8_fast`!) have 0 residual traps:
     for (GATE4_HOT_FUNCTIONS) |hot_name| {
         var matched_count: usize = 0;
         for (all_bodies.items) |*body_ptr| {
@@ -1520,10 +1520,10 @@ test "test_phase11_std01_gate4_pentagon_zero_trap_and_ram_budget" {
         try std.testing.expect(matched_count >= 1);
     }
 
-    // Also check inner `validate_utf8_fast` explicitly:
+    // Also check inner `is_valid_utf8_fast` explicitly:
     var seen_utf8_fast = false;
     for (all_bodies.items) |*body_ptr| {
-        if (std.mem.eql(u8, db.interner.get(body_ptr.name), "validate_utf8_fast")) {
+        if (std.mem.eql(u8, db.interner.get(body_ptr.name), "is_valid_utf8_fast")) {
             seen_utf8_fast = true;
             try std.testing.expectEqual(@as(usize, 0), countResidualTrapsInBody(body_ptr));
         }

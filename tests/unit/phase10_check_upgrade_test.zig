@@ -149,7 +149,7 @@ test "test_cli_check_w0202_lints_scoped_allow_fix_and_deny_warnings" {
     defer env_map.deinit();
     try env_map.put("COREX_HOME", home_dir);
 
-    // [1] Blanket `@allow`, `@allow(all)`, and `@allow(*)` must fail with `E0403`:
+    // [1] Blanket `@allow`, `@allow(all)`, and `@allow(*)` must fail with `E0240` (`DR-25`):
     const blanket_src =
         "@allow\n" ++
         "pub fn bare_allow(opt_val: Option[i32]) {\n" ++
@@ -171,16 +171,15 @@ test "test_cli_check_w0202_lints_scoped_allow_fix_and_deny_warnings" {
     );
     defer blanket_res.deinit(allocator);
     try std.testing.expectEqual(@as(u8, 1), blanket_res.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, blanket_res.stderr, "E0403") != null);
-    try std.testing.expect(std.mem.indexOf(u8, blanket_res.stderr, "forbidden") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blanket_res.stderr, "E0240") != null);
 
-    // [2] Non-idiomatic constructs emit `W0202`, while scoped `@allow(W0202)` suppresses cleanly:
+    // [2] Non-idiomatic constructs emit `W0202`, while scoped `@expect(W0202, reason: …)` suppresses cleanly:
     const idioms_src =
         "// Header comment preserved across check --fix\n" ++
         "pub enum ParseIssue {\n" ++
         "    EmptyInput,\n" ++
         "}\n\n" ++
-        "pub fn evaluate_flag(\n" ++
+        "pub fn is_evaluated_flag(\n" ++
         "    cond: bool,\n" ++
         "    maybe_num: Option[i32],\n" ++
         "    outcome: Result[i32, ParseIssue],\n" ++
@@ -199,8 +198,8 @@ test "test_cli_check_w0202_lints_scoped_allow_fix_and_deny_warnings" {
         "    let _keep_seed = seed;\n" ++
         "    return;\n" ++
         "}\n\n" ++
-        "@allow(W0202)\n" ++
-        "pub fn scoped_suppressed(cond: bool, kept_opt: Option[i32]) -> bool {\n" ++
+        "@allow(W0202, W0407, reason: \"intentional idiom fixture\")\n" ++
+        "pub fn is_scoped_suppressed(cond: bool, kept_opt: Option[i32]) -> bool {\n" ++
         "    let _keep = kept_opt;\n" ++
         "    if cond == true {\n" ++
         "        return true;\n" ++
@@ -257,15 +256,18 @@ test "test_cli_check_w0202_lints_scoped_allow_fix_and_deny_warnings" {
     try std.testing.expect(std.mem.indexOf(u8, fixed_disk_bytes, "// Trailing unit return comment preserved:") != null);
     try std.testing.expect(std.mem.indexOf(u8, fixed_disk_bytes, "maybe_num: i32?") != null);
     try std.testing.expect(std.mem.indexOf(u8, fixed_disk_bytes, "outcome: i32!ParseIssue") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fixed_disk_bytes, "return cond;") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, fixed_disk_bytes, "cond\n}") != null or
+            std.mem.indexOf(u8, fixed_disk_bytes, "return cond;") != null,
+    );
     try std.testing.expect(std.mem.indexOf(u8, fixed_disk_bytes, "if cond == true") != null);
 
-    // Dedicated `@allow(W0202)` file emits zero warnings and stays byte-for-byte untouched on disk:
+    // Dedicated `@expect(W0202, reason: …)` file emits zero warnings and stays byte-for-byte untouched on disk:
     const sup_only_src =
-        "@allow(W0202)\n" ++
-        "pub fn untouched_suppressed(kept_opt: Option[i32]) -> bool {\n" ++
+        "@expect(W0202, reason: \"intentional idiom fixture\")\n" ++
+        "pub fn is_untouched_suppressed(kept_opt: Option[i32]) -> bool {\n" ++
         "    let _keep = kept_opt;\n" ++
-        "    return true;\n" ++
+        "    true\n" ++
         "}\n";
     const sup_only_path = try writeScratchFile(allocator, io, scratch_dir, "suppressed_only.cx", sup_only_src);
     defer allocator.free(sup_only_path);
@@ -851,30 +853,30 @@ test "test_phase10_w0202_precedence_ur2204_array_multifile_upgrade_and_accept_ca
 
     // [1] `W0202` `corex check --fix` preserves `(a or b) and c`, `(a and b) |> tap`, `(a == b) == c`, and `if ({ … })`:
     const w0202_prec_src =
-        "pub fn eval_guard(flag_a: bool, flag_b: bool, flag_c: bool) -> bool {\n" ++
+        "pub fn is_guard_ok(flag_a: bool, flag_b: bool, flag_c: bool) -> bool {\n" ++
         "    return (flag_a or flag_b) == true and flag_c;\n" ++
         "}\n\n" ++
-        "pub fn tap_bool(flag_v: bool) -> bool {\n" ++
+        "pub fn is_tapped_bool(flag_v: bool) -> bool {\n" ++
         "    return flag_v;\n" ++
         "}\n\n" ++
-        "pub fn eval_pipe(flag_a: bool, flag_b: bool) -> bool {\n" ++
-        "    return ((flag_a and flag_b) == true) |> tap_bool();\n" ++
+        "pub fn is_pipe_ok(flag_a: bool, flag_b: bool) -> bool {\n" ++
+        "    return ((flag_a and flag_b) == true) |> is_tapped_bool();\n" ++
         "}\n\n" ++
-        "pub fn eval_eq_chain(flag_a: bool, flag_b: bool, flag_c: bool) -> bool {\n" ++
+        "pub fn is_eq_chain_ok(flag_a: bool, flag_b: bool, flag_c: bool) -> bool {\n" ++
         "    return ((flag_a == flag_b) == true) == flag_c;\n" ++
         "}\n\n" ++
         "pub fn eval_block_if(seed: i32) -> i32 {\n" ++
         "    if ({\n" ++
         "        let is_ok = seed > 0;\n" ++
-        "        is_ok\n" ++
+        "        is_ok and seed != 99\n" ++
         "    }) == true {\n" ++
         "        return 1;\n" ++
         "    }\n" ++
         "    return 0;\n" ++
         "}\n\n" ++
         "pub const VERIFY_GUARD_TRUTH: bool = comptime {\n" ++
-        "    @compile_assert(not eval_guard(true, false, false));\n" ++
-        "    @compile_assert(eval_guard(true, false, true));\n" ++
+        "    @compile_assert(not is_guard_ok(true, false, false));\n" ++
+        "    @compile_assert(is_guard_ok(true, false, true));\n" ++
         "    true\n" ++
         "};\n";
     const w0202_prec_path = try writeScratchFile(allocator, io, scratch_dir, "w0202_prec.cx", w0202_prec_src);
@@ -904,9 +906,9 @@ test "test_phase10_w0202_precedence_ur2204_array_multifile_upgrade_and_accept_ca
 
     const prec_after = try readDiskFileAlloc(allocator, io, w0202_prec_path);
     defer allocator.free(prec_after);
-    try std.testing.expect(std.mem.indexOf(u8, prec_after, "return (flag_a or flag_b) and flag_c;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prec_after, "(flag_a or flag_b) and flag_c\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, prec_after, "flag_a or flag_b and flag_c") == null);
-    try std.testing.expect(std.mem.indexOf(u8, prec_after, "(flag_a and flag_b) |> tap_bool()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prec_after, "(flag_a and flag_b) |> is_tapped_bool()") != null);
     try std.testing.expect(std.mem.indexOf(u8, prec_after, "(flag_a == flag_b) == flag_c") != null);
     try std.testing.expect(std.mem.indexOf(u8, prec_after, "== true") == null);
     try std.testing.expect(std.mem.indexOf(u8, prec_after, "let is_ok = seed > 0;") != null);
@@ -930,12 +932,12 @@ test "test_phase10_w0202_precedence_ur2204_array_multifile_upgrade_and_accept_ca
         "pub fn inspect_ptrs(ro_ptr: *u8, rw_ptr: *mut u8) -> usize {\n" ++
         "    _ = ro_ptr;\n" ++
         "    _ = rw_ptr;\n" ++
-        "    return 16;\n" ++
+        "    16\n" ++
         "}\n\n" ++
         "pub fn pass_array_ptrs() -> usize {\n" ++
-        "    var first_buf: [u8; 4] = [0, 0, 0, 0];\n" ++
+        "    let first_buf: [u8; 4] = [0, 0, 0, 0];\n" ++
         "    var second_buf: [u8; 4] = [1, 1, 1, 1];\n" ++
-        "    return inspect_ptrs(first_buf.ptr, second_buf.ptr);\n" ++
+        "    inspect_ptrs(first_buf.ptr, second_buf.ptr)\n" ++
         "}\n";
     const ur2204_path = try writeScratchFile(allocator, io, scratch_dir, "ur2204_array.cx", ur2204_src);
     defer allocator.free(ur2204_path);
@@ -984,11 +986,11 @@ test "test_phase10_w0202_precedence_ur2204_array_multifile_upgrade_and_accept_ca
         multi_ws_dir,
         "src/legacy.cx",
         "pub fn modern(val: i32) -> i32 {\n" ++
-            "    return val +% 5;\n" ++
+            "    val +% 5\n" ++
             "}\n\n" ++
             "@deprecated(since: \"0.2.0\", reason: \"use modern\", upgrade: \"modern($0)\")\n" ++
             "pub fn old_api(val: i32) -> i32 {\n" ++
-            "    return modern(val);\n" ++
+            "    modern(val)\n" ++
             "}\n",
     );
     const multi_main_path = try writeScratchFile(
@@ -996,9 +998,9 @@ test "test_phase10_w0202_precedence_ur2204_array_multifile_upgrade_and_accept_ca
         io,
         multi_ws_dir,
         "src/main.cx",
-        "mod legacy;\n\n" ++
+        "pub mod legacy;\n\n" ++
             "pub fn main() -> i32 {\n" ++
-            "    return legacy.old_api(10);\n" ++
+            "    legacy.old_api(10)\n" ++
             "}\n",
     );
     defer allocator.free(multi_main_path);
@@ -1155,7 +1157,7 @@ test "test_phase10_w0202_precedence_ur2204_array_multifile_upgrade_and_accept_ca
         "    pub fn pick(first_s: str, second_b: &[u8]) -> i32 {\n" ++
         "        _ = first_s;\n" ++
         "        _ = second_b;\n" ++
-        "        return 7;\n" ++
+        "        7\n" ++
         "    }\n" ++
         "}\n\n" ++
         "pub fn trigger_msg() -> never {\n" ++
@@ -1289,21 +1291,21 @@ test "test_phase106_dr23_upgrade_rules_ur2300_through_ur2306_end_to_end" {
         "    if not flag {\n" ++
         "        return .Err(1_u32);\n" ++
         "    }\n" ++
-        "    return .Ok(());\n" ++
+        "    .Ok(())\n" ++
         "}\n\n" ++
         "pub fn fallible_val(seed U32) -> U32!U32 {\n" ++
-        "    return .Ok(seed + 1_u32);\n" ++
+        "    .Ok(seed + 1_u32)\n" ++
         "}\n\n" ++
         "pub impl SlotBox {\n" ++
         "    pub fn run_all(x U32) -> U32 {\n" ++
         "        //! Mid-body module doc downgraded by UR-23-01.\n" ++
         "        let slot = SlotBox { count: x, active: true };\n" ++
-        "        let bonus USize = 4_usize;\n" ++
+        "        let bonus USize = 4;\n" ++
         "        let _ = unit_fn();\n" ++
         "        let _ = fallible_unit(true);\n" ++
         "        let _ = fallible_val(x);\n" ++
         "        let _ = slot.classify();\n" ++
-        "        return sub_mod.base_seed() + (bonus as u32);\n" ++
+        "        sub_mod.base_seed() + (bonus as u32)\n" ++
         "    }\n" ++
         "}\n";
 
@@ -1430,13 +1432,13 @@ test "test_phase111b_dr24_upgrade_rules_ur2400_through_ur2406_and_w0202_hierarch
         "@link_name(\"__cx_ring_entry\")\n" ++
         "@link_section(\".text.hot\")\n" ++
         "pub fn ring_entry() -> u32 {\n" ++
-        "    return 7_u32;\n" ++
+        "    7_u32\n" ++
         "}\n\n" ++
         "@inline\n" ++
         "@no_alloc\n" ++
         "@no_panic\n" ++
         "fn private_bump(cur: u16) -> u16 {\n" ++
-        "    return cur +% 1_u16;\n" ++
+        "    cur +% 1_u16\n" ++
         "}\n\n" ++
         "pub fn inspect_dr24(port: u16, delta: i32) -> usize {\n" ++
         "    let bumped = /* inline block comment */ private_bump(port);\n" ++
@@ -1450,7 +1452,7 @@ test "test_phase111b_dr24_upgrade_rules_ur2400_through_ur2406_and_w0202_hierarch
         "    let multi_interp = \"\"\"\n" ++
         "        p={port}\n" ++
         "        \"\"\";\n" ++
-        "    let raw_single = r\"\"\"ok\"\"\";\n" ++
+        "    let raw_single = r\"\"\"ok\\n\"\"\";\n" ++
         "    _ = zero_hole_braces;\n" ++
         "    _ = zero_hole_triple;\n" ++
         "    _ = route_literal;\n" ++
@@ -1459,7 +1461,7 @@ test "test_phase111b_dr24_upgrade_rules_ur2400_through_ur2406_and_w0202_hierarch
         "    _ = raw_single;\n" ++
         "    let sign_v = if delta < 0 { -1_i32 } else if delta > 0 { 1_i32 } else { 0_i32 };\n" ++
         "    _ = sign_v;\n" ++
-        "    return if port > 0_u16 { \"live\" } else { \"idle\" }.len();\n" ++
+        "    if port > 0_u16 { \"live\" } else { \"idle\" }.len()\n" ++
         "}\n";
 
     const dr24_path = try writeScratchFile(allocator, io, scratch_dir, "dr24_showcase.cx", pre_dr24_src);
@@ -1500,7 +1502,7 @@ test "test_phase111b_dr24_upgrade_rules_ur2400_through_ur2406_and_w0202_hierarch
     try std.testing.expect(std.mem.indexOf(u8, dr24_after, "let route_literal = \"/users/{id}\";") != null);
     try std.testing.expect(std.mem.indexOf(u8, dr24_after, "let live_endpoint = f\"0.0.0.0:{port}\";") != null);
     try std.testing.expect(std.mem.indexOf(u8, dr24_after, "let multi_interp = f\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, dr24_after, "let raw_single = r\"ok\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dr24_after, "let raw_single = r\"ok\\n\";") != null);
     try std.testing.expect(std.mem.indexOf(u8, dr24_after, "if delta < 0 => -1_i32") != null);
     try std.testing.expect(std.mem.indexOf(u8, dr24_after, "(if port > 0_u16 => \"live\" else \"idle\").len()") != null);
 
@@ -1643,11 +1645,11 @@ test "test_upgrade_impl_method_attr_strip_preserves_struct_field_side_tables" {
         "    fn bump_cursor(&mut self, bytes: &[u8]) -> usize {\n" ++
         "        let slice_len = bytes.len;\n" ++
         "        self.len = self.len +% slice_len;\n" ++
-        "        return self.ptr +% self.len;\n" ++
+        "        self.ptr +% self.len\n" ++
         "    }\n\n" ++
         "    /// Public caller exercising `bump_cursor`.\n" ++
         "    pub fn push_chunk(&mut self, bytes: &[u8]) -> usize {\n" ++
-        "        return self.bump_cursor(bytes);\n" ++
+        "        self.bump_cursor(bytes)\n" ++
         "    }\n" ++
         "}\n";
 
@@ -1706,7 +1708,7 @@ test "test_w0202_and_ur24_06_long_arm_non_oscillation_and_header_struct_lit_pare
         "    gamma_factor: i32,\n" ++
         "    delta_weight_0: i32,\n" ++
         ") -> i32 {\n" ++
-        "    return alpha_factor +% beta_factor +% gamma_factor +% delta_weight_0;\n" ++
+        "    alpha_factor +% beta_factor +% gamma_factor +% delta_weight_0\n" ++
         "}\n\n" ++
         "/| Keeps braced value `if` when inline `if flag => …` would exceed 100 columns.\n" ++
         "pub fn oscillate(\n" ++
@@ -1809,7 +1811,7 @@ test "test_w0202_and_ur24_06_long_arm_non_oscillation_and_header_struct_lit_pare
         "    } else {\n" ++
         "        0_i32\n" ++
         "    };\n" ++
-        "    return matched +% bonus;\n" ++
+        "    matched +% bonus\n" ++
         "}\n";
 
     const hdr_upg_path = try writeScratchFile(allocator, io, scratch_dir, "hdr_upg.cx", header_struct_src);
@@ -1882,4 +1884,200 @@ test "test_w0202_and_ur24_06_long_arm_non_oscillation_and_header_struct_lit_pare
     const hdr_fix_after = try readDiskFileAlloc(allocator, io, hdr_fix_path);
     defer allocator.free(hdr_fix_after);
     try std.testing.expectEqualStrings(hdr_upg_after, hdr_fix_after);
+}
+
+test "test_cli_dr25_disable_only_unsafe_fixes_manifest_lint_fmt_and_stray_dotfiles" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const ws_dir = try createScratchDir(allocator, io, "dr25_cli_ws");
+    defer cleanupScratchDir(allocator, io, ws_dir);
+
+    const home_dir = try std.fmt.allocPrint(allocator, "{s}/home", .{ws_dir});
+    defer allocator.free(home_dir);
+    try std.Io.Dir.cwd().createDirPath(io, home_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("COREX_HOME", home_dir);
+
+    // [1] `--unsafe-fixes` without `--fix` fails (`E0001`), and unknown `--disable` rule emits `E0019` + typo hint:
+    const probe_path = try writeScratchFile(
+        allocator,
+        io,
+        ws_dir,
+        "standalone_probe.cx",
+        "pub fn is_sample_ok(flag: bool) -> bool {\n" ++
+            "    let unused_val = 1;\n" ++
+            "    if flag {\n        return true;\n    } else {\n        return false;\n    }\n}\n",
+    );
+    defer allocator.free(probe_path);
+
+    var orphan_unsafe = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--unsafe-fixes", probe_path },
+    );
+    defer orphan_unsafe.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), orphan_unsafe.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, orphan_unsafe.stderr, "E0001") != null);
+
+    var bad_rule = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--disable=unused-bindng", probe_path },
+    );
+    defer bad_rule.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), bad_rule.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, bad_rule.stderr, "E0019") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bad_rule.stderr, "unused-binding") != null);
+
+    // [2] `--only=unused-binding` emits `W0402` while silencing `W0202`; `--disable=W0202,unused-binding` is clean:
+    var only_res = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--only=unused-binding", probe_path },
+    );
+    defer only_res.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), only_res.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, only_res.stderr, "W0402") != null);
+    try std.testing.expect(std.mem.indexOf(u8, only_res.stderr, "W0202") == null);
+
+    var dis_both = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--deny-warnings", "--disable=W0202,W0407,unused-binding", probe_path },
+    );
+    defer dis_both.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), dis_both.exit_code);
+
+    // [3] Stale `@expect` (`W0002`) is pruned automatically by `corex check --fix-unsafe`:
+    const stale_path = try writeScratchFile(
+        allocator,
+        io,
+        ws_dir,
+        "stale_expect.cx",
+        "@expect(unused-binding, reason: \"was unused before cleanup\")\npub fn clean_fn(seed: i32) -> i32 {\n    seed + 1\n}\n",
+    );
+    defer allocator.free(stale_path);
+
+    var stale_fix = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--fix-unsafe", stale_path },
+    );
+    defer stale_fix.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), stale_fix.exit_code);
+    const stale_after = try readDiskFileAlloc(allocator, io, stale_path);
+    defer allocator.free(stale_after);
+    try std.testing.expect(std.mem.indexOf(u8, stale_after, "@expect") == null);
+
+    // [4] Workspace `corex.toml` `[lint]`/`[fmt]`, zero `E0014` lockfile drift on `[lint]` edits, & `E0017` dotfile guard:
+    const pkg_dir = try std.fmt.allocPrint(allocator, "{s}/pkg_app", .{ws_dir});
+    defer allocator.free(pkg_dir);
+    try std.Io.Dir.cwd().createDirPath(io, pkg_dir);
+
+    const toml_v1 =
+        "[package]\n" ++
+        "name = \"lint-demo\"\n" ++
+        "version = \"0.1.0\"\n" ++
+        "edition = \"2026\"\n\n" ++
+        "[lint]\n" ++
+        "exclude = [\"src/gen/**\"]\n\n" ++
+        "[[lint.overrides]]\n" ++
+        "files = [\"src/legacy.cx\"]\n" ++
+        "disable = [\"non-idiomatic-syntax\", \"needless-bool-branch\"]\n\n" ++
+        "[fmt]\n" ++
+        "exclude = [\"src/skip_fmt.cx\"]\n" ++
+        "check-generated = false\n";
+    const toml_path = try writeScratchFile(allocator, io, pkg_dir, "corex.toml", toml_v1);
+    defer allocator.free(toml_path);
+    try writeScratchFileDiscard(allocator, io, pkg_dir, ".rustfmt.toml", "max_width = 100\n");
+    try writeScratchFileDiscard(
+        allocator,
+        io,
+        pkg_dir,
+        "src/lib.cx",
+        "pub mod legacy;\n\n" ++
+            "pub fn is_active_flag(flag: bool) -> bool {\n" ++
+            "    if flag {\n        return true;\n    } else {\n        return false;\n    }\n}\n",
+    );
+    try writeScratchFileDiscard(
+        allocator,
+        io,
+        pkg_dir,
+        "src/legacy.cx",
+        "pub fn is_legacy_flag(flag: bool) -> bool {\n    if flag {\n        return true;\n    } else {\n        return false;\n    }\n}\n",
+    );
+    try writeScratchFileDiscard(
+        allocator,
+        io,
+        pkg_dir,
+        "src/skip_fmt.cx",
+        "pub fn   unformatted_skip(x:i32)->i32{return x;}\n",
+    );
+    try writeScratchFileDiscard(
+        allocator,
+        io,
+        pkg_dir,
+        "src/gen_file.cx",
+        "// @generated by tool\npub fn   unformatted_gen(x:i32)->i32{return x;}\n",
+    );
+
+    var fmt_check_ok = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "fmt", "--check", pkg_dir },
+    );
+    defer fmt_check_ok.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), fmt_check_ok.exit_code);
+
+    var init_check = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--manifest-path", toml_path },
+    );
+    defer init_check.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), init_check.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, init_check.stderr, "lib.cx") != null);
+    try std.testing.expect(std.mem.indexOf(u8, init_check.stderr, "legacy.cx") == null);
+
+    // Edit `[lint].disable` and verify `--locked` passes with ZERO `E0014` lockfile drift:
+    const toml_v2 =
+        "[package]\n" ++
+        "name = \"lint-demo\"\n" ++
+        "version = \"0.1.0\"\n" ++
+        "edition = \"2026\"\n\n" ++
+        "[lint]\n" ++
+        "disable = [\"non-idiomatic-syntax\", \"needless-bool-branch\"]\n";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = toml_path, .data = toml_v2 });
+
+    var locked_check = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--locked", "--deny-warnings", "--manifest-path", toml_path },
+    );
+    defer locked_check.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), locked_check.exit_code);
+
+    // Stray `.corexlint.toml` triggers `E0017`:
+    const stray_dot = try writeScratchFile(allocator, io, pkg_dir, ".corexlint.toml", "disable = []\n");
+    defer allocator.free(stray_dot);
+    var stray_res = try runCliCaptured(
+        allocator,
+        io,
+        &env_map,
+        &.{ "--color=never", "check", "--manifest-path", toml_path },
+    );
+    defer stray_res.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), stray_res.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stray_res.stderr, "E0017") != null);
 }

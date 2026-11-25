@@ -21,8 +21,7 @@ pub const FRAC_PI_2: f64 = 1.57079632679489661923;
 /| Eighth-turn circle constant `pi / 4` (`0x3FE921FB54442D18`).
 pub const FRAC_PI_4: f64 = 0.78539816339744830962;
 
-/| Euler's base of natural logarithms `e` (`0x4005BF0A8B145769`; `@allow(W0201)` preserves canonical 1-char `STD-01` constant `E`).
-@allow(W0201)
+/| Euler's base of natural logarithms `e` (`0x4005BF0A8B145769`).
 pub const E: f64 = 2.71828182845904523536;
 
 /| Natural logarithm `ln(2)` (`0x3FE62E42FEFA39EF`).
@@ -43,13 +42,13 @@ pub const SQRT_2: f64 = 1.41421356237309504880;
 // --------- Payne-Hanek 19-Word 2/pi & Split Constants ---------
 /| Exact 19-word (`1,152`-bit fractional + leading `0_u64` guard word) expansion of `2 / pi` (`152 B`).
 const TWO_OVER_PI_WORDS: [u64; 19] = [
-    0x0000000000000000_u64, 0xA2F9836E4E441529_u64, 0xFC2757D1F534DDC0_u64,
-    0xDB6295993C439041_u64, 0xFE5163ABDEBBC561_u64, 0xB7246E3A424DD2E0_u64,
-    0x06492EEA09D1921C_u64, 0xFE1DEB1CB129A73E_u64, 0xE88235F52EBB4484_u64,
-    0xE99C7026B45F7E41_u64, 0x3991D639835339F4_u64, 0x9C845F8BBDF9283B_u64,
-    0x1FF897FFDE05980F_u64, 0xEF2F118B5A0A6D1F_u64, 0x6D367ECF27CB09B7_u64,
-    0x4F463F669E5FEA2D_u64, 0x7527BAC7EBE5F17B_u64, 0x3D0739F78A5292EA_u64,
-    0x6BFB5FB11F8D5D08_u64,
+    0x0000_0000_0000_0000_u64, 0xA2F9_836E_4E44_1529_u64, 0xFC27_57D1_F534_DDC0_u64,
+    0xDB62_9599_3C43_9041_u64, 0xFE51_63AB_DEBB_C561_u64, 0xB724_6E3A_424D_D2E0_u64,
+    0x0649_2EEA_09D1_921C_u64, 0xFE1D_EB1C_B129_A73E_u64, 0xE882_35F5_2EBB_4484_u64,
+    0xE99C_7026_B45F_7E41_u64, 0x3991_D639_8353_39F4_u64, 0x9C84_5F8B_BDF9_283B_u64,
+    0x1FF8_97FF_DE05_980F_u64, 0xEF2F_118B_5A0A_6D1F_u64, 0x6D36_7ECF_27CB_09B7_u64,
+    0x4F46_3F66_9E5F_EA2D_u64, 0x7527_BAC7_EBE5_F17B_u64, 0x3D07_39F7_8A52_92EA_u64,
+    0x6BFB_5FB1_1F8D_5D08_u64,
 ];
 
 /| Anchor angles `atan(0.5)`, `atan(1.0)`, `atan(1.5)`, `atan(inf)` high words (`32 B`).
@@ -163,7 +162,7 @@ fn two_sum_f64(x: f64, y: f64, /) -> (f64, f64) {
     let sum_hi: f64 = x + y;
     let virt_y: f64 = sum_hi - x;
     let sum_lo: f64 = (x - (sum_hi - virt_y)) + (y - virt_y);
-    return (sum_hi, sum_lo);
+    (sum_hi, sum_lo)
 }
 
 /| Veltkamp 27-bit split error-free multiplication `x * y = (prod_hi, prod_lo)` on scaled finite inputs.
@@ -176,7 +175,7 @@ fn two_prod_f64(x: f64, y: f64, /) -> (f64, f64) {
     let y_lo: f64 = y - y_hi;
     let prod_hi: f64 = x * y;
     let prod_lo: f64 = ((x_hi * y_hi - prod_hi) + x_hi * y_lo + x_lo * y_hi) + x_lo * y_lo;
-    return (prod_hi, prod_lo);
+    (prod_hi, prod_lo)
 }
 
 /| Double-double division `(num_hi + num_lo) / (den_hi + den_lo)` accurate to `~105` bits.
@@ -185,7 +184,7 @@ fn dd_div_f64(num_hi: f64, num_lo: f64, den_hi: f64, den_lo: f64, /) -> (f64, f6
     let (prod_hi, prod_lo) = two_prod_f64(quo_hi, den_hi);
     let rem: f64 = ((num_hi - prod_hi) - prod_lo) + (num_lo - quo_hi * den_lo);
     let quo_lo: f64 = rem / (den_hi + den_lo);
-    return two_sum_f64(quo_hi, quo_lo);
+    two_sum_f64(quo_hi, quo_lo)
 }
 
 /| Double-double principal square root `sqrt(val_hi + val_lo)` accurate to `~105` bits.
@@ -197,7 +196,7 @@ fn dd_sqrt_f64(val_hi: f64, val_lo: f64, /) -> (f64, f64) {
     let (prod_hi, prod_lo) = two_prod_f64(root, root);
     let rem: f64 = ((val_hi - prod_hi) - prod_lo) + val_lo;
     let root_lo: f64 = rem / (2.0 * root);
-    return two_sum_f64(root, root_lo);
+    two_sum_f64(root, root_lo)
 }
 
 /| Boldo–Melquiond round-to-odd sticky adjustment of `hi` given exact remainder `lo`.
@@ -214,7 +213,7 @@ fn round_to_odd_f64(hi: f64, lo: f64, /) -> f64 {
     }
     let same_sign: bool = (hi > 0.0) == (lo > 0.0);
     let next_bits: u64 = if same_sign => bits +% 1_u64 else bits -% 1_u64;
-    return @bit_cast[f64](next_bits);
+    @bit_cast[f64](next_bits)
 }
 
 /| Exact single-rounded scaling `(u_hi + v_hi + v_lo) * 2^scale_exp` across normal and subnormal `f64` ranges.
@@ -269,14 +268,14 @@ fn scale_triple_to_f64(u_hi: f64, v_hi: f64, v_lo: f64, scale_exp: i32, /) -> f6
         (trunc_f64(mag_int * 0.5) * 2.0) != mag_int
     };
     let final_mag: f64 = if round_up => mag_int + 1.0 else mag_int;
-    return copysign_f64(ldexp_f64(final_mag, -1074), comb_hi);
+    copysign_f64(ldexp_f64(final_mag, -1074), comb_hi)
 }
 
 /| Converts an already-integral `f64` in `[-2_147_483_648.0, +2_147_483_647.0]` to `i32` via pure bit extraction (`@no_panic`).
 @std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
 fn exact_f64_to_i32(int_val: f64, /) -> i32 {
     let bits: u64 = @bit_cast[u64](int_val);
-    let biased_exp: i32 = ((bits >> 52_u64) & 0x7FF_u64) as i32;
+    let biased_exp = ((bits >> 52_u64) & 0x7FF_u64) as i32;
     if biased_exp < 1023 {
         return 0;
     }
@@ -286,16 +285,17 @@ fn exact_f64_to_i32(int_val: f64, /) -> i32 {
     }
     let sig53: u64 = (bits & ((1_u64 << 52_u64) - 1_u64)) | (1_u64 << 52_u64);
     let rshift: u64 = ((52 -% unbiased) as u32) as u64 & 63_u64;
-    let mag: i32 = (sig53 >> rshift) as i32;
-    return if (bits >> 63_u64) != 0_u64 => 0 -% mag else mag;
+    let mag = (sig53 >> rshift) as i32;
+    if (bits >> 63_u64) != 0_u64 => 0 -% mag else mag
 }
 
 // ----------------- IEEE-754 f64 & f32 Kernels -----------------
 /| Returns `true` iff `x` is `NaN` (`f64`).
-fn is_nan_f64(x: f64, /) -> bool = x != x;
+fn is_nan_f64(x: f64, /) -> bool =
+    (@bit_cast[u64](x) & 0x7FFF_FFFF_FFFF_FFFF_u64) > 0x7FF0_0000_0000_0000_u64;
 
 /| Returns `true` iff `x` is `NaN` (`f32`).
-fn is_nan_f32(x: f32, /) -> bool = x != x;
+fn is_nan_f32(x: f32, /) -> bool = (@bit_cast[u32](x) & 0x7FFF_FFFF_u32) > 0x7F80_0000_u32;
 
 /| Returns `true` iff `x` is finite (`f64`).
 fn is_finite_f64(x: f64, /) -> bool =
@@ -307,13 +307,13 @@ fn is_finite_f32(x: f32, /) -> bool = (@bit_cast[u32](x) & 0x7F80_0000_u32) != 0
 /| Returns `true` iff `x` is a non-zero subnormal (`f64`).
 fn is_subnormal_f64(x: f64, /) -> bool {
     let abs_bits: u64 = @bit_cast[u64](x) & 0x7FFF_FFFF_FFFF_FFFF_u64;
-    return abs_bits != 0_u64 and (abs_bits >> 52_u64) == 0_u64;
+    abs_bits != 0_u64 and (abs_bits >> 52_u64) == 0_u64
 }
 
 /| Returns `true` iff `x` is a non-zero subnormal (`f32`).
 fn is_subnormal_f32(x: f32, /) -> bool {
     let abs_bits: u32 = @bit_cast[u32](x) & 0x7FFF_FFFF_u32;
-    return abs_bits != 0_u32 and (abs_bits >> 23_u32) == 0_u32;
+    abs_bits != 0_u32 and (abs_bits >> 23_u32) == 0_u32
 }
 
 /| Clears the IEEE-754 sign bit of `x` (`abs_f64(-0.0) == +0.0`).
@@ -326,20 +326,20 @@ fn abs_f32(x: f32, /) -> f32 = @bit_cast[f32](@bit_cast[u32](x) & 0x7FFF_FFFF_u3
 fn copysign_f64(mag: f64, sgn: f64, /) -> f64 {
     let mag_bits: u64 = @bit_cast[u64](mag) & 0x7FFF_FFFF_FFFF_FFFF_u64;
     let sgn_bit: u64 = @bit_cast[u64](sgn) & 0x8000_0000_0000_0000_u64;
-    return @bit_cast[f64](mag_bits | sgn_bit);
+    @bit_cast[f64](mag_bits | sgn_bit)
 }
 
 /| Copies the IEEE-754 sign bit of `sgn` onto `mag` (`f32`).
 fn copysign_f32(mag: f32, sgn: f32, /) -> f32 {
     let mag_bits: u32 = @bit_cast[u32](mag) & 0x7FFF_FFFF_u32;
     let sgn_bit: u32 = @bit_cast[u32](sgn) & 0x8000_0000_u32;
-    return @bit_cast[f32](mag_bits | sgn_bit);
+    @bit_cast[f32](mag_bits | sgn_bit)
 }
 
 /| Least representable `f64` strictly greater than `x` (`next_up_f64(-0.0) == +MIN_SUBNORMAL`).
 fn next_up_f64(x: f64, /) -> f64 {
     let pos_inf: f64 = @bit_cast[f64](0x7FF0_0000_0000_0000_u64);
-    if x != x or x == pos_inf {
+    if is_nan_f64(x) or x == pos_inf {
         return x;
     }
     if x == 0.0 {
@@ -347,13 +347,13 @@ fn next_up_f64(x: f64, /) -> f64 {
     }
     let bits: u64 = @bit_cast[u64](x);
     let next_bits: u64 = if x > 0.0 => bits +% 1_u64 else bits -% 1_u64;
-    return @bit_cast[f64](next_bits);
+    @bit_cast[f64](next_bits)
 }
 
 /| Least representable `f32` strictly greater than `x` (`next_up_f32(-0.0_f32) == +MIN_SUBNORMAL`).
 fn next_up_f32(x: f32, /) -> f32 {
     let pos_inf: f32 = @bit_cast[f32](0x7F80_0000_u32);
-    if x != x or x == pos_inf {
+    if is_nan_f32(x) or x == pos_inf {
         return x;
     }
     if x == 0.0_f32 {
@@ -361,7 +361,7 @@ fn next_up_f32(x: f32, /) -> f32 {
     }
     let bits: u32 = @bit_cast[u32](x);
     let next_bits: u32 = if x > 0.0_f32 => bits +% 1_u32 else bits -% 1_u32;
-    return @bit_cast[f32](next_bits);
+    @bit_cast[f32](next_bits)
 }
 
 /| Greatest representable `f64` strictly less than `x` (`next_down_f64(+0.0) == -MIN_SUBNORMAL`).
@@ -381,7 +381,7 @@ fn ulp_f64(x: f64, /) -> f64 {
     if biased_exp <= 52_u64 {
         return @bit_cast[f64](1_u64);
     }
-    return @bit_cast[f64]((biased_exp -% 52_u64) << 52_u64);
+    @bit_cast[f64]((biased_exp -% 52_u64) << 52_u64)
 }
 
 /| Returns `1` unit in the last place at `x`'s `f32` binade (`NaN` for `NaN` or `+-Inf`).
@@ -395,7 +395,7 @@ fn ulp_f32(x: f32, /) -> f32 {
     if biased_exp <= 23_u32 {
         return @bit_cast[f32](1_u32);
     }
-    return @bit_cast[f32]((biased_exp -% 23_u32) << 23_u32);
+    @bit_cast[f32]((biased_exp -% 23_u32) << 23_u32)
 }
 
 /| Branchless IEEE-754 `totalOrder` on `f64` (`-NaN < -Inf < -0.0 < +0.0 < +Inf < +NaN`).
@@ -411,7 +411,7 @@ fn total_cmp_f64(lhs: f64, rhs: f64, /) -> Ordering {
     } else if lhs_key > rhs_key {
         return .Greater;
     }
-    return .Equal;
+    .Equal
 }
 
 /| Branchless IEEE-754 `totalOrder` on `f32` (`-NaN < -Inf < -0.0 < +0.0 < +Inf < +NaN`).
@@ -427,7 +427,7 @@ fn total_cmp_f32(lhs: f32, rhs: f32, /) -> Ordering {
     } else if lhs_key > rhs_key {
         return .Greater;
     }
-    return .Equal;
+    .Equal
 }
 
 /| Rounds `f64` toward `0.0` preserving `-0.0` (`trunc_f64(-0.9) == -0.0`, `0.0000 ULP`).
@@ -443,7 +443,7 @@ fn trunc_f64(x: f64, /) -> f64 {
     }
     let shift_cnt: u64 = ((52 -% unbiased_exp) as u32) as u64 & 63_u64;
     let frac_mask: u64 = (1_u64 << shift_cnt) -% 1_u64;
-    return @bit_cast[f64](bits & ~frac_mask);
+    @bit_cast[f64](bits & ~frac_mask)
 }
 
 /| Rounds `f32` toward `0.0` preserving `-0.0` (`0.0000 ULP`).
@@ -459,30 +459,30 @@ fn trunc_f32(x: f32, /) -> f32 {
     }
     let shift_cnt: u32 = ((23 -% unbiased_exp) as u32) & 31_u32;
     let frac_mask: u32 = (1_u32 << shift_cnt) -% 1_u32;
-    return @bit_cast[f32](bits & ~frac_mask);
+    @bit_cast[f32](bits & ~frac_mask)
 }
 
 /| Rounds `f64` toward `-Infinity` preserving `-0.0` (`0.0000 ULP`).
 fn floor_f64(x: f64, /) -> f64 {
-    if x != x {
+    if is_nan_f64(x) {
         return x;
     }
     let tr: f64 = trunc_f64(x);
-    return if x < tr => tr - 1.0 else tr;
+    if x < tr => tr - 1.0 else tr
 }
 
 /| Rounds `f32` toward `-Infinity` preserving `-0.0` (`0.0000 ULP`).
 fn floor_f32(x: f32, /) -> f32 {
-    if x != x {
+    if is_nan_f32(x) {
         return x;
     }
     let tr: f32 = trunc_f32(x);
-    return if x < tr => tr - 1.0_f32 else tr;
+    if x < tr => tr - 1.0_f32 else tr
 }
 
 /| Rounds `f64` toward `+Infinity` preserving `-0.0` (`ceil_f64(-0.5) == -0.0`, `0.0000 ULP`).
 fn ceil_f64(x: f64, /) -> f64 {
-    if x != x {
+    if is_nan_f64(x) {
         return x;
     }
     let tr: f64 = trunc_f64(x);
@@ -490,12 +490,12 @@ fn ceil_f64(x: f64, /) -> f64 {
         let next_int: f64 = tr + 1.0;
         return if next_int == 0.0 => copysign_f64(next_int, x) else next_int;
     }
-    return tr;
+    tr
 }
 
 /| Rounds `f32` toward `+Infinity` preserving `-0.0` (`0.0000 ULP`).
 fn ceil_f32(x: f32, /) -> f32 {
-    if x != x {
+    if is_nan_f32(x) {
         return x;
     }
     let tr: f32 = trunc_f32(x);
@@ -503,31 +503,31 @@ fn ceil_f32(x: f32, /) -> f32 {
         let next_int: f32 = tr + 1.0_f32;
         return if next_int == 0.0_f32 => copysign_f32(next_int, x) else next_int;
     }
-    return tr;
+    tr
 }
 
 /| IEEE-754 `f64` `roundToIntegralTiesToEven` preserving `-0.0` (`round_ties_even_f64(-0.5) == -0.0`).
 fn round_ties_even_f64(x: f64, /) -> f64 {
-    if x != x {
+    if is_nan_f64(x) {
         return x;
     }
     let abs_x: f64 = abs_f64(x);
     if abs_x >= TWO_POW_52 {
         return x;
     }
-    return copysign_f64((abs_x + TWO_POW_52) - TWO_POW_52, x);
+    copysign_f64((abs_x + TWO_POW_52) - TWO_POW_52, x)
 }
 
 /| IEEE-754 `f32` `roundToIntegralTiesToEven` preserving `-0.0` (`round_ties_even_f32(-0.5_f32) == -0.0_f32`).
 fn round_ties_even_f32(x: f32, /) -> f32 {
-    if x != x {
+    if is_nan_f32(x) {
         return x;
     }
     let abs_x: f32 = abs_f32(x);
     if abs_x >= TWO_POW_23 {
         return x;
     }
-    return copysign_f32((abs_x + TWO_POW_23) - TWO_POW_23, x);
+    copysign_f32((abs_x + TWO_POW_23) - TWO_POW_23, x)
 }
 
 /| Decomposes `f64` `x = frac * 2^exp` with `|frac| in [0.5, 1.0)`, normalizing subnormals.
@@ -543,10 +543,10 @@ fn frexp_f64(x: f64, /) -> (f64, i32) {
         work_bits = @bit_cast[u64](x * 18_014_398_509_481_984.0);
         exp_adj = -54;
     }
-    let biased_exp: i32 = ((work_bits >> 52_u64) & 0x7FF_u64) as i32;
+    let biased_exp = ((work_bits >> 52_u64) & 0x7FF_u64) as i32;
     let out_exp: i32 = biased_exp -% 1022 +% exp_adj;
     let frac_bits: u64 = (work_bits & 0x800F_FFFF_FFFF_FFFF_u64) | 0x3FE0_0000_0000_0000_u64;
-    return (@bit_cast[f64](frac_bits), out_exp);
+    (@bit_cast[f64](frac_bits), out_exp)
 }
 
 /| Decomposes `f32` `x = frac * 2^exp` with `|frac| in [0.5, 1.0)`, normalizing subnormals.
@@ -562,16 +562,16 @@ fn frexp_f32(x: f32, /) -> (f32, i32) {
         work_bits = @bit_cast[u32](x * 33_554_432.0_f32);
         exp_adj = -25;
     }
-    let biased_exp: i32 = ((work_bits >> 23_u32) & 0xFF_u32) as i32;
+    let biased_exp = ((work_bits >> 23_u32) & 0xFF_u32) as i32;
     let out_exp: i32 = biased_exp -% 126 +% exp_adj;
     let frac_bits: u32 = (work_bits & 0x807F_FFFF_u32) | 0x3F00_0000_u32;
-    return (@bit_cast[f32](frac_bits), out_exp);
+    (@bit_cast[f32](frac_bits), out_exp)
 }
 
 /| Scales `f64` `x * 2^exp2` safely across `i32.MIN..=i32.MAX` (`[-2100, 2100]` clamped, gradual underflow).
 @std_cap_boundary(clears: [may_panic]) @no_alloc @no_panic
 fn ldexp_f64(x: f64, exp2: i32, /) -> f64 {
-    if x == 0.0 or x != x or not is_finite_f64(x) {
+    if x == 0.0 or is_nan_f64(x) or not is_finite_f64(x) {
         return x;
     }
     var rem_exp: i32 = if exp2 < -2100 => -2100
@@ -579,31 +579,31 @@ fn ldexp_f64(x: f64, exp2: i32, /) -> f64 {
         else exp2;
     var res: f64 = x;
     while rem_exp > 1023 {
-        res = res * SCALE_UP_1023;
+        res *= SCALE_UP_1023;
         rem_exp = rem_exp -% 1023;
     }
     while rem_exp < -1022 {
-        res = res * SCALE_DN_1022;
+        res *= SCALE_DN_1022;
         rem_exp = rem_exp +% 1022;
     }
     let biased_bits: u64 = (((rem_exp +% 1023) as u32) as u64 & 0x7FF_u64) << 52_u64;
-    return res * @bit_cast[f64](biased_bits);
+    res * @bit_cast[f64](biased_bits)
 }
 
 /| Scales `f32` `x * 2^exp2` safely across `i32.MIN..=i32.MAX` (`[-280, 280]` clamped).
 fn ldexp_f32(x: f32, exp2: i32, /) -> f32 {
-    if x == 0.0_f32 or x != x or not is_finite_f32(x) {
+    if x == 0.0_f32 or is_nan_f32(x) or not is_finite_f32(x) {
         return x;
     }
     let clamped: i32 = if exp2 < -280 => -280
         else if exp2 > 280 => 280
         else exp2;
-    return ldexp_f64(x as f64, clamped) as f32;
+    ldexp_f64(x as f64, clamped) as f32
 }
 
 /| Exact single-rounded software `f64` `mul_add` (`0.0000 ULP` vs IEEE-754 across normals, subnormals & cancellation).
 fn mul_add_f64(x: f64, y: f64, z: f64, /) -> f64 {
-    if x != x or y != y or z != z {
+    if is_nan_f64(x) or is_nan_f64(y) or is_nan_f64(z) {
         return @bit_cast[f64](0x7FF8_0000_0000_0000_u64);
     }
     let x_inf: bool = not is_finite_f64(x);
@@ -648,17 +648,17 @@ fn mul_add_f64(x: f64, y: f64, z: f64, /) -> f64 {
         return 0.0;
     }
     let (v_hi, v_lo) = two_sum_f64(u_lo, t_lo);
-    return scale_triple_to_f64(u_hi, v_hi, v_lo, prod_exp);
+    scale_triple_to_f64(u_hi, v_hi, v_lo, prod_exp)
 }
 
 /| Exact single-rounded `f32` `mul_add` via Boldo–Melquiond `f64` round-to-odd (`0.0000 ULP` across normals & subnormals).
 fn mul_add_f32(x: f32, y: f32, z: f32, /) -> f32 {
-    if x != x or y != y or z != z {
+    if is_nan_f32(x) or is_nan_f32(y) or is_nan_f32(z) {
         return @bit_cast[f32](0x7FC0_0000_u32);
     }
-    let x64: f64 = x as f64;
-    let y64: f64 = y as f64;
-    let z64: f64 = z as f64;
+    let x64 = x as f64;
+    let y64 = y as f64;
+    let z64 = z as f64;
     let x_inf: bool = not is_finite_f64(x64);
     let y_inf: bool = not is_finite_f64(y64);
     if (x_inf and y == 0.0_f32) or (y_inf and x == 0.0_f32) {
@@ -671,13 +671,13 @@ fn mul_add_f32(x: f32, y: f32, z: f32, /) -> f32 {
         return (x * y) + z;
     }
     let (s_hi, s_lo) = two_sum_f64(x64 * y64, z64);
-    return round_to_odd_f64(s_hi, s_lo) as f32;
+    round_to_odd_f64(s_hi, s_lo) as f32
 }
 
 /| Pure-software correctly-rounded IEEE-754 `f64` `sqrt` (`0.0000 ULP`, zero `libm`).
 @std_cap_boundary(clears: [may_panic]) @no_alloc @no_panic
 fn sqrt_f64(x: f64, /) -> f64 {
-    if x != x or x == 0.0 or x == @bit_cast[f64](0x7FF0_0000_0000_0000_u64) {
+    if is_nan_f64(x) or x == 0.0 or x == @bit_cast[f64](0x7FF0_0000_0000_0000_u64) {
         return x;
     }
     if x < 0.0 {
@@ -685,7 +685,7 @@ fn sqrt_f64(x: f64, /) -> f64 {
     }
     var (mant, exp2) = frexp_f64(x);
     if (exp2 & 1) != 0 {
-        mant = mant * 2.0;
+        mant *= 2.0;
         exp2 = exp2 -% 1;
     }
     var root: f64 = 0.5 + 0.5 * mant;
@@ -695,18 +695,18 @@ fn sqrt_f64(x: f64, /) -> f64 {
     root = 0.5 * (root + mant / root);
     let (p_hi, p_lo) = two_prod_f64(root, root);
     let rem: f64 = (mant - p_hi) - p_lo;
-    return ldexp_f64(root + rem / (2.0 * root), exp2 >> 1);
+    ldexp_f64(root + rem / (2.0 * root), exp2 >> 1)
 }
 
 /| Pure-software correctly-rounded `f32` `sqrt` (`0.0000 ULP`).
 fn sqrt_f32(x: f32, /) -> f32 {
-    if x != x or x == 0.0_f32 {
+    if is_nan_f32(x) or x == 0.0_f32 {
         return x;
     }
     if x < 0.0_f32 {
         return @bit_cast[f32](0x7FC0_0000_u32);
     }
-    return sqrt_f64(x as f64) as f32;
+    sqrt_f64(x as f64) as f32
 }
 
 /| Reduces `abs_x >= 2^20` modulo `pi / 2` via the 19-word Payne–Hanek `TWO_OVER_PI_WORDS` expansion (`> 115` bits).
@@ -716,24 +716,27 @@ fn payne_hanek_reduce_f64(abs_x: f64, /) -> (i32, f64, f64) {
     let unbiased_exp: i32 = (((bits >> 52_u64) & 0x7FF_u64) as i32) -% 1023;
     let sig53: u64 = (bits & ((1_u64 << 52_u64) - 1_u64)) | (1_u64 << 52_u64);
 
-    let bit_pos: u32 = (unbiased_exp +% 12) as u32;
-    let word_idx: usize = (bit_pos >> 6_u32) as usize;
-    let bit_rem: u64 = (bit_pos & 63_u32) as u64;
+    let bit_pos = (unbiased_exp +% 12) as u32;
+    let word_idx = (bit_pos >> 6_u32) as usize;
+    let bit_rem = (bit_pos & 63_u32) as u64;
 
     let prev_idx: usize = if word_idx >= 1_usize => (word_idx -% 1_usize) % 19_usize else 0_usize;
     let w_prev: u64 = if word_idx >= 1_usize => TWO_OVER_PI_WORDS[prev_idx] else 0_u64;
     let w0: u64 = TWO_OVER_PI_WORDS[word_idx % 19_usize];
     let w1: u64 = TWO_OVER_PI_WORDS[(word_idx +% 1_usize) % 19_usize];
     let w2: u64 = TWO_OVER_PI_WORDS[(word_idx +% 2_usize) % 19_usize];
-    let w3: u64 = if (word_idx +% 3_usize) < 19_usize => TWO_OVER_PI_WORDS[
-        (word_idx +% 3_usize) % 19_usize,
-    ]
-        else 0_u64;
+    let w3: u64 = if (word_idx +% 3_usize) < 19_usize {
+        TWO_OVER_PI_WORDS[
+            (word_idx +% 3_usize) % 19_usize,
+        ]
+    } else {
+        0_u64
+    };
 
-    var a_int: u64 = 0_u64;
-    var a0: u64 = 0_u64;
-    var a1: u64 = 0_u64;
-    var a2: u64 = 0_u64;
+    var a_int = 0_u64;
+    var a0 = 0_u64;
+    var a1 = 0_u64;
+    var a2 = 0_u64;
     if bit_rem == 0_u64 {
         a_int = w_prev & 3_u64;
         a0 = w0;
@@ -786,7 +789,7 @@ fn payne_hanek_reduce_f64(abs_x: f64, /) -> (i32, f64, f64) {
     let signed_top: f64 = if neg_frac => -f_top else f_top;
     let signed_lo: f64 = if neg_frac => -f_lo else f_lo;
     let (r_hi, r_lo) = two_sum_f64(signed_top, signed_lo);
-    return (quad, r_hi, r_lo);
+    (quad, r_hi, r_lo)
 }
 
 /| Hybrid 4-part Cody–Waite (`|x| < 2^20`) + 19-word Payne–Hanek (`|x| >= 2^20`) `pi / 2` range reduction.
@@ -796,10 +799,10 @@ fn reduce_pio2_f64(x: f64, /) -> (i32, f64, f64) {
         return (0, x, 0.0);
     }
     if abs_x < 1_048_576.0 {
-        let pio2_1: f64 = @bit_cast[f64](0x3FF921FB54400000_u64);
-        let pio2_2: f64 = @bit_cast[f64](0x3DD0B4611A600000_u64);
-        let pio2_3: f64 = @bit_cast[f64](0x3BA3198A2E000000_u64);
-        let pio2_4: f64 = @bit_cast[f64](0x397B839A252049C1_u64);
+        let pio2_1: f64 = @bit_cast[f64](0x3FF9_21FB_5440_0000_u64);
+        let pio2_2: f64 = @bit_cast[f64](0x3DD0_B461_1A60_0000_u64);
+        let pio2_3: f64 = @bit_cast[f64](0x3BA3_198A_2E00_0000_u64);
+        let pio2_4: f64 = @bit_cast[f64](0x397B_839A_2520_49C1_u64);
 
         let k_flt: f64 = round_ties_even_f64(x * INV_PIO2);
         let quad: i32 = exact_f64_to_i32(k_flt) & 3;
@@ -832,7 +835,7 @@ fn kernel_sin_f64(r_hi: f64, r_lo: f64, /) -> f64 {
     if r_lo == 0.0 {
         return r_hi + z * (r_hi * (s1 + z * r_poly));
     }
-    return r_hi - (((z * (0.5 * r_lo - z * (r_hi * r_poly)) - r_lo) - z * (r_hi * s1)));
+    r_hi - (((z * (0.5 * r_lo - z * (r_hi * r_poly)) - r_lo) - z * (r_hi * s1)))
 }
 
 /| Degree-12 minimax `cos(r_hi + r_lo)` kernel on `[-pi / 4, +pi / 4]`.
@@ -848,7 +851,7 @@ fn kernel_cos_f64(r_hi: f64, r_lo: f64, /) -> f64 {
     let r_poly: f64 = c1 + z * (c2 + z * c3) + z * w * (c4 + z * (c5 + z * c6));
     let hz: f64 = 0.5 * z;
     let w_top: f64 = 1.0 - hz;
-    return w_top + (((1.0 - w_top) - hz) + (w * r_poly - r_hi * r_lo));
+    w_top + (((1.0 - w_top) - hz) + (w * r_poly - r_hi * r_lo))
 }
 
 /| Double-double `(sin_hi, sin_lo, cos_hi, cos_lo)` on `[-pi / 4, +pi / 4]` for `<= 0.52 ULP` `tan` across poles.
@@ -902,7 +905,7 @@ fn sin_cos_dd_f64(r_hi: f64, r_lo: f64, /) -> (f64, f64, f64, f64) {
     let (pc3_hi, pc3_lo) = two_prod_f64(z_hi, ac2_hi);
     let (sc3_hi, sc3_lo) = two_sum_f64(1.0, pc3_hi);
     let (cos_hi, cos_lo) = two_sum_f64(sc3_hi, sc3_lo + pc3_lo + z_hi * ac2_lo + z_lo * ac2_hi);
-    return (sin_hi, sin_lo, cos_hi, cos_lo);
+    (sin_hi, sin_lo, cos_hi, cos_lo)
 }
 
 /| Double-double `atan(x_hi + x_lo)` for `x_hi >= 0`, shared across `atan`, `atan2`, `asin`, and `acos`.
@@ -963,23 +966,23 @@ fn atan_pos_ext_f64(x_hi: f64, x_lo: f64, /) -> (f64, f64) {
     }
     let slot: usize = (id_idx as usize) & 3_usize;
     let (sh, sl) = two_sum_f64(ATAN_ANCHOR_HI[slot], t_hi);
-    return two_sum_f64(sh, sl + ATAN_ANCHOR_LO[slot] + poly_tail);
+    two_sum_f64(sh, sl + ATAN_ANCHOR_LO[slot] + poly_tail)
 }
 
 /| Evaluates the degree-14 minimax polynomial tail for `ln((1 + s) / (1 - s))` on `z = s^2`.
 fn ln_remez_poly_f64(z: f64, /) -> f64 {
     let w: f64 = z * z;
-    return z * (LN_POLY_LG1 + w * (LN_POLY_LG3 + w * (LN_POLY_LG5 + w * LN_POLY_LG7))) + w * (
+    z * (LN_POLY_LG1 + w * (LN_POLY_LG3 + w * (LN_POLY_LG5 + w * LN_POLY_LG7))) + w * (
         LN_POLY_LG2 + w * (LN_POLY_LG4 + w * LN_POLY_LG6)
-    );
+    )
 }
 
 /| Evaluates the rational Remez `exp` auxiliary `r_val - r_val^2 * P(r_val^2)` shared by `exp`, `exp2`, and `powf`.
 fn exp_remez_c_f64(r_val: f64, /) -> f64 {
     let z: f64 = r_val * r_val;
-    return r_val - z * (
+    r_val - z * (
         EXP_POLY_P1 + z * (EXP_POLY_P2 + z * (EXP_POLY_P3 + z * (EXP_POLY_P4 + z * EXP_POLY_P5)))
-    );
+    )
 }
 
 /| Minimax `ln(f_val) + corr / f_val` kernel on `[sqrt(2)/2, sqrt(2)]` returning `(hi, lo)`.
@@ -990,7 +993,7 @@ fn ln_kernel_ext_f64(f_val: f64, corr: f64, /) -> (f64, f64) {
     let hfsq: f64 = 0.5 * f_minus_1 * f_minus_1;
     let (hi, e0) = two_sum_f64(f_minus_1, -hfsq);
     let lo: f64 = e0 + s_arg * (hfsq + r_poly) + corr / f_val;
-    return two_sum_f64(hi, lo);
+    two_sum_f64(hi, lo)
 }
 
 /| Double-double Horner step `1 / odd_denom + z * acc` for `log2_ext_f64`.
@@ -1005,14 +1008,14 @@ fn dd_horner_odd_recip(
     let (ph, pl) = two_prod_f64(z_hi, acc_hi);
     let (rh, rl) = dd_div_f64(1.0, 0.0, odd_denom, 0.0);
     let (sh, sl) = two_sum_f64(rh, ph);
-    return two_sum_f64(sh, sl + rl + pl + z_hi * acc_lo + z_lo * acc_hi);
+    two_sum_f64(sh, sl + rl + pl + z_hi * acc_lo + z_lo * acc_hi)
 }
 
 /| Extended-precision `log2(x) = (hi, lo)` accurate to `~98` bits (`0 B` `.rodata`), powering `log2`, `log10`, `powf`, and `powi`.
 fn log2_ext_f64(x: f64, /) -> (f64, f64) {
     var (frac, k) = frexp_f64(x);
     if frac < 0.7071067811865475 {
-        frac = frac * 2.0;
+        frac *= 2.0;
         k = k -% 1;
     }
     let (rt_hi, rt_lo) = dd_sqrt_f64(frac, 0.0);
@@ -1047,16 +1050,14 @@ fn log2_ext_f64(x: f64, /) -> (f64, f64) {
     let (p1_hi, p1_lo) = two_sum_f64(p1_a, p1_b + s_hi * acc_lo + s_lo * acc_hi);
     let (lg_hi, lg_lo) = two_prod_f64(p1_hi, four_inv_ln2_hi);
     let (kh, kl) = two_sum_f64(k as f64, lg_hi);
-    return two_sum_f64(kh, kl + lg_lo + p1_hi * four_inv_ln2_lo + p1_lo * four_inv_ln2_hi);
+    two_sum_f64(kh, kl + lg_lo + p1_hi * four_inv_ln2_lo + p1_lo * four_inv_ln2_hi)
 }
 
 /| Extended-precision `2^(y_hi + y_lo)` kernel for `powf` and `powi`.
 fn exp2_ext_f64(y_hi: f64, y_lo: f64, /) -> f64 {
     let total: f64 = y_hi + y_lo;
-    if total >= 1024.0 {
-        if y_hi > 1024.0 or (y_hi == 1024.0 and y_lo >= 0.0) {
-            return @bit_cast[f64](0x7FF0_0000_0000_0000_u64);
-        }
+    if total >= 1024.0 and (y_hi > 1024.0 or (y_hi == 1024.0 and y_lo >= 0.0)) {
+        return @bit_cast[f64](0x7FF0_0000_0000_0000_u64);
     }
     if total < -1075.0 {
         return 0.0;
@@ -1073,7 +1074,7 @@ fn exp2_ext_f64(y_hi: f64, y_lo: f64, /) -> f64 {
     if k == 1024 {
         return (y_val * @bit_cast[f64](0x7FD0_0000_0000_0000_u64)) * 4.0;
     }
-    return ldexp_f64(y_val, k);
+    ldexp_f64(y_val, k)
 }
 
 /| Classifies `exp` as `0 = non-integer`, `1 = odd integer`, or `2 = even integer` without `i64` cast overflow.
@@ -1084,13 +1085,13 @@ fn float_int_parity_f64(exp: f64, /) -> i32 {
     if trunc_f64(exp) != exp {
         return 0;
     }
-    return if trunc_f64(exp * 0.5) * 2.0 == exp => 2 else 1;
+    if trunc_f64(exp * 0.5) * 2.0 == exp => 2 else 1
 }
 
 /| Real `f64` cube root `cbrt` (`max 0.5000 ULP`; odd-symmetric, `frexp`-scaled to prevent `> MAX/2` overflow).
 @std_cap_boundary(clears: [may_panic]) @no_alloc @no_panic
 fn cbrt_f64(x: f64, /) -> f64 {
-    if x == 0.0 or x != x or not is_finite_f64(x) {
+    if x == 0.0 or is_nan_f64(x) or not is_finite_f64(x) {
         return x;
     }
     let (mant, exp2) = frexp_f64(abs_f64(x));
@@ -1099,17 +1100,17 @@ fn cbrt_f64(x: f64, /) -> f64 {
     let m_scaled: f64 = ldexp_f64(mant, rem_exp);
 
     var est: f64 = 0.6 + 0.28 * m_scaled;
-    var step_i: u32 = 0_u32;
+    var step_i = 0_u32;
     while step_i < 3_u32 {
         let est3: f64 = est * est * est;
-        est = est * ((est3 + 2.0 * m_scaled) / (2.0 * est3 + m_scaled));
+        est *= (est3 + 2.0 * m_scaled) / (2.0 * est3 + m_scaled);
         step_i = step_i +% 1_u32;
     }
     let (sq_hi, sq_lo) = two_prod_f64(est, est);
     let (cb_hi, cb_lo) = two_prod_f64(sq_hi, est);
     let rem: f64 = (m_scaled - cb_hi) - (cb_lo + sq_lo * est);
     let refined: f64 = est + rem / (3.0 * sq_hi);
-    return copysign_f64(ldexp_f64(refined, quo_neg_adj), x);
+    copysign_f64(ldexp_f64(refined, quo_neg_adj), x)
 }
 
 /| Overflow/underflow-immune `f64` Euclidean norm (`max 0.4999 ULP`; `hypot(+-Inf, NaN) == +Inf`).
@@ -1120,7 +1121,7 @@ fn hypot_f64(x: f64, y: f64, /) -> f64 {
     if abs_x == pos_inf or abs_y == pos_inf {
         return pos_inf;
     }
-    if x != x or y != y {
+    if is_nan_f64(x) or is_nan_f64(y) {
         return @bit_cast[f64](0x7FF8_0000_0000_0000_u64);
     }
     let hi: f64 = if abs_x >= abs_y => abs_x else abs_y;
@@ -1138,12 +1139,12 @@ fn hypot_f64(x: f64, y: f64, /) -> f64 {
     let (l2_hi, l2_lo) = two_prod_f64(ls, ls);
     let (sum_hi, sum_lo) = two_sum_f64(h2_hi, l2_hi);
     let (rt_hi, rt_lo) = dd_sqrt_f64(sum_hi, sum_lo + h2_lo + l2_lo);
-    return ldexp_f64(rt_hi + rt_lo, k);
+    ldexp_f64(rt_hi + rt_lo, k)
 }
 
 /| Simultaneous `f64` `(sin(x), cos(x))` (`max 0.7121 ULP` `sin`, `0.7366 ULP` `cos`).
 fn sin_cos_f64(x: f64, /) -> (f64, f64) {
-    if x != x or not is_finite_f64(x) {
+    if is_nan_f64(x) or not is_finite_f64(x) {
         let nan_val: f64 = @bit_cast[f64](0x7FF8_0000_0000_0000_u64);
         return (nan_val, nan_val);
     }
@@ -1153,17 +1154,17 @@ fn sin_cos_f64(x: f64, /) -> (f64, f64) {
     let (quad, r_hi, r_lo) = reduce_pio2_f64(x);
     let ks: f64 = kernel_sin_f64(r_hi, r_lo);
     let kc: f64 = kernel_cos_f64(r_hi, r_lo);
-    return match quad {
+    match quad {
         0 => (ks, kc),
         1 => (kc, -ks),
         2 => (-ks, -kc),
         _ => (-kc, ks),
-    };
+    }
 }
 
 /| Trigonometric `f64` tangent (`max 0.5200 ULP` across all quadrants and odd-quadrant poles).
 fn tan_f64(x: f64, /) -> f64 {
-    if x != x or not is_finite_f64(x) {
+    if is_nan_f64(x) or not is_finite_f64(x) {
         return @bit_cast[f64](0x7FF8_0000_0000_0000_u64);
     }
     if x == 0.0 {
@@ -1173,12 +1174,12 @@ fn tan_f64(x: f64, /) -> f64 {
     let (s_hi, s_lo, c_hi, c_lo) = sin_cos_dd_f64(r_hi, r_lo);
     let (t_hi, t_lo) = if (quad & 1) == 0 => dd_div_f64(s_hi, s_lo, c_hi, c_lo)
         else dd_div_f64(-c_hi, -c_lo, s_hi, s_lo);
-    return t_hi + t_lo;
+    t_hi + t_lo
 }
 
 /| Principal `f64` arc-sine in `[-pi / 2, +pi / 2]` (`max 0.6717 ULP`).
 fn asin_f64(x: f64, /) -> f64 {
-    if x != x {
+    if is_nan_f64(x) {
         return x;
     }
     let abs_x: f64 = abs_f64(x);
@@ -1208,12 +1209,12 @@ fn asin_f64(x: f64, /) -> f64 {
     let (rt_hi, rt_lo) = dd_sqrt_f64(om_hi, om_lo);
     let (q_hi, q_lo) = dd_div_f64(abs_x, 0.0, rt_hi, rt_lo);
     let (a_hi, a_lo) = atan_pos_ext_f64(q_hi, q_lo);
-    return copysign_f64(a_hi + a_lo, x);
+    copysign_f64(a_hi + a_lo, x)
 }
 
 /| Principal `f64` arc-cosine in `[0, pi]` (`max 0.6551 ULP`).
 fn acos_f64(x: f64, /) -> f64 {
-    if x != x {
+    if is_nan_f64(x) {
         return x;
     }
     let abs_x: f64 = abs_f64(x);
@@ -1237,21 +1238,21 @@ fn acos_f64(x: f64, /) -> f64 {
     let pi_hi: f64 = @bit_cast[f64](0x4009_21FB_5444_2D18_u64);
     let pi_lo: f64 = @bit_cast[f64](0x3CA1_A626_3314_5C07_u64);
     let (sh, sl) = two_sum_f64(pi_hi, -2.0 * a_hi);
-    return sh + (sl + pi_lo - 2.0 * a_lo);
+    sh + (sl + pi_lo - 2.0 * a_lo)
 }
 
 /| Principal `f64` arc-tangent in `[-pi / 2, +pi / 2]` (`max 0.7227 ULP`).
 fn atan_f64(x: f64, /) -> f64 {
-    if x != x or x == 0.0 {
+    if is_nan_f64(x) or x == 0.0 {
         return x;
     }
     let (a_hi, a_lo) = atan_pos_ext_f64(abs_f64(x), 0.0);
-    return copysign_f64(a_hi + a_lo, x);
+    copysign_f64(a_hi + a_lo, x)
 }
 
 /| Four-quadrant `f64` `atan2(y, x)` honoring IEEE-754 signed zeros via sign-bit inspection (`max 1.1074 ULP`).
 fn atan2_f64(y: f64, x: f64, /) -> f64 {
-    if x != x or y != y {
+    if is_nan_f64(x) or is_nan_f64(y) {
         return @bit_cast[f64](0x7FF8_0000_0000_0000_u64);
     }
     let x_neg: bool = (@bit_cast[u64](x) >> 63_u64) != 0_u64;
@@ -1292,12 +1293,12 @@ fn atan2_f64(y: f64, x: f64, /) -> f64 {
             ang = base_hi + base_lo;
         }
     }
-    return if y_neg => -ang else ang;
+    if y_neg => -ang else ang
 }
 
 /| Natural `f64` exponential `e^x` (`max 0.8079 ULP`).
 fn exp_f64(x: f64, /) -> f64 {
-    if x != x {
+    if is_nan_f64(x) {
         return x;
     }
     if x > 709.78271289338397 {
@@ -1317,12 +1318,12 @@ fn exp_f64(x: f64, /) -> f64 {
     let r_val: f64 = hi - lo;
     let c_val: f64 = exp_remez_c_f64(r_val);
     let y_val: f64 = 1.0 - ((lo - (r_val * c_val) / (2.0 - c_val)) - hi);
-    return ldexp_f64(y_val, k);
+    ldexp_f64(y_val, k)
 }
 
 /| Base-2 `f64` exponential `2^x` (`max 0.9778 ULP`).
 fn exp2_f64(x: f64, /) -> f64 {
-    if x != x {
+    if is_nan_f64(x) {
         return x;
     }
     if x >= 1024.0 {
@@ -1344,12 +1345,12 @@ fn exp2_f64(x: f64, /) -> f64 {
     let r_val: f64 = hi - lo;
     let c_val: f64 = exp_remez_c_f64(r_val);
     let y_val: f64 = 1.0 - ((lo - (r_val * c_val) / (2.0 - c_val)) - hi);
-    return ldexp_f64(y_val, k);
+    ldexp_f64(y_val, k)
 }
 
 /| Cancellation-free `f64` `e^x - 1` (`max 0.9825 ULP`).
 fn expm1_f64(x: f64, /) -> f64 {
-    if x != x or x == 0.0 {
+    if is_nan_f64(x) or x == 0.0 {
         return x;
     }
     if x > 709.78271289338397 {
@@ -1402,12 +1403,12 @@ fn expm1_f64(x: f64, /) -> f64 {
     if k < 20 {
         return ldexp_f64((1.0 - twop_neg_k) - (err_term - r_val), k);
     }
-    return ldexp_f64((r_val - (err_term + twop_neg_k)) + 1.0, k);
+    ldexp_f64((r_val - (err_term + twop_neg_k)) + 1.0, k)
 }
 
 /| Natural `f64` logarithm `ln(x)` (`max 0.6885 ULP`).
 fn ln_f64(x: f64, /) -> f64 {
-    if x != x or x == @bit_cast[f64](0x7FF0_0000_0000_0000_u64) {
+    if is_nan_f64(x) or x == @bit_cast[f64](0x7FF0_0000_0000_0000_u64) {
         return x;
     }
     if x == 0.0 {
@@ -1418,20 +1419,20 @@ fn ln_f64(x: f64, /) -> f64 {
     }
     var (frac, k) = frexp_f64(x);
     if frac < 0.7071067811865475 {
-        frac = frac * 2.0;
+        frac *= 2.0;
         k = k -% 1;
     }
     let (k_hi, k_lo) = ln_kernel_ext_f64(frac, 0.0);
     if k == 0 {
         return k_hi + k_lo;
     }
-    let kf: f64 = k as f64;
-    return kf * LN2_CW_HI + ((k_lo + kf * LN2_CW_LO) + k_hi);
+    let kf = k as f64;
+    kf * LN2_CW_HI + ((k_lo + kf * LN2_CW_LO) + k_hi)
 }
 
 /| Base-2 `f64` logarithm `log2(x)` (`max 0.5000 ULP`; exact on integer powers of `2`).
 fn log2_f64(x: f64, /) -> f64 {
-    if x != x or x == @bit_cast[f64](0x7FF0_0000_0000_0000_u64) {
+    if is_nan_f64(x) or x == @bit_cast[f64](0x7FF0_0000_0000_0000_u64) {
         return x;
     }
     if x == 0.0 {
@@ -1441,12 +1442,12 @@ fn log2_f64(x: f64, /) -> f64 {
         return @bit_cast[f64](0x7FF8_0000_0000_0000_u64);
     }
     let (hi, lo) = log2_ext_f64(x);
-    return hi + lo;
+    hi + lo
 }
 
 /| Base-10 `f64` logarithm `log10(x)` (`max 0.5000 ULP`).
 fn log10_f64(x: f64, /) -> f64 {
-    if x != x or x == @bit_cast[f64](0x7FF0_0000_0000_0000_u64) {
+    if is_nan_f64(x) or x == @bit_cast[f64](0x7FF0_0000_0000_0000_u64) {
         return x;
     }
     if x == 0.0 {
@@ -1459,12 +1460,12 @@ fn log10_f64(x: f64, /) -> f64 {
     let log10_2_hi: f64 = @bit_cast[f64](0x3FD3_4413_509F_79FF_u64);
     let log10_2_lo: f64 = @bit_cast[f64](0xBC49_DC1D_A994_FD21_u64);
     let (ph, pl) = two_prod_f64(l2_hi, log10_2_hi);
-    return ph + (pl + l2_hi * log10_2_lo + l2_lo * log10_2_hi);
+    ph + (pl + l2_hi * log10_2_lo + l2_lo * log10_2_hi)
 }
 
 /| Cancellation-free `f64` `ln(1 + x)` (`max 0.5754 ULP`).
 fn ln_1p_f64(x: f64, /) -> f64 {
-    if x != x or x == 0.0 or x == @bit_cast[f64](0x7FF0_0000_0000_0000_u64) {
+    if is_nan_f64(x) or x == 0.0 or x == @bit_cast[f64](0x7FF0_0000_0000_0000_u64) {
         return x;
     }
     if x < -1.0 {
@@ -1487,16 +1488,16 @@ fn ln_1p_f64(x: f64, /) -> f64 {
     var (frac, k) = frexp_f64(u_val);
     var corr: f64 = ldexp_f64(corr_u, 0 -% k);
     if frac < 0.7071067811865475 {
-        frac = frac * 2.0;
-        corr = corr * 2.0;
+        frac *= 2.0;
+        corr *= 2.0;
         k = k -% 1;
     }
     let (k_hi, k_lo) = ln_kernel_ext_f64(frac, corr);
     if k == 0 {
         return k_hi + k_lo;
     }
-    let kf: f64 = k as f64;
-    return kf * LN2_CW_HI + ((k_lo + kf * LN2_CW_LO) + k_hi);
+    let kf = k as f64;
+    kf * LN2_CW_HI + ((k_lo + kf * LN2_CW_LO) + k_hi)
 }
 
 /| Floating-point `f64` power `base^exp` honoring all 19 IEEE-754-2019 special cases (`max 0.8450 ULP`).
@@ -1504,7 +1505,7 @@ fn powf_f64(base: f64, exp: f64, /) -> f64 {
     if exp == 0.0 or base == 1.0 {
         return 1.0;
     }
-    if base != base or exp != exp {
+    if is_nan_f64(base) or is_nan_f64(exp) {
         return @bit_cast[f64](0x7FF8_0000_0000_0000_u64);
     }
     let pos_inf: f64 = @bit_cast[f64](0x7FF0_0000_0000_0000_u64);
@@ -1525,7 +1526,7 @@ fn powf_f64(base: f64, exp: f64, /) -> f64 {
         let base_neg: bool = (@bit_cast[u64](base) >> 63_u64) != 0_u64;
         return if parity == 1 and base_neg => -mag else mag;
     }
-    var neg_res: bool = false;
+    var neg_res = false;
     if base < 0.0 {
         if parity == 0 {
             return @bit_cast[f64](0x7FF8_0000_0000_0000_u64);
@@ -1544,7 +1545,7 @@ fn powf_f64(base: f64, exp: f64, /) -> f64 {
     let (ya, yb) = two_prod_f64(exp, l2_hi);
     let (y_hi, y_lo) = two_sum_f64(ya, yb + exp * l2_lo);
     let mag: f64 = exp2_ext_f64(y_hi, y_lo);
-    return if neg_res => -mag else mag;
+    if neg_res => -mag else mag
 }
 
 /| Integer-exponent `f64` power `base^exp` in `O(1)` via `log2_ext` + `exp2_ext` (`max 0.8422 ULP`).
@@ -1552,7 +1553,7 @@ fn powi_f64(base: f64, exp: i32, /) -> f64 {
     if exp == 0 {
         return 1.0;
     }
-    if base != base {
+    if is_nan_f64(base) {
         return base;
     }
     let pos_inf: f64 = @bit_cast[f64](0x7FF0_0000_0000_0000_u64);
@@ -1567,12 +1568,12 @@ fn powi_f64(base: f64, exp: i32, /) -> f64 {
         return if is_odd and base < 0.0 => -mag else mag;
     }
     let neg_out: bool = base < 0.0 and is_odd;
-    let exp_flt: f64 = exp as f64;
+    let exp_flt = exp as f64;
     let (l2_hi, l2_lo) = log2_ext_f64(abs_f64(base));
     let (ya, yb) = two_prod_f64(exp_flt, l2_hi);
     let (y_hi, y_lo) = two_sum_f64(ya, yb + exp_flt * l2_lo);
     let mag: f64 = exp2_ext_f64(y_hi, y_lo);
-    return if neg_out => -mag else mag;
+    if neg_out => -mag else mag
 }
 
 // ------------------------------------- PUBLIC API --------------------------------------
@@ -1603,7 +1604,7 @@ pub fn min[T: Comparable + Copy](lhs: T, rhs: T, /) -> T {
             }
         }
     }
-    return if rhs < lhs => rhs else lhs;
+    if rhs < lhs => rhs else lhs
 }
 
 /| Returns the larger of `lhs` and `rhs` (signed-zero-commutative `+0.0 > -0.0` & non-`NaN` preferring on `Float`).
@@ -1632,7 +1633,7 @@ pub fn max[T: Comparable + Copy](lhs: T, rhs: T, /) -> T {
             }
         }
     }
-    return if lhs < rhs => rhs else lhs;
+    if lhs < rhs => rhs else lhs
 }
 
 /| Clamps `value` into the inclusive range `[low, high]`.
@@ -1643,7 +1644,7 @@ pub fn clamp[T: Comparable + Copy](value: T, low: T, high: T, /) -> T {
     } else if value > high {
         return high;
     }
-    return value;
+    value
 }
 
 /| Overflow-free unsigned ceiling division `ceil(lhs / rhs)` for `rhs >= 1`.
@@ -1671,13 +1672,13 @@ pub fn div_floor[T: Integer](lhs: T, rhs: T, /) -> T? {
     if rem != (0 as T) and ((rem < (0 as T)) != (rhs < (0 as T))) {
         return .Some(quot -% (1 as T));
     }
-    return .Some(quot);
+    .Some(quot)
 }
 
 /| Returns `true` iff `x` is a non-zero unsigned power of two (`1`, `2`, `4`, `8`, …).
 @no_alloc @no_panic
 pub fn is_power_of_two[T: Unsigned](x: T, /) -> bool {
-    return x != (0 as T) and (x & (x -% (1 as T))) == (0 as T);
+    x != (0 as T) and (x & (x -% (1 as T))) == (0 as T)
 }
 
 /| Returns the smallest power of two `>= x`, or `.None` if the result overflows `T`.
@@ -1690,7 +1691,7 @@ pub fn next_power_of_two[T: Unsigned](x: T, /) -> T? {
     if lz == 0_u32 {
         return .None;
     }
-    return .Some((1 as T) << ((T.BITS -% lz) as T));
+    .Some((1 as T) << ((T.BITS -% lz) as T))
 }
 
 /| Returns `floor(log2(x))` for positive `x >= 1`.
@@ -1705,8 +1706,8 @@ pub fn ilog2[T: Unsigned](x: T is 1..=T.MAX, /) -> u32 {
 /| Returns `floor(log10(x))` for positive `x >= 1` (`0 B` `.rodata`, supports `u8..u128`).
 @std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
 pub fn ilog10[T: Unsigned](x: T is 1..=T.MAX, /) -> u32 {
-    var rem_val: u128 = x as u128;
-    var digits: u32 = 0_u32;
+    var rem_val = x as u128;
+    var digits = 0_u32;
     while rem_val >= 10_000_u128 {
         rem_val /= 10_000_u128;
         digits = digits +% 4_u32;
@@ -1715,7 +1716,7 @@ pub fn ilog10[T: Unsigned](x: T is 1..=T.MAX, /) -> u32 {
         rem_val /= 10_u128;
         digits = digits +% 1_u32;
     }
-    return digits;
+    digits
 }
 
 /| Checked integer addition returning `.None` on signed or unsigned overflow.
@@ -1777,7 +1778,7 @@ pub fn checked_div[T: Integer](lhs: T, rhs: T, /) -> T? {
             return .None;
         }
     }
-    return .Some(lhs / rhs);
+    .Some(lhs / rhs)
 }
 
 /| Checked left shift returning `.None` when `shift >= T.BITS`.
@@ -1786,7 +1787,7 @@ pub fn checked_shl[T: Integer](lhs: T, shift: u32, /) -> T? {
     if shift >= T.BITS {
         return .None;
     }
-    return .Some(lhs << (shift as T));
+    .Some(lhs << (shift as T))
 }
 
 /| Checked right shift returning `.None` when `shift >= T.BITS`.
@@ -1795,19 +1796,19 @@ pub fn checked_shr[T: Integer](lhs: T, shift: u32, /) -> T? {
     if shift >= T.BITS {
         return .None;
     }
-    return .Some(lhs >> (shift as T));
+    .Some(lhs >> (shift as T))
 }
 
 /| Bit-width-masked wrapping left shift `lhs << (shift & (T.BITS - 1))`.
 @std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
 pub fn wrapping_shl[T: Integer](lhs: T, shift: u32, /) -> T {
-    return lhs << ((shift & (T.BITS -% 1_u32)) as T);
+    lhs << ((shift & (T.BITS -% 1_u32)) as T)
 }
 
 /| Bit-width-masked wrapping right shift `lhs >> (shift & (T.BITS - 1))`.
 @std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
 pub fn wrapping_shr[T: Integer](lhs: T, shift: u32, /) -> T {
-    return lhs >> ((shift & (T.BITS -% 1_u32)) as T);
+    lhs >> ((shift & (T.BITS -% 1_u32)) as T)
 }
 
 /| Saturating integer addition clamping at `T.MIN` and `T.MAX` (`lhs +| rhs`).
@@ -1838,7 +1839,7 @@ pub fn widening_mul_u64(lhs: u64, rhs: u64, /) -> (u64, u64) {
     let mid_a: u64 = (p00 >> 32_u64) +% (p01 & 0xFFFF_FFFF_u64) +% (p10 & 0xFFFF_FFFF_u64);
     let low_64: u64 = (p00 & 0xFFFF_FFFF_u64) | (mid_a << 32_u64);
     let high_64: u64 = p11 +% (p01 >> 32_u64) +% (p10 >> 32_u64) +% (mid_a >> 32_u64);
-    return (low_64, high_64);
+    (low_64, high_64)
 }
 
 /| Pure `u64` addition with `carry_in` returning `(sum, carry_out)`.
@@ -1847,13 +1848,19 @@ pub fn carrying_add_u64(lhs: u64, rhs: u64, carry_in: bool, /) -> (u64, bool) {
     let sum0: u64 = lhs +% rhs;
     let carry0: bool = sum0 < lhs;
     let sum1: u64 = sum0 +% (carry_in as u64);
-    return (sum1, carry0 or (sum1 < sum0));
+    (sum1, carry0 or (sum1 < sum0))
 }
 
 // ---------- IEEE-754 Bit, ULP & Approximate Equality ----------
 /| Returns `true` iff `x` is IEEE-754 `NaN`.
 @no_alloc @no_panic
-pub fn is_nan[T: Float](x: T, /) -> bool = x != x;
+pub fn is_nan[T: Float](x: T, /) -> bool {
+    comptime if @size_of[T]() == 4_usize {
+        return is_nan_f32(x as f32);
+    } else {
+        return is_nan_f64(x as f64);
+    }
+}
 
 /| Returns `true` iff `x` is neither `NaN` nor `+-Infinity`.
 @no_alloc @no_panic
@@ -1931,14 +1938,14 @@ pub fn degrees_to_radians[T: Float](deg: T, /) -> T {
     if deg == (0.0 as T) or not is_finite(deg) {
         return deg;
     }
-    let d64: f64 = deg as f64;
+    let d64 = deg as f64;
     if abs_f64(d64) > 1.0e299 {
         let d_scaled: f64 = d64 * RAD_DEG_PRESCALE_DOWN;
         let (ph, pl) = two_prod_f64(d_scaled, DEG_TO_RAD_HI);
         return ldexp_f64(ph + (pl + d_scaled * DEG_TO_RAD_LO), 28) as T;
     }
     let (ph, pl) = two_prod_f64(d64, DEG_TO_RAD_HI);
-    return (ph + (pl + d64 * DEG_TO_RAD_LO)) as T;
+    (ph + (pl + d64 * DEG_TO_RAD_LO)) as T
 }
 
 /| Converts angle `rad` from radians to degrees (`rad * (180 / pi)`).
@@ -1947,20 +1954,20 @@ pub fn radians_to_degrees[T: Float](rad: T, /) -> T {
     if rad == (0.0 as T) or not is_finite(rad) {
         return rad;
     }
-    let r64: f64 = rad as f64;
+    let r64 = rad as f64;
     if abs_f64(r64) > 1.0e299 {
         let r_scaled: f64 = r64 * RAD_DEG_PRESCALE_DOWN;
         let (ph, pl) = two_prod_f64(r_scaled, RAD_TO_DEG_HI);
         return ldexp_f64(ph + (pl + r_scaled * RAD_TO_DEG_LO), 28) as T;
     }
     let (ph, pl) = two_prod_f64(r64, RAD_TO_DEG_HI);
-    return (ph + (pl + r64 * RAD_TO_DEG_LO)) as T;
+    (ph + (pl + r64 * RAD_TO_DEG_LO)) as T
 }
 
 /| Returns `true` when `|lhs - rhs| <= tol` (`false` if any argument is `NaN` or `tol < 0`).
 @std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
 pub fn approx_eq_abs[T: Float](lhs: T, rhs: T, /, *, tol: T) -> bool {
-    if lhs != lhs or rhs != rhs or tol != tol or tol < (0.0 as T) {
+    if is_nan(lhs) or is_nan(rhs) or is_nan(tol) or tol < (0.0 as T) {
         return false;
     }
     if lhs == rhs {
@@ -1969,19 +1976,19 @@ pub fn approx_eq_abs[T: Float](lhs: T, rhs: T, /, *, tol: T) -> bool {
     if not is_finite(lhs) or not is_finite(rhs) {
         return false;
     }
-    let lhs64: f64 = lhs as f64;
-    let rhs64: f64 = rhs as f64;
-    let tol64: f64 = tol as f64;
+    let lhs64 = lhs as f64;
+    let rhs64 = rhs as f64;
+    let tol64 = tol as f64;
     if abs_f64(lhs64) > 1.0e300 or abs_f64(rhs64) > 1.0e300 {
         return abs_f64(0.5 * lhs64 - 0.5 * rhs64) <= 0.5 * tol64;
     }
-    return abs_f64(lhs64 - rhs64) <= tol64;
+    abs_f64(lhs64 - rhs64) <= tol64
 }
 
 /| Returns `true` when `|lhs - rhs| <= rel_tol * max(|lhs|, |rhs|)` (`default rel_tol = 1.0e-12`).
 @std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
 pub fn approx_eq_rel[T: Float](lhs: T, rhs: T, /, *, rel_tol: T = 1.0e-12) -> bool {
-    if lhs != lhs or rhs != rhs or rel_tol != rel_tol or rel_tol < (0.0 as T) {
+    if is_nan(lhs) or is_nan(rhs) or is_nan(rel_tol) or rel_tol < (0.0 as T) {
         return false;
     }
     if lhs == rhs {
@@ -1990,22 +1997,22 @@ pub fn approx_eq_rel[T: Float](lhs: T, rhs: T, /, *, rel_tol: T = 1.0e-12) -> bo
     if not is_finite(lhs) or not is_finite(rhs) {
         return false;
     }
-    let lhs64: f64 = lhs as f64;
-    let rhs64: f64 = rhs as f64;
-    let rel_tol64: f64 = rel_tol as f64;
+    let lhs64 = lhs as f64;
+    let rhs64 = rhs as f64;
+    let rel_tol64 = rel_tol as f64;
     let mag_lhs: f64 = abs_f64(lhs64);
     let mag_rhs: f64 = abs_f64(rhs64);
     let max_mag: f64 = if mag_lhs >= mag_rhs => mag_lhs else mag_rhs;
     if max_mag > 1.0e300 {
         return abs_f64(0.5 * lhs64 - 0.5 * rhs64) <= (0.5 * max_mag) * rel_tol64;
     }
-    return abs_f64(lhs64 - rhs64) <= rel_tol64 * max_mag;
+    abs_f64(lhs64 - rhs64) <= rel_tol64 * max_mag
 }
 
 /| Returns `true` when `lhs` and `rhs` lie within `max_ulps` (`default = 4`) representable floats.
 @no_alloc @no_panic
 pub fn approx_eq_ulp[T: Float](lhs: T, rhs: T, /, *, max_ulps: u64 = 4_u64) -> bool {
-    if lhs != lhs or rhs != rhs {
+    if is_nan(lhs) or is_nan(rhs) {
         return false;
     }
     if lhs == rhs {
@@ -2017,8 +2024,8 @@ pub fn approx_eq_ulp[T: Float](lhs: T, rhs: T, /, *, max_ulps: u64 = 4_u64) -> b
     comptime if @size_of[T]() == 4_usize {
         let bits_a: u32 = @bit_cast[u32](lhs as f32);
         let bits_b: u32 = @bit_cast[u32](rhs as f32);
-        let mag_a: u64 = (bits_a & 0x7FFF_FFFF_u32) as u64;
-        let mag_b: u64 = (bits_b & 0x7FFF_FFFF_u32) as u64;
+        let mag_a = (bits_a & 0x7FFF_FFFF_u32) as u64;
+        let mag_b = (bits_b & 0x7FFF_FFFF_u32) as u64;
         if (bits_a >> 31_u32) != (bits_b >> 31_u32) {
             return (mag_a +| mag_b) <= max_ulps;
         }
@@ -2048,7 +2055,7 @@ pub fn abs[T: Signed | Float](x: T, /) -> T {
             return abs_f64(x as f64) as T;
         }
     } else {
-        let wide: i128 = x as i128;
+        let wide = x as i128;
         return (if wide < 0_i128 => 0_i128 -% wide else wide) as T;
     }
 }
@@ -2116,13 +2123,13 @@ pub fn sqrt[T: Float](x: T, /) -> T {
 /| Real cube root `cbrt(x)` (`<= 0.5000 ULP`; preserves sign on negative inputs and `-0.0`).
 @no_alloc @no_panic
 pub fn cbrt[T: Float](x: T, /) -> T {
-    return cbrt_f64(x as f64) as T;
+    cbrt_f64(x as f64) as T
 }
 
 /| Overflow/underflow-immune Euclidean norm `sqrt(x^2 + y^2)` (`hypot(+-Inf, NaN) == +Inf`).
 @no_alloc @no_panic
 pub fn hypot[T: Float](x: T, y: T, /) -> T {
-    return hypot_f64(x as f64, y as f64) as T;
+    hypot_f64(x as f64, y as f64) as T
 }
 
 /| Decomposes `x = frac * 2^exp` with `|frac| in [0.5, 1.0)` (`(x, 0)` on `+-0.0`, `+-Inf`, `NaN`).
@@ -2151,103 +2158,103 @@ pub fn ldexp[T: Float](x: T, exp2: i32, /) -> T {
 @no_alloc @no_panic
 pub fn sin[T: Float](x: T, /) -> T {
     let (sin_val, _) = sin_cos_f64(x as f64);
-    return sin_val as T;
+    sin_val as T
 }
 
 /| Trigonometric cosine `cos(x)` in radians (`max 0.7366 ULP` on `f64`, `0.5000 ULP` on `f32`).
 @no_alloc @no_panic
 pub fn cos[T: Float](x: T, /) -> T {
     let (_, cos_val) = sin_cos_f64(x as f64);
-    return cos_val as T;
+    cos_val as T
 }
 
 /| Simultaneous `(sin(x), cos(x))` sharing a single Cody–Waite / Payne–Hanek reduction.
 @no_alloc @no_panic
 pub fn sin_cos[T: Float](x: T, /) -> (T, T) {
     let (sin_val, cos_val) = sin_cos_f64(x as f64);
-    return (sin_val as T, cos_val as T);
+    (sin_val as T, cos_val as T)
 }
 
 /| Trigonometric tangent `tan(x)` in radians (`max 0.5200 ULP` on `f64`, `0.5000 ULP` on `f32`).
 @no_alloc @no_panic
 pub fn tan[T: Float](x: T, /) -> T {
-    return tan_f64(x as f64) as T;
+    tan_f64(x as f64) as T
 }
 
 /| Principal arc-sine `asin(x)` in `[-pi / 2, +pi / 2]` (`NaN` for `|x| > 1.0`).
 @no_alloc @no_panic
 pub fn asin[T: Float](x: T, /) -> T {
-    return asin_f64(x as f64) as T;
+    asin_f64(x as f64) as T
 }
 
 /| Principal arc-cosine `acos(x)` in `[0, pi]` (`NaN` for `|x| > 1.0`).
 @no_alloc @no_panic
 pub fn acos[T: Float](x: T, /) -> T {
-    return acos_f64(x as f64) as T;
+    acos_f64(x as f64) as T
 }
 
 /| Principal arc-tangent `atan(x)` in `[-pi / 2, +pi / 2]`.
 @no_alloc @no_panic
 pub fn atan[T: Float](x: T, /) -> T {
-    return atan_f64(x as f64) as T;
+    atan_f64(x as f64) as T
 }
 
 /| Four-quadrant arc-tangent `atan2(y, x)` in `[-pi, +pi]` honoring IEEE-754 signed zeros.
 @no_alloc @no_panic
 pub fn atan2[T: Float](y: T, x: T, /) -> T {
-    return atan2_f64(y as f64, x as f64) as T;
+    atan2_f64(y as f64, x as f64) as T
 }
 
 /| Natural exponential `e^x` (`max 0.8079 ULP` on `f64`, `0.5000 ULP` on `f32`).
 @no_alloc @no_panic
 pub fn exp[T: Float](x: T, /) -> T {
-    return exp_f64(x as f64) as T;
+    exp_f64(x as f64) as T
 }
 
 /| Base-2 exponential `2^x` (`max 0.9778 ULP` on `f64`, `0.5000 ULP` on `f32`).
 @no_alloc @no_panic
 pub fn exp2[T: Float](x: T, /) -> T {
-    return exp2_f64(x as f64) as T;
+    exp2_f64(x as f64) as T
 }
 
 /| Cancellation-free `e^x - 1` accurate for `|x| << 1` (`max 0.9825 ULP` on `f64`).
 @no_alloc @no_panic
 pub fn expm1[T: Float](x: T, /) -> T {
-    return expm1_f64(x as f64) as T;
+    expm1_f64(x as f64) as T
 }
 
 /| Natural logarithm `ln(x)` (`-Inf` on `+-0.0`, `NaN` on `x < 0`).
 @no_alloc @no_panic
 pub fn ln[T: Float](x: T, /) -> T {
-    return ln_f64(x as f64) as T;
+    ln_f64(x as f64) as T
 }
 
 /| Base-2 logarithm `log2(x)` (`max 0.5000 ULP`; exact on integer powers of `2`).
 @no_alloc @no_panic
 pub fn log2[T: Float](x: T, /) -> T {
-    return log2_f64(x as f64) as T;
+    log2_f64(x as f64) as T
 }
 
 /| Base-10 logarithm `log10(x)` (`max 0.5000 ULP`).
 @no_alloc @no_panic
 pub fn log10[T: Float](x: T, /) -> T {
-    return log10_f64(x as f64) as T;
+    log10_f64(x as f64) as T
 }
 
 /| Cancellation-free `ln(1 + x)` accurate for `|x| << 1` (`max 0.5754 ULP` on `f64`).
 @no_alloc @no_panic
 pub fn ln_1p[T: Float](x: T, /) -> T {
-    return ln_1p_f64(x as f64) as T;
+    ln_1p_f64(x as f64) as T
 }
 
 /| Floating-point power `base^exp` honoring all 19 IEEE-754-2019 special cases (`max 0.8450 ULP`).
 @no_alloc @no_panic
 pub fn powf[T: Float](base: T, exp: T, /) -> T {
-    return powf_f64(base as f64, exp as f64) as T;
+    powf_f64(base as f64, exp as f64) as T
 }
 
 /| Integer-exponent power `base^exp` in `O(1)` (`max 0.8422 ULP`, immune to `i32.MIN` overflow).
 @no_alloc @no_panic
 pub fn powi[T: Float](base: T, exp: i32, /) -> T {
-    return powi_f64(base as f64, exp) as T;
+    powi_f64(base as f64, exp) as T
 }

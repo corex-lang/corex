@@ -3,9 +3,9 @@
 //! Aggregates and executes all Phase 0, Phase 1, Phase 2, Phase 3, Phase 4, Phase 5, Phase 6,
 //! Phase 7, Phase 7.5 (`DR-21`), Phase 7.6 (`DR-22`), Phase 8 (`DR-08`, `DR-10`, `DR-18`),
 //! Phase 9 (`DR-11`, `DR-16`, `DR-17`), Phase 10 (`DR-12`, `DR-14`, `DR-17`), Phase 10.6 (`DR-23`),
-//! Phase 11.1 (`STD-01`), and Phase 11.1b (`DR-24`) isolated unit tests (`tests/unit/`), golden
-//! snapshot tests (`tests/snapshots/`), deterministic PRNG fuzzers (`tests/fuzz/`), and drift
-//! guards (`tests/drift/`).
+//! Phase 11.1 (`STD-01`), Phase 11.1b (`DR-24`), and Phase 11.1c (`DR-25`) isolated unit tests
+//! (`tests/unit/`), negative lint/safety tests (`tests/compile_fail/`), golden snapshot tests
+//! (`tests/snapshots/`), deterministic PRNG fuzzers (`tests/fuzz/`), and drift guards (`tests/drift/`).
 //!
 //! Invoked automatically by `zig build test` alongside internal `stage0/src/` module tests.
 
@@ -67,6 +67,14 @@ pub const phase11_std01_step1_test = @import("unit/phase11_std01_step1_test.zig"
 pub const phase11_std01_step2_test = @import("unit/phase11_std01_step2_test.zig");
 /// Comprehensive Phase 11.1 (`STD-01` §3.3) 5-gate architectural prover & Stage-4 red-team regression suite.
 pub const phase11_std01_gates_test = @import("unit/phase11_std01_gates_test.zig");
+/// Comprehensive Phase 11.1c (`RDG-25` Step 3A) Lexer, Parser/CST, and `SymbolTable` single-pass lint rules suite.
+pub const phase11_step3a_lints_test = @import("unit/phase11_step3a_lints_test.zig");
+/// Comprehensive Phase 11.1c (`RDG-25` Step 3B) `TypeChecker`, Idiom Audit, and `MIR` single-pass lint rules suite.
+pub const phase11_step3b_lints_test = @import("unit/phase11_step3b_lints_test.zig");
+/// Exhaustive Phase 11.1c (`DR-25` §4.4) 44-rule matrix, `<= 2`-pass `--fix`, `CRLF`, `CompiledGlob64`, & `W0413` suite.
+pub const dr25_all_44_rules_test = @import("compile_fail/lint/dr25_all_44_rules_test.zig");
+/// Stage 3 Red-Team (`[BUG-01]`–`[BUG-12]`), `E0302` shared-ref move soundness, & CLI/LSP polish regression suite.
+pub const phase11_dr25_redteam_regressions_test = @import("unit/phase11_dr25_redteam_regressions_test.zig");
 /// Unit tests for `diag/diagnostic.zig` and `diag/renderer.zig` (`DiagnosticSink`, `TransactionalPatcher`).
 pub const diagnostic_test = @import("unit/diagnostic_test.zig");
 /// Unit tests for `cli/style.zig`, `cli/box_draw.zig`, and `cli/router.zig`.
@@ -99,6 +107,8 @@ pub const phase9_pkg_fuzz = @import("fuzz/phase9_pkg_fuzz.zig");
 pub const phase10_lsp_upgrade_fuzz = @import("fuzz/phase10_lsp_upgrade_fuzz.zig");
 /// Phase 11.1 (`STD-01`) deterministic PRNG fuzzing suite (container models, `ipnsort` vs `Powersort`, UTF-8 SIMD, & float/int round-trips).
 pub const phase11_std01_fuzz = @import("fuzz/phase11_std01_fuzz.zig");
+/// Phase 11.1c (`DR-25`) deterministic PRNG fuzzing suite (`SuppressionTable`, `CompiledGlob64`, & `--fix` convergence).
+pub const phase11_dr25_lint_fuzz = @import("fuzz/phase11_dr25_lint_fuzz.zig");
 /// Repository-wide drift guards (zero colored emojis, CLI parity, diagnostic catalog, `< 150` col format).
 pub const drift_guard_test = @import("drift/drift_guard_test.zig");
 
@@ -131,6 +141,10 @@ test "test_runner_references_all_phase0_to_phase11_verification_suites" {
     _ = phase11_std01_step1_test;
     _ = phase11_std01_step2_test;
     _ = phase11_std01_gates_test;
+    _ = phase11_step3a_lints_test;
+    _ = phase11_step3b_lints_test;
+    _ = dr25_all_44_rules_test;
+    _ = phase11_dr25_redteam_regressions_test;
     _ = diagnostic_test;
     _ = cli_router_test;
     _ = bench_harness_test;
@@ -147,5 +161,6 @@ test "test_runner_references_all_phase0_to_phase11_verification_suites" {
     _ = phase9_pkg_fuzz;
     _ = phase10_lsp_upgrade_fuzz;
     _ = phase11_std01_fuzz;
+    _ = phase11_dr25_lint_fuzz;
     _ = drift_guard_test;
 }

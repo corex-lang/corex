@@ -20,6 +20,9 @@ const vfs_sourcemap = @import("vfs_sourcemap.zig");
 const diagnostic = @import("diag/diagnostic.zig");
 const query_db = @import("query_db.zig");
 const codegen_abi = @import("codegen_abi.zig");
+const unicode_confusables = @import("unicode_confusables.zig");
+const lint_filter = @import("lint_filter.zig");
+const type_system = @import("type_system.zig");
 
 const FileId = mem_foundation.FileId;
 const Span = mem_foundation.Span;
@@ -521,8 +524,8 @@ pub const AttrTargetMask = packed struct(u8) {
     }
 };
 
-/// 2-byte bit-packed semantic and attribute flags attached to each `SymbolRecord`.
-pub const SymbolFlags = packed struct(u16) {
+/// 4-byte bit-packed semantic, visibility-reachability, and lint flags attached to each `SymbolRecord`.
+pub const SymbolFlags = packed struct(u32) {
     /// `true` if declared with `pub`.
     is_pub: bool = false,
     /// `true` if declared with `var` (`&var` or `var` local/parameter).
@@ -555,6 +558,22 @@ pub const SymbolFlags = packed struct(u16) {
     is_attribute_schema: bool = false,
     /// `true` if declared with `extern` or `@extern` (`DR-05` Section 3.1).
     is_extern: bool = false,
+    /// `true` if mutated or `&mut`/`&out` borrowed after initialization (`W0405` pre-wire).
+    is_mutated: bool = false,
+    /// `true` if referenced from `parentModule(def_mod)` or its descendants outside `def_mod` (`W0406`).
+    has_parent_mod_ref: bool = false,
+    /// `true` if referenced from a module in `pkg_id` outside `parentModule(def_mod)` (`W0406`).
+    has_pkg_wide_ref: bool = false,
+    /// `true` when this `.use_alias_sym` was expanded from a `use prefix.*;` glob import (`W0404`).
+    is_glob_use_alias: bool = false,
+    /// `true` when this local binding originated from a struct pattern field shorthand (`Point { y }`, `W0402`).
+    is_shorthand_field_pat: bool = false,
+    /// Leading modifier on a shorthand `.field_pat` (`0 = none`, `1 = var`, `2 = &`, `3 = &mut`).
+    shorthand_field_mod: u2 = 0,
+    /// Byte distance `decl_span.start_byte - field_pat_start_byte` when `shorthand_field_mod != 0`.
+    shorthand_lead_bytes: u8 = 0,
+    /// Reserved zero-initialized bit keeping `SymbolFlags` exact at 32 bits.
+    _reserved: u1 = 0,
 };
 
 /// 2-byte bit-packed Phase 6 contract, safety, and FFI attributes attached to `SymbolRecord` (`DR-17`, `DR-20`).
@@ -709,7 +728,7 @@ pub const SymbolRecord = struct {
     enclosing_cfg_cst: CstNodeIndex = .none,
 
     comptime {
-        std.debug.assert(@sizeOf(SymbolRecord) <= 136);
+        std.debug.assert(@sizeOf(SymbolRecord) <= 144);
     }
 
     /// Returns the packed field alignment cap in bytes (`1 | 2 | 4 | 8 | 16`), or `0` when unpacked.
@@ -1593,6 +1612,37 @@ const HEADER_ATTR_MAP = std.StaticStringMap(HeaderAttrKind).initComptime(.{
     .{ "wasm_import", .wasm_import },
     .{ "zero_pad", .zero_pad },
 });
+
+/// Virtual `SymbolIndex` sentinel for the built-in `@expect` attribute schema (`DR-25`, zero `SymbolIndex` shift).
+const BUILTIN_EXPECT_ATTR_SYM_IDX: SymbolIndex = SymbolIndex.fromInt(std.math.maxInt(u32) - 1);
+
+/// Static `SymbolRecord` returned for `BUILTIN_EXPECT_ATTR_SYM_IDX` during `TypeChecker` `@expect(…)` validation.
+const BUILTIN_EXPECT_ATTR_RECORD: SymbolRecord = .{
+    .name = .empty,
+    .name_text = "ExpectAttr",
+    .kind = .struct_sym,
+    .namespace = .type_ns,
+    .visibility = .public,
+    .flags = .{
+        .is_pub = true,
+        .is_used = true,
+        .is_builtin = true,
+        .is_attribute_schema = true,
+    },
+    .scope_id = ScopeId.fromInt(0),
+    .target_scope = .none,
+    .type_id = .err_ty,
+    .attr_target_mask = .{
+        .has_struct_target = true,
+        .has_enum_target = true,
+        .has_union_target = true,
+        .has_field_target = true,
+        .has_variant_target = true,
+        .has_fn_target = true,
+        .has_param_target = true,
+        .has_local_target = true,
+    },
+};
 
 /// Canonical scoped `@allow(…)` lint names for typo suggestions on `E0403`.
 pub const ALLOW_LINT_NAMES = [_][]const u8{
@@ -2660,6 +2710,7 @@ fn collectItemSliceInScopeWithOrdinal(
                         ExtraIndex.fromInt(ast_node.lhs.payload),
                         ast_node.rhs.payload,
                     );
+                    const pre_trait_sym_len = sym_table.symbols.items.len;
                     try collectItemSliceInScope(
                         sym_table,
                         interner,
@@ -2675,6 +2726,14 @@ fn collectItemSliceInScopeWithOrdinal(
                         extra_ends,
                         diagnostic_sink,
                     );
+                    if (visibility != .private) {
+                        for (sym_table.symbols.items[pre_trait_sym_len..]) |*added_sym| {
+                            if (added_sym.scope_id == trait_scope and added_sym.visibility == .private) {
+                                added_sym.visibility = visibility;
+                                added_sym.flags.is_pub = (visibility == .public);
+                            }
+                        }
+                    }
                 }
             },
             .type_alias_decl => {
@@ -3420,7 +3479,6 @@ fn emitUseOrPathDeprecatedIfNeeded(
     if (is_suppressed or raw_sym_idx.isNone() or ref_span.file_id.isNone()) return;
     const sink = diagnostic_sink orelse return;
     if (sym_table.scope_arena.isInsideDeprecated(caller_scope)) return;
-    if (sym_table.getScopeAllowMask(caller_scope).has_allow_deprecated_w0403) return;
 
     const target_idx = if (sym_table.getDeprecatedMeta(raw_sym_idx) != null)
         raw_sym_idx
@@ -3651,6 +3709,32 @@ pub const ScopeArena = struct {
 
 // ------------------------ Symbol Table ------------------------
 
+/// Metadata for a resolved private `use` leaf specifier (`W0404` `unused-import`, `DR-25` §2.2).
+pub const UseLeafBindingRecord = struct {
+    /// Owning source file of the `use` declaration.
+    file_id: FileId,
+    /// Owning `DefId` of the enclosing `use` item when top-level.
+    def_id: DefId = .NONE,
+    /// Lexical or module scope into which the import was bound.
+    scope_id: ScopeId,
+    /// Enclosing `.use_item` CST node.
+    use_item_cst: CstNodeIndex,
+    /// Specific leaf `.use_tree` CST node for this specifier (`a.b`, `b`, `b as c`, `self`, `*`).
+    leaf_tree_cst: CstNodeIndex,
+    /// Exact source span highlighted when this specifier is unused.
+    report_span: Span,
+    /// Created `.use_alias_sym` or `.module_sym` (`SymbolIndex.none` for `is_glob` / `as _`).
+    alias_sym: SymbolIndex = .none,
+    /// Bound local identifier (`SymbolId.none` for `is_glob` / `as _`).
+    bound_name: SymbolId = .none,
+    /// Target module scope when `is_glob == true` (checked against `inactive_cfg_idents`).
+    glob_target_scope: ScopeId = .none,
+    /// `true` when this leaf is a `use prefix.*;` wildcard import.
+    is_glob: bool = false,
+    /// `true` when explicitly bound to `_` (`use pkg.Trait as _;`), preserving it during sibling pruning.
+    is_exempt_underscore: bool = false,
+};
+
 /// Unified symbol table owning `ScopeArena`, `SymbolRecord` storage, `OverloadSet`s, and module maps.
 pub const SymbolTable = struct {
     /// Backing allocator for symbol records, scope maps, and overload sets.
@@ -3747,6 +3831,14 @@ pub const SymbolTable = struct {
     is_including_tests: bool = true,
     /// Active `@cfg(expr)` target and build-mode evaluation context for `use` imports (`SE-18`).
     cfg_env: CfgEnv = .{},
+    /// Interned `"ExpectAttr"` `SymbolId` for zero-shift built-in `@expect(…)` resolution (`DR-25`).
+    expect_attr_name_id: SymbolId = .none,
+    /// Per-leaf private `use` specifier bindings tracked for `W0404` (`unused-import`).
+    use_leaf_records: std.ArrayListUnmanaged(UseLeafBindingRecord) = .empty,
+    /// Maps `(scope_id << 32) | canonical_trait_sym_idx` to the `.use_alias_sym` importing that trait (`W0404`).
+    trait_alias_by_scope_and_target: std.AutoHashMapUnmanaged(u64, SymbolIndex) = .empty,
+    /// Active package `LintSettings` (`allowed_confusables`, etc.) consulted by `W0103` during scope checks.
+    active_lint_settings: lint_filter.LintSettings = .{},
 
     /// Initializes a new `SymbolTable` and pre-populates the global prelude scope (`ScopeId` `0`).
     pub fn init(allocator: std.mem.Allocator, interner: *StringInterner) !SymbolTable {
@@ -3825,6 +3917,8 @@ pub const SymbolTable = struct {
         self.trait_impl_pairs.deinit(self.allocator);
         self.impl_method_trait.deinit(self.allocator);
         self.pending_imports.deinit(self.allocator);
+        self.use_leaf_records.deinit(self.allocator);
+        self.trait_alias_by_scope_and_target.deinit(self.allocator);
         self.scope_arena.deinit();
         self.* = undefined;
     }
@@ -3895,6 +3989,8 @@ pub const SymbolTable = struct {
         self.trait_impl_pairs.clearRetainingCapacity();
         self.impl_method_trait.clearRetainingCapacity();
         self.pending_imports.clearRetainingCapacity();
+        self.use_leaf_records.clearRetainingCapacity();
+        self.trait_alias_by_scope_and_target.clearRetainingCapacity();
         self.scope_arena.resetRetainingCapacity();
         self.cx_meta_scope = .none;
         self.cx_root_scope = .none;
@@ -4452,6 +4548,16 @@ pub const SymbolTable = struct {
 
         self.cx_meta_scope = meta_scope;
         return meta_scope;
+    }
+
+    /// Synchronizes `cx_prelude_scope`, `cx_root_scope`, and `prelude_scope`'s `cx` binding after `mod.cx` re-collection.
+    pub fn syncCxPreludeScope(self: *SymbolTable, interner: *StringInterner, new_scope: ScopeId) anyerror!void {
+        if (new_scope.isNone()) return;
+        if (self.cx_root_scope != new_scope) {
+            self.cx_meta_scope = .none;
+        }
+        self.cx_prelude_scope = new_scope;
+        _ = try self.ensureCxRootScope(interner);
     }
 
     /// Lazily resolves or synthesizes the unified `cx` standard library root scope and built-in submodule bridges (`DR-21`).
@@ -5030,6 +5136,7 @@ pub const SymbolTable = struct {
             });
             try self.scoped_map.put(self.allocator, key, sym_idx);
         }
+        self.expect_attr_name_id = try interner.intern("ExpectAttr");
     }
 
     /// Appends `record` to `self.symbols` and records it in `scope_members[record.scope_id]`.
@@ -5080,6 +5187,7 @@ pub const SymbolTable = struct {
 
     /// Retrieves a read-only pointer to the `SymbolRecord` at `sym_idx`.
     pub inline fn getSymbol(self: *const SymbolTable, sym_idx: SymbolIndex) *const SymbolRecord {
+        if (sym_idx == BUILTIN_EXPECT_ATTR_SYM_IDX) return &BUILTIN_EXPECT_ATTR_RECORD;
         std.debug.assert(!sym_idx.isNone() and sym_idx.asInt() < self.symbols.items.len);
         return &self.symbols.items[sym_idx.asInt()];
     }
@@ -5102,6 +5210,182 @@ pub const SymbolTable = struct {
         }
     }
 
+    /// Marks `sym_idx` as mutated or `&mut`/`&out`-borrowed after initialization (`W0405` pre-wire).
+    pub inline fn markSymbolMutated(self: *SymbolTable, sym_idx: SymbolIndex) void {
+        if (sym_idx.isNone() or sym_idx.asInt() >= self.symbols.items.len) return;
+        self.symbols.items[sym_idx.asInt()].flags.is_mutated = true;
+    }
+
+    /// Removes stale `use_leaf_records` and `trait_alias_by_scope_and_target` entries for `file_id` before re-resolving.
+    pub fn clearFileUseLeafRecords(self: *SymbolTable, file_id: FileId) void {
+        var keep_len: usize = 0;
+        for (self.use_leaf_records.items) |rec_item| {
+            if (rec_item.file_id != file_id) {
+                self.use_leaf_records.items[keep_len] = rec_item;
+                keep_len += 1;
+            }
+        }
+        self.use_leaf_records.items.len = keep_len;
+        if (self.file_module_scopes.get(file_id.asInt())) |mod_scope| {
+            var dead_keys: [64]u64 = undefined;
+            var dead_len: usize = 0;
+            var it = self.trait_alias_by_scope_and_target.keyIterator();
+            while (it.next()) |key_ptr| {
+                const scope_raw: u32 = @intCast(key_ptr.* >> 32);
+                if (scope_raw == mod_scope.asInt() and dead_len < dead_keys.len) {
+                    dead_keys[dead_len] = key_ptr.*;
+                    dead_len += 1;
+                }
+            }
+            for (dead_keys[0..dead_len]) |dead_key| {
+                _ = self.trait_alias_by_scope_and_target.remove(dead_key);
+            }
+        }
+    }
+
+    /// Records cross-module visibility exercise (`has_parent_mod_ref` / `has_pkg_wide_ref`) on `raw_sym_idx` (`W0406`).
+    pub fn recordCrossModuleAccess(self: *SymbolTable, caller_scope: ScopeId, raw_sym_idx: SymbolIndex) void {
+        if (raw_sym_idx.isNone() or raw_sym_idx.asInt() >= self.symbols.items.len) return;
+        if (caller_scope.isNone() or caller_scope.asInt() >= self.scope_arena.countScopes()) return;
+        const raw_sym = self.symbols.items[raw_sym_idx.asInt()];
+        const sym_idx = if (raw_sym.kind == .use_alias_sym and
+            !raw_sym.target_symbol.isNone() and
+            raw_sym.target_symbol.asInt() < self.symbols.items.len)
+            raw_sym.target_symbol
+        else
+            raw_sym_idx;
+        const sym_ptr = &self.symbols.items[sym_idx.asInt()];
+        if (sym_ptr.flags.is_builtin or sym_ptr.scope_id.isNone() or
+            sym_ptr.scope_id.asInt() >= self.scope_arena.countScopes())
+        {
+            return;
+        }
+        const decl_scope_rec = self.scope_arena.getScope(sym_ptr.scope_id);
+        const caller_scope_rec = self.scope_arena.getScope(caller_scope);
+        if (caller_scope_rec.pkg_id != decl_scope_rec.pkg_id) {
+            sym_ptr.flags.has_pkg_wide_ref = true;
+            return;
+        }
+        const def_mod = decl_scope_rec.enclosing_module;
+        const caller_mod = caller_scope_rec.enclosing_module;
+        if (def_mod.isNone() or caller_mod.isNone() or caller_mod == def_mod) return;
+
+        const is_super_ok = Visibility.pub_super.isVisibleFrom(
+            def_mod,
+            decl_scope_rec.pkg_id,
+            caller_mod,
+            caller_scope_rec.pkg_id,
+            &self.scope_arena,
+        );
+        if (is_super_ok) {
+            sym_ptr.flags.has_parent_mod_ref = true;
+        } else {
+            sym_ptr.flags.has_pkg_wide_ref = true;
+        }
+
+        if (!decl_scope_rec.owner_def_id.isNone()) {
+            if (self.def_to_symbol.get(decl_scope_rec.owner_def_id.asInt())) |owner_idx| {
+                if (!owner_idx.isNone() and owner_idx.asInt() < self.symbols.items.len and owner_idx != sym_idx) {
+                    if (is_super_ok) {
+                        self.symbols.items[owner_idx.asInt()].flags.has_parent_mod_ref = true;
+                    } else {
+                        self.symbols.items[owner_idx.asInt()].flags.has_pkg_wide_ref = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Marks an imported `trait_sym` alias in `caller_scope`'s lexical chain as used (`W0404` & `W0406`).
+    pub fn markImportedTraitUsed(self: *SymbolTable, caller_scope: ScopeId, trait_sym_idx: SymbolIndex) void {
+        if (trait_sym_idx.isNone() or trait_sym_idx.asInt() >= self.symbols.items.len) return;
+        self.markSymbolUsed(trait_sym_idx);
+        self.recordCrossModuleAccess(caller_scope, trait_sym_idx);
+        if (self.trait_alias_by_scope_and_target.count() == 0) return;
+        var cur = caller_scope;
+        var steps: usize = 0;
+        while (!cur.isNone() and cur.asInt() < self.scope_arena.countScopes() and steps <= MAX_SCOPE_DEPTH) : (steps += 1) {
+            const key: u64 = (@as(u64, cur.asInt()) << 32) | @as(u64, trait_sym_idx.asInt());
+            if (self.trait_alias_by_scope_and_target.get(key)) |alias_idx| {
+                self.markSymbolUsed(alias_idx);
+                break;
+            }
+            cur = self.scope_arena.getScope(cur).parent;
+        }
+    }
+
+    /// Marks `resolved_idx` and any matching lexical `use` alias for `queried_name` in `caller_scope` as used.
+    pub fn markLexicalSymbolUsed(
+        self: *SymbolTable,
+        caller_scope: ScopeId,
+        queried_name: SymbolId,
+        resolved_idx: SymbolIndex,
+    ) void {
+        if (resolved_idx.isNone() or resolved_idx.asInt() >= self.symbols.items.len) return;
+        self.markSymbolUsed(resolved_idx);
+        self.recordCrossModuleAccess(caller_scope, resolved_idx);
+        if (queried_name.isNone()) return;
+
+        const resolved_sym = self.symbols.items[resolved_idx.asInt()];
+        const target_ns = resolved_sym.namespace;
+        var cur = caller_scope;
+        var steps: usize = 0;
+        while (!cur.isNone() and cur.asInt() < self.scope_arena.countScopes() and steps <= MAX_SCOPE_DEPTH) : (steps += 1) {
+            if (self.scoped_map.get(packScopedSymbolKey(cur, queried_name, target_ns))) |cand_idx| {
+                if (cand_idx == resolved_idx) {
+                    self.markSymbolUsed(cand_idx);
+                    break;
+                }
+                const cand_sym = self.symbols.items[cand_idx.asInt()];
+                if (cand_sym.kind == .use_alias_sym) {
+                    var unwrapped_idx = cand_sym.target_symbol;
+                    var hop: u8 = 0;
+                    while (!unwrapped_idx.isNone() and unwrapped_idx.asInt() < self.symbols.items.len and hop < 16) : (hop += 1) {
+                        const unwrapped_sym = self.symbols.items[unwrapped_idx.asInt()];
+                        if (unwrapped_sym.kind != .use_alias_sym or unwrapped_sym.target_symbol.isNone()) break;
+                        unwrapped_idx = unwrapped_sym.target_symbol;
+                    }
+                    const matches_overload_sibling = !unwrapped_idx.isNone() and
+                        unwrapped_idx.asInt() < self.symbols.items.len and
+                        resolved_sym.flags.is_overload and
+                        self.symbols.items[unwrapped_idx.asInt()].flags.is_overload and
+                        self.symbols.items[unwrapped_idx.asInt()].scope_id == resolved_sym.scope_id and
+                        self.symbols.items[unwrapped_idx.asInt()].name == resolved_sym.name;
+                    if (cand_sym.target_symbol == resolved_idx or
+                        unwrapped_idx == resolved_idx or
+                        matches_overload_sibling)
+                    {
+                        var alias_walk = cand_idx;
+                        var mark_hop: u8 = 0;
+                        while (!alias_walk.isNone() and alias_walk.asInt() < self.symbols.items.len and mark_hop < 16) : (mark_hop += 1) {
+                            self.markSymbolUsed(alias_walk);
+                            self.recordCrossModuleAccess(caller_scope, alias_walk);
+                            const step_sym = self.symbols.items[alias_walk.asInt()];
+                            if (step_sym.kind != .use_alias_sym) break;
+                            alias_walk = step_sym.target_symbol;
+                        }
+                        break;
+                    }
+                }
+            }
+            cur = self.scope_arena.getScope(cur).parent;
+        }
+    }
+
+    /// Marks a target-scope member/method `resolved_idx` used from `caller_scope`, propagating `impl_method_trait` (`W0404`/`W0406`).
+    pub fn markTargetScopeSymbolUsed(
+        self: *SymbolTable,
+        caller_scope: ScopeId,
+        resolved_idx: SymbolIndex,
+    ) void {
+        if (resolved_idx.isNone() or resolved_idx.asInt() >= self.symbols.items.len) return;
+        self.markSymbolUsed(resolved_idx);
+        self.recordCrossModuleAccess(caller_scope, resolved_idx);
+        if (self.impl_method_trait.get(resolved_idx.asInt())) |trait_sym_idx| {
+            self.markImportedTraitUsed(caller_scope, trait_sym_idx);
+        }
+    }
+
     /// Returns the slice of `SymbolIndex` members declared directly inside `scope_id`.
     pub fn getScopeMembers(self: *const SymbolTable, scope_id: ScopeId) []const SymbolIndex {
         if (self.scope_members.getPtr(scope_id.asInt())) |list_ptr| {
@@ -5110,7 +5394,7 @@ pub const SymbolTable = struct {
         return &.{};
     }
 
-    /// Prunes prior body-local bindings from `fn_scope` and resets parameter `is_used` flags before body re-checking.
+    /// Prunes prior body-local bindings from `fn_scope` and resets parameter `is_used`/`is_mutated` flags before body re-checking.
     pub fn resetFnScopeForBodyRecheck(
         self: *SymbolTable,
         fn_scope: ScopeId,
@@ -5127,9 +5411,11 @@ pub const SymbolTable = struct {
             };
             if (is_sig_param) {
                 if (mem_sym.kind == .param_sym) {
-                    self.getSymbolMut(mem_idx).flags.is_used =
+                    const param_mut = self.getSymbolMut(mem_idx);
+                    param_mut.flags.is_used =
                         mem_sym.member_ordinal < param_specs.len and
                         param_specs[mem_sym.member_ordinal].is_used_by_default;
+                    param_mut.flags.is_mutated = false;
                 }
                 list_ptr.items[write_idx] = mem_idx;
                 write_idx += 1;
@@ -5141,6 +5427,73 @@ pub const SymbolTable = struct {
             }
         }
         list_ptr.items.len = write_idx;
+    }
+
+    /// Purges prior symbols declared in `target_fid` from shared `prim_inherent_scopes` before file Pass-1 re-collection.
+    pub fn purgeFileMembersFromPrimInherentScopes(
+        self: *SymbolTable,
+        target_fid: FileId,
+    ) !void {
+        if (target_fid.isNone()) return;
+        for (self.prim_inherent_scopes) |prim_scope| {
+            if (prim_scope.isNone()) continue;
+            const list_ptr = self.scope_members.getPtr(prim_scope.asInt()) orelse continue;
+            var has_removed = false;
+            for (list_ptr.items) |mem_idx| {
+                const mem_sym = self.getSymbol(mem_idx).*;
+                if (!mem_sym.flags.is_builtin and mem_sym.decl_span.file_id == target_fid) {
+                    has_removed = true;
+                    break;
+                }
+            }
+            if (!has_removed) continue;
+
+            for (list_ptr.items) |mem_idx| {
+                const mem_sym = self.getSymbol(mem_idx).*;
+                if (mem_sym.flags.is_builtin) continue;
+                _ = self.scoped_map.remove(packScopedSymbolKey(prim_scope, mem_sym.name, mem_sym.namespace));
+            }
+
+            var write_idx: usize = 0;
+            for (list_ptr.items) |mem_idx| {
+                const mem_sym = self.getSymbol(mem_idx).*;
+                if (mem_sym.flags.is_builtin) {
+                    list_ptr.items[write_idx] = mem_idx;
+                    write_idx += 1;
+                    continue;
+                }
+                if (mem_sym.kind == .overload_group_sym and !mem_sym.target_symbol.isNone() and
+                    mem_sym.target_symbol.asInt() < self.overload_sets.items.len)
+                {
+                    const ov_set = &self.overload_sets.items[mem_sym.target_symbol.asInt()];
+                    var ov_write: usize = 0;
+                    for (ov_set.members.items) |ov_mem_idx| {
+                        if (self.getSymbol(ov_mem_idx).decl_span.file_id != target_fid) {
+                            ov_set.members.items[ov_write] = ov_mem_idx;
+                            ov_write += 1;
+                        }
+                    }
+                    ov_set.members.items.len = ov_write;
+                    if (ov_write > 0) {
+                        const scoped_key = packScopedSymbolKey(prim_scope, mem_sym.name, mem_sym.namespace);
+                        const mapped_idx = if (ov_write == 1) ov_set.members.items[0] else mem_idx;
+                        try self.scoped_map.put(self.allocator, scoped_key, mapped_idx);
+                        list_ptr.items[write_idx] = mem_idx;
+                        write_idx += 1;
+                    }
+                    continue;
+                }
+                if (mem_sym.decl_span.file_id != target_fid) {
+                    const scoped_key = packScopedSymbolKey(prim_scope, mem_sym.name, mem_sym.namespace);
+                    if (!self.scoped_map.contains(scoped_key)) {
+                        try self.scoped_map.put(self.allocator, scoped_key, mem_idx);
+                    }
+                    list_ptr.items[write_idx] = mem_idx;
+                    write_idx += 1;
+                }
+            }
+            list_ptr.items.len = write_idx;
+        }
     }
 
     /// Returns the total number of symbols in `self.symbols`.
@@ -5257,7 +5610,10 @@ pub const SymbolTable = struct {
             // [2] Local variable shadowing inside `.block_scope` / `.match_arm_scope` is permitted across nested blocks,
             //     and within the same block `let x = …; let x = …;` rebinds `x` cleanly in CoreX/Rust style:
             const scope_kind = self.scope_arena.getScope(record.scope_id).kind;
-            if (scope_kind == .block_scope or scope_kind == .match_arm_scope or scope_kind == .loop_scope) {
+            if (scope_kind == .fn_scope or scope_kind == .block_scope or
+                scope_kind == .match_arm_scope or scope_kind == .loop_scope or
+                scope_kind == .condition_scope)
+            {
                 if (record.kind == .local_let_sym or record.kind == .local_var_sym) {
                     const shadowed_idx = try self.appendSymbol(record);
                     try self.scoped_map.put(self.allocator, key, shadowed_idx);
@@ -5355,6 +5711,27 @@ pub const SymbolTable = struct {
         return .none;
     }
 
+    /// Looks up a type `SymbolIndex` inside `cx.<submod_name>` in $O(1)$ when `stdlib/cx` is mounted.
+    pub fn lookupCxSubmoduleSymbol(
+        self: *const SymbolTable,
+        interner: *const StringInterner,
+        submod_name: []const u8,
+        type_name: []const u8,
+    ) SymbolIndex {
+        const root_scope = if (!self.cx_prelude_scope.isNone())
+            self.cx_prelude_scope
+        else
+            self.cx_root_scope;
+        if (root_scope.isNone()) return .none;
+        const submod_id = interner.lookup(submod_name) orelse return .none;
+        const type_sym_id = interner.lookup(type_name) orelse return .none;
+        const mod_sym_idx = self.lookupInScopeDirect(root_scope, submod_id, NamespaceMask.VALUE_ONLY);
+        if (mod_sym_idx.isNone()) return .none;
+        const mod_scope = self.getSymbol(mod_sym_idx).target_scope;
+        if (mod_scope.isNone()) return .none;
+        return self.lookupInScopeDirect(mod_scope, type_sym_id, NamespaceMask.TYPE_ONLY);
+    }
+
     /// Resolves a nominal struct `TypeId` inside `cx.<submod_name>` in $O(1)$ when `stdlib/cx` is mounted.
     pub fn lookupCxSubmoduleType(
         self: *const SymbolTable,
@@ -5362,18 +5739,7 @@ pub const SymbolTable = struct {
         submod_name: []const u8,
         type_name: []const u8,
     ) ?TypeId {
-        const root_scope = if (!self.cx_prelude_scope.isNone())
-            self.cx_prelude_scope
-        else
-            self.cx_root_scope;
-        if (root_scope.isNone()) return null;
-        const submod_id = interner.lookup(submod_name) orelse return null;
-        const type_sym_id = interner.lookup(type_name) orelse return null;
-        const mod_sym_idx = self.lookupInScopeDirect(root_scope, submod_id, NamespaceMask.VALUE_ONLY);
-        if (mod_sym_idx.isNone()) return null;
-        const mod_scope = self.getSymbol(mod_sym_idx).target_scope;
-        if (mod_scope.isNone()) return null;
-        const found_idx = self.lookupInScopeDirect(mod_scope, type_sym_id, NamespaceMask.TYPE_ONLY);
+        const found_idx = self.lookupCxSubmoduleSymbol(interner, submod_name, type_name);
         if (found_idx.isNone()) return null;
         const found_sym = self.getSymbol(found_idx).*;
         if (found_sym.kind == .struct_sym and !found_sym.type_id.isError()) {
@@ -5425,6 +5791,11 @@ pub const SymbolTable = struct {
                 return self.checkSymbolVisibility(sym_idx, start_scope);
             }
             cursor = self.scope_arena.getScope(cursor).parent;
+        }
+        if (!self.expect_attr_name_id.isNone() and name == self.expect_attr_name_id and
+            mask.contains(.type_ns) and !mask.contains(.value_ns))
+        {
+            return .{ .found = BUILTIN_EXPECT_ATTR_SYM_IDX };
         }
         return .not_found;
     }
@@ -5548,6 +5919,7 @@ pub const SymbolTable = struct {
                 if (!mask.contains(sym.namespace)) continue;
                 if (sym.name_text.len == 0 or sym.name_text.len > MAX_EDIT_DISTANCE_LEN) continue;
                 if (std.mem.startsWith(u8, sym.name_text, "_")) continue;
+                if (sym.flags.is_builtin and sym.flags.is_attribute_schema) continue;
 
                 // Skip candidates whose length difference alone exceeds `max_allowed_dist`:
                 const len_diff = if (query_text.len > sym.name_text.len)
@@ -5603,21 +5975,58 @@ pub const SymbolTable = struct {
         return best_candidate;
     }
 
-    /// Emits `W0402` (`w0402_unused_binding`) for any unreferenced local bindings/parameters in `scope_id`.
+    /// Emits `W0103` (`confusable-ident`) and `W0402` (`w0402_unused_binding`) for local/parameter bindings in `scope_id`.
     pub fn checkUnusedBindingsInScope(
         self: *const SymbolTable,
         scope_id: ScopeId,
         interner: *StringInterner,
         diagnostic_sink: *DiagnosticSink,
     ) !void {
-        if (self.getScopeAllowMask(scope_id).has_allow_unused_w0402) return;
-        for (self.getScopeMembers(scope_id)) |sym_idx| {
+        return self.checkUnusedBindingsInScopeWithFn(scope_id, .none, interner, diagnostic_sink);
+    }
+
+    /// Emits `W0103` and `W0402` for local/parameter bindings in `scope_id` with an optional `enclosing_fn_hint`.
+    pub fn checkUnusedBindingsInScopeWithFn(
+        self: *const SymbolTable,
+        scope_id: ScopeId,
+        enclosing_fn_hint: SymbolIndex,
+        interner: *StringInterner,
+        diagnostic_sink: *DiagnosticSink,
+    ) !void {
+        const members = self.getScopeMembers(scope_id);
+        if (members.len == 0) return;
+
+        // [1] Zero-ASCII-cost local/parameter `W0103` (`confusable-ident`) check:
+        if (self.hasNonAsciiSymbolInLexicalChain(scope_id)) {
+            for (members) |sym_idx| {
+                const sym = self.getSymbol(sym_idx);
+                if (sym.kind != .local_let_sym and sym.kind != .local_var_sym and sym.kind != .param_sym) continue;
+                if (sym.flags.is_builtin or sym.decl_span.file_id.isNone()) continue;
+                try emitConfusableWarningForSymbol(self, sym_idx, self.active_lint_settings, diagnostic_sink);
+            }
+        }
+
+        // [2] `W0402` (`unused-binding`) check:
+        var enclosing_fn_sym_idx: SymbolIndex = .none;
+        if (!scope_id.isNone() and scope_id.asInt() < self.scope_arena.countScopes()) {
+            const sc_rec = self.scope_arena.getScope(scope_id);
+            if (sc_rec.kind == .fn_scope) {
+                if (!enclosing_fn_hint.isNone()) {
+                    enclosing_fn_sym_idx = enclosing_fn_hint;
+                } else if (!sc_rec.owner_def_id.isNone()) {
+                    if (self.def_to_symbol.get(sc_rec.owner_def_id.asInt())) |fn_idx| {
+                        enclosing_fn_sym_idx = fn_idx;
+                    }
+                }
+            }
+        }
+
+        for (members) |sym_idx| {
             const sym = self.getSymbol(sym_idx);
             if (sym.kind != .local_let_sym and sym.kind != .local_var_sym and sym.kind != .param_sym) {
                 continue;
             }
             if (sym.flags.is_used or sym.flags.is_builtin) continue;
-            if (self.getSymbolAllowMask(sym_idx).has_allow_unused_w0402) continue;
             if (sym.name_text.len == 0 or
                 std.mem.startsWith(u8, sym.name_text, "_") or
                 std.mem.eql(u8, sym.name_text, "self"))
@@ -5625,22 +6034,45 @@ pub const SymbolTable = struct {
                 continue;
             }
             if (sym.decl_span.file_id.isNone()) continue;
+            if (sym.kind == .param_sym and !enclosing_fn_sym_idx.isNone() and
+                self.impl_method_trait.contains(enclosing_fn_sym_idx.asInt()))
+            {
+                continue;
+            }
 
-            const prefixed_name = try std.fmt.allocPrint(
+            var edit_start: u32 = sym.decl_span.start_byte;
+            const replacement_text = if (sym.flags.is_shorthand_field_pat) blk_shorthand: {
+                if (sym.flags.shorthand_field_mod != 0 and
+                    sym.decl_span.start_byte >= sym.flags.shorthand_lead_bytes)
+                {
+                    edit_start = sym.decl_span.start_byte - sym.flags.shorthand_lead_bytes;
+                }
+                const mod_prefix: []const u8 = switch (sym.flags.shorthand_field_mod) {
+                    1 => "var ",
+                    2 => "&",
+                    3 => "&mut ",
+                    else => "",
+                };
+                break :blk_shorthand try std.fmt.allocPrint(
+                    diagnostic_sink.arena.asAllocator(),
+                    "{s}: {s}_{s}",
+                    .{ sym.name_text, mod_prefix, sym.name_text },
+                );
+            } else try std.fmt.allocPrint(
                 diagnostic_sink.arena.asAllocator(),
                 "_{s}",
                 .{sym.name_text},
             );
-            const replacement_id = try interner.intern(prefixed_name);
+            const replacement_id = try interner.intern(replacement_text);
             const edit = [1]TextEdit{.{
                 .file_id = sym.decl_span.file_id,
-                .start_byte = sym.decl_span.start_byte,
+                .start_byte = edit_start,
                 .end_byte = sym.decl_span.end_byte,
                 .replacement_id = replacement_id,
             }};
             const fix = [1]SuggestedFix{.{
                 .message = "prefix the unused binding with `_` to silence this warning",
-                .applicability = .machine_applicable,
+                .applicability = .maybe_incorrect,
                 .priority = .lint_idiom,
                 .edits = &edit,
             }};
@@ -5673,9 +6105,23 @@ pub const SymbolTable = struct {
             });
         }
     }
+    /// Returns `true` in $O(1)$ per scope when any symbol in `start_scope`'s non-prelude lexical chain is non-ASCII.
+    pub fn hasNonAsciiSymbolInLexicalChain(self: *const SymbolTable, start_scope: ScopeId) bool {
+        var cur = start_scope;
+        var steps: usize = 0;
+        while (!cur.isNone() and cur != self.prelude_scope and
+            cur.asInt() < self.scope_arena.countScopes() and steps <= MAX_SCOPE_DEPTH) : (steps += 1)
+        {
+            for (self.getScopeMembers(cur)) |mem_idx| {
+                if (hasNonAsciiByte(self.getSymbol(mem_idx).name_text)) {
+                    return true;
+                }
+            }
+            cur = self.scope_arena.getScope(cur).parent;
+        }
+        return false;
+    }
 };
-
-// ---------------- Diagnostic Emission Helpers -----------------
 
 /// Maps unambiguous `PascalCase` foreign scalar type spellings (`U32`, `UInt32`, `Bool`, `Str`, `Void`, …) to CoreX primitives.
 pub fn lookupUnambiguousForeignScalar(name: []const u8) ?[]const u8 {
@@ -5687,6 +6133,85 @@ pub fn lookupForeignScalarHint(name: []const u8) ?[]const u8 {
     return UNAMBIGUOUS_FOREIGN_SCALAR_MAP.get(name) orelse LOWERCASE_FOREIGN_SCALAR_HINT_MAP.get(name);
 }
 
+/// Optional syntax/body context supplied to `checkUnusedBindingsInScopeExt` for `W0405` (`unused-mut-binding`).
+pub const UnusedMutScopeContext = struct {
+    /// Full UTF-8 source buffer of the checked file.
+    source: []const u8,
+    /// Token/trivia buffer of the checked file.
+    token_buffer: *const TokenBuffer,
+    /// Lossless CST arena of the checked file.
+    cst_arena: *const LosslessCstArena,
+    /// `true` if the enclosing body emitted type errors (suppressing `W0405` noise on poisoned bodies).
+    has_body_errors: bool = false,
+    /// Set of `SymbolIndex.asInt()` handles bound by statement-level `var pat = …;` declarations (checked per statement).
+    stmt_var_syms: ?*const std.AutoHashMapUnmanaged(u32, void) = null,
+    /// Enclosing function or method `SymbolIndex` being body-checked (`.none` outside function scopes).
+    enclosing_fn_sym: SymbolIndex = .none,
+};
+
+/// Finds the removable `var ` byte range `[start_byte, end_byte)` on a `param_sym` or pattern-level `var` binding.
+fn findRemovableVarPrefixInParamOrPatCst(
+    sym: SymbolRecord,
+    ctx: UnusedMutScopeContext,
+) ?struct { start_byte: u32, end_byte: u32 } {
+    if (sym.flags.is_shorthand_field_pat and sym.flags.shorthand_field_mod == 1 and
+        sym.flags.shorthand_lead_bytes > 0 and sym.decl_span.start_byte >= sym.flags.shorthand_lead_bytes)
+    {
+        const start_b = sym.decl_span.start_byte - sym.flags.shorthand_lead_bytes;
+        const end_b = sym.decl_span.start_byte;
+        if (!hasCommentInSourceRange(ctx.source, start_b, end_b)) {
+            return .{ .start_byte = start_b, .end_byte = end_b };
+        }
+        return null;
+    }
+
+    if (sym.cst_node.isNone() or sym.cst_node.asInt() >= ctx.cst_arena.countNodes()) return null;
+    const start_idx: usize = sym.cst_node.asInt();
+    const root_rec = ctx.cst_arena.getNode(sym.cst_node);
+    const end_idx: usize = @min(
+        start_idx + @max(@as(usize, root_rec.subtree_size), 1),
+        ctx.cst_arena.countNodes(),
+    );
+    const tok_count = ctx.token_buffer.countTokens();
+
+    var var_tok: TokenIndex = .none;
+    var next_tok: TokenIndex = .none;
+    var cur = start_idx + 1;
+    while (cur < end_idx) : (cur += 1) {
+        const sub = ctx.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+        if (sub.kind == .attribute) {
+            if (sub.subtree_size > 1) cur += @as(usize, sub.subtree_size) - 1;
+            continue;
+        }
+        if (sub.subtree_size > 1 or sub.flags.is_missing_or_injected or
+            sub.token.isNone() or sub.token.asInt() >= tok_count)
+        {
+            continue;
+        }
+        const tok_rec = ctx.token_buffer.getToken(sub.token);
+        if (tok_rec.flags.is_synthesized) continue;
+        if (var_tok.isNone()) {
+            if (sym.kind == .param_sym and tok_rec.kind == .colon) break;
+            if (sym.kind != .param_sym and tok_rec.byte_offset >= sym.decl_span.start_byte) break;
+            if (tok_rec.kind == .kw_var) {
+                var_tok = sub.token;
+            }
+        } else {
+            next_tok = sub.token;
+            break;
+        }
+    }
+    if (var_tok.isNone()) return null;
+    const var_rec = ctx.token_buffer.getToken(var_tok);
+    const start_b = var_rec.byte_offset;
+    const end_b = if (!next_tok.isNone())
+        ctx.token_buffer.getToken(next_tok).byte_offset
+    else
+        var_rec.byte_offset +| var_rec.byte_len;
+    if (end_b <= start_b or hasCommentInSourceRange(ctx.source, start_b, end_b)) return null;
+    return .{ .start_byte = start_b, .end_byte = end_b };
+}
+
 /// Emits `W0402` (`w0402_unused_binding`) for any unreferenced local bindings/parameters in `scope_id`.
 pub fn checkUnusedBindingsInScope(
     sym_table: *const SymbolTable,
@@ -5694,8 +6219,90 @@ pub fn checkUnusedBindingsInScope(
     interner: *StringInterner,
     diagnostic_sink: ?*DiagnosticSink,
 ) !void {
+    return checkUnusedBindingsInScopeExt(sym_table, scope_id, interner, diagnostic_sink, null);
+}
+
+/// Emits `W0103`, `W0402`, and parameter/pattern-level `W0405` (`unused-mut-binding`) for bindings in `scope_id`.
+pub fn checkUnusedBindingsInScopeExt(
+    sym_table: *const SymbolTable,
+    scope_id: ScopeId,
+    interner: *StringInterner,
+    diagnostic_sink: ?*DiagnosticSink,
+    mut_ctx_opt: ?UnusedMutScopeContext,
+) !void {
     const sink = diagnostic_sink orelse return;
-    try sym_table.checkUnusedBindingsInScope(scope_id, interner, sink);
+    const fn_hint: SymbolIndex = if (mut_ctx_opt) |mc| mc.enclosing_fn_sym else .none;
+    try sym_table.checkUnusedBindingsInScopeWithFn(scope_id, fn_hint, interner, sink);
+    const mut_ctx = mut_ctx_opt orelse return;
+    if (mut_ctx.has_body_errors) return;
+
+    const members = sym_table.getScopeMembers(scope_id);
+    if (members.len == 0) return;
+
+    var enclosing_fn_sym_idx: SymbolIndex = .none;
+    if (!scope_id.isNone() and scope_id.asInt() < sym_table.scope_arena.countScopes()) {
+        const sc_rec = sym_table.scope_arena.getScope(scope_id);
+        if (sc_rec.kind == .fn_scope) {
+            if (!fn_hint.isNone()) {
+                enclosing_fn_sym_idx = fn_hint;
+            } else if (!sc_rec.owner_def_id.isNone()) {
+                if (sym_table.def_to_symbol.get(sc_rec.owner_def_id.asInt())) |fn_idx| {
+                    enclosing_fn_sym_idx = fn_idx;
+                }
+            }
+        }
+    }
+    if (!enclosing_fn_sym_idx.isNone()) {
+        const fn_sym = sym_table.getSymbol(enclosing_fn_sym_idx);
+        if (fn_sym.flags.is_prototype_only or fn_sym.flags.is_extern) return;
+    }
+
+    const arena_alloc = sink.arena.asAllocator();
+    for (members) |sym_idx| {
+        const sym = sym_table.getSymbol(sym_idx).*;
+        if (sym.kind != .param_sym and sym.kind != .local_var_sym) continue;
+        if (!sym.flags.is_mut or sym.flags.is_mutated or sym.flags.is_builtin) continue;
+        if (sym.decl_span.file_id.isNone()) continue;
+        if (mut_ctx.stmt_var_syms) |stmt_map| {
+            if (stmt_map.contains(sym_idx.asInt())) continue;
+        }
+
+        const rem_opt = findRemovableVarPrefixInParamOrPatCst(sym, mut_ctx) orelse continue;
+        const empty_id = try interner.intern("");
+        const edits = try arena_alloc.alloc(TextEdit, 1);
+        edits[0] = .{
+            .file_id = sym.decl_span.file_id,
+            .start_byte = rem_opt.start_byte,
+            .end_byte = rem_opt.end_byte,
+            .replacement_id = empty_id,
+        };
+        const fixes = try arena_alloc.alloc(SuggestedFix, 1);
+        fixes[0] = .{
+            .message = "remove unnecessary `var` mutability modifier",
+            .applicability = .machine_applicable,
+            .priority = .lint_idiom,
+            .edits = edits,
+        };
+        const labels = try arena_alloc.alloc(LabeledSpan, 1);
+        labels[0] = .{
+            .span = sym.decl_span,
+            .label = try std.fmt.allocPrint(arena_alloc, "binding `{s}` is never mutated", .{sym.name_text}),
+            .style = .primary,
+        };
+        const kind_label: []const u8 = if (sym.kind == .param_sym) "parameter" else "binding";
+        try sink.emit(.{
+            .code = .w0405_unused_mut_binding,
+            .severity = .warning,
+            .primary_span = sym.decl_span,
+            .message = try std.fmt.allocPrint(
+                arena_alloc,
+                "{s} `{s}` is declared `var` but never mutated",
+                .{ kind_label, sym.name_text },
+            ),
+            .labels = labels,
+            .suggestions = fixes,
+        });
+    }
 }
 
 /// Emits `E0408` (`e0408_duplicate_definition`) with primary and secondary labels.
@@ -10100,7 +10707,7 @@ pub fn computeCstSubtreeSpan(
     return Span.init(file_id, min_byte, max_byte);
 }
 
-/// Extracts and validates scoped `@allow(…)` lint names inside `[arg_start .. attr_end)`, rejecting blanket suppressors (`E0403`).
+/// Retires legacy `E0403` `@allow` validation; `Parser` (`E0240`) and `SuppressionTable` are now sole authorities (`DR-25`).
 pub fn extractAndValidateAllowAttrRange(
     source: []const u8,
     file_id: FileId,
@@ -10112,111 +10719,16 @@ pub fn extractAndValidateAllowAttrRange(
     attr_end: usize,
     diagnostic_sink: ?*DiagnosticSink,
 ) !AllowLintMask {
-    const name_span = if (!name_token.isNone() and name_token.asInt() < token_buffer.countTokens())
-        token_buffer.getTokenSpan(file_id, name_token)
-    else
-        Span.ZERO;
-    const attr_head_span: Span = if (!at_token.isNone() and at_token.asInt() < token_buffer.countTokens() and
-        !name_span.file_id.isNone())
-    blk: {
-        const at_span = token_buffer.getTokenSpan(file_id, at_token);
-        if (at_span.file_id == name_span.file_id and at_span.start_byte <= name_span.end_byte) {
-            break :blk Span.init(file_id, at_span.start_byte, name_span.end_byte);
-        }
-        break :blk name_span;
-    } else name_span;
-
-    const first_tok = peekNextAttrLeafToken(token_buffer, cst_arena, arg_start, attr_end);
-    if (first_tok.isNone() or token_buffer.getToken(first_tok).kind != .lparen) {
-        try emitInvalidAllowAttrDiagnostic(
-            diagnostic_sink,
-            attr_head_span,
-            "bare `@allow` without explicit lint names is forbidden (`AGENTS.md` §1); write `@allow(W0402)` or similar",
-            "expected `(lint_name)` argument list after `@allow`",
-            null,
-        );
-        return .{};
-    }
-
-    var mask = AllowLintMask{};
-    var seen_arg_count: u32 = 0;
-    var paren_depth: u32 = 0;
-    var arg_cur = arg_start;
-    while (arg_cur < attr_end) : (arg_cur += 1) {
-        const arg_leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(arg_cur)));
-        if (arg_leaf.subtree_size > 1 or arg_leaf.flags.is_missing_or_injected or
-            arg_leaf.token.isNone() or arg_leaf.token.asInt() >= token_buffer.countTokens())
-        {
-            continue;
-        }
-        const tok_kind = token_buffer.getToken(arg_leaf.token).kind;
-        if (tok_kind == .lparen) {
-            paren_depth += 1;
-            continue;
-        } else if (tok_kind == .rparen) {
-            if (paren_depth <= 1) break;
-            paren_depth -= 1;
-            continue;
-        } else if (tok_kind == .comma) {
-            continue;
-        }
-
-        seen_arg_count += 1;
-        const tok_span = token_buffer.getTokenSpan(file_id, arg_leaf.token);
-        const raw_lex = extractTokenSlice(source, token_buffer, arg_leaf.token);
-        if (tok_kind == .star or std.mem.eql(u8, raw_lex, "all") or std.mem.eql(u8, raw_lex, "warnings")) {
-            var msg_buf: [200]u8 = undefined;
-            const msg = std.fmt.bufPrint(
-                &msg_buf,
-                "blanket `@allow({s})` suppressor is forbidden (`AGENTS.md` §1); specify an explicit lint code or name",
-                .{raw_lex},
-            ) catch "blanket `@allow` suppressor is forbidden (`AGENTS.md` §1)";
-            try emitInvalidAllowAttrDiagnostic(
-                diagnostic_sink,
-                tok_span,
-                msg,
-                "blanket lint suppression is forbidden",
-                null,
-            );
-            continue;
-        } else if (!isIdentifierToken(tok_kind)) {
-            try emitInvalidAllowAttrDiagnostic(
-                diagnostic_sink,
-                tok_span,
-                "`@allow(…)` argument must be a recognized lint identifier (e.g., `W0402`, `unused`, `deprecated`)",
-                "expected lint identifier here",
-                null,
-            );
-            continue;
-        } else if (AllowLintMask.fromLintName(raw_lex)) |lint_bit| {
-            mask = mask.merge(lint_bit);
-        } else {
-            var msg_buf: [200]u8 = undefined;
-            const msg = std.fmt.bufPrint(
-                &msg_buf,
-                "unknown `@allow` lint `{s}`; expected `W0119`–`W0120`, `W0201`–`W0202`, `W0333`, or `W0401`–`W0403`",
-                .{raw_lex},
-            ) catch "unknown lint identifier in `@allow(…)`";
-            try emitInvalidAllowAttrDiagnostic(
-                diagnostic_sink,
-                tok_span,
-                msg,
-                "unknown lint identifier",
-                raw_lex,
-            );
-        }
-    }
-
-    if (seen_arg_count == 0) {
-        try emitInvalidAllowAttrDiagnostic(
-            diagnostic_sink,
-            attr_head_span,
-            "empty `@allow()` is forbidden (`AGENTS.md` §1); specify at least one explicit lint code or name",
-            "empty `@allow()` attribute",
-            null,
-        );
-    }
-    return mask;
+    _ = source;
+    _ = file_id;
+    _ = token_buffer;
+    _ = cst_arena;
+    _ = at_token;
+    _ = name_token;
+    _ = arg_start;
+    _ = attr_end;
+    _ = diagnostic_sink;
+    return AllowLintMask{};
 }
 
 /// Parses `@deprecated` and `@fix_inline` arguments inside `[arg_start .. attr_end)` into `meta_io` (`DR-14` §2.2).
@@ -10338,7 +10850,7 @@ pub fn parseDeprecatedOrFixInlineAttrRange(
     }
 }
 
-/// Scans `cst_arena` in $O(N)$ to collect all lexical `AllowedSpanEntry` ranges carrying valid `@allow(…)` attributes.
+/// Retires legacy CST `@allow` pre-filtering so `SuppressionTable` in `CompilerDb` is sole authority (`DR-25`).
 pub fn collectAllowedSpansFromCst(
     allocator: std.mem.Allocator,
     file_id: FileId,
@@ -10346,68 +10858,12 @@ pub fn collectAllowedSpansFromCst(
     token_buffer: *const TokenBuffer,
     cst_arena: *const LosslessCstArena,
 ) ![]AllowedSpanEntry {
-    var entries: std.ArrayListUnmanaged(AllowedSpanEntry) = .empty;
-    errdefer entries.deinit(allocator);
-
-    const total_nodes = cst_arena.countNodes();
-    const total_tokens = token_buffer.countTokens();
-    var node_cur: usize = 0;
-    while (node_cur < total_nodes) : (node_cur += 1) {
-        const owner_cst = CstNodeIndex.fromInt(@intCast(node_cur));
-        const owner_rec = cst_arena.getNode(owner_cst);
-        if (owner_rec.subtree_size <= 1 or owner_rec.kind == .attribute or owner_rec.kind == .file_end) continue;
-
-        const owner_end = @min(node_cur + @as(usize, owner_rec.subtree_size), total_nodes);
-        var owner_mask = AllowLintMask{};
-        var child_cur = node_cur + 1;
-        while (child_cur < owner_end) {
-            const child_rec = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(child_cur)));
-            if (child_rec.kind == .visibility_modifier) {
-                child_cur += @max(@as(usize, child_rec.subtree_size), 1);
-                continue;
-            } else if (child_rec.kind != .attribute) {
-                break;
-            }
-
-            const attr_end = @min(child_cur + @max(@as(usize, child_rec.subtree_size), 1), owner_end);
-            var at_tok: TokenIndex = .none;
-            var attr_cur = child_cur + 1;
-            while (attr_cur < attr_end) : (attr_cur += 1) {
-                const leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(attr_cur)));
-                if (leaf.subtree_size <= 1 and !leaf.token.isNone() and leaf.token.asInt() < total_tokens) {
-                    const leaf_kind = token_buffer.getToken(leaf.token).kind;
-                    if (leaf_kind == .at and at_tok.isNone()) {
-                        at_tok = leaf.token;
-                        continue;
-                    } else if (isIdentifierToken(leaf_kind)) {
-                        if (std.mem.eql(u8, extractTokenSlice(source, token_buffer, leaf.token), "allow")) {
-                            const parsed = try extractAndValidateAllowAttrRange(
-                                source,
-                                file_id,
-                                token_buffer,
-                                cst_arena,
-                                at_tok,
-                                leaf.token,
-                                attr_cur + 1,
-                                attr_end,
-                                null,
-                            );
-                            owner_mask = owner_mask.merge(parsed);
-                        }
-                        break;
-                    }
-                }
-            }
-            child_cur = attr_end;
-        }
-
-        if (!owner_mask.isEmpty()) {
-            if (computeCstSubtreeSpan(file_id, token_buffer, cst_arena, owner_cst)) |owner_span| {
-                try entries.append(allocator, .{ .span = owner_span, .mask = owner_mask });
-            }
-        }
-    }
-    return entries.toOwnedSlice(allocator);
+    _ = allocator;
+    _ = file_id;
+    _ = source;
+    _ = token_buffer;
+    _ = cst_arena;
+    return &.{};
 }
 
 /// Returns the combined `AllowLintMask` covering `target_span` across `entries`.
@@ -10943,6 +11399,11 @@ fn resolveImplTargetScope(
                 } else sym_table.lookupLexical(enclosing_scope, trait_id, NamespaceMask.TYPE_ONLY);
                 switch (trait_lookup) {
                     .found => |found_trait| {
+                        if (before_for_len > 1) {
+                            sym_table.markTargetScopeSymbolUsed(enclosing_scope, found_trait);
+                        } else {
+                            sym_table.markLexicalSymbolUsed(enclosing_scope, trait_id, found_trait);
+                        }
                         if (sym_table.getSymbol(found_trait).kind == .trait_sym) {
                             trait_sym_idx = found_trait;
                         }
@@ -11458,6 +11919,7 @@ pub fn resolveFileUseImports(
     cst_arena: *const LosslessCstArena,
     diagnostic_sink: ?*DiagnosticSink,
 ) !void {
+    sym_table.clearFileUseLeafRecords(file_id);
     const effective_cfg = sym_table.resolveCfgEnvForFile(file_id);
     var i: usize = 0;
     while (i < sym_table.pending_imports.items.len) : (i += 1) {
@@ -11489,8 +11951,7 @@ pub fn resolveFileUseImports(
             if (!is_use_enabled) continue;
         }
 
-        const is_dep_suppressed = use_header_meta.extra_flags.is_deprecated or
-            use_header_meta.allow_mask.has_allow_deprecated_w0403;
+        const is_dep_suppressed = use_header_meta.extra_flags.is_deprecated;
         const root_idx: usize = pending.cst_node.asInt();
         const root_rec = cst_arena.getNode(pending.cst_node);
         const end_idx: usize = @min(
@@ -11592,13 +12053,13 @@ fn resolveUseTreeCst(
             const alias_sym_id = try interner.intern(inline_view.alias_slice);
             const is_pub_inline = (visibility == .public);
             if (sym_table.lookupExternalPackageScope(file_id, alias_sym_id)) |dep_scope| {
-                _ = try sym_table.defineSymbol(.{
+                const inline_sym_idx = try sym_table.defineSymbol(.{
                     .name = alias_sym_id,
                     .name_text = interner.get(alias_sym_id),
                     .kind = .module_sym,
                     .namespace = .value_ns,
                     .visibility = visibility,
-                    .flags = .{ .is_pub = is_pub_inline, .is_used = true, .is_imported = true },
+                    .flags = .{ .is_pub = is_pub_inline, .is_used = visibility != .private, .is_imported = true },
                     .scope_id = dest_module_scope,
                     .def_id = def_id,
                     .cst_node = use_item_cst,
@@ -11606,6 +12067,18 @@ fn resolveUseTreeCst(
                     .target_scope = dep_scope,
                     .has_cfg_attr = has_use_cfg,
                 }, diagnostic_sink);
+                if (visibility == .private and !inline_sym_idx.isNone()) {
+                    try sym_table.use_leaf_records.append(sym_table.allocator, .{
+                        .file_id = file_id,
+                        .def_id = def_id,
+                        .scope_id = dest_module_scope,
+                        .use_item_cst = use_item_cst,
+                        .leaf_tree_cst = tree_cst,
+                        .report_span = inline_view.alias_span,
+                        .alias_sym = inline_sym_idx,
+                        .bound_name = alias_sym_id,
+                    });
+                }
                 return;
             }
             if (diagnostic_sink) |sink| {
@@ -11765,8 +12238,9 @@ fn resolveUseTreeCst(
                 }
             }
             const clamped_vis: Visibility = @fromBackingInt(@min(@backingInt(visibility), max_member_vis_raw));
+            sym_table.recordCrossModuleAccess(dest_module_scope, vis_check.found);
 
-            _ = try sym_table.defineSymbol(.{
+            const glob_alias_idx = try sym_table.defineSymbol(.{
                 .name = member.name,
                 .name_text = member.name_text,
                 .kind = .use_alias_sym,
@@ -11774,18 +12248,35 @@ fn resolveUseTreeCst(
                 .visibility = clamped_vis,
                 .flags = .{
                     .is_pub = clamped_vis == .public,
-                    .is_used = true,
+                    .is_used = visibility != .private,
                     .is_imported = true,
+                    .is_glob_use_alias = true,
                 },
                 .scope_id = dest_module_scope,
                 .def_id = def_id,
-                .cst_node = use_item_cst,
+                .cst_node = tree_cst,
                 .decl_span = member.decl_span,
                 .type_id = member.type_id,
                 .target_symbol = vis_check.found,
                 .target_scope = member.target_scope,
                 .has_cfg_attr = has_use_cfg,
             }, null);
+            if (visibility == .private and !glob_alias_idx.isNone() and resolved_member.kind == .trait_sym) {
+                const trait_key: u64 = (@as(u64, dest_module_scope.asInt()) << 32) | @as(u64, vis_check.found.asInt());
+                try sym_table.trait_alias_by_scope_and_target.put(sym_table.allocator, trait_key, glob_alias_idx);
+            }
+        }
+        if (visibility == .private) {
+            try sym_table.use_leaf_records.append(sym_table.allocator, .{
+                .file_id = file_id,
+                .def_id = def_id,
+                .scope_id = dest_module_scope,
+                .use_item_cst = use_item_cst,
+                .leaf_tree_cst = tree_cst,
+                .report_span = computeCstSubtreeTokenSpan(file_id, token_buffer, cst_arena, tree_cst),
+                .glob_target_scope = target_scope,
+                .is_glob = true,
+            });
         }
         return;
     }
@@ -11799,12 +12290,26 @@ fn resolveUseTreeCst(
         const bind_name_tok = if (!alias_tok.isNone()) alias_tok else parent_mod_tok;
         if (bind_name_tok.isNone()) return;
         const bind_lexeme = extractTokenSlice(source, token_buffer, bind_name_tok);
-        if (bind_lexeme.len == 0 or std.mem.eql(u8, bind_lexeme, "_")) return;
-        const bind_sym_id = try interner.intern(bind_lexeme);
+        if (bind_lexeme.len == 0) return;
         const decl_tok = if (!alias_tok.isNone()) alias_tok else final_tok;
         const decl_span = token_buffer.getTokenSpan(file_id, decl_tok);
+        if (std.mem.eql(u8, bind_lexeme, "_")) {
+            if (visibility == .private) {
+                try sym_table.use_leaf_records.append(sym_table.allocator, .{
+                    .file_id = file_id,
+                    .def_id = def_id,
+                    .scope_id = dest_module_scope,
+                    .use_item_cst = use_item_cst,
+                    .leaf_tree_cst = tree_cst,
+                    .report_span = decl_span,
+                    .is_exempt_underscore = true,
+                });
+            }
+            return;
+        }
+        const bind_sym_id = try interner.intern(bind_lexeme);
         var self_mod_vis = visibility;
-        if (visibility != .private and !parent_mod_tok.isNone()) {
+        if (!parent_mod_tok.isNone()) {
             const parent_mod_lex = extractTokenSlice(source, token_buffer, parent_mod_tok);
             if (interner.lookup(parent_mod_lex)) |parent_sym_id| {
                 const mod_parent_scope = sym_table.scope_arena.getScope(current_lookup_scope).parent;
@@ -11815,30 +12320,37 @@ fn resolveUseTreeCst(
                         NamespaceMask.VALUE_ONLY,
                     );
                     if (!mod_sym_idx.isNone()) {
-                        const mod_sym = sym_table.getSymbol(mod_sym_idx).*;
-                        if (!mod_sym.flags.is_builtin and @backingInt(visibility) > @backingInt(mod_sym.visibility)) {
-                            if (diagnostic_sink) |sink| {
-                                try emitUseVisibilityEscalationDiagnostic(
-                                    sink,
-                                    &mod_sym,
-                                    visibility,
-                                    mod_sym.visibility,
-                                    decl_span,
-                                );
+                        sym_table.recordCrossModuleAccess(dest_module_scope, mod_sym_idx);
+                        if (visibility != .private) {
+                            const mod_sym = sym_table.getSymbol(mod_sym_idx).*;
+                            if (!mod_sym.flags.is_builtin and @backingInt(visibility) > @backingInt(mod_sym.visibility)) {
+                                if (diagnostic_sink) |sink| {
+                                    try emitUseVisibilityEscalationDiagnostic(
+                                        sink,
+                                        &mod_sym,
+                                        visibility,
+                                        mod_sym.visibility,
+                                        decl_span,
+                                    );
+                                }
+                                self_mod_vis = mod_sym.visibility;
                             }
-                            self_mod_vis = mod_sym.visibility;
                         }
                     }
                 }
             }
         }
-        _ = try sym_table.defineSymbol(.{
+        const self_sym_idx = try sym_table.defineSymbol(.{
             .name = bind_sym_id,
             .name_text = interner.get(bind_sym_id),
             .kind = .module_sym,
             .namespace = .value_ns,
             .visibility = self_mod_vis,
-            .flags = .{ .is_pub = self_mod_vis == .public, .is_used = true, .is_imported = true },
+            .flags = .{
+                .is_pub = self_mod_vis == .public,
+                .is_used = self_mod_vis != .private,
+                .is_imported = true,
+            },
             .scope_id = dest_module_scope,
             .def_id = def_id,
             .cst_node = use_item_cst,
@@ -11846,6 +12358,18 @@ fn resolveUseTreeCst(
             .target_scope = current_lookup_scope,
             .has_cfg_attr = has_use_cfg,
         }, diagnostic_sink);
+        if (self_mod_vis == .private and !self_sym_idx.isNone()) {
+            try sym_table.use_leaf_records.append(sym_table.allocator, .{
+                .file_id = file_id,
+                .def_id = def_id,
+                .scope_id = dest_module_scope,
+                .use_item_cst = use_item_cst,
+                .leaf_tree_cst = tree_cst,
+                .report_span = computeCstSubtreeTokenSpan(file_id, token_buffer, cst_arena, tree_cst),
+                .alias_sym = self_sym_idx,
+                .bound_name = bind_sym_id,
+            });
+        }
         return;
     }
 
@@ -11855,15 +12379,29 @@ fn resolveUseTreeCst(
         const pkg_root_scope = sym_table.resolveCallerPackageRootScope(file_id, dest_module_scope);
         const bind_tok = if (!alias_tok.isNone()) alias_tok else final_tok;
         const bind_lexeme = extractTokenSlice(source, token_buffer, bind_tok);
-        if (bind_lexeme.len == 0 or std.mem.eql(u8, bind_lexeme, "_") or std.mem.eql(u8, bind_lexeme, "pkg")) return;
+        if (bind_lexeme.len == 0 or std.mem.eql(u8, bind_lexeme, "pkg")) return;
+        if (std.mem.eql(u8, bind_lexeme, "_")) {
+            if (visibility == .private) {
+                try sym_table.use_leaf_records.append(sym_table.allocator, .{
+                    .file_id = file_id,
+                    .def_id = def_id,
+                    .scope_id = dest_module_scope,
+                    .use_item_cst = use_item_cst,
+                    .leaf_tree_cst = tree_cst,
+                    .report_span = computeCstSubtreeTokenSpan(file_id, token_buffer, cst_arena, tree_cst),
+                    .is_exempt_underscore = true,
+                });
+            }
+            return;
+        }
         const bind_sym_id = try interner.intern(bind_lexeme);
-        _ = try sym_table.defineSymbol(.{
+        const pkg_sym_idx = try sym_table.defineSymbol(.{
             .name = bind_sym_id,
             .name_text = interner.get(bind_sym_id),
             .kind = .module_sym,
             .namespace = .value_ns,
             .visibility = visibility,
-            .flags = .{ .is_pub = is_pub_export, .is_used = true, .is_imported = true },
+            .flags = .{ .is_pub = is_pub_export, .is_used = visibility != .private, .is_imported = true },
             .scope_id = dest_module_scope,
             .def_id = def_id,
             .cst_node = use_item_cst,
@@ -11871,6 +12409,18 @@ fn resolveUseTreeCst(
             .target_scope = pkg_root_scope,
             .has_cfg_attr = has_use_cfg,
         }, diagnostic_sink);
+        if (visibility == .private and !pkg_sym_idx.isNone()) {
+            try sym_table.use_leaf_records.append(sym_table.allocator, .{
+                .file_id = file_id,
+                .def_id = def_id,
+                .scope_id = dest_module_scope,
+                .use_item_cst = use_item_cst,
+                .leaf_tree_cst = tree_cst,
+                .report_span = computeCstSubtreeTokenSpan(file_id, token_buffer, cst_arena, tree_cst),
+                .alias_sym = pkg_sym_idx,
+                .bound_name = bind_sym_id,
+            });
+        }
         return;
     }
     if (seg_count == 1 and current_lookup_scope == dest_module_scope and
@@ -11887,15 +12437,29 @@ fn resolveUseTreeCst(
         if (!root_mod_scope.isNone()) {
             const bind_tok = if (!alias_tok.isNone()) alias_tok else final_tok;
             const bind_lexeme = extractTokenSlice(source, token_buffer, bind_tok);
-            if (bind_lexeme.len == 0 or std.mem.eql(u8, bind_lexeme, "_")) return;
+            if (bind_lexeme.len == 0) return;
+            if (std.mem.eql(u8, bind_lexeme, "_")) {
+                if (visibility == .private) {
+                    try sym_table.use_leaf_records.append(sym_table.allocator, .{
+                        .file_id = file_id,
+                        .def_id = def_id,
+                        .scope_id = dest_module_scope,
+                        .use_item_cst = use_item_cst,
+                        .leaf_tree_cst = tree_cst,
+                        .report_span = computeCstSubtreeTokenSpan(file_id, token_buffer, cst_arena, tree_cst),
+                        .is_exempt_underscore = true,
+                    });
+                }
+                return;
+            }
             const bind_sym_id = try interner.intern(bind_lexeme);
-            _ = try sym_table.defineSymbol(.{
+            const root_sym_idx = try sym_table.defineSymbol(.{
                 .name = bind_sym_id,
                 .name_text = interner.get(bind_sym_id),
                 .kind = .module_sym,
                 .namespace = .value_ns,
                 .visibility = visibility,
-                .flags = .{ .is_pub = is_pub_export, .is_used = true, .is_imported = true },
+                .flags = .{ .is_pub = is_pub_export, .is_used = visibility != .private, .is_imported = true },
                 .scope_id = dest_module_scope,
                 .def_id = def_id,
                 .cst_node = use_item_cst,
@@ -11903,6 +12467,18 @@ fn resolveUseTreeCst(
                 .target_scope = root_mod_scope,
                 .has_cfg_attr = has_use_cfg,
             }, diagnostic_sink);
+            if (visibility == .private and !root_sym_idx.isNone()) {
+                try sym_table.use_leaf_records.append(sym_table.allocator, .{
+                    .file_id = file_id,
+                    .def_id = def_id,
+                    .scope_id = dest_module_scope,
+                    .use_item_cst = use_item_cst,
+                    .leaf_tree_cst = tree_cst,
+                    .report_span = computeCstSubtreeTokenSpan(file_id, token_buffer, cst_arena, tree_cst),
+                    .alias_sym = root_sym_idx,
+                    .bound_name = bind_sym_id,
+                });
+            }
             return;
         }
         if (std.mem.eql(u8, final_lexeme, "core") and !sym_table.isCoreAllowedForFile(file_id)) {
@@ -11939,6 +12515,7 @@ fn resolveUseTreeCst(
     switch (lookup_res) {
         .found => |resolved_idx| {
             sym_table.markSymbolUsed(resolved_idx);
+            sym_table.recordCrossModuleAccess(dest_module_scope, resolved_idx);
             try emitUseOrPathDeprecatedIfNeeded(
                 sym_table,
                 interner,
@@ -11951,7 +12528,21 @@ fn resolveUseTreeCst(
             const target_rec = sym_table.getSymbol(resolved_idx).*;
             const bind_tok = if (!alias_tok.isNone()) alias_tok else final_tok;
             const bind_lexeme = extractTokenSlice(source, token_buffer, bind_tok);
-            if (bind_lexeme.len == 0 or std.mem.eql(u8, bind_lexeme, "_")) return;
+            if (bind_lexeme.len == 0) return;
+            if (std.mem.eql(u8, bind_lexeme, "_")) {
+                if (visibility == .private) {
+                    try sym_table.use_leaf_records.append(sym_table.allocator, .{
+                        .file_id = file_id,
+                        .def_id = def_id,
+                        .scope_id = dest_module_scope,
+                        .use_item_cst = use_item_cst,
+                        .leaf_tree_cst = tree_cst,
+                        .report_span = computeCstSubtreeTokenSpan(file_id, token_buffer, cst_arena, tree_cst),
+                        .is_exempt_underscore = true,
+                    });
+                }
+                return;
+            }
 
             const direct_idx = sym_table.lookupInScopeDirect(prefix_scope, final_sym_id, NamespaceMask.ALL);
             const direct_vis_raw: u2 = if (!direct_idx.isNone() and !sym_table.getSymbol(direct_idx).flags.is_builtin)
@@ -11987,7 +12578,7 @@ fn resolveUseTreeCst(
                 .visibility = effective_alias_vis,
                 .flags = .{
                     .is_pub = effective_alias_vis == .public,
-                    .is_used = true,
+                    .is_used = effective_alias_vis != .private,
                     .is_imported = true,
                 },
                 .extra_flags = .{
@@ -12004,6 +12595,22 @@ fn resolveUseTreeCst(
             }, diagnostic_sink);
             if (use_header_meta.has_deprecated_meta) {
                 try sym_table.setDeprecatedMeta(alias_sym_idx, use_header_meta.deprecated_meta);
+            }
+            if (effective_alias_vis == .private and !alias_sym_idx.isNone()) {
+                try sym_table.use_leaf_records.append(sym_table.allocator, .{
+                    .file_id = file_id,
+                    .def_id = def_id,
+                    .scope_id = dest_module_scope,
+                    .use_item_cst = use_item_cst,
+                    .leaf_tree_cst = tree_cst,
+                    .report_span = computeCstSubtreeTokenSpan(file_id, token_buffer, cst_arena, tree_cst),
+                    .alias_sym = alias_sym_idx,
+                    .bound_name = bind_sym_id,
+                });
+                if (target_rec.kind == .trait_sym) {
+                    const trait_key: u64 = (@as(u64, dest_module_scope.asInt()) << 32) | @as(u64, resolved_idx.asInt());
+                    try sym_table.trait_alias_by_scope_and_target.put(sym_table.allocator, trait_key, alias_sym_idx);
+                }
             }
         },
         .private_error => |priv_idx| {
@@ -12030,20 +12637,47 @@ fn resolveUseTreeCst(
                 if (sym_table.lookupExternalPackageScope(file_id, final_sym_id)) |ext_mod_scope| {
                     const bind_tok = if (!alias_tok.isNone()) alias_tok else final_tok;
                     const bind_lexeme = extractTokenSlice(source, token_buffer, bind_tok);
-                    if (bind_lexeme.len == 0 or std.mem.eql(u8, bind_lexeme, "_")) return;
+                    if (bind_lexeme.len == 0) return;
+                    if (std.mem.eql(u8, bind_lexeme, "_")) {
+                        if (visibility == .private) {
+                            try sym_table.use_leaf_records.append(sym_table.allocator, .{
+                                .file_id = file_id,
+                                .def_id = def_id,
+                                .scope_id = dest_module_scope,
+                                .use_item_cst = use_item_cst,
+                                .leaf_tree_cst = tree_cst,
+                                .report_span = computeCstSubtreeTokenSpan(file_id, token_buffer, cst_arena, tree_cst),
+                                .is_exempt_underscore = true,
+                            });
+                        }
+                        return;
+                    }
                     const bind_sym_id = try interner.intern(bind_lexeme);
-                    _ = try sym_table.defineSymbol(.{
+                    const ext_sym_idx = try sym_table.defineSymbol(.{
                         .name = bind_sym_id,
                         .name_text = interner.get(bind_sym_id),
                         .kind = .module_sym,
                         .namespace = .value_ns,
                         .visibility = visibility,
-                        .flags = .{ .is_pub = is_pub_export, .is_used = true, .is_imported = true },
+                        .flags = .{ .is_pub = is_pub_export, .is_used = visibility != .private, .is_imported = true },
                         .scope_id = dest_module_scope,
                         .def_id = def_id,
+                        .cst_node = use_item_cst,
                         .decl_span = token_buffer.getTokenSpan(file_id, bind_tok),
                         .target_scope = ext_mod_scope,
                     }, diagnostic_sink);
+                    if (visibility == .private and !ext_sym_idx.isNone()) {
+                        try sym_table.use_leaf_records.append(sym_table.allocator, .{
+                            .file_id = file_id,
+                            .def_id = def_id,
+                            .scope_id = dest_module_scope,
+                            .use_item_cst = use_item_cst,
+                            .leaf_tree_cst = tree_cst,
+                            .report_span = computeCstSubtreeTokenSpan(file_id, token_buffer, cst_arena, tree_cst),
+                            .alias_sym = ext_sym_idx,
+                            .bound_name = bind_sym_id,
+                        });
+                    }
                     return;
                 }
             }
@@ -12142,7 +12776,11 @@ pub fn resolveModulePathSegmentsWithOpts(
 
         switch (lookup_res) {
             .found => |sym_idx| {
-                sym_table.markSymbolUsed(sym_idx);
+                if (i == 0 and cur_scope == caller_scope) {
+                    sym_table.markLexicalSymbolUsed(caller_scope, seg_sym_id, sym_idx);
+                } else {
+                    sym_table.markTargetScopeSymbolUsed(caller_scope, sym_idx);
+                }
                 try emitUseOrPathDeprecatedIfNeeded(
                     sym_table,
                     interner,
@@ -12820,6 +13458,1931 @@ pub fn scanFileInactiveCfgCapabilities(
     return result;
 }
 
+// -------------- Symbol & Visibility Lint Sweeps ---------------
+
+/// Returns `true` if `text` contains at least one non-ASCII byte (`>= 0x80`).
+inline fn hasNonAsciiByte(text: []const u8) bool {
+    for (text) |byte_val| {
+        if (byte_val >= 0x80) return true;
+    }
+    return false;
+}
+
+/// Computes the exact non-synthesized token byte span `[min_start .. max_end)` covered by `cst_node`.
+fn computeCstSubtreeTokenSpan(
+    file_id: FileId,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    cst_node: CstNodeIndex,
+) Span {
+    if (cst_node.isNone() or cst_node.asInt() >= cst_arena.countNodes()) {
+        return Span.init(file_id, 0, 0);
+    }
+    const start_idx: usize = cst_node.asInt();
+    const root_rec = cst_arena.getNode(cst_node);
+    const end_idx: usize = @min(
+        start_idx + @max(@as(usize, root_rec.subtree_size), 1),
+        cst_arena.countNodes(),
+    );
+    var first_start: ?u32 = null;
+    var last_end: u32 = 0;
+    var cursor = start_idx;
+    while (cursor < end_idx) : (cursor += 1) {
+        const sub = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cursor)));
+        if (sub.subtree_size <= 1 and !sub.flags.is_missing_or_injected and
+            !sub.token.isNone() and sub.token.asInt() < token_buffer.countTokens())
+        {
+            const tok_rec = token_buffer.getToken(sub.token);
+            if (!tok_rec.flags.is_synthesized) {
+                if (first_start == null) first_start = tok_rec.byte_offset;
+                last_end = tok_rec.byte_offset +| tok_rec.byte_len;
+            }
+        }
+    }
+    if (first_start) |fs| return Span.init(file_id, fs, @max(last_end, fs));
+    return Span.init(file_id, 0, 0);
+}
+
+/// Returns `true` if `source[start_byte .. end_byte]` contains `//`, `/|`, `/#`, or `/*` comment markers.
+fn hasCommentInSourceRange(source: []const u8, start_byte: u32, end_byte: u32) bool {
+    const lo: usize = @min(@as(usize, start_byte), source.len);
+    const hi: usize = @min(@max(@as(usize, end_byte), lo), source.len);
+    const slice = source[lo..hi];
+    var idx: usize = 0;
+    while (idx + 1 < slice.len) : (idx += 1) {
+        if (slice[idx] == '/') {
+            const next_ch = slice[idx + 1];
+            if (next_ch == '/' or next_ch == '|' or next_ch == '#' or next_ch == '*') return true;
+        }
+    }
+    return false;
+}
+
+/// Returns `true` when every non-ASCII codepoint in `ident` is explicitly permitted by `settings.allowed_confusables`.
+fn areAllNonAsciiConfusablesAllowed(ident: []const u8, settings: lint_filter.LintSettings) bool {
+    if (settings.allowed_confusables.len == 0) return false;
+    var has_seen_non_ascii = false;
+    var pos: usize = 0;
+    while (pos < ident.len) {
+        const cur_b = ident[pos];
+        if (cur_b < 0x80) {
+            pos += 1;
+            continue;
+        }
+        const seq_len = std.unicode.utf8ByteSequenceLength(cur_b) catch return false;
+        if (pos + seq_len > ident.len) return false;
+        const cp = std.unicode.utf8Decode(ident[pos .. pos + seq_len]) catch return false;
+        has_seen_non_ascii = true;
+        if (!settings.isAllowedConfusable(cp)) return false;
+        pos += seq_len;
+    }
+    return has_seen_non_ascii;
+}
+
+/// Returns `true` if `sym_idx` is a currently active (non-`@cfg`-pruned, non-stale) symbol in `sym.scope_id`.
+fn isSymbolActiveInScope(sym_table: *const SymbolTable, sym_idx: SymbolIndex) bool {
+    if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return false;
+    const sym = sym_table.getSymbol(sym_idx);
+    if (sym.flags.is_builtin) return false;
+    const key = packScopedSymbolKey(sym.scope_id, sym.name, sym.namespace);
+    if (sym_table.scoped_map.get(key)) |active_idx| {
+        if (active_idx == sym_idx) return true;
+        const active_sym = sym_table.getSymbol(active_idx);
+        if (active_sym.kind == .overload_group_sym and !active_sym.target_symbol.isNone() and
+            active_sym.target_symbol.asInt() < sym_table.overload_sets.items.len)
+        {
+            for (sym_table.overload_sets.items[active_sym.target_symbol.asInt()].members.items) |ov_mem| {
+                if (ov_mem == sym_idx) return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Checks `sym_idx` for `UTS #55` mixed-script confusables and `UTS #39` lexical skeleton collisions (`W0103`).
+fn emitConfusableWarningForSymbol(
+    sym_table: *const SymbolTable,
+    sym_idx: SymbolIndex,
+    settings: lint_filter.LintSettings,
+    sink: *DiagnosticSink,
+) !void {
+    const sym = sym_table.getSymbol(sym_idx);
+    if (sym.name_text.len == 0 or std.mem.eql(u8, sym.name_text, "_")) return;
+    if (sym.decl_span.file_id.isNone()) return;
+
+    const arena_alloc = sink.arena.asAllocator();
+    const is_self_non_ascii = hasNonAsciiByte(sym.name_text);
+
+    // [1] `UTS #55` mixed-script confusable chunk check (`pаypal`, `Строкa`; `Δt` / `μs` allowed):
+    if (is_self_non_ascii and !areAllNonAsciiConfusablesAllowed(sym.name_text, settings)) {
+        const chunk_res = unicode_confusables.analyzeUts55IdentifierChunks(sym.name_text);
+        if (chunk_res.has_mixed_script_confusable) {
+            var skel_buf: [256]u8 = undefined;
+            const skel_str = unicode_confusables.computeUts39Skeleton(sym.name_text, &skel_buf);
+            const msg = try std.fmt.allocPrint(
+                arena_alloc,
+                "identifier `{s}` mixes scripts with visually confusable character `U+{X:0>4}`",
+                .{ sym.name_text, chunk_res.first_confusable_cp },
+            );
+            const labels = try arena_alloc.alloc(LabeledSpan, 1);
+            labels[0] = .{
+                .span = sym.decl_span,
+                .label = "mixed-script confusable identifier (`UTS #55` / `UTS #39`)",
+                .style = .primary,
+            };
+            const note_str = try std.fmt.allocPrint(
+                arena_alloc,
+                "help: replace homoglyph characters with unambiguous single-script spelling (ASCII skeleton `{s}`)",
+                .{skel_str},
+            );
+            const notes = try arena_alloc.alloc([]const u8, 1);
+            notes[0] = note_str;
+            try sink.emit(.{
+                .code = .w0103_confusable_ident,
+                .severity = .warning,
+                .primary_span = sym.decl_span,
+                .message = msg,
+                .labels = labels,
+                .notes = notes,
+            });
+            return;
+        }
+    }
+
+    // [2] `UTS #39` same-scope and ancestor-scope skeleton collision check (`let c = 1; let с = 2;`):
+    var self_skel_buf: [256]u8 = undefined;
+    const self_skel = unicode_confusables.computeUts39Skeleton(sym.name_text, &self_skel_buf);
+    var cur_scope = sym.scope_id;
+    var steps: usize = 0;
+    while (!cur_scope.isNone() and cur_scope != sym_table.prelude_scope and
+        cur_scope.asInt() < sym_table.scope_arena.countScopes() and steps <= MAX_SCOPE_DEPTH) : (steps += 1)
+    {
+        for (sym_table.getScopeMembers(cur_scope)) |other_idx| {
+            if (other_idx == sym_idx) continue;
+            const other = sym_table.getSymbol(other_idx);
+            if (other.flags.is_builtin or other.namespace != sym.namespace) continue;
+            if (other.name == sym.name or other.name_text.len == 0) continue;
+            if (!is_self_non_ascii and !hasNonAsciiByte(other.name_text)) continue;
+            if (cur_scope == sym.scope_id) {
+                const is_other_earlier = if (other.decl_span.file_id == sym.decl_span.file_id and
+                    other.decl_span.start_byte != sym.decl_span.start_byte)
+                    other.decl_span.start_byte < sym.decl_span.start_byte
+                else
+                    other_idx.asInt() < sym_idx.asInt();
+                if (!is_other_earlier) continue;
+            }
+            if ((is_self_non_ascii and areAllNonAsciiConfusablesAllowed(sym.name_text, settings)) or
+                (hasNonAsciiByte(other.name_text) and
+                    areAllNonAsciiConfusablesAllowed(other.name_text, settings)))
+            {
+                continue;
+            }
+            var other_skel_buf: [256]u8 = undefined;
+            const other_skel = unicode_confusables.computeUts39Skeleton(other.name_text, &other_skel_buf);
+            if (std.mem.eql(u8, self_skel, other_skel)) {
+                const msg = try std.fmt.allocPrint(
+                    arena_alloc,
+                    "identifier `{s}` is visually confusable with `{s}` in scope (identical UTS #39 skeleton `{s}`)",
+                    .{ sym.name_text, other.name_text, self_skel },
+                );
+                const has_same_file_other = !other.decl_span.file_id.isNone() and
+                    other.decl_span.file_id == sym.decl_span.file_id and
+                    (other.decl_span.start_byte != sym.decl_span.start_byte or
+                        other.decl_span.end_byte != sym.decl_span.end_byte);
+                const labels: []const LabeledSpan = if (has_same_file_other) blk_lbls: {
+                    const two = try arena_alloc.alloc(LabeledSpan, 2);
+                    two[0] = .{
+                        .span = sym.decl_span,
+                        .label = "confusable homoglyph identifier declared here",
+                        .style = .primary,
+                    };
+                    two[1] = .{
+                        .span = other.decl_span,
+                        .label = try std.fmt.allocPrint(
+                            arena_alloc,
+                            "visually similar identifier `{s}` in scope here",
+                            .{other.name_text},
+                        ),
+                        .style = .secondary,
+                    };
+                    break :blk_lbls two;
+                } else blk_lbls: {
+                    const one = try arena_alloc.alloc(LabeledSpan, 1);
+                    one[0] = .{
+                        .span = sym.decl_span,
+                        .label = "confusable homoglyph identifier declared here",
+                        .style = .primary,
+                    };
+                    break :blk_lbls one;
+                };
+                try sink.emit(.{
+                    .code = .w0103_confusable_ident,
+                    .severity = .warning,
+                    .primary_span = sym.decl_span,
+                    .message = msg,
+                    .labels = labels,
+                });
+                return;
+            }
+        }
+        cur_scope = sym_table.scope_arena.getScope(cur_scope).parent;
+    }
+}
+
+/// Recursively checks non-local declarations in `mod_or_member_scope` of `file_id` for `W0103`.
+fn checkModuleOrMemberScopeConfusablesRecursive(
+    sym_table: *const SymbolTable,
+    file_id: FileId,
+    scope_id: ScopeId,
+    settings: lint_filter.LintSettings,
+    sink: *DiagnosticSink,
+    depth: u32,
+) anyerror!void {
+    if (scope_id.isNone() or scope_id.asInt() >= sym_table.scope_arena.countScopes() or depth > 32) return;
+    for (sym_table.getScopeMembers(scope_id)) |sym_idx| {
+        if (!isSymbolActiveInScope(sym_table, sym_idx)) continue;
+        const sym = sym_table.getSymbol(sym_idx).*;
+        if (sym.flags.is_builtin) continue;
+        if (sym.flags.is_imported and sym.decl_span.file_id != file_id) continue;
+        if (sym.kind == .local_let_sym or sym.kind == .local_var_sym) continue;
+        if (sym.kind == .param_sym) continue;
+        if (sym.decl_span.file_id == file_id) {
+            try emitConfusableWarningForSymbol(sym_table, sym_idx, settings, sink);
+        }
+        if (sym.flags.is_imported) continue;
+        switch (sym.kind) {
+            .module_sym => {
+                if (!sym.target_scope.isNone() and
+                    sym_table.scope_arena.getScope(sym.target_scope).file_id == file_id)
+                {
+                    try checkModuleOrMemberScopeConfusablesRecursive(
+                        sym_table,
+                        file_id,
+                        sym.target_scope,
+                        settings,
+                        sink,
+                        depth + 1,
+                    );
+                }
+            },
+            .struct_sym, .enum_sym, .union_sym, .bit_field_sym, .trait_sym => {
+                if (!sym.target_scope.isNone()) {
+                    try checkModuleOrMemberScopeConfusablesRecursive(
+                        sym_table,
+                        file_id,
+                        sym.target_scope,
+                        settings,
+                        sink,
+                        depth + 1,
+                    );
+                }
+            },
+            .fn_sym => {
+                if (!sym.target_scope.isNone()) {
+                    for (sym_table.getScopeMembers(sym.target_scope)) |p_idx| {
+                        const p_sym = sym_table.getSymbol(p_idx).*;
+                        if (p_sym.decl_span.file_id != file_id) continue;
+                        if (p_sym.kind == .type_param_sym or p_sym.kind == .const_param_sym or
+                            (p_sym.kind == .param_sym and sym.flags.is_prototype_only))
+                        {
+                            try emitConfusableWarningForSymbol(sym_table, p_idx, settings, sink);
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+/// Emits `W0103` (`confusable-ident`) on module, nominal, member, and prototype parameter declarations in `file_id`.
+pub fn emitFileConfusableIdentifierWarnings(
+    sym_table: *const SymbolTable,
+    file_id: FileId,
+    source: []const u8,
+    settings: lint_filter.LintSettings,
+    sink: *DiagnosticSink,
+) !void {
+    const file_mod_scope = sym_table.file_module_scopes.get(file_id.asInt()) orelse return;
+    if (!hasNonAsciiByte(source) and
+        !sym_table.hasNonAsciiSymbolInLexicalChain(file_mod_scope))
+    {
+        return;
+    }
+    try checkModuleOrMemberScopeConfusablesRecursive(sym_table, file_id, file_mod_scope, settings, sink, 0);
+}
+
+/// Collects interned `SymbolId` handles referenced inside `@cfg`-disabled CST subtrees of `file_id` (`wasmtime` guard).
+pub fn collectFileInactiveCfgIdents(
+    allocator: std.mem.Allocator,
+    sym_table: *const SymbolTable,
+    interner: *const StringInterner,
+    file_id: FileId,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    out_idents: *std.AutoHashMapUnmanaged(SymbolId, void),
+) !void {
+    const cst_count = cst_arena.countNodes();
+    if (cst_count == 0) return;
+    const effective_cfg = sym_table.resolveCfgEnvForFile(file_id);
+
+    var cursor: usize = 0;
+    while (cursor < cst_count) {
+        const cst_id = CstNodeIndex.fromInt(@intCast(cursor));
+        const node = cst_arena.getNode(cst_id);
+        const subtree_end = @min(cursor + @max(@as(usize, node.subtree_size), 1), cst_count);
+        if (cursor > 0 and node.subtree_size > 1 and node.kind != .attribute) {
+            const is_enabled = try evaluateCstNodeCfgWithEnv(
+                &effective_cfg,
+                file_id,
+                source,
+                token_buffer,
+                cst_arena,
+                cst_id,
+                null,
+            );
+            if (!is_enabled) {
+                var scan_cur = cursor + 1;
+                while (scan_cur < subtree_end) {
+                    const sub = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(scan_cur)));
+                    if (sub.kind == .attribute) {
+                        scan_cur += @max(@as(usize, sub.subtree_size), 1);
+                        continue;
+                    }
+                    if (sub.subtree_size <= 1 and !sub.flags.is_missing_or_injected and
+                        !sub.token.isNone() and sub.token.asInt() < token_buffer.countTokens())
+                    {
+                        const tok_rec = token_buffer.getToken(sub.token);
+                        if (!tok_rec.flags.is_synthesized and isIdentifierToken(tok_rec.kind)) {
+                            const lex = extractTokenSlice(source, token_buffer, sub.token);
+                            if (interner.lookup(lex)) |sym_id| {
+                                try out_idents.put(allocator, sym_id, {});
+                            }
+                        }
+                    }
+                    scan_cur += 1;
+                }
+                cursor = subtree_end;
+                continue;
+            }
+        }
+        cursor += 1;
+    }
+}
+
+/// Returns `true` if `cst_node` carries a leading `@used` or `@wasm_export` attribute.
+fn hasUsedOrWasmExportAttrInCst(
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    cst_node: CstNodeIndex,
+) bool {
+    if (cst_node.isNone() or cst_node.asInt() >= cst_arena.countNodes()) return false;
+    const start_idx: usize = cst_node.asInt();
+    const end_idx: usize = @min(
+        start_idx + @max(@as(usize, cst_arena.getNode(cst_node).subtree_size), 1),
+        cst_arena.countNodes(),
+    );
+    var cur = start_idx + 1;
+    while (cur < end_idx) : (cur += 1) {
+        const sub = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+        if (sub.kind == .block or sub.kind == .fn_expr_body or sub.kind == .param_list) break;
+        if (sub.kind == .attribute) {
+            const attr_end = @min(cur + @max(@as(usize, sub.subtree_size), 1), end_idx);
+            var ac = cur + 1;
+            while (ac < attr_end) : (ac += 1) {
+                const leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(ac)));
+                if (leaf.subtree_size <= 1 and !leaf.token.isNone() and
+                    leaf.token.asInt() < token_buffer.countTokens())
+                {
+                    const lk = token_buffer.getToken(leaf.token).kind;
+                    if (lk == .at) continue;
+                    if (isIdentifierToken(lk)) {
+                        const attr_lex = extractTokenSlice(source, token_buffer, leaf.token);
+                        if (std.mem.eql(u8, attr_lex, "used") or std.mem.eql(u8, attr_lex, "wasm_export")) {
+                            return true;
+                        }
+                    }
+                    break;
+                }
+            }
+            if (sub.subtree_size > 1) cur += @as(usize, sub.subtree_size) - 1;
+        }
+    }
+    return false;
+}
+
+/// Recursively emits `W0402` (`unused-binding`, `.maybe_incorrect`) for unreferenced private items in `mod_scope`.
+fn emitUnusedPrivateItemsInModuleScope(
+    sym_table: *const SymbolTable,
+    interner: *StringInterner,
+    file_id: FileId,
+    mod_scope: ScopeId,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    inactive_cfg_idents: *const std.AutoHashMapUnmanaged(SymbolId, void),
+    sink: *DiagnosticSink,
+    depth: u32,
+) anyerror!void {
+    if (mod_scope.isNone() or mod_scope.asInt() >= sym_table.scope_arena.countScopes() or depth > 32) return;
+    const arena_alloc = sink.arena.asAllocator();
+
+    for (sym_table.getScopeMembers(mod_scope)) |sym_idx| {
+        if (!isSymbolActiveInScope(sym_table, sym_idx)) continue;
+        const sym = sym_table.getSymbol(sym_idx).*;
+        if (sym.flags.is_builtin or sym.flags.is_imported) continue;
+
+        if (sym.kind == .module_sym) {
+            if (!sym.target_scope.isNone() and
+                sym_table.scope_arena.getScope(sym.target_scope).file_id == file_id)
+            {
+                try emitUnusedPrivateItemsInModuleScope(
+                    sym_table,
+                    interner,
+                    file_id,
+                    sym.target_scope,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                    inactive_cfg_idents,
+                    sink,
+                    depth + 1,
+                );
+            }
+            continue;
+        }
+
+        const kind_noun: ?[]const u8 = switch (sym.kind) {
+            .fn_sym => "function",
+            .const_sym => "constant",
+            .struct_sym => "struct",
+            .enum_sym => "enum",
+            .union_sym => "union",
+            .bit_field_sym => "bit_field",
+            .type_alias_sym, .type_group_sym, .distinct_type_sym, .refined_type_sym => "type",
+            .trait_sym => "trait",
+            else => null,
+        };
+        if (kind_noun == null) continue;
+        if (sym.visibility != .private or sym.flags.is_used or sym.flags.is_extern or sym.flags.is_from_error) continue;
+        if (sym.extra_flags.is_test or sym.extra_flags.is_bench or sym.extra_flags.is_constructor) continue;
+        if (sym.contract_flags.is_export or sym.contract_flags.is_ifunc or
+            sym.contract_flags.has_link_name or sym.contract_flags.has_link_section)
+        {
+            continue;
+        }
+        if (sym.decl_span.file_id != file_id or sym.name_text.len == 0) continue;
+        if (std.mem.startsWith(u8, sym.name_text, "_") or std.mem.eql(u8, sym.name_text, "main")) continue;
+        if (inactive_cfg_idents.contains(sym.name)) continue;
+        if (hasUsedOrWasmExportAttrInCst(source, token_buffer, cst_arena, sym.cst_node)) continue;
+
+        var fixes_slice: []const SuggestedFix = &.{};
+        if (sym.kind == .fn_sym) {
+            const prefixed_name = try std.fmt.allocPrint(arena_alloc, "_{s}", .{sym.name_text});
+            const edit = try arena_alloc.alloc(TextEdit, 1);
+            edit[0] = .{
+                .file_id = file_id,
+                .start_byte = sym.decl_span.start_byte,
+                .end_byte = sym.decl_span.end_byte,
+                .replacement_id = try interner.intern(prefixed_name),
+            };
+            const fix = try arena_alloc.alloc(SuggestedFix, 1);
+            fix[0] = .{
+                .message = "prefix the unused private function with `_` to silence this warning",
+                .applicability = .maybe_incorrect,
+                .priority = .lint_idiom,
+                .edits = edit,
+            };
+            fixes_slice = fix;
+        } else if (!sym.cst_node.isNone()) {
+            const item_sp = computeCstSubtreeTokenSpan(file_id, token_buffer, cst_arena, sym.cst_node);
+            if (item_sp.end_byte > item_sp.start_byte and
+                !hasCommentInSourceRange(source, item_sp.start_byte, item_sp.end_byte))
+            {
+                const rem = computeFullLineItemRemovalBounds(source, item_sp.start_byte, item_sp.end_byte);
+                const edit = try arena_alloc.alloc(TextEdit, 1);
+                edit[0] = .{
+                    .file_id = file_id,
+                    .start_byte = rem.start,
+                    .end_byte = rem.end,
+                    .replacement_id = try interner.intern(""),
+                };
+                const fix = try arena_alloc.alloc(SuggestedFix, 1);
+                fix[0] = .{
+                    .message = try std.fmt.allocPrint(arena_alloc, "remove unused private {s} `{s}`", .{ kind_noun.?, sym.name_text }),
+                    .applicability = .maybe_incorrect,
+                    .priority = .lint_idiom,
+                    .edits = edit,
+                };
+                fixes_slice = fix;
+            }
+        }
+        const labels = try arena_alloc.alloc(LabeledSpan, 1);
+        labels[0] = .{
+            .span = sym.decl_span,
+            .label = try std.fmt.allocPrint(arena_alloc, "private {s} `{s}` is never used", .{ kind_noun.?, sym.name_text }),
+            .style = .primary,
+        };
+        const notes = try arena_alloc.alloc([]const u8, 1);
+        notes[0] = if (sym.kind == .fn_sym)
+            "help: remove the unused function or prefix its name with `_` if kept intentionally"
+        else
+            "help: remove the unused item or add `@allow(unused-binding, reason: \"…\")` if kept intentionally";
+        try sink.emit(.{
+            .code = .w0402_unused_binding,
+            .severity = .warning,
+            .primary_span = sym.decl_span,
+            .message = try std.fmt.allocPrint(arena_alloc, "unused private {s} `{s}`", .{ kind_noun.?, sym.name_text }),
+            .labels = labels,
+            .notes = notes,
+            .suggestions = fixes_slice,
+        });
+    }
+}
+
+/// Emits `W0402` (`unused-binding`) for unreferenced module-private items in `file_id` when the file is error-free.
+pub fn emitFileUnusedPrivateItemWarnings(
+    sym_table: *const SymbolTable,
+    interner: *StringInterner,
+    file_id: FileId,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    inactive_cfg_idents: *const std.AutoHashMapUnmanaged(SymbolId, void),
+    sink: *DiagnosticSink,
+) !void {
+    const file_mod_scope = sym_table.file_module_scopes.get(file_id.asInt()) orelse return;
+    try emitUnusedPrivateItemsInModuleScope(
+        sym_table,
+        interner,
+        file_id,
+        file_mod_scope,
+        source,
+        token_buffer,
+        cst_arena,
+        inactive_cfg_idents,
+        sink,
+        0,
+    );
+}
+
+/// Counts syntactic leaf `.use_tree` nodes inside `tree_cst` (detecting partially unresolved `use` groups).
+fn countSyntacticUseTreeLeaves(cst_arena: *const LosslessCstArena, tree_cst: CstNodeIndex) usize {
+    if (tree_cst.isNone() or tree_cst.asInt() >= cst_arena.countNodes()) return 0;
+    const start_idx: usize = tree_cst.asInt();
+    const end_idx: usize = @min(
+        start_idx + @max(@as(usize, cst_arena.getNode(tree_cst).subtree_size), 1),
+        cst_arena.countNodes(),
+    );
+    var child_trees: usize = 0;
+    var cursor = start_idx + 1;
+    while (cursor < end_idx) {
+        const sub_id = CstNodeIndex.fromInt(@intCast(cursor));
+        const sub = cst_arena.getNode(sub_id);
+        if (sub.kind == .use_tree) {
+            child_trees += countSyntacticUseTreeLeaves(cst_arena, sub_id);
+            cursor += @max(@as(usize, sub.subtree_size), 1);
+            continue;
+        }
+        cursor += 1;
+    }
+    return if (child_trees > 0) child_trees else 1;
+}
+
+/// Expands `[item_start .. item_end)` to a clean full-line deletion when sole item on its line(s) and comment-free.
+fn computeFullLineItemRemovalBounds(source: []const u8, item_start: u32, item_end: u32) struct { start: u32, end: u32 } {
+    const start_usize: usize = @min(@as(usize, item_start), source.len);
+    const end_usize: usize = @min(@max(@as(usize, item_end), start_usize), source.len);
+    if (hasCommentInSourceRange(source, item_start, item_end)) {
+        return .{ .start = item_start, .end = item_end };
+    }
+    var line_lo = start_usize;
+    while (line_lo > 0 and (source[line_lo - 1] == ' ' or source[line_lo - 1] == '\t')) : (line_lo -= 1) {}
+    const is_at_line_start = (line_lo == 0 or source[line_lo - 1] == '\n');
+
+    var line_hi = end_usize;
+    while (line_hi < source.len and (source[line_hi] == ' ' or source[line_hi] == '\t')) : (line_hi += 1) {}
+    if (is_at_line_start) {
+        if (line_hi < source.len and source[line_hi] == '\r' and line_hi + 1 < source.len and source[line_hi + 1] == '\n') {
+            return .{ .start = @intCast(line_lo), .end = @intCast(line_hi + 2) };
+        }
+        if (line_hi < source.len and source[line_hi] == '\n') {
+            return .{ .start = @intCast(line_lo), .end = @intCast(line_hi + 1) };
+        }
+        if (line_hi == source.len) {
+            return .{ .start = @intCast(line_lo), .end = @intCast(line_hi) };
+        }
+    }
+    if (end_usize < source.len and source[end_usize] == ' ') {
+        return .{ .start = item_start, .end = item_end + 1 };
+    }
+    return .{ .start = item_start, .end = item_end };
+}
+
+/// Recursively computes surgical `TextEdit`s pruning `dead_leaves` inside a braced `.use_tree` (`W0404`).
+fn collectPrunedUseTreeEditsRecursive(
+    allocator: std.mem.Allocator,
+    interner: *StringInterner,
+    file_id: FileId,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    tree_cst: CstNodeIndex,
+    dead_leaf_cst_set: *const std.AutoHashMapUnmanaged(u32, void),
+    out_edits: *std.ArrayListUnmanaged(TextEdit),
+) !bool {
+    if (tree_cst.isNone() or tree_cst.asInt() >= cst_arena.countNodes()) return false;
+    const start_idx: usize = tree_cst.asInt();
+    const end_idx: usize = @min(
+        start_idx + @max(@as(usize, cst_arena.getNode(tree_cst).subtree_size), 1),
+        cst_arena.countNodes(),
+    );
+
+    const ChildTreeEntry = struct {
+        cst_id: CstNodeIndex,
+        span: Span,
+        is_all_dead: bool,
+    };
+    var children: std.ArrayListUnmanaged(ChildTreeEntry) = .empty;
+    defer children.deinit(allocator);
+
+    var dot_before_lbrace_tok: TokenIndex = .none;
+    var lbrace_tok: TokenIndex = .none;
+    var rbrace_tok: TokenIndex = .none;
+    var prev_leaf_tok: TokenIndex = .none;
+
+    var cursor = start_idx + 1;
+    while (cursor < end_idx) {
+        const sub_id = CstNodeIndex.fromInt(@intCast(cursor));
+        const sub = cst_arena.getNode(sub_id);
+        if (sub.kind == .use_tree) {
+            const sub_leaves = countSyntacticUseTreeLeaves(cst_arena, sub_id);
+            const is_sub_dead = if (sub_leaves == 1 and isLeafUseTreeCst(cst_arena, sub_id))
+                dead_leaf_cst_set.contains(sub_id.asInt())
+            else
+                areAllLeavesDeadInUseTree(cst_arena, sub_id, dead_leaf_cst_set);
+            try children.append(allocator, .{
+                .cst_id = sub_id,
+                .span = computeCstSubtreeTokenSpan(file_id, token_buffer, cst_arena, sub_id),
+                .is_all_dead = is_sub_dead,
+            });
+            cursor += @max(@as(usize, sub.subtree_size), 1);
+            continue;
+        }
+        if (sub.subtree_size <= 1 and !sub.flags.is_missing_or_injected and
+            !sub.token.isNone() and sub.token.asInt() < token_buffer.countTokens())
+        {
+            const tk = token_buffer.getToken(sub.token).kind;
+            if (tk == .lbrace and lbrace_tok.isNone()) {
+                lbrace_tok = sub.token;
+                if (!prev_leaf_tok.isNone() and token_buffer.getToken(prev_leaf_tok).kind == .dot) {
+                    dot_before_lbrace_tok = prev_leaf_tok;
+                }
+            } else if (tk == .rbrace) {
+                rbrace_tok = sub.token;
+            }
+            prev_leaf_tok = sub.token;
+        }
+        cursor += 1;
+    }
+
+    if (children.items.len == 0) return true;
+    if (lbrace_tok.isNone() or rbrace_tok.isNone()) return false;
+
+    var kept_count: usize = 0;
+    var sole_kept_idx: usize = 0;
+    for (children.items, 0..) |ch, idx| {
+        if (!ch.is_all_dead) {
+            kept_count += 1;
+            sole_kept_idx = idx;
+        }
+    }
+    if (kept_count == 0) return false;
+
+    const lbrace_span = token_buffer.getTokenSpan(file_id, lbrace_tok);
+    const rbrace_span = token_buffer.getTokenSpan(file_id, rbrace_tok);
+
+    // Collapse `{sole_kept}` -> `sole_kept` (or `.{self}` -> `""`!) when a single leaf survives in `{ … }`:
+    if (kept_count == 1) {
+        const kept_child = children.items[sole_kept_idx];
+        if (isLeafUseTreeCst(cst_arena, kept_child.cst_id) and
+            !hasCommentInSourceRange(source, lbrace_span.start_byte, rbrace_span.end_byte))
+        {
+            const kept_s: usize = @min(@as(usize, kept_child.span.start_byte), source.len);
+            const kept_e: usize = @min(@max(@as(usize, kept_child.span.end_byte), kept_s), source.len);
+            const kept_slice = source[kept_s..kept_e];
+            if (std.mem.eql(u8, kept_slice, "self") and !dot_before_lbrace_tok.isNone()) {
+                const dot_span = token_buffer.getTokenSpan(file_id, dot_before_lbrace_tok);
+                if (!hasCommentInSourceRange(source, dot_span.start_byte, rbrace_span.end_byte)) {
+                    try out_edits.append(allocator, .{
+                        .file_id = file_id,
+                        .start_byte = dot_span.start_byte,
+                        .end_byte = rbrace_span.end_byte,
+                        .replacement_id = try interner.intern(""),
+                    });
+                    return true;
+                }
+            } else if (!std.mem.eql(u8, kept_slice, "self")) {
+                try out_edits.append(allocator, .{
+                    .file_id = file_id,
+                    .start_byte = lbrace_span.start_byte,
+                    .end_byte = rbrace_span.end_byte,
+                    .replacement_id = try interner.intern(kept_slice),
+                });
+                return true;
+            }
+        }
+    }
+
+    // `kept_count >= 2` (or nested group): prune dead child runs and recurse into partially-dead child groups:
+    const empty_id = try interner.intern("");
+    var idx: usize = 0;
+    while (idx < children.items.len) {
+        if (!children.items[idx].is_all_dead) {
+            if (!isLeafUseTreeCst(cst_arena, children.items[idx].cst_id)) {
+                const ok = try collectPrunedUseTreeEditsRecursive(
+                    allocator,
+                    interner,
+                    file_id,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                    children.items[idx].cst_id,
+                    dead_leaf_cst_set,
+                    out_edits,
+                );
+                if (!ok) return false;
+            }
+            idx += 1;
+            continue;
+        }
+        var run_end = idx;
+        while (run_end + 1 < children.items.len and children.items[run_end + 1].is_all_dead) : (run_end += 1) {}
+        if (run_end + 1 < children.items.len) {
+            const del_start = children.items[idx].span.start_byte;
+            const del_end = children.items[run_end + 1].span.start_byte;
+            if (hasCommentInSourceRange(source, del_start, del_end)) return false;
+            try out_edits.append(allocator, .{
+                .file_id = file_id,
+                .start_byte = del_start,
+                .end_byte = del_end,
+                .replacement_id = empty_id,
+            });
+        } else if (idx > 0) {
+            const del_start = children.items[idx - 1].span.end_byte;
+            var del_end = children.items[run_end].span.end_byte;
+            var scan_pos: usize = @min(@as(usize, del_end), source.len);
+            const rbrace_start: usize = @min(@as(usize, rbrace_span.start_byte), source.len);
+            while (scan_pos < rbrace_start and (source[scan_pos] == ' ' or source[scan_pos] == '\t')) : (scan_pos += 1) {}
+            if (scan_pos < rbrace_start and source[scan_pos] == ',') {
+                del_end = @intCast(scan_pos + 1);
+            }
+            if (hasCommentInSourceRange(source, del_start, del_end)) return false;
+            try out_edits.append(allocator, .{
+                .file_id = file_id,
+                .start_byte = del_start,
+                .end_byte = del_end,
+                .replacement_id = empty_id,
+            });
+        }
+        idx = run_end + 1;
+    }
+    return true;
+}
+
+/// Returns `true` when `tree_cst` has zero nested `.use_tree` children.
+fn isLeafUseTreeCst(cst_arena: *const LosslessCstArena, tree_cst: CstNodeIndex) bool {
+    if (tree_cst.isNone() or tree_cst.asInt() >= cst_arena.countNodes()) return true;
+    const start_idx: usize = tree_cst.asInt();
+    const end_idx: usize = @min(
+        start_idx + @max(@as(usize, cst_arena.getNode(tree_cst).subtree_size), 1),
+        cst_arena.countNodes(),
+    );
+    var cur = start_idx + 1;
+    while (cur < end_idx) {
+        const sub = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+        if (sub.kind == .use_tree) return false;
+        cur += 1;
+    }
+    return true;
+}
+
+/// Returns `true` when every leaf `.use_tree` inside `tree_cst` is present in `dead_leaf_cst_set`.
+fn areAllLeavesDeadInUseTree(
+    cst_arena: *const LosslessCstArena,
+    tree_cst: CstNodeIndex,
+    dead_leaf_cst_set: *const std.AutoHashMapUnmanaged(u32, void),
+) bool {
+    if (isLeafUseTreeCst(cst_arena, tree_cst)) {
+        return dead_leaf_cst_set.contains(tree_cst.asInt());
+    }
+    const start_idx: usize = tree_cst.asInt();
+    const end_idx: usize = @min(
+        start_idx + @max(@as(usize, cst_arena.getNode(tree_cst).subtree_size), 1),
+        cst_arena.countNodes(),
+    );
+    var saw_child = false;
+    var cur = start_idx + 1;
+    while (cur < end_idx) {
+        const sub_id = CstNodeIndex.fromInt(@intCast(cur));
+        const sub = cst_arena.getNode(sub_id);
+        if (sub.kind == .use_tree) {
+            saw_child = true;
+            if (!areAllLeavesDeadInUseTree(cst_arena, sub_id, dead_leaf_cst_set)) return false;
+            cur += @max(@as(usize, sub.subtree_size), 1);
+            continue;
+        }
+        cur += 1;
+    }
+    return saw_child;
+}
+
+/// Live syntactic `.use_tree` leaf descriptor extracted for Early-Cutoff CST/span rebasing.
+const LiveSyntacticUseLeaf = struct {
+    use_item_cst: CstNodeIndex,
+    leaf_tree_cst: CstNodeIndex,
+    report_span: Span,
+    decl_span: Span,
+    bound_lexeme: []const u8,
+    is_glob: bool = false,
+    is_underscore: bool = false,
+};
+
+/// Recursively collects live leaf `.use_tree` descriptors inside `tree_cst` for Early-Cutoff rebasing.
+fn collectLiveUseTreeLeavesInCst(
+    allocator: std.mem.Allocator,
+    file_id: FileId,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    use_item_cst: CstNodeIndex,
+    parent_mod_tok: TokenIndex,
+    is_root_tree: bool,
+    tree_cst: CstNodeIndex,
+    out_leaves: *std.ArrayListUnmanaged(LiveSyntacticUseLeaf),
+) !void {
+    if (tree_cst.isNone() or tree_cst.asInt() >= cst_arena.countNodes()) return;
+    if (is_root_tree) {
+        if (parser.extractInlineUseDeclView(source, file_id, token_buffer, cst_arena, use_item_cst, .none)) |inline_view| {
+            try out_leaves.append(allocator, .{
+                .use_item_cst = use_item_cst,
+                .leaf_tree_cst = tree_cst,
+                .report_span = inline_view.alias_span,
+                .decl_span = inline_view.alias_span,
+                .bound_lexeme = inline_view.alias_slice,
+            });
+            return;
+        }
+    }
+
+    const start_idx: usize = tree_cst.asInt();
+    const end_idx: usize = @min(
+        start_idx + @max(@as(usize, cst_arena.getNode(tree_cst).subtree_size), 1),
+        cst_arena.countNodes(),
+    );
+    const tok_count = token_buffer.countTokens();
+
+    var segments: [32]TokenIndex = undefined;
+    var seg_count: usize = 0;
+    var is_glob = false;
+    var has_seen_as = false;
+    var alias_tok: TokenIndex = .none;
+    var has_nested = false;
+
+    var cur = start_idx + 1;
+    while (cur < end_idx) {
+        const sub_id = CstNodeIndex.fromInt(@intCast(cur));
+        const sub = cst_arena.getNode(sub_id);
+        if (sub.kind == .use_tree) {
+            has_nested = true;
+            const next_parent_tok = if (seg_count > 0) segments[seg_count - 1] else parent_mod_tok;
+            try collectLiveUseTreeLeavesInCst(
+                allocator,
+                file_id,
+                source,
+                token_buffer,
+                cst_arena,
+                use_item_cst,
+                next_parent_tok,
+                false,
+                sub_id,
+                out_leaves,
+            );
+            cur += @max(@as(usize, sub.subtree_size), 1);
+            continue;
+        }
+        if (sub.subtree_size <= 1 and !sub.flags.is_missing_or_injected and
+            !sub.token.isNone() and sub.token.asInt() < tok_count)
+        {
+            const tk = token_buffer.getToken(sub.token).kind;
+            if (tk == .star) {
+                is_glob = true;
+            } else if (tk == .kw_as) {
+                has_seen_as = true;
+            } else if (has_seen_as and (isIdentifierToken(tk) or tk == .underscore)) {
+                alias_tok = sub.token;
+            } else if (!has_seen_as and (isIdentifierToken(tk) or tk == .kw_self_val)) {
+                if (seg_count < segments.len) {
+                    segments[seg_count] = sub.token;
+                    seg_count += 1;
+                }
+            }
+        }
+        cur += 1;
+    }
+
+    if (has_nested) return;
+    const tree_span = computeCstSubtreeTokenSpan(file_id, token_buffer, cst_arena, tree_cst);
+    if (is_glob) {
+        try out_leaves.append(allocator, .{
+            .use_item_cst = use_item_cst,
+            .leaf_tree_cst = tree_cst,
+            .report_span = tree_span,
+            .decl_span = tree_span,
+            .bound_lexeme = "",
+            .is_glob = true,
+        });
+        return;
+    }
+    if (seg_count == 0) return;
+    const final_tok = segments[seg_count - 1];
+    const final_lex = extractTokenSlice(source, token_buffer, final_tok);
+    if (seg_count == 1 and std.mem.eql(u8, final_lex, "self") and !is_root_tree) {
+        const bind_tok = if (!alias_tok.isNone()) alias_tok else parent_mod_tok;
+        if (bind_tok.isNone()) return;
+        const bind_lex = extractTokenSlice(source, token_buffer, bind_tok);
+        const decl_tok = if (!alias_tok.isNone()) alias_tok else final_tok;
+        const d_span = token_buffer.getTokenSpan(file_id, decl_tok);
+        const is_us = std.mem.eql(u8, bind_lex, "_");
+        try out_leaves.append(allocator, .{
+            .use_item_cst = use_item_cst,
+            .leaf_tree_cst = tree_cst,
+            .report_span = if (is_us) d_span else tree_span,
+            .decl_span = d_span,
+            .bound_lexeme = bind_lex,
+            .is_underscore = is_us,
+        });
+        return;
+    }
+    const bind_tok = if (!alias_tok.isNone()) alias_tok else final_tok;
+    const bind_lex = extractTokenSlice(source, token_buffer, bind_tok);
+    const d_span = token_buffer.getTokenSpan(file_id, bind_tok);
+    try out_leaves.append(allocator, .{
+        .use_item_cst = use_item_cst,
+        .leaf_tree_cst = tree_cst,
+        .report_span = tree_span,
+        .decl_span = d_span,
+        .bound_lexeme = bind_lex,
+        .is_underscore = std.mem.eql(u8, bind_lex, "_"),
+    });
+}
+
+/// Rebases `use_leaf_records` (and imported alias `cst_node`/`decl_span`) onto the live CST after Early Cutoff.
+pub fn refreshFileUseLeafRecordsLiveCst(
+    allocator: std.mem.Allocator,
+    sym_table: *SymbolTable,
+    interner: *const StringInterner,
+    file_id: FileId,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+) !void {
+    var has_any_for_file = false;
+    for (sym_table.use_leaf_records.items) |rec| {
+        if (rec.file_id == file_id) {
+            has_any_for_file = true;
+            break;
+        }
+    }
+    if (!has_any_for_file) return;
+
+    var live_leaves: std.ArrayListUnmanaged(LiveSyntacticUseLeaf) = .empty;
+    defer live_leaves.deinit(allocator);
+
+    const cst_total = cst_arena.countNodes();
+    var cst_cur: usize = 0;
+    while (cst_cur < cst_total) {
+        const cid = CstNodeIndex.fromInt(@intCast(cst_cur));
+        const crec = cst_arena.getNode(cid);
+        if (crec.kind == .block or crec.kind == .fn_expr_body) {
+            cst_cur += @max(@as(usize, crec.subtree_size), 1);
+            continue;
+        }
+        if (crec.kind == .use_item) {
+            const u_end = @min(cst_cur + @max(@as(usize, crec.subtree_size), 1), cst_total);
+            var is_pub_use = false;
+            var root_tree: CstNodeIndex = .none;
+            var u_i = cst_cur + 1;
+            while (u_i < u_end) : (u_i += 1) {
+                const sub = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(u_i)));
+                if (sub.kind == .attribute) {
+                    if (sub.subtree_size > 1) u_i += @as(usize, sub.subtree_size) - 1;
+                    continue;
+                }
+                if (sub.kind == .use_tree) {
+                    root_tree = CstNodeIndex.fromInt(@intCast(u_i));
+                    break;
+                }
+                if (sub.subtree_size <= 1 and !sub.token.isNone() and sub.token.asInt() < token_buffer.countTokens()) {
+                    if (token_buffer.getToken(sub.token).kind == .kw_pub) is_pub_use = true;
+                }
+            }
+            if (!is_pub_use and !root_tree.isNone()) {
+                try collectLiveUseTreeLeavesInCst(
+                    allocator,
+                    file_id,
+                    source,
+                    token_buffer,
+                    cst_arena,
+                    cid,
+                    .none,
+                    true,
+                    root_tree,
+                    &live_leaves,
+                );
+            }
+            cst_cur = u_end;
+            continue;
+        }
+        cst_cur += 1;
+    }
+
+    var live_cursor: usize = 0;
+    for (sym_table.use_leaf_records.items) |*rec_ptr| {
+        if (rec_ptr.file_id != file_id) continue;
+        const expected_name: []const u8 = if (!rec_ptr.bound_name.isNone())
+            interner.get(rec_ptr.bound_name)
+        else
+            "";
+        var search = live_cursor;
+        while (search < live_leaves.items.len) : (search += 1) {
+            const cand = live_leaves.items[search];
+            if (cand.is_glob != rec_ptr.is_glob) continue;
+            if (cand.is_underscore != rec_ptr.is_exempt_underscore) continue;
+            if (!rec_ptr.is_glob and !rec_ptr.is_exempt_underscore and
+                !std.mem.eql(u8, cand.bound_lexeme, expected_name))
+            {
+                continue;
+            }
+            const old_leaf_cst = rec_ptr.leaf_tree_cst;
+            rec_ptr.use_item_cst = cand.use_item_cst;
+            rec_ptr.leaf_tree_cst = cand.leaf_tree_cst;
+            rec_ptr.report_span = cand.report_span;
+            if (rec_ptr.is_glob) {
+                for (sym_table.getScopeMembers(rec_ptr.scope_id)) |s_idx| {
+                    const s_rec = sym_table.getSymbol(s_idx);
+                    if (s_rec.kind == .use_alias_sym and s_rec.flags.is_glob_use_alias and
+                        s_rec.cst_node == old_leaf_cst)
+                    {
+                        sym_table.getSymbolMut(s_idx).cst_node = cand.leaf_tree_cst;
+                    }
+                }
+            } else if (!rec_ptr.alias_sym.isNone() and rec_ptr.alias_sym.asInt() < sym_table.countSymbols()) {
+                const alias_mut = sym_table.getSymbolMut(rec_ptr.alias_sym);
+                alias_mut.cst_node = cand.use_item_cst;
+                alias_mut.decl_span = cand.decl_span;
+            }
+            live_cursor = search + 1;
+            break;
+        }
+    }
+}
+
+/// Emits `W0404` (`unused-import`, `Auto`) with surgical `UseTree` specifier pruning for `file_id`.
+pub fn emitFileUnusedImportWarnings(
+    sym_table: *const SymbolTable,
+    interner: *StringInterner,
+    file_id: FileId,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    inactive_cfg_idents: *const std.AutoHashMapUnmanaged(SymbolId, void),
+    sup_table: *const lint_filter.SuppressionTable,
+    tracker: *lint_filter.FulfillmentTracker,
+    eff_rules: lint_filter.EffectiveFileRules,
+    proj_sink: *DiagnosticSink,
+) !void {
+    if (!eff_rules.isEnabled(.unused_import)) return;
+    const arena_alloc = proj_sink.arena.asAllocator();
+
+    var surviving_indices: std.ArrayListUnmanaged(usize) = .empty;
+    var dead_leaf_cst_set: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    var resolved_count_by_item: std.AutoHashMapUnmanaged(u32, usize) = .empty;
+
+    for (sym_table.use_leaf_records.items, 0..) |rec, rec_idx| {
+        if (rec.file_id != file_id) continue;
+        const cnt_gop = try resolved_count_by_item.getOrPut(arena_alloc, rec.use_item_cst.asInt());
+        if (!cnt_gop.found_existing) cnt_gop.value_ptr.* = 0;
+        cnt_gop.value_ptr.* += 1;
+
+        var is_used = rec.is_exempt_underscore;
+        if (!is_used and rec.is_glob) {
+            for (sym_table.getScopeMembers(rec.scope_id)) |s_idx| {
+                const s_rec = sym_table.getSymbol(s_idx);
+                if (s_rec.kind == .use_alias_sym and s_rec.flags.is_glob_use_alias and
+                    s_rec.cst_node == rec.leaf_tree_cst and s_rec.flags.is_used)
+                {
+                    is_used = true;
+                    break;
+                }
+            }
+            if (!is_used and inactive_cfg_idents.count() > 0 and !rec.glob_target_scope.isNone()) {
+                for (sym_table.getScopeMembers(rec.glob_target_scope)) |m_idx| {
+                    if (inactive_cfg_idents.contains(sym_table.getSymbol(m_idx).name)) {
+                        is_used = true;
+                        break;
+                    }
+                }
+            }
+        } else if (!is_used and !rec.alias_sym.isNone()) {
+            is_used = sym_table.getSymbol(rec.alias_sym).flags.is_used;
+            if (!is_used and !rec.bound_name.isNone() and inactive_cfg_idents.contains(rec.bound_name)) {
+                is_used = true;
+            }
+        }
+        if (is_used) continue;
+
+        const leaf_cand = lint_filter.RawLintCandidate{
+            .rule_id = .unused_import,
+            .fix_kind = 1,
+            .start_byte = rec.report_span.start_byte,
+            .end_byte = rec.report_span.end_byte,
+            .node_or_tok = rec.leaf_tree_cst.asInt(),
+        };
+        if (lint_filter.isCandidateSuppressed(sup_table, tracker, leaf_cand)) continue;
+        try surviving_indices.append(arena_alloc, rec_idx);
+        try dead_leaf_cst_set.put(arena_alloc, rec.leaf_tree_cst.asInt(), {});
+    }
+
+    if (surviving_indices.items.len == 0) return;
+
+    var processed_use_items: std.AutoHashMapUnmanaged(u32, void) = .empty;
+
+    for (surviving_indices.items) |surv_idx| {
+        const rec = sym_table.use_leaf_records.items[surv_idx];
+        const use_key = rec.use_item_cst.asInt();
+        const is_first_for_item = !processed_use_items.contains(use_key);
+        if (is_first_for_item) {
+            try processed_use_items.put(arena_alloc, use_key, {});
+        }
+
+        var fixes_slice: []const SuggestedFix = &.{};
+        if (is_first_for_item and !rec.use_item_cst.isNone() and rec.use_item_cst.asInt() < cst_arena.countNodes()) {
+            var root_tree_cst: CstNodeIndex = .none;
+            const u_start: usize = rec.use_item_cst.asInt();
+            const u_end: usize = @min(
+                u_start + @max(@as(usize, cst_arena.getNode(rec.use_item_cst).subtree_size), 1),
+                cst_arena.countNodes(),
+            );
+            var u_cur = u_start + 1;
+            while (u_cur < u_end) : (u_cur += 1) {
+                const sub_id = CstNodeIndex.fromInt(@intCast(u_cur));
+                if (cst_arena.getNode(sub_id).kind == .use_tree) {
+                    root_tree_cst = sub_id;
+                    break;
+                }
+            }
+
+            if (!root_tree_cst.isNone()) {
+                const total_syntactic = countSyntacticUseTreeLeaves(cst_arena, root_tree_cst);
+                const resolved_in_item = resolved_count_by_item.get(use_key) orelse 0;
+                var dead_in_item: usize = 0;
+                for (surviving_indices.items) |other_surv| {
+                    if (sym_table.use_leaf_records.items[other_surv].use_item_cst == rec.use_item_cst) {
+                        dead_in_item += 1;
+                    }
+                }
+
+                if (resolved_in_item == total_syntactic and dead_in_item == total_syntactic) {
+                    const u_span = computeCstSubtreeTokenSpan(file_id, token_buffer, cst_arena, rec.use_item_cst);
+                    if (u_span.end_byte > u_span.start_byte and
+                        !hasCommentInSourceRange(source, u_span.start_byte, u_span.end_byte))
+                    {
+                        const rem = computeFullLineItemRemovalBounds(source, u_span.start_byte, u_span.end_byte);
+                        const edits = try arena_alloc.alloc(TextEdit, 1);
+                        edits[0] = .{
+                            .file_id = file_id,
+                            .start_byte = rem.start,
+                            .end_byte = rem.end,
+                            .replacement_id = try interner.intern(""),
+                        };
+                        const fix_arr = try arena_alloc.alloc(SuggestedFix, 1);
+                        fix_arr[0] = .{
+                            .message = "remove unused `use` import",
+                            .applicability = .machine_applicable,
+                            .priority = .lint_idiom,
+                            .edits = edits,
+                        };
+                        fixes_slice = fix_arr;
+                    }
+                } else if (resolved_in_item == total_syntactic) {
+                    var pruned_edits: std.ArrayListUnmanaged(TextEdit) = .empty;
+                    const ok = try collectPrunedUseTreeEditsRecursive(
+                        arena_alloc,
+                        interner,
+                        file_id,
+                        source,
+                        token_buffer,
+                        cst_arena,
+                        root_tree_cst,
+                        &dead_leaf_cst_set,
+                        &pruned_edits,
+                    );
+                    if (ok and pruned_edits.items.len > 0) {
+                        const fix_arr = try arena_alloc.alloc(SuggestedFix, 1);
+                        fix_arr[0] = .{
+                            .message = "remove unused `use` specifier",
+                            .applicability = .machine_applicable,
+                            .priority = .lint_idiom,
+                            .edits = pruned_edits.items,
+                        };
+                        fixes_slice = fix_arr;
+                    }
+                }
+            }
+        }
+
+        const spec_s: usize = @min(@as(usize, rec.report_span.start_byte), source.len);
+        const spec_e: usize = @min(@max(@as(usize, rec.report_span.end_byte), spec_s), source.len);
+        const spec_text = source[spec_s..spec_e];
+        const labels = try arena_alloc.alloc(LabeledSpan, 1);
+        labels[0] = .{
+            .span = rec.report_span,
+            .label = "imported symbol is never referenced in this scope",
+            .style = .primary,
+        };
+        try proj_sink.emit(.{
+            .code = .w0404_unused_import,
+            .severity = .warning,
+            .primary_span = rec.report_span,
+            .message = try std.fmt.allocPrint(arena_alloc, "unused import `{s}`", .{spec_text}),
+            .labels = labels,
+            .suggestions = fixes_slice,
+        });
+    }
+}
+
+/// Raises `req_vis_map[T]` to at least `min(T.visibility, min_vis)` for every nominal/trait/alias reachable from `ty` (`rustc #110923`).
+fn clampTypeSignatureExposureVisibility(
+    allocator: std.mem.Allocator,
+    type_pool: *const type_system.InternPool,
+    sym_table: *const SymbolTable,
+    pkg_id: PackageId,
+    ty: TypeId,
+    min_vis: Visibility,
+    req_vis_map: *std.AutoHashMapUnmanaged(u32, Visibility),
+    depth: u32,
+) anyerror!bool {
+    if (ty.isError() or depth > 24 or min_vis == .private) return false;
+    var did_change = false;
+
+    if (sym_table.type_to_symbol.get(ty.toU32())) |mapped_sym| {
+        if (try raiseSymbolReqVisibility(allocator, sym_table, pkg_id, mapped_sym, min_vis, req_vis_map)) {
+            did_change = true;
+        }
+    }
+    if (ty.toU32() < TypeId.first_dynamic.toU32() or ty.toU32() >= type_pool.nodes.len) return did_change;
+
+    const node = type_pool.getNode(ty);
+    switch (node.tag) {
+        .tilde_approx,
+        .refined_ty,
+        .ref_ty,
+        .mut_ref_ty,
+        .raw_ptr_ty,
+        .slice_ty,
+        .soa_slice_ty,
+        .array_ty,
+        .soa_array_ty,
+        .soa_vec_ty,
+        .optional_ty,
+        .dyn_trait_ty,
+        .associated_ty,
+        .future_ty,
+        => {
+            if (try clampTypeSignatureExposureVisibility(
+                allocator,
+                type_pool,
+                sym_table,
+                pkg_id,
+                TypeId.fromInt(node.lhs),
+                min_vis,
+                req_vis_map,
+                depth + 1,
+            )) did_change = true;
+        },
+        .distinct_ty => {
+            if (try raiseSymbolReqVisibility(allocator, sym_table, pkg_id, SymbolIndex.fromInt(node.rhs), min_vis, req_vis_map)) {
+                did_change = true;
+            }
+            if (try clampTypeSignatureExposureVisibility(
+                allocator,
+                type_pool,
+                sym_table,
+                pkg_id,
+                TypeId.fromInt(node.lhs),
+                min_vis,
+                req_vis_map,
+                depth + 1,
+            )) did_change = true;
+        },
+        .result_ty => {
+            if (try clampTypeSignatureExposureVisibility(
+                allocator,
+                type_pool,
+                sym_table,
+                pkg_id,
+                TypeId.fromInt(node.lhs),
+                min_vis,
+                req_vis_map,
+                depth + 1,
+            )) did_change = true;
+            if (try clampTypeSignatureExposureVisibility(
+                allocator,
+                type_pool,
+                sym_table,
+                pkg_id,
+                TypeId.fromInt(node.rhs),
+                min_vis,
+                req_vis_map,
+                depth + 1,
+            )) did_change = true;
+        },
+        .tuple_ty => {
+            for (type_pool.getTupleElements(ty)) |raw_elem| {
+                if (try clampTypeSignatureExposureVisibility(
+                    allocator,
+                    type_pool,
+                    sym_table,
+                    pkg_id,
+                    TypeId.fromInt(raw_elem),
+                    min_vis,
+                    req_vis_map,
+                    depth + 1,
+                )) did_change = true;
+            }
+        },
+        .struct_ty, .enum_ty, .union_ty, .bit_field_ty, .trait_ty => {
+            const nom_sym = SymbolIndex.fromInt(node.rhs);
+            if (try raiseSymbolReqVisibility(allocator, sym_table, pkg_id, nom_sym, min_vis, req_vis_map)) {
+                did_change = true;
+            }
+            for (type_pool.getGenericTypeArgs(ty)) |raw_ga| {
+                if (try clampTypeSignatureExposureVisibility(
+                    allocator,
+                    type_pool,
+                    sym_table,
+                    pkg_id,
+                    TypeId.fromInt(raw_ga),
+                    min_vis,
+                    req_vis_map,
+                    depth + 1,
+                )) did_change = true;
+            }
+        },
+        .type_param, .bind_once_group_var, .bind_many_any_var => {
+            if (try clampTypeSignatureExposureVisibility(
+                allocator,
+                type_pool,
+                sym_table,
+                pkg_id,
+                TypeId.fromInt(node.lhs),
+                min_vis,
+                req_vis_map,
+                depth + 1,
+            )) did_change = true;
+        },
+        .user_group => {
+            if (type_pool.getUserGroupView(ty)) |ug_view| {
+                for (ug_view.exact_members) |raw_m| {
+                    if (try clampTypeSignatureExposureVisibility(
+                        allocator,
+                        type_pool,
+                        sym_table,
+                        pkg_id,
+                        TypeId.fromInt(raw_m),
+                        min_vis,
+                        req_vis_map,
+                        depth + 1,
+                    )) did_change = true;
+                }
+                for (ug_view.tilde_members) |raw_tm| {
+                    if (try clampTypeSignatureExposureVisibility(
+                        allocator,
+                        type_pool,
+                        sym_table,
+                        pkg_id,
+                        TypeId.fromInt(raw_tm),
+                        min_vis,
+                        req_vis_map,
+                        depth + 1,
+                    )) did_change = true;
+                }
+            }
+        },
+        .fn_ty, .closure_ty => {
+            if (type_pool.getFnSignatureView(ty)) |sig| {
+                const arity = sig.paramCount();
+                const ret_ty = sig.ret_ty;
+                for (0..arity) |p_idx| {
+                    if (try clampTypeSignatureExposureVisibility(
+                        allocator,
+                        type_pool,
+                        sym_table,
+                        pkg_id,
+                        sig.getParamType(p_idx),
+                        min_vis,
+                        req_vis_map,
+                        depth + 1,
+                    )) did_change = true;
+                }
+                if (try clampTypeSignatureExposureVisibility(
+                    allocator,
+                    type_pool,
+                    sym_table,
+                    pkg_id,
+                    ret_ty,
+                    min_vis,
+                    req_vis_map,
+                    depth + 1,
+                )) did_change = true;
+            }
+        },
+        else => {},
+    }
+    return did_change;
+}
+
+/// Raises `req_vis_map[sym_idx]` in `pkg_id` to `@max(cur, @min(sym.visibility, floor_vis))`, returning `true` if raised.
+fn raiseSymbolReqVisibility(
+    allocator: std.mem.Allocator,
+    sym_table: *const SymbolTable,
+    pkg_id: PackageId,
+    sym_idx: SymbolIndex,
+    floor_vis: Visibility,
+    req_vis_map: *std.AutoHashMapUnmanaged(u32, Visibility),
+) !bool {
+    if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return false;
+    const sym = sym_table.getSymbol(sym_idx);
+    if (sym.flags.is_builtin or sym.scope_id.isNone() or sym.scope_id.asInt() >= sym_table.scope_arena.countScopes()) {
+        return false;
+    }
+    if (sym_table.scope_arena.getScope(sym.scope_id).pkg_id != pkg_id) return false;
+    const clamped: Visibility = @fromBackingInt(@min(@backingInt(sym.visibility), @backingInt(floor_vis)));
+    const gop = try req_vis_map.getOrPut(allocator, sym_idx.asInt());
+    if (!gop.found_existing) {
+        gop.value_ptr.* = clamped;
+        return clamped != .private;
+    }
+    if (@backingInt(clamped) > @backingInt(gop.value_ptr.*)) {
+        gop.value_ptr.* = clamped;
+        return true;
+    }
+    return false;
+}
+
+/// Collects live package-level symbols inside `scope_id` (and child module / nominal scopes) into `out_syms`.
+fn collectLivePackageScopesAndSymbols(
+    allocator: std.mem.Allocator,
+    sym_table: *const SymbolTable,
+    mod_scope: ScopeId,
+    seen_scopes: *std.AutoHashMapUnmanaged(u32, void),
+    out_mod_scopes: *std.ArrayListUnmanaged(ScopeId),
+    out_syms: *std.ArrayListUnmanaged(SymbolIndex),
+    depth: u32,
+) anyerror!void {
+    if (mod_scope.isNone() or mod_scope.asInt() >= sym_table.scope_arena.countScopes() or depth > 32) return;
+    const sc_gop = try seen_scopes.getOrPut(allocator, mod_scope.asInt());
+    if (sc_gop.found_existing) return;
+    if (sym_table.scope_arena.getScope(mod_scope).kind == .module_scope) {
+        try out_mod_scopes.append(allocator, mod_scope);
+    }
+
+    for (sym_table.getScopeMembers(mod_scope)) |sym_idx| {
+        if (!isSymbolActiveInScope(sym_table, sym_idx)) continue;
+        const sym = sym_table.getSymbol(sym_idx).*;
+        if (sym.flags.is_builtin) continue;
+        try out_syms.append(allocator, sym_idx);
+        if (sym.flags.is_imported) continue;
+
+        switch (sym.kind) {
+            .module_sym, .struct_sym, .enum_sym, .union_sym, .bit_field_sym, .trait_sym => {
+                if (!sym.target_scope.isNone() and sym.target_scope.asInt() < sym_table.scope_arena.countScopes()) {
+                    try collectLivePackageScopesAndSymbols(
+                        allocator,
+                        sym_table,
+                        sym.target_scope,
+                        seen_scopes,
+                        out_mod_scopes,
+                        out_syms,
+                        depth + 1,
+                    );
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+/// Finds the `.visibility_modifier` span and following token `start_byte` inside `item_cst`.
+fn findVisibilityModifierEditBounds(
+    file_id: FileId,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    item_cst: CstNodeIndex,
+) ?struct { vis_span: Span, next_tok_start: u32 } {
+    if (item_cst.isNone() or item_cst.asInt() >= cst_arena.countNodes()) return null;
+    const start_idx: usize = item_cst.asInt();
+    const end_idx: usize = @min(
+        start_idx + @max(@as(usize, cst_arena.getNode(item_cst).subtree_size), 1),
+        cst_arena.countNodes(),
+    );
+    var vis_span_opt: ?Span = null;
+    var cursor = start_idx + 1;
+    while (cursor < end_idx) {
+        const sub_id = CstNodeIndex.fromInt(@intCast(cursor));
+        const sub = cst_arena.getNode(sub_id);
+        if (sub.kind == .attribute) {
+            cursor += @max(@as(usize, sub.subtree_size), 1);
+            continue;
+        }
+        if (vis_span_opt == null) {
+            if (sub.kind == .visibility_modifier) {
+                const v_sp = computeCstSubtreeTokenSpan(file_id, token_buffer, cst_arena, sub_id);
+                if (v_sp.end_byte > v_sp.start_byte) {
+                    vis_span_opt = v_sp;
+                }
+                cursor += @max(@as(usize, sub.subtree_size), 1);
+                continue;
+            }
+            if (sub.kind == .block or sub.kind == .param_list or sub.kind == .struct_field or sub.kind == .enum_variant) {
+                break;
+            }
+            cursor += 1;
+            continue;
+        }
+        if (sub.subtree_size <= 1 and !sub.flags.is_missing_or_injected and
+            !sub.token.isNone() and sub.token.asInt() < token_buffer.countTokens())
+        {
+            const tok_rec = token_buffer.getToken(sub.token);
+            if (!tok_rec.flags.is_synthesized) {
+                return .{
+                    .vis_span = vis_span_opt.?,
+                    .next_tok_start = tok_rec.byte_offset,
+                };
+            }
+        }
+        cursor += 1;
+    }
+    if (vis_span_opt) |v_sp| {
+        return .{ .vis_span = v_sp, .next_tok_start = v_sp.end_byte };
+    }
+    return null;
+}
+
+/// Emits `W0406` (`unused-pkg-visibility`, `Auto`) for `file_id`, enforcing module ceilings and `rustc #110923`.
+pub fn emitPackageUnusedVisibilityWarningsForFile(
+    sym_table: *const SymbolTable,
+    interner: *StringInterner,
+    type_pool: *const type_system.InternPool,
+    pkg_id: PackageId,
+    pkg_files: []const FileId,
+    target_file_id: FileId,
+    target_source: []const u8,
+    target_token_buffer: *const TokenBuffer,
+    target_cst_arena: *const LosslessCstArena,
+    pkg_inactive_cfg_idents: *const std.AutoHashMapUnmanaged(SymbolId, void),
+    sink: *DiagnosticSink,
+) !void {
+    const arena_alloc = sink.arena.asAllocator();
+    var seen_scopes: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    var mod_scopes: std.ArrayListUnmanaged(ScopeId) = .empty;
+    var pkg_syms: std.ArrayListUnmanaged(SymbolIndex) = .empty;
+
+    for (pkg_files) |fid| {
+        if (sym_table.file_module_scopes.get(fid.asInt())) |f_mod| {
+            try collectLivePackageScopesAndSymbols(
+                arena_alloc,
+                sym_table,
+                f_mod,
+                &seen_scopes,
+                &mod_scopes,
+                &pkg_syms,
+                0,
+            );
+        }
+    }
+    if (pkg_syms.items.len == 0) return;
+
+    // [1] Compute module reachability ceilings (`mod_ceiling[mod_scope]`):
+    var child_mod_targets: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    for (pkg_syms.items) |sym_idx| {
+        const sym = sym_table.getSymbol(sym_idx);
+        if (sym.kind == .module_sym and !sym.flags.is_imported and !sym.target_scope.isNone()) {
+            try child_mod_targets.put(arena_alloc, sym.target_scope.asInt(), {});
+        }
+    }
+
+    var mod_ceiling: std.AutoHashMapUnmanaged(u32, Visibility) = .empty;
+    for (mod_scopes.items) |m_sc| {
+        const init_vis: Visibility = if (!child_mod_targets.contains(m_sc.asInt())) .public else .private;
+        try mod_ceiling.put(arena_alloc, m_sc.asInt(), init_vis);
+    }
+
+    var pass_i: usize = 0;
+    while (pass_i < 8) : (pass_i += 1) {
+        var any_mod_changed = false;
+        for (pkg_syms.items) |sym_idx| {
+            const sym = sym_table.getSymbol(sym_idx);
+            if (sym.kind != .module_sym or sym.flags.is_imported or sym.target_scope.isNone()) continue;
+            const parent_mod = sym_table.scope_arena.getScope(sym.scope_id).enclosing_module;
+            const parent_ceil = mod_ceiling.get(parent_mod.asInt()) orelse .public;
+            const child_reach: Visibility = switch (sym.visibility) {
+                .private => .pub_super,
+                .pub_super => if (parent_ceil == .private)
+                    .pub_super
+                else
+                    @fromBackingInt(@max(
+                        @backingInt(Visibility.pub_super),
+                        @min(@backingInt(parent_ceil), @backingInt(Visibility.pub_pkg)),
+                    )),
+                .pub_pkg => if (@backingInt(parent_ceil) >= @backingInt(Visibility.pub_pkg)) .pub_pkg else .pub_super,
+                .public => parent_ceil,
+            };
+            const gop = try mod_ceiling.getOrPut(arena_alloc, sym.target_scope.asInt());
+            if (!gop.found_existing or @backingInt(child_reach) > @backingInt(gop.value_ptr.*)) {
+                gop.value_ptr.* = child_reach;
+                any_mod_changed = true;
+            }
+        }
+        if (!any_mod_changed) break;
+    }
+
+    // [2] Compute re-export floors (`pub use internal.Item;`):
+    var reexport_floor: std.AutoHashMapUnmanaged(u32, Visibility) = .empty;
+    for (pkg_syms.items) |sym_idx| {
+        const sym = sym_table.getSymbol(sym_idx);
+        if (sym.visibility == .private or !sym.flags.is_imported) continue;
+        const ua_mod = sym_table.scope_arena.getScope(sym.scope_id).enclosing_module;
+        const ua_ceil = mod_ceiling.get(ua_mod.asInt()) orelse .public;
+        const eff_reexport: Visibility = @fromBackingInt(@min(@backingInt(sym.visibility), @backingInt(ua_ceil)));
+        if (sym.kind == .use_alias_sym and !sym.target_symbol.isNone()) {
+            const gop = try reexport_floor.getOrPut(arena_alloc, sym.target_symbol.asInt());
+            if (!gop.found_existing or @backingInt(eff_reexport) > @backingInt(gop.value_ptr.*)) {
+                gop.value_ptr.* = eff_reexport;
+            }
+        } else if (sym.kind == .module_sym and !sym.target_scope.isNone()) {
+            const m_gop = try mod_ceiling.getOrPut(arena_alloc, sym.target_scope.asInt());
+            if (!m_gop.found_existing or @backingInt(eff_reexport) > @backingInt(m_gop.value_ptr.*)) {
+                m_gop.value_ptr.* = eff_reexport;
+            }
+        }
+    }
+
+    // [3] Compute initial required visibility per symbol before `rustc #110923` signature clamping:
+    var req_vis_map: std.AutoHashMapUnmanaged(u32, Visibility) = .empty;
+    for (pkg_syms.items) |sym_idx| {
+        const sym = sym_table.getSymbol(sym_idx).*;
+        if (sym.flags.is_imported) continue;
+        const def_mod = sym_table.scope_arena.getScope(sym.scope_id).enclosing_module;
+        var container_ceil = mod_ceiling.get(def_mod.asInt()) orelse .public;
+
+        // If `sym` is a struct field or inherent `impl` member, clamp ceiling by its owner nominal's reachability:
+        const sc_rec = sym_table.scope_arena.getScope(sym.scope_id);
+        if (sc_rec.kind == .nominal_type_scope and !sc_rec.owner_def_id.isNone()) {
+            if (sym_table.def_to_symbol.get(sc_rec.owner_def_id.asInt())) |owner_idx| {
+                const owner_sym = sym_table.getSymbol(owner_idx);
+                const owner_reexp = reexport_floor.get(owner_idx.asInt()) orelse .private;
+                const owner_eff_raw = @max(
+                    @backingInt(owner_reexp),
+                    @min(@backingInt(owner_sym.visibility), @backingInt(container_ceil)),
+                );
+                container_ceil = @fromBackingInt(owner_eff_raw);
+            }
+        }
+
+        const reexp = reexport_floor.get(sym_idx.asInt()) orelse .private;
+        const eff_reach: Visibility = @fromBackingInt(
+            @max(@backingInt(reexp), @min(@backingInt(sym.visibility), @backingInt(container_ceil))),
+        );
+
+        var req: Visibility = reexp;
+        if (eff_reach == .public and sym.visibility == .public) {
+            req = .public;
+        } else {
+            if (sym.flags.has_pkg_wide_ref) {
+                req = @fromBackingInt(@max(@backingInt(req), @backingInt(Visibility.pub_pkg)));
+            } else if (sym.flags.has_parent_mod_ref) {
+                const has_super_parent = !def_mod.isNone() and
+                    !sym_table.scope_arena.findImmediateParentModule(def_mod).isNone();
+                const parent_req: Visibility = if (has_super_parent) .pub_super else .pub_pkg;
+                req = @fromBackingInt(@max(@backingInt(req), @backingInt(parent_req)));
+            }
+            req = @fromBackingInt(@min(@backingInt(req), @backingInt(eff_reach)));
+            req = @fromBackingInt(@min(@backingInt(req), @backingInt(sym.visibility)));
+        }
+        try req_vis_map.put(arena_alloc, sym_idx.asInt(), req);
+    }
+
+    // [4] `rustc #110923` multi-pass public/pkg signature & trait-bound exposure fixpoint:
+    var sig_pass: usize = 0;
+    while (sig_pass < 6) : (sig_pass += 1) {
+        var any_sig_raised = false;
+        for (pkg_syms.items) |sym_idx| {
+            const sym = sym_table.getSymbol(sym_idx).*;
+            if (sym.flags.is_imported) continue;
+            const item_vis = req_vis_map.get(sym_idx.asInt()) orelse sym.visibility;
+            if (item_vis == .private) continue;
+
+            if (!sym.type_id.isError()) {
+                if (try clampTypeSignatureExposureVisibility(
+                    arena_alloc,
+                    type_pool,
+                    sym_table,
+                    pkg_id,
+                    sym.type_id,
+                    item_vis,
+                    &req_vis_map,
+                    0,
+                )) any_sig_raised = true;
+            }
+            if ((sym.kind == .struct_sym or sym.kind == .enum_sym or sym.kind == .union_sym or
+                sym.kind == .bit_field_sym or sym.kind == .trait_sym or sym.kind == .fn_sym) and
+                !sym.target_scope.isNone())
+            {
+                for (sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
+                    const mem = sym_table.getSymbol(mem_idx).*;
+                    if (mem.kind == .type_param_sym or mem.kind == .enum_variant_sym) {
+                        if (try clampTypeSignatureExposureVisibility(
+                            arena_alloc,
+                            type_pool,
+                            sym_table,
+                            pkg_id,
+                            mem.type_id,
+                            item_vis,
+                            &req_vis_map,
+                            0,
+                        )) any_sig_raised = true;
+                    } else if (mem.kind == .field_sym and mem.visibility != .private) {
+                        const field_eff: Visibility = @fromBackingInt(@min(@backingInt(mem.visibility), @backingInt(item_vis)));
+                        if (try clampTypeSignatureExposureVisibility(
+                            arena_alloc,
+                            type_pool,
+                            sym_table,
+                            pkg_id,
+                            mem.type_id,
+                            field_eff,
+                            &req_vis_map,
+                            0,
+                        )) any_sig_raised = true;
+                    }
+                }
+            }
+        }
+        var pair_it = sym_table.trait_impl_pairs.keyIterator();
+        while (pair_it.next()) |pair_key_ptr| {
+            const target_tid = TypeId.fromInt(@intCast(pair_key_ptr.* >> 32));
+            const trait_idx = SymbolIndex.fromInt(@intCast(pair_key_ptr.* & 0xFFFF_FFFF));
+            if (sym_table.type_to_symbol.get(target_tid.toU32())) |nom_idx| {
+                const nom_req = req_vis_map.get(nom_idx.asInt()) orelse .private;
+                const trait_req = req_vis_map.get(trait_idx.asInt()) orelse .private;
+                if (nom_req != .private and trait_req != .private) {
+                    const shared_floor: Visibility = @fromBackingInt(@min(@backingInt(nom_req), @backingInt(trait_req)));
+                    if (try raiseSymbolReqVisibility(arena_alloc, sym_table, pkg_id, trait_idx, shared_floor, &req_vis_map)) {
+                        any_sig_raised = true;
+                    }
+                }
+            }
+        }
+        if (!any_sig_raised) break;
+    }
+
+    // [5] Emit `W0406` diagnostics + `Auto` narrowing edits for symbols declared in `target_file_id`:
+    for (pkg_syms.items) |sym_idx| {
+        const sym = sym_table.getSymbol(sym_idx).*;
+        if (sym.decl_span.file_id != target_file_id or sym.flags.is_imported or sym.flags.is_builtin) continue;
+        if (sym.visibility == .private) continue;
+
+        const is_eligible_kind = switch (sym.kind) {
+            .fn_sym,
+            .const_sym,
+            .struct_sym,
+            .enum_sym,
+            .union_sym,
+            .bit_field_sym,
+            .type_alias_sym,
+            .type_group_sym,
+            .distinct_type_sym,
+            .refined_type_sym,
+            .trait_sym,
+            .module_sym,
+            .field_sym,
+            => true,
+            else => false,
+        };
+        if (!is_eligible_kind) continue;
+        if (sym.flags.is_extern or sym.extra_flags.is_test or sym.extra_flags.is_bench) continue;
+        if (sym.contract_flags.is_export or sym.contract_flags.is_ifunc or
+            sym.contract_flags.has_link_name or sym.contract_flags.has_link_section)
+        {
+            continue;
+        }
+        if (std.mem.eql(u8, sym.name_text, "main") or std.mem.startsWith(u8, sym.name_text, "_")) continue;
+        if (sym_table.impl_method_trait.contains(sym_idx.asInt())) continue;
+        const parent_sc = sym_table.scope_arena.getScope(sym.scope_id);
+        if (parent_sc.kind == .trait_scope) continue;
+        if (sym.kind == .field_sym and !parent_sc.owner_def_id.isNone()) {
+            if (sym_table.def_to_symbol.get(parent_sc.owner_def_id.asInt())) |owner_idx| {
+                const owner_sym = sym_table.getSymbol(owner_idx);
+                if (owner_sym.contract_flags.is_repr_c or owner_sym.flags.is_attribute_schema) continue;
+            }
+        }
+        if (pkg_inactive_cfg_idents.contains(sym.name)) continue;
+        if (hasUsedOrWasmExportAttrInCst(target_source, target_token_buffer, target_cst_arena, sym.cst_node)) continue;
+
+        const req_vis = req_vis_map.get(sym_idx.asInt()) orelse sym.visibility;
+        if (@backingInt(req_vis) >= @backingInt(sym.visibility)) continue;
+
+        const vis_bounds = findVisibilityModifierEditBounds(
+            target_file_id,
+            target_token_buffer,
+            target_cst_arena,
+            sym.cst_node,
+        ) orelse continue;
+
+        const cur_vis_label: []const u8 = switch (sym.visibility) {
+            .public => "pub",
+            .pub_pkg => "pub(pkg)",
+            .pub_super => "pub(super)",
+            .private => "private",
+        };
+        const target_vis_desc: []const u8 = switch (req_vis) {
+            .private => "module-private",
+            .pub_super => "`pub(super)`",
+            .pub_pkg => "`pub(pkg)`",
+            .public => "`pub`",
+        };
+
+        var fixes_slice: []const SuggestedFix = &.{};
+        if (!hasCommentInSourceRange(target_source, vis_bounds.vis_span.start_byte, vis_bounds.next_tok_start)) {
+            const edit = try arena_alloc.alloc(TextEdit, 1);
+            if (req_vis == .private) {
+                edit[0] = .{
+                    .file_id = target_file_id,
+                    .start_byte = vis_bounds.vis_span.start_byte,
+                    .end_byte = vis_bounds.next_tok_start,
+                    .replacement_id = try interner.intern(""),
+                };
+            } else {
+                const repl_kw: []const u8 = if (req_vis == .pub_super) "pub(super)" else "pub(pkg)";
+                edit[0] = .{
+                    .file_id = target_file_id,
+                    .start_byte = vis_bounds.vis_span.start_byte,
+                    .end_byte = vis_bounds.vis_span.end_byte,
+                    .replacement_id = try interner.intern(repl_kw),
+                };
+            }
+            const fix_arr = try arena_alloc.alloc(SuggestedFix, 1);
+            fix_arr[0] = .{
+                .message = try std.fmt.allocPrint(
+                    arena_alloc,
+                    "narrow `{s}` visibility to {s}",
+                    .{ cur_vis_label, target_vis_desc },
+                ),
+                .applicability = .machine_applicable,
+                .priority = .lint_idiom,
+                .edits = edit,
+            };
+            fixes_slice = fix_arr;
+        }
+
+        const labels = try arena_alloc.alloc(LabeledSpan, 1);
+        labels[0] = .{
+            .span = vis_bounds.vis_span,
+            .label = try std.fmt.allocPrint(
+                arena_alloc,
+                "`{s}` visibility is wider than intra-package usage requires; narrow to {s}",
+                .{ cur_vis_label, target_vis_desc },
+            ),
+            .style = .primary,
+        };
+        try sink.emit(.{
+            .code = .w0406_unused_pkg_visibility,
+            .severity = .warning,
+            .primary_span = vis_bounds.vis_span,
+            .message = try std.fmt.allocPrint(
+                arena_alloc,
+                "`{s}` item `{s}` is never referenced outside {s} scope",
+                .{ cur_vis_label, sym.name_text, target_vis_desc },
+            ),
+            .labels = labels,
+            .suggestions = fixes_slice,
+        });
+    }
+}
+
 // ---------------------------------------- MAIN -----------------------------------------
 
 test "test_edit_distance_and_symbol_table_overload_and_visibility" {
@@ -13412,7 +15975,7 @@ test "test_multi_package_scope_isolation_hygiene_and_inactive_cfg_caps" {
 test "test_dr24_allow_lint_mask_consolidated_repr_link_and_retired_e0239" {
     const allocator = std.testing.allocator;
     try std.testing.expectEqual(@as(usize, 1), @sizeOf(AllowLintMask));
-    try std.testing.expect(@sizeOf(SymbolRecord) <= 136);
+    try std.testing.expect(@sizeOf(SymbolRecord) <= 144);
     try std.testing.expect(AllowLintMask.fromLintName("W0119").?.isCodeAllowed(.w0119_useless_format_string));
     try std.testing.expect(AllowLintMask.fromLintName("useless_format_string").?.isCodeAllowed(.w0119_useless_format_string));
     try std.testing.expect(AllowLintMask.fromLintName("W0120").?.isCodeAllowed(.w0120_uninterpolated_fmt_placeholder));

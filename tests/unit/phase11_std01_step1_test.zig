@@ -404,8 +404,8 @@ test "test_step1_cx_prelude_auto_mount_and_4_tier_differential_parity" {
         "    pub fn next(&mut self) -> i32? {\n" ++
         "        if self.cur >= self.stop { return .None; }\n" ++
         "        let out = self.cur;\n" ++
-        "        self.cur = self.cur + 1;\n" ++
-        "        return .Some(out);\n" ++
+        "        self.cur += 1;\n" ++
+        "        .Some(out)\n" ++
         "    }\n" ++
         "}\n" ++
         "pub struct TagVal {\n" ++
@@ -415,7 +415,7 @@ test "test_step1_cx_prelude_auto_mount_and_4_tier_differential_parity" {
         "    pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec) -> unit!FmtError {\n" ++
         "        if spec.has_alt() { out.write_str(\"#\")?; }\n" ++
         "        out.write_str(\"T=\")?;\n" ++
-        "        return @fmt_write(out, f\"{self.code}\");\n" ++
+        "        @fmt_write(out, f\"{self.code}\")\n" ++
         "    }\n" ++
         "}\n" ++
         "pub struct FixedSink {\n" ++
@@ -424,7 +424,7 @@ test "test_step1_cx_prelude_auto_mount_and_4_tier_differential_parity" {
         "}\n" ++
         "pub fn sink_write_cb(ctx: *mut opaque, chunk: &[u8]) -> unit!FmtError {\n" ++
         "    if ctx.is_null() { return .Ok(()); }\n" ++
-        "    let sink_ptr: *mut FixedSink = ctx as *mut FixedSink;\n" ++
+        "    let sink_ptr = ctx as *mut FixedSink;\n" ++
         "    if sink_ptr.is_null() { return .Ok(()); }\n" ++
         "    let sink: &mut FixedSink = unsafe { &mut sink_ptr.* };\n" ++
         "    if chunk.len() > 16 - sink.len { return .Err(.BufferFull); }\n" ++
@@ -433,18 +433,18 @@ test "test_step1_cx_prelude_auto_mount_and_4_tier_differential_parity" {
         "        sink.buf[sink.len + idx] = chunk[idx];\n" ++
         "        idx += 1;\n" ++
         "    }\n" ++
-        "    sink.len = sink.len + chunk.len();\n" ++
-        "    return .Ok(());\n" ++
+        "    sink.len += chunk.len();\n" ++
+        "    .Ok(())\n" ++
         "}\n" ++
         "@inline(never)\n" ++
         "pub fn unwrap_nonzero[T: Unsigned](val: T is 1..=T.MAX) -> T {\n" ++
-        "    return val;\n" ++
+        "    val\n" ++
         "}\n" ++
         "pub fn add_explicit_group(lhs: Integer, rhs: Integer) -> i32 {\n" ++
-        "    return (lhs as i32) + (rhs as i32);\n" ++
+        "    (lhs as i32) + (rhs as i32)\n" ++
         "}\n" ++
         "pub fn add_any_group(lhs: any Integer, rhs: any Integer) -> i32 {\n" ++
-        "    return (lhs as i32) + (rhs as i32);\n" ++
+        "    (lhs as i32) + (rhs as i32)\n" ++
         "}\n" ++
         "pub fn main() -> i32 {\n" ++
         "    // [1] Prelude auto-import (`PairKey`), `@derive(Comparable, Default)`, `<` / `>`:\n" ++
@@ -455,17 +455,17 @@ test "test_step1_cx_prelude_auto_mount_and_4_tier_differential_parity" {
         "    // [2] `@implements[T, TrivialDrop]()`, inline refinement, explicit `[TypeArgs]`:\n" ++
         "    let td_ok: i32 = if comptime @implements[u64, TrivialDrop]() => 5 else 0;\n" ++
         "    let nz_v: u32 is 1..=u32.MAX = 7;\n" ++
-        "    let nz_u: i32 = unwrap_nonzero[u32](nz_v) as i32;\n" ++
+        "    let nz_u = unwrap_nonzero[u32](nz_v) as i32;\n" ++
         "    let grp_sum: i32 = add_explicit_group[u16](10_u16, 2_u16) + add_any_group[u16, u8](2_u16, 1_u8);\n" ++
         "\n" ++
         "    // [3] `#soa Vec[Particle]` push, element read, column slices, pop:\n" ++
-        "    var pvec: #soa Vec[Particle] = #soa Vec[Particle].new();\n" ++
+        "    var pvec = #soa Vec[Particle].new();\n" ++
         "    pvec.push(Particle { x: 4, y: 10 });\n" ++
         "    pvec.push(Particle { x: 6, y: 20 });\n" ++
         "    pvec.x_mut()[0] = 8;\n" ++
         "    var x_sum: i32 = 0;\n" ++
         "    for px in pvec.x {\n" ++
-        "        x_sum = x_sum + px;\n" ++
+        "        x_sum += px;\n" ++
         "    }\n" ++
         "    let popped_y: i32 = match pvec.pop() {\n" ++
         "        .Some(pt) => pt.y,\n" ++
@@ -475,9 +475,9 @@ test "test_step1_cx_prelude_auto_mount_and_4_tier_differential_parity" {
         "    // [4] `for` over custom `.next()` iterator + inherent `impl str`:\n" ++
         "    var iter_sum: i32 = 0;\n" ++
         "    for step in (RangeIter { cur: 1, stop: 4 }) {\n" ++
-        "        iter_sum = iter_sum + step;\n" ++
+        "        iter_sum += step;\n" ++
         "    }\n" ++
-        "    let ch_b: i32 = \"AB\".byte_at_or_zero(1) as i32;\n" ++
+        "    let ch_b = \"AB\".byte_at_or_zero(1) as i32;\n" ++
         "\n" ++
         "    // [5] Scalar, slice, raw-ptr, SIMD, TLS, `@ctx_next_rng_seed`, streaming `@fmt_write`:\n" ++
         "    let bit_score: i32 = ((8_u32.trailing_zeros() + 7_u32.count_ones()) as i32) +\n" ++
@@ -488,8 +488,8 @@ test "test_step1_cx_prelude_auto_mount_and_4_tier_differential_parity" {
         "    sl_mut.reverse();\n" ++
         "    let (left_half, right_half) = sl_mut.split_at(2);\n" ++
         "    let raw_second: i32 = unsafe { left_half.as_ptr().add(1).read() } + right_half[0];\n" ++
-        "    let v_a: [u8; 16] = @simd_splat[[u8; 16]](0x81_u8);\n" ++
-        "    let v_b: [u8; 16] = @simd_splat[[u8; 16]](0x81_u8);\n" ++
+        "    let v_a = @simd_splat[[u8; 16]](0x81_u8);\n" ++
+        "    let v_b = @simd_splat[[u8; 16]](0x81_u8);\n" ++
         "    let eq_mask: u16 = @simd_bitmask(@simd_eq(v_a, v_b));\n" ++
         "    let simd_ok: i32 = if eq_mask == 0xFFFF_u16 => 4 else 0;\n" ++
         "    let s1: u64 = @ctx_next_rng_seed();\n" ++
@@ -498,7 +498,8 @@ test "test_step1_cx_prelude_auto_mount_and_4_tier_differential_parity" {
         "not @tls_alloc_state().is_null() and s1 != s2 => 3 else 0;\n" ++
         "\n" ++
         "    var sink = FixedSink { buf: [0; 16], len: 0 };\n" ++
-        "    var writer = FmtWriter { ctx: (&raw mut sink) as *mut opaque, write_fn: sink_write_cb };\n" ++
+        "    let writer_val = FmtWriter { ctx: (&raw mut sink) as *mut opaque, write_fn: sink_write_cb };\n" ++
+        "    var writer = writer_val;\n" ++
         "    let tag = TagVal { code: 42 };\n" ++
         "    let manual_spec = FmtSpec {\n" ++
         "        flags_and_fill: 1_u32 << 25,\n" ++
@@ -514,8 +515,8 @@ test "test_step1_cx_prelude_auto_mount_and_4_tier_differential_parity" {
         "        0\n" ++
         "    };\n" ++
         "\n" ++
-        "    return cmp_score + td_ok + nz_u + grp_sum + x_sum + popped_y + iter_sum +\n" ++
-        "        ch_b + bit_score + raw_second + simd_ok + tls_ok + fmt_ok;\n" ++
+        "    cmp_score + td_ok + nz_u + grp_sum + x_sum + popped_y + iter_sum +\n" ++
+        "        ch_b + bit_score + raw_second + simd_ok + tls_ok + fmt_ok\n" ++
         "}\n";
 
     var db = try CompilerDb.init(allocator);

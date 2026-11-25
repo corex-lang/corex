@@ -25,6 +25,7 @@ const type_system = @import("type_system.zig");
 const hir = @import("hir.zig");
 const mir = @import("mir.zig");
 const query_db = @import("query_db.zig");
+const lint_filter = @import("lint_filter.zig");
 
 const FileId = mem_foundation.FileId;
 const Span = mem_foundation.Span;
@@ -32,6 +33,8 @@ const SymbolId = mem_foundation.SymbolId;
 const StringInterner = mem_foundation.StringInterner;
 const TokenIndex = mem_foundation.TokenIndex;
 const CstNodeIndex = mem_foundation.CstNodeIndex;
+const NodeIndex = mem_foundation.NodeIndex;
+const ExtraIndex = mem_foundation.ExtraIndex;
 const TypeId = mem_foundation.TypeId;
 const BumpArena = mem_foundation.BumpArena;
 const TokenKind = syntax_arenas.TokenKind;
@@ -43,6 +46,9 @@ const DiagnosticCode = diagnostic.DiagnosticCode;
 const DiagnosticSink = diagnostic.DiagnosticSink;
 const LabeledSpan = diagnostic.LabeledSpan;
 const Severity = diagnostic.Severity;
+const TextEdit = diagnostic.TextEdit;
+const SuggestedFix = diagnostic.SuggestedFix;
+const FixApplicability = diagnostic.FixApplicability;
 const SymbolIndex = symbol_resolver.SymbolIndex;
 const SymbolKind = symbol_resolver.SymbolKind;
 const SymbolRecord = symbol_resolver.SymbolRecord;
@@ -625,6 +631,8 @@ pub const PlacePathLookup = struct {
     id: MovePathId,
     /// `true` if resolution stopped early at dynamic `ProjKind.index` or `MAX_MOVE_PATHS` cap.
     is_partial: bool,
+    /// `true` if the full projection path traverses a shared reference `&T` or shared slice `&[T]`.
+    is_behind_shared_ref: bool = false,
 };
 
 /// Hybrid bitset using single-register `u64` ops for `<= 64` bits and `BumpArena` words for `> 64` bits.
@@ -1244,6 +1252,18 @@ pub const SastConfig = struct {
     token_buffer: ?*const TokenBuffer = null,
     /// Optional `LosslessCstArena` for fine-grained attribute inspection.
     cst_arena: ?*const LosslessCstArena = null,
+    /// Optional `AstArena` for `W0334` / `W0413` call-site and parameter AST inspection.
+    ast_arena: ?*const AstArena = null,
+    /// Optional mutable `StringInterner` for interning `SuggestedFix` replacement texts.
+    interner_mut: ?*StringInterner = null,
+    /// Optional explicit `[lint.settings].trivial_copy_max_bytes` override for `W0413`.
+    trivial_copy_max_bytes: ?u8 = null,
+    /// `true` when compiled under deterministic simulation mode (`corex test --sim`, `W0332`).
+    is_sim_mode: bool = false,
+    /// `true` when `CompilerDb` governs lint target filtering via `is_lint_target_file`.
+    has_db_lint_gate: bool = false,
+    /// `true` when the analyzed file is an active lint target in `CompilerDb` (`W0207`, `W0334`, `W0335`, `W0413`).
+    is_lint_target_file: bool = false,
     /// Optional external `FnRegionSummary` resolver for per-`DefId` incremental queries.
     external_resolver: ?ExternalSummaryResolver = null,
     /// Optional `PackageCapPolicy` checked after Pass 3 (`null` skips `E0324`/`W0330`).
@@ -2040,15 +2060,2034 @@ fn resolveBodyDeclSpan(body: *const MirBody, sym_table: *const SymbolTable) Span
     return Span.init(body.file_id, 0, 0);
 }
 
-/// Returns `true` if `@allow(W0333)` / `@allow(redundant_private_contract)` covers `sym_idx` or its enclosing scope.
-inline fn isSymbolW0333Suppressed(
+/// Resolved per-file syntax buffers for `MIR` lint fix synthesis (`W0207`, `W0334`, `W0413`).
+const ResolvedFileSyntaxCtx = struct {
+    /// Raw UTF-8 source buffer for the file.
+    source: []const u8,
+    /// Lexed token buffer for the file.
+    tokens: *const TokenBuffer,
+    /// Lossless CST arena for the file.
+    cst: *const LosslessCstArena,
+    /// Optional AST arena for the file.
+    ast_opt: ?*const AstArena,
+};
+
+/// Resolves `(source, token_buffer, cst_arena, ast_arena)` for `target_file_id` from `config` or `CompilerDb`.
+fn resolveFileSyntaxCtx(
+    target_file_id: FileId,
+    active_file_id: FileId,
+    config: SastConfig,
+) ?ResolvedFileSyntaxCtx {
+    if (!target_file_id.isNone() and target_file_id == active_file_id) {
+        if (config.source_text != null and config.token_buffer != null and config.cst_arena != null) {
+            return .{
+                .source = config.source_text.?,
+                .tokens = config.token_buffer.?,
+                .cst = config.cst_arena.?,
+                .ast_opt = config.ast_arena,
+            };
+        }
+    }
+    if (config.external_resolver) |ext_res| {
+        if (ext_res.compiler_db) |db| {
+            const fid_raw = target_file_id.asInt();
+            if (db.source_inputs.getPtr(fid_raw)) |src_in| {
+                if (db.parsed_artifacts.getPtr(fid_raw)) |parsed_art| {
+                    return .{
+                        .source = src_in.owned_text,
+                        .tokens = &parsed_art.token_buffer,
+                        .cst = &parsed_art.cst_arena,
+                        .ast_opt = &parsed_art.ast_arena,
+                    };
+                }
+            }
+        }
+    }
+    return null;
+}
+
+/// Resolves a mutable `StringInterner` from `config` or `CompilerDb` (`null` if unavailable).
+fn resolveMutableInterner(config: SastConfig) ?*StringInterner {
+    if (config.interner_mut) |int_mut| return int_mut;
+    if (config.external_resolver) |ext_res| {
+        if (ext_res.compiler_db) |db| return &db.interner;
+    }
+    return null;
+}
+
+/// Raw host OS clock, entropy, and OS-thread FFI symbols that bypass `sim_seam` (`W0332`).
+const RAW_HOST_NONDETERMINISTIC_FFI_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "BCryptGenRandom", {} },
+    .{ "CreateThread", {} },
+    .{ "GetSystemTimeAsFileTime", {} },
+    .{ "GetSystemTimePreciseAsFileTime", {} },
+    .{ "GetTickCount", {} },
+    .{ "GetTickCount64", {} },
+    .{ "QueryPerformanceCounter", {} },
+    .{ "RtlGenRandom", {} },
+    .{ "SystemFunction036", {} },
+    .{ "_beginthreadex", {} },
+    .{ "arc4random", {} },
+    .{ "arc4random_buf", {} },
+    .{ "arc4random_uniform", {} },
+    .{ "clock_gettime", {} },
+    .{ "getentropy", {} },
+    .{ "getrandom", {} },
+    .{ "gettimeofday", {} },
+    .{ "mach_absolute_time", {} },
+    .{ "mach_continuous_time", {} },
+    .{ "pthread_create", {} },
+    .{ "rand", {} },
+    .{ "random", {} },
+    .{ "thrd_create", {} },
+    .{ "time", {} },
+    .{ "timespec_get", {} },
+});
+
+/// Pre-sizing constructor and reservation method names exempting `String` builders from `W0335`.
+const STRING_PRESIZE_METHOD_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "reserve", {} },
+    .{ "reserve_exact", {} },
+    .{ "try_reserve", {} },
+    .{ "try_reserve_exact", {} },
+    .{ "try_with_capacity", {} },
+    .{ "try_with_capacity_in", {} },
+    .{ "with_capacity", {} },
+    .{ "with_capacity_in", {} },
+});
+
+/// Unreserved `String` constructor names eligible for `W0335` loop `.push_str` checks.
+const STRING_UNRESERVED_INIT_METHOD_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "default", {} },
+    .{ "empty", {} },
+    .{ "from_str", {} },
+    .{ "in_arena", {} },
+    .{ "new", {} },
+});
+
+/// Loop-body `String` growth methods flagged by `W0335` when receiver local is unreserved.
+const STRING_LOOP_APPEND_METHOD_SET = std.StaticStringMap(void).initComptime(.{
+    .{ "push_char", {} },
+    .{ "push_str", {} },
+    .{ "try_push_char", {} },
+    .{ "try_push_str", {} },
+    .{ "write_fmt", {} },
+});
+
+/// Returns `true` when `raw_ty` is bitwise `Copy` (`OwnershipTier.copy_tier`).
+inline fn isMirCopyType(
+    pool: *const InternPool,
     sym_table: *const SymbolTable,
-    sym_idx: SymbolIndex,
-    scope_id: symbol_resolver.ScopeId,
+    raw_ty: TypeId,
 ) bool {
-    return sym_table.getSymbolAllowMask(sym_idx)
-        .merge(sym_table.getScopeAllowMask(scope_id))
-        .isCodeAllowed(.w0333_redundant_private_contract);
+    return type_system.classifyOwnershipTier(pool, sym_table, raw_ty) == .copy_tier;
+}
+
+/// Returns `true` if `raw_ty` is the nominal `String` type (`cx.str.String` / `String`).
+fn isNominalStringType(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    raw_ty: TypeId,
+) bool {
+    const ty = pool.unwrapUnderlyingType(raw_ty);
+    if (ty.isError() or ty.isPrimitive()) return false;
+    const node = pool.getNode(ty);
+    if (node.tag != .struct_ty) return false;
+    const sym_idx = SymbolIndex.fromInt(node.rhs);
+    if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return false;
+    return std.mem.eql(u8, sym_table.getSymbol(sym_idx).name_text, "String");
+}
+
+/// Returns `true` if `tokens` contains any line/block comment trivia inside `[start_byte, end_byte)`.
+fn hasCommentInByteRange(tokens: *const TokenBuffer, start_byte: u32, end_byte: u32) bool {
+    const tok_count = tokens.countTokens();
+    var idx: u32 = 0;
+    while (idx < tok_count) : (idx += 1) {
+        const tok_id = TokenIndex.fromInt(idx);
+        const tok = tokens.getToken(tok_id);
+        for (tokens.getLeadingTrivia(tok_id)) |triv| {
+            if (triv.byte_offset >= start_byte and triv.byte_offset < end_byte and
+                (triv.kind == .line_comment or triv.kind == .doc_comment or
+                    triv.kind == .module_doc_comment))
+            {
+                return true;
+            }
+        }
+        for (tokens.getTrailingTrivia(tok_id)) |triv| {
+            if (triv.byte_offset >= start_byte and triv.byte_offset < end_byte and
+                (triv.kind == .line_comment or triv.kind == .doc_comment or
+                    triv.kind == .module_doc_comment))
+            {
+                return true;
+            }
+        }
+        if (tok.byte_offset > end_byte) break;
+    }
+    return false;
+}
+
+/// Marks root locals directly read by SSA `val_raw` (`place_load`, `place_addr`, `place_discriminant`) in `out_set`.
+fn markValueDirectRootLocals(
+    body: *const MirBody,
+    val_raw: u32,
+    local_count: usize,
+    out_set: *DenseBitSet,
+    depth: u8,
+) void {
+    if (depth > 8 or val_raw >= body.insts.len) return;
+    const peeled = peelCopyValId(body, val_raw);
+    if (peeled >= body.insts.len) return;
+    const inst = body.getInst(MirValueId.fromInt(peeled));
+    switch (inst.op) {
+        .place_load, .place_addr, .place_discriminant, .soa_column_slice => {
+            if (inst.operands.lhs < body.places.items.len) {
+                const pl = body.places.items[inst.operands.lhs];
+                if (pl.base < local_count) out_set.set(pl.base);
+            }
+        },
+        .unary_op, .aggregate_extract, .bitfield_extract => {
+            markValueDirectRootLocals(body, inst.operands.lhs, local_count, out_set, depth + 1);
+        },
+        .bin_op => {
+            markValueDirectRootLocals(body, inst.operands.lhs, local_count, out_set, depth + 1);
+            markValueDirectRootLocals(body, inst.operands.rhs, local_count, out_set, depth + 1);
+        },
+        else => {},
+    }
+}
+
+/// Checks whether SSA `clone_ret_val` in `normal_bb` directly feeds an `own` (`.sink_mode`) call or `@forget`/`@ptr_write`.
+fn isCloneResultConsumedByOwnParam(
+    body: *const MirBody,
+    normal_bb_id: MirBlockId,
+    clone_ret_val: u32,
+) bool {
+    if (normal_bb_id.isNone() or normal_bb_id.asInt() >= body.blocks.items.len) return false;
+    var tracked_val = clone_ret_val;
+    var temp_local: u32 = mir.NONE_U32;
+    var cur_bb = normal_bb_id.asInt();
+    var hops: u8 = 0;
+
+    while (hops < 4 and cur_bb < body.blocks.items.len) : (hops += 1) {
+        for (body.getBlockInsts(MirBlockId.fromInt(cur_bb))) |iv| {
+            const inst = body.getInst(iv);
+            if (inst.op == .copy_val and inst.operands.lhs == tracked_val) {
+                tracked_val = iv.asInt();
+            } else if (inst.op == .place_store and inst.operands.rhs == tracked_val and
+                inst.operands.lhs < body.places.items.len)
+            {
+                const pl = body.places.items[inst.operands.lhs];
+                if (pl.proj_len == 0 and pl.base < body.locals.items.len and
+                    body.locals.items[pl.base].flags().is_synthetic_temp)
+                {
+                    temp_local = pl.base;
+                }
+            } else if (temp_local != mir.NONE_U32 and inst.op == .place_load and
+                inst.operands.lhs < body.places.items.len)
+            {
+                const pl = body.places.items[inst.operands.lhs];
+                if (pl.proj_len == 0 and pl.base == temp_local) {
+                    tracked_val = iv.asInt();
+                }
+            } else if (inst.op == .intrinsic_op) {
+                const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+                if (ikind == .ghost_storage_free) continue;
+                if (inst.operands.rhs > 0 and inst.operands.lhs + inst.operands.rhs <= body.extra_args.items.len) {
+                    const args = body.extra_args.items[inst.operands.lhs .. inst.operands.lhs + inst.operands.rhs];
+                    for (args) |arg_v| {
+                        if (peelCopyValId(body, arg_v) == tracked_val) {
+                            // `@forget` / `@ptr_write` intrinsic lowers as intrinsic or store; check AST for `@forget`/`@ptr_write`:
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        const term = body.blocks.items[cur_bb].terminator;
+        if (term.kind == .call and term.cond_or_val < body.calls.items.len) {
+            const outer_cs = body.calls.items[term.cond_or_val];
+            for (0..outer_cs.args_len) |arg_i| {
+                const mode = body.call_arg_modes.items[outer_cs.modes_start + arg_i];
+                const word = body.extra_args.items[outer_cs.args_start + arg_i];
+                if (mode == .sink_mode and peelCopyValId(body, word) == tracked_val) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (term.kind == .br and term.edge_len == 1 and term.edge_start < body.extra_edges.items.len) {
+            const edge = body.extra_edges.items[term.edge_start];
+            cur_bb = edge.target_bb.asInt();
+            continue;
+        }
+        break;
+    }
+    return false;
+}
+
+/// Returns `true` when `tag` is a syntax type node inside a generic call `extra_data` slice.
+fn isCallSliceTypeAstTag(tag: syntax_arenas.AstTag) bool {
+    return switch (tag) {
+        .type_hole,
+        .prim_type,
+        .named_type,
+        .generic_type,
+        .tuple_type,
+        .array_type,
+        .slice_type,
+        .ref_type,
+        .ptr_type,
+        .optional_type,
+        .result_type,
+        .refined_type,
+        .fn_type,
+        .closure_type,
+        .mode_type,
+        .union_bound_type,
+        .intersect_bound_type,
+        => true,
+        else => false,
+    };
+}
+
+/// Bounds AST scans for a single function/item CST subtree in $O(\log |AST|)$ via monotonic `cst_origins`.
+fn computeFnAstNodeWindow(
+    ast_ar: *const AstArena,
+    cst_ar: *const LosslessCstArena,
+    fn_cst: CstNodeIndex,
+) struct { start: u32, end: u32 } {
+    const ast_cnt: u32 = @intCast(ast_ar.countNodes());
+    if (ast_cnt <= 1 or fn_cst.isNone() or fn_cst.asInt() >= cst_ar.countNodes()) {
+        return .{ .start = 1, .end = ast_cnt };
+    }
+    const fn_cst_start: u32 = fn_cst.asInt();
+    const fn_cst_end: u32 = @intCast(
+        @min(cst_ar.countNodes(), @as(usize, fn_cst_start) + @max(@as(usize, 1), cst_ar.getNode(fn_cst).subtree_size)),
+    );
+
+    // Binary search `[1, ast_cnt)` for the first AST node with `cst_origin >= fn_cst_start`:
+    var lo: u32 = 1;
+    var hi: u32 = ast_cnt;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        var probe = mid;
+        var probe_cst: CstNodeIndex = .none;
+        while (probe < hi and probe < mid + 64) : (probe += 1) {
+            const c = ast_ar.getCstOrigin(NodeIndex.fromInt(probe));
+            if (!c.isNone()) {
+                probe_cst = c;
+                break;
+            }
+        }
+        if (probe_cst.isNone()) {
+            return .{ .start = 1, .end = ast_cnt };
+        }
+        if (probe_cst.asInt() < fn_cst_start) {
+            lo = probe + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    var win_start = lo;
+    while (win_start > 1) {
+        const prev_c = ast_ar.getCstOrigin(NodeIndex.fromInt(win_start - 1));
+        if (!prev_c.isNone() and prev_c.asInt() < fn_cst_start) break;
+        win_start -= 1;
+    }
+
+    // Binary search `[win_start, ast_cnt)` for the first AST node with `cst_origin >= fn_cst_end`:
+    var end_lo: u32 = win_start;
+    var end_hi: u32 = ast_cnt;
+    while (end_lo < end_hi) {
+        const mid = end_lo + (end_hi - end_lo) / 2;
+        var probe = mid;
+        var probe_cst: CstNodeIndex = .none;
+        while (probe < end_hi and probe < mid + 64) : (probe += 1) {
+            const c = ast_ar.getCstOrigin(NodeIndex.fromInt(probe));
+            if (!c.isNone()) {
+                probe_cst = c;
+                break;
+            }
+        }
+        if (probe_cst.isNone()) {
+            end_lo = ast_cnt;
+            break;
+        }
+        if (probe_cst.asInt() < fn_cst_end) {
+            end_lo = probe + 1;
+        } else {
+            end_hi = mid;
+        }
+    }
+    var win_end = end_lo;
+    while (win_end < ast_cnt) {
+        const cur_c = ast_ar.getCstOrigin(NodeIndex.fromInt(win_end));
+        if (!cur_c.isNone() and cur_c.asInt() >= fn_cst_end) break;
+        win_end += 1;
+    }
+    return .{ .start = win_start, .end = win_end };
+}
+
+/// Resolves the exclusive `extra_data` end index for `target_start` within `[win_start, win_end)`.
+fn resolveSingleAstExtraEndInWindow(
+    ast_ar: *const AstArena,
+    win_start: u32,
+    win_end: u32,
+    target_start: u32,
+) usize {
+    const extra_len: u32 = @intCast(ast_ar.extra_data.items.len);
+    var best_end: u32 = extra_len;
+
+    const considerNode = struct {
+        fn step(ar: *const AstArena, idx: u32, t_start: u32, cur_best: *u32) bool {
+            const n = ar.getNode(NodeIndex.fromInt(idx));
+            var saw_after = false;
+            if (n.lhs.tag == .extra and n.rhs.tag == .extra) {
+                if (n.lhs.payload > t_start and n.lhs.payload < cur_best.*) cur_best.* = n.lhs.payload;
+                const e_pos = n.lhs.payload +| n.rhs.payload;
+                if (e_pos > t_start and e_pos < cur_best.*) cur_best.* = e_pos;
+                if (n.lhs.payload > t_start) saw_after = true;
+            } else {
+                if (n.lhs.tag == .extra and n.lhs.payload > t_start) {
+                    if (n.lhs.payload < cur_best.*) cur_best.* = n.lhs.payload;
+                    saw_after = true;
+                }
+                if (n.rhs.tag == .extra and n.rhs.payload > t_start) {
+                    if (n.rhs.payload < cur_best.*) cur_best.* = n.rhs.payload;
+                    saw_after = true;
+                }
+            }
+            return saw_after;
+        }
+    }.step;
+
+    const ast_cnt: u32 = @intCast(ast_ar.countNodes());
+    if (ast_cnt > 0) _ = considerNode(ast_ar, 0, target_start, &best_end);
+    var idx = win_start;
+    while (idx < win_end) : (idx += 1) {
+        _ = considerNode(ast_ar, idx, target_start, &best_end);
+    }
+    var tail_idx = win_end;
+    while (tail_idx < ast_cnt) : (tail_idx += 1) {
+        if (considerNode(ast_ar, tail_idx, target_start, &best_end)) break;
+    }
+    return @min(@as(usize, best_end), ast_ar.extra_data.items.len);
+}
+
+/// Finds the byte offset of the `.` token in a `.postfix_deref_expr` CST node (`null` if missing).
+fn findPostfixDerefDotStartByte(
+    tokens: *const TokenBuffer,
+    cst: *const LosslessCstArena,
+    deref_cst: CstNodeIndex,
+) ?u32 {
+    if (deref_cst.isNone() or deref_cst.asInt() >= cst.countNodes()) return null;
+    const d_start: usize = deref_cst.asInt();
+    const d_rec = cst.getNode(deref_cst);
+    const d_end: usize = @min(d_start + @max(@as(usize, d_rec.subtree_size), 1), cst.countNodes());
+    var child = d_start + 1;
+    while (child < d_end) {
+        const sub = cst.getNode(CstNodeIndex.fromInt(@intCast(child)));
+        if (sub.subtree_size <= 1) {
+            if (!sub.flags.is_missing_or_injected and !sub.token.isNone() and
+                sub.token.asInt() < tokens.countTokens())
+            {
+                const tk = tokens.getToken(sub.token);
+                if (tk.kind == .dot) return tk.byte_offset;
+            }
+            child += 1;
+        } else {
+            child += @as(usize, sub.subtree_size);
+        }
+    }
+    return null;
+}
+
+/// Pass 2 post-convergence audit for `W0334` (`redundant-move-clone`, `RuleId 27`, `Auto`, `Ruling 4.2 #2`).
+fn auditBodyRedundantMoveCloneW0334(
+    arena_alloc: std.mem.Allocator,
+    body: *const MirBody,
+    dom: *const DominatorTree,
+    trie: *const MovePathTrie,
+    horizon: *const BodyProvenanceHorizon,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    interner_opt: ?*const StringInterner,
+    config: SastConfig,
+    decl_fallback_span: Span,
+) !void {
+    const sink = config.diagnostic_sink orelse return;
+    if (!config.is_lint_target_file) return;
+    const pkg_id = sym_table.getFilePackageId(body.file_id);
+    if (pkg_id != .root and pkg_id != .std_core) return;
+
+    const block_count = body.blocks.items.len;
+    const local_count = body.locals.items.len;
+    if (block_count == 0 or local_count <= 1) return;
+
+    // [1] Quick filter: check if `body` has at least one 1-arg `.clone()` call:
+    var has_any_clone_call = false;
+    for (body.calls.items) |cs| {
+        if (cs.args_len == 1 and std.mem.eql(u8, lookupCallSiteMethodName(sym_table, cs), "clone")) {
+            has_any_clone_call = true;
+            break;
+        }
+    }
+    if (!has_any_clone_call) return;
+
+    // [2] Identify closure-captured or raw-address-taken root locals (`ineligible`):
+    const is_captured_or_raw = try arena_alloc.alloc(bool, local_count);
+    @memset(is_captured_or_raw, false);
+    for (0..body.insts.len) |inst_i| {
+        const inst = body.getInst(MirValueId.fromInt(@intCast(inst_i)));
+        if (inst.op == .place_addr and inst.operands.rhs >= 2 and inst.operands.lhs < body.places.items.len) {
+            const base = body.places.items[inst.operands.lhs].base;
+            if (base < local_count) is_captured_or_raw[base] = true;
+        } else if (inst.op == .aggregate_make) {
+            const agg_k: AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+            if (agg_k == .closure_make and inst.operands.rhs < body.extra_args.items.len) {
+                const cap_len = body.extra_args.items[inst.operands.rhs];
+                const cap_start = @min(body.extra_args.items.len, @as(usize, inst.operands.rhs) + 1);
+                const cap_end = @min(body.extra_args.items.len, cap_start + @as(usize, cap_len));
+                var tmp_set = try DenseBitSet.initEmpty(arena_alloc, local_count);
+                for (body.extra_args.items[cap_start..cap_end]) |cap_val| {
+                    markValueDirectRootLocals(body, cap_val, local_count, &tmp_set, 0);
+                }
+                for (0..local_count) |lid| {
+                    if (tmp_set.isSet(lid)) is_captured_or_raw[lid] = true;
+                }
+            }
+        } else if (inst.op == .intrinsic_op and
+            @as(MirIntrinsicKind, @fromBackingInt(inst.aux_u16)) == .async_future_make and
+            inst.operands.rhs >= 3)
+        {
+            const arg_start = @min(body.extra_args.items.len, @as(usize, inst.operands.lhs) + 3);
+            const arg_end = @min(body.extra_args.items.len, @as(usize, inst.operands.lhs) + @as(usize, inst.operands.rhs));
+            var tmp_set = try DenseBitSet.initEmpty(arena_alloc, local_count);
+            for (body.extra_args.items[arg_start..arg_end]) |cap_val| {
+                markValueDirectRootLocals(body, cap_val, local_count, &tmp_set, 0);
+            }
+            for (0..local_count) |lid| {
+                if (tmp_set.isSet(lid)) is_captured_or_raw[lid] = true;
+            }
+        }
+    }
+
+    // [3] Compute backward root-local liveness + reassignment-before-deinit (`gen[bb]` / `kill[bb]`):
+    //     Note: `place_store` ALSO sets `gen` here so any reassignment before `deinit` prevents `W0334`!
+    const bb_gen = try arena_alloc.alloc(DenseBitSet, block_count);
+    const bb_kill = try arena_alloc.alloc(DenseBitSet, block_count);
+    const live_in = try arena_alloc.alloc(DenseBitSet, block_count);
+    const live_out = try arena_alloc.alloc(DenseBitSet, block_count);
+    for (0..block_count) |b_i| {
+        bb_gen[b_i] = try DenseBitSet.initEmpty(arena_alloc, local_count);
+        bb_kill[b_i] = try DenseBitSet.initEmpty(arena_alloc, local_count);
+        live_in[b_i] = try DenseBitSet.initEmpty(arena_alloc, local_count);
+        live_out[b_i] = try DenseBitSet.initEmpty(arena_alloc, local_count);
+    }
+
+    for (0..block_count) |b_i| {
+        const bb_id = MirBlockId.fromInt(@intCast(b_i));
+        const term = body.blocks.items[b_i].terminator;
+        switch (term.kind) {
+            .ret => {
+                markValueDirectRootLocals(body, term.cond_or_val, local_count, &bb_gen[b_i], 0);
+                for (1..@min(local_count, 1 + @as(usize, body.param_count))) |p_lid| {
+                    const p_mode = body.locals.items[p_lid].mode();
+                    if (p_mode == .inout_mode or p_mode == .set_mode) bb_gen[b_i].set(p_lid);
+                }
+            },
+            .cond_br, .switch_int, .coro_suspend => {
+                markValueDirectRootLocals(body, term.cond_or_val, local_count, &bb_gen[b_i], 0);
+            },
+            .call => {
+                if (term.cond_or_val < body.calls.items.len) {
+                    const cs = body.calls.items[term.cond_or_val];
+                    markValueDirectRootLocals(body, cs.callee_val.asInt(), local_count, &bb_gen[b_i], 0);
+                    for (0..cs.args_len) |arg_i| {
+                        const mode = body.call_arg_modes.items[cs.modes_start + arg_i];
+                        const word = body.extra_args.items[cs.args_start + arg_i];
+                        if (mode == .inout_mode or mode == .set_mode) {
+                            if (word < body.places.items.len) {
+                                const base = body.places.items[word].base;
+                                if (base < local_count) bb_gen[b_i].set(base);
+                            }
+                        } else {
+                            markValueDirectRootLocals(body, word, local_count, &bb_gen[b_i], 0);
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+
+        const insts = body.getBlockInsts(bb_id);
+        var rev_i = insts.len;
+        while (rev_i > 0) {
+            rev_i -= 1;
+            const inst = body.getInst(insts[rev_i]);
+            switch (inst.op) {
+                .ghost_storage_deinit => {},
+                .ghost_storage_init => {
+                    const lid = inst.operands.lhs;
+                    if (lid < local_count) {
+                        bb_gen[b_i].unset(lid);
+                        bb_kill[b_i].set(lid);
+                    }
+                },
+                .place_load,
+                .place_discriminant,
+                .place_addr,
+                .soa_column_slice,
+                .ghost_access_let,
+                .ghost_access_inout,
+                .ghost_access_set,
+                .ghost_storage_move,
+                => {
+                    if (inst.operands.lhs < body.places.items.len) {
+                        const pl = body.places.items[inst.operands.lhs];
+                        if (pl.base < local_count) bb_gen[b_i].set(pl.base);
+                        for (body.getPlaceProjections(PlaceId.fromInt(inst.operands.lhs))) |proj| {
+                            if (proj.kind == .index) {
+                                markValueDirectRootLocals(body, proj.payload, local_count, &bb_gen[b_i], 0);
+                            }
+                        }
+                    }
+                },
+                .place_store, .place_set_discrim => {
+                    if (inst.operands.lhs < body.places.items.len) {
+                        const pl = body.places.items[inst.operands.lhs];
+                        // Treat post-clone reassignment before `deinit` as blocking `W0334`:
+                        if (pl.base < local_count) bb_gen[b_i].set(pl.base);
+                        for (body.getPlaceProjections(PlaceId.fromInt(inst.operands.lhs))) |proj| {
+                            if (proj.kind == .index) {
+                                markValueDirectRootLocals(body, proj.payload, local_count, &bb_gen[b_i], 0);
+                            }
+                        }
+                    }
+                    if (inst.op == .place_store) {
+                        markValueDirectRootLocals(body, inst.operands.rhs, local_count, &bb_gen[b_i], 0);
+                    }
+                },
+                .intrinsic_op => {
+                    const ikind: MirIntrinsicKind = @fromBackingInt(inst.aux_u16);
+                    if (ikind != .ghost_storage_free and ikind.hasPlaceInLhs() and
+                        inst.operands.lhs < body.places.items.len)
+                    {
+                        const base = body.places.items[inst.operands.lhs].base;
+                        if (base < local_count) bb_gen[b_i].set(base);
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    var changed = true;
+    var iter: usize = 0;
+    var scratch_in = try DenseBitSet.initEmpty(arena_alloc, local_count);
+    while (changed and iter < 64) : (iter += 1) {
+        changed = false;
+        var rev_b = block_count;
+        while (rev_b > 0) {
+            rev_b -= 1;
+            const term = body.blocks.items[rev_b].terminator;
+            for (body.extra_edges.items[term.edge_start .. term.edge_start + term.edge_len]) |edge| {
+                const dst = edge.target_bb.asInt();
+                if (dst < block_count) {
+                    live_out[rev_b].unionInPlace(live_in[dst]);
+                }
+            }
+            scratch_in.copyFrom(live_out[rev_b]);
+            scratch_in.differenceInPlace(bb_kill[rev_b]);
+            scratch_in.unionInPlace(bb_gen[rev_b]);
+            if (live_in[rev_b].unionAssignChanged(scratch_in)) {
+                changed = true;
+            }
+        }
+    }
+
+    const syn_ctx_opt = resolveFileSyntaxCtx(body.file_id, body.file_id, config);
+    const mut_interner_opt = resolveMutableInterner(config);
+    const owner_fn_cst: CstNodeIndex = blk_cst: {
+        if (!body.symbol_index.isNone() and body.symbol_index.asInt() < sym_table.countSymbols()) {
+            const sc = sym_table.getSymbol(body.symbol_index).cst_node;
+            if (!sc.isNone()) break :blk_cst sc;
+        }
+        if (!body.def_id.isNone()) {
+            if (sym_table.def_to_symbol.get(body.def_id.asInt())) |def_sym| {
+                if (!def_sym.isNone() and def_sym.asInt() < sym_table.countSymbols()) {
+                    break :blk_cst sym_table.getSymbol(def_sym).cst_node;
+                }
+            }
+        }
+        break :blk_cst .none;
+    };
+
+    // [4] Evaluate each reachable `.clone()` call site against all 7 soundness guards:
+    for (dom.rpo_blocks) |bb_idx| {
+        const term = body.blocks.items[bb_idx].terminator;
+        if (term.kind != .call or term.cond_or_val >= body.calls.items.len) continue;
+        const cs = body.calls.items[term.cond_or_val];
+        if (cs.args_len != 1 or !std.mem.eql(u8, lookupCallSiteMethodName(sym_table, cs), "clone")) continue;
+
+        const arg0_mode = body.call_arg_modes.items[cs.modes_start];
+        const arg0_word = body.extra_args.items[cs.args_start];
+        if (arg0_mode != .let_mode or arg0_word >= body.insts.len) continue;
+        const arg0_peeled = peelCopyValId(body, arg0_word);
+        const arg0_inst = body.getInst(MirValueId.fromInt(arg0_peeled));
+        if ((arg0_inst.op != .place_addr and arg0_inst.op != .place_load) or
+            arg0_inst.operands.lhs >= body.places.items.len)
+        {
+            continue;
+        }
+        if (arg0_inst.op == .place_addr and arg0_inst.operands.rhs != 0) continue;
+        const pl = body.places.items[arg0_inst.operands.lhs];
+        if (pl.proj_len != 0) continue;
+
+        const lid = pl.base;
+        if (lid < 1 or lid >= local_count or lid >= trie.direct_local_limit) continue;
+        if (is_captured_or_raw[lid]) continue;
+
+        const loc = body.locals.items[lid];
+        if (loc.flags().is_synthetic_temp) continue;
+        if (loc.flags().is_arg and loc.mode() != .sink_mode) continue;
+        if (loc.mode() == .inout_mode or loc.mode() == .set_mode) continue;
+
+        const loc_name = lookupLocalNameText(loc, interner_opt);
+        if (loc_name.len == 0 or loc_name[0] == '_' or std.mem.eql(u8, loc_name, "self")) continue;
+
+        const loc_ty = pool.unwrapUnderlyingType(loc.type_id);
+        if (loc_ty.isError() or pool.getFlags(loc_ty).has_type_vars) continue;
+        const loc_tag = pool.getTag(loc_ty);
+        if (loc_tag == .ref_ty or loc_tag == .mut_ref_ty or loc_tag == .raw_ptr_ty) continue;
+        if (isMirCopyType(pool, sym_table, loc_ty)) continue;
+        if (type_system.hasLinearObligation(pool, sym_table, loc_ty)) continue;
+        if (pool.unwrapUnderlyingType(cs.ret_ty) != loc_ty) continue;
+
+        // Post-call liveness guard across ALL normal + unwind/cleanup-pad edges (`live_out[bb_idx]`):
+        if (live_out[bb_idx].isSet(lid)) continue;
+
+        // Active NLL loan guard across `bb_idx` terminator (excluding `arg0_peeled` temporary receiver borrow):
+        const inst_slice = body.getBlockInsts(MirBlockId.fromInt(bb_idx));
+        const loans_before = try arena_alloc.alloc(DenseBitSet, inst_slice.len);
+        const scratch_before = try arena_alloc.alloc(u2, inst_slice.len);
+        var term_loans = DenseBitSet.EMPTY;
+        var term_scratch: u2 = 0;
+        try computeBlockStepHorizons(
+            arena_alloc,
+            body,
+            MirBlockId.fromInt(bb_idx),
+            trie,
+            horizon,
+            pool,
+            sym_table,
+            loans_before,
+            scratch_before,
+            &term_loans,
+            &term_scratch,
+        );
+        var has_conflicting_loan = false;
+        var l_cur: usize = 0;
+        while (term_loans.nextSetBit(l_cur)) |l_idx| : (l_cur = l_idx + 1) {
+            if (l_idx >= horizon.loans.len) break;
+            const loan = horizon.loans[l_idx];
+            if (loan.open_token == cs.origin_token) continue;
+            if (loan.is_overflow_wildcard or
+                (!loan.path_id.isNone() and trie.subtree[lid].isSet(loan.path_id.asInt())))
+            {
+                has_conflicting_loan = true;
+                break;
+            }
+        }
+        if (has_conflicting_loan) continue;
+
+        var call_span = resolveTokenSpan(body.file_id, cs.origin_token, config, decl_fallback_span);
+        var fixes_slice: []const SuggestedFix = &.{};
+        const out_arena = sink.arena.asAllocator();
+
+        // Synthesize `Auto` fix (`Ruling 4.2 #2`: `own x` ONLY when unwrapped direct arg to `own` param; else `x`):
+        if (syn_ctx_opt != null and mut_interner_opt != null and !cs.origin_token.isNone()) {
+            const syn_ctx = syn_ctx_opt.?;
+            const mut_interner = mut_interner_opt.?;
+            if (syn_ctx.ast_opt) |ast_ar| {
+                const orig_byte = if (cs.origin_token.asInt() < syn_ctx.tokens.countTokens())
+                    syn_ctx.tokens.getToken(cs.origin_token).byte_offset
+                else
+                    call_span.start_byte;
+
+                const ast_cnt = ast_ar.countNodes();
+                const fn_win = computeFnAstNodeWindow(ast_ar, syn_ctx.cst, owner_fn_cst);
+                var best_mc_id: NodeIndex = .none;
+                var best_mc_len: u32 = std.math.maxInt(u32);
+                var a_idx: u32 = fn_win.start;
+                while (a_idx < fn_win.end) : (a_idx += 1) {
+                    const aid = NodeIndex.fromInt(a_idx);
+                    const anode = ast_ar.getNode(aid);
+                    if (anode.tag != .method_call) continue;
+                    const acst = ast_ar.getCstOrigin(aid);
+                    if (acst.isNone()) continue;
+                    const asp = symbol_resolver.computeCstSubtreeSpan(
+                        body.file_id,
+                        syn_ctx.tokens,
+                        syn_ctx.cst,
+                        acst,
+                    ) orelse continue;
+                    if (orig_byte >= asp.start_byte and orig_byte < asp.end_byte) {
+                        const span_len = asp.end_byte - asp.start_byte;
+                        if (span_len < best_mc_len) {
+                            best_mc_len = span_len;
+                            best_mc_id = aid;
+                        }
+                    }
+                }
+
+                if (!best_mc_id.isNone()) {
+                    const mc_node = ast_ar.getNode(best_mc_id);
+                    const mc_cst = ast_ar.getCstOrigin(best_mc_id);
+                    if (mc_node.lhs.tag == .node and !mc_cst.isNone()) {
+                        const recv_id = NodeIndex.fromInt(mc_node.lhs.payload);
+                        const recv_node = ast_ar.getNode(recv_id);
+                        const recv_cst = ast_ar.getCstOrigin(recv_id);
+                        const mc_sp_opt = symbol_resolver.computeCstSubtreeSpan(
+                            body.file_id,
+                            syn_ctx.tokens,
+                            syn_ctx.cst,
+                            mc_cst,
+                        );
+                        const recv_sp_opt = if (!recv_cst.isNone())
+                            symbol_resolver.computeCstSubtreeSpan(body.file_id, syn_ctx.tokens, syn_ctx.cst, recv_cst)
+                        else
+                            null;
+
+                        if (recv_node.tag == .ident_expr and mc_sp_opt != null and recv_sp_opt != null) {
+                            const mc_sp = mc_sp_opt.?;
+                            const recv_sp = recv_sp_opt.?;
+                            call_span = mc_sp;
+                            const recv_txt = syn_ctx.source[recv_sp.start_byte..@min(syn_ctx.source.len, recv_sp.end_byte)];
+                            if (std.mem.eql(u8, recv_txt, loc_name) and
+                                !hasCommentInByteRange(syn_ctx.tokens, recv_sp.end_byte, mc_sp.end_byte))
+                            {
+                                // Check if `mc_sp` is already preceded by `own` or is a direct unwrapped call/pipe arg:
+                                var is_already_wrapped_own = false;
+                                var is_direct_call_arg = false;
+                                var is_pipe_lhs_arg = false;
+                                var is_intrinsic_own_arg = false;
+                                var p_scan: u32 = fn_win.start;
+                                while (p_scan < fn_win.end) : (p_scan += 1) {
+                                    const pid = NodeIndex.fromInt(p_scan);
+                                    const pnode = ast_ar.getNode(pid);
+                                    if (pnode.tag == .unary_expr and !pnode.main_token.isNone() and
+                                        pnode.main_token.asInt() < syn_ctx.tokens.countTokens() and
+                                        syn_ctx.tokens.getToken(pnode.main_token).kind == .kw_own and
+                                        pnode.lhs.tag == .node and
+                                        NodeIndex.fromInt(pnode.lhs.payload) == best_mc_id)
+                                    {
+                                        is_already_wrapped_own = true;
+                                    } else if (pnode.tag == .pipe_expr and pnode.lhs.tag == .node and
+                                        NodeIndex.fromInt(pnode.lhs.payload) == best_mc_id)
+                                    {
+                                        is_direct_call_arg = true;
+                                        is_pipe_lhs_arg = true;
+                                    } else if (pnode.tag == .call_expr or pnode.tag == .generic_call or
+                                        pnode.tag == .method_call)
+                                    {
+                                        var single_arg_buf: [1]u32 = .{0};
+                                        var raw_arg_items: []const u32 = &.{};
+                                        if ((pnode.tag == .call_expr or pnode.tag == .generic_call) and
+                                            pnode.rhs.tag == .node)
+                                        {
+                                            single_arg_buf[0] = pnode.rhs.payload;
+                                            raw_arg_items = &single_arg_buf;
+                                        } else if (pnode.rhs.tag == .extra) {
+                                            const start_idx: usize = pnode.rhs.payload;
+                                            const end_idx: usize = resolveSingleAstExtraEndInWindow(
+                                                ast_ar,
+                                                fn_win.start,
+                                                fn_win.end,
+                                                pnode.rhs.payload,
+                                            );
+                                            if (start_idx < end_idx) {
+                                                const full_extra = ast_ar.extra_data.items[start_idx..end_idx];
+                                                const skip_member: usize = if (pnode.tag == .method_call) 1 else 0;
+                                                if (skip_member <= full_extra.len) {
+                                                    raw_arg_items = full_extra[skip_member..];
+                                                }
+                                            }
+                                        }
+                                        var val_arg_ord: usize = 0;
+                                        for (raw_arg_items) |raw_arg_id| {
+                                            const cand_arg = NodeIndex.fromInt(raw_arg_id);
+                                            if (cand_arg.isNone() or cand_arg.asInt() >= ast_cnt) continue;
+                                            if (isCallSliceTypeAstTag(ast_ar.getNode(cand_arg).tag)) continue;
+                                            var cur_arg = cand_arg;
+                                            if (ast_ar.getNode(cur_arg).tag == .named_arg and
+                                                ast_ar.getNode(cur_arg).rhs.tag == .node)
+                                            {
+                                                cur_arg = NodeIndex.fromInt(ast_ar.getNode(cur_arg).rhs.payload);
+                                            }
+                                            if (cur_arg == best_mc_id) {
+                                                is_direct_call_arg = true;
+                                                if ((pnode.tag == .call_expr or pnode.tag == .generic_call) and
+                                                    pnode.lhs.tag == .node)
+                                                {
+                                                    const cal_node = ast_ar.getNode(NodeIndex.fromInt(pnode.lhs.payload));
+                                                    if (!cal_node.main_token.isNone() and
+                                                        cal_node.main_token.asInt() < syn_ctx.tokens.countTokens())
+                                                    {
+                                                        const cal_lex = symbol_resolver.extractTokenSlice(
+                                                            syn_ctx.source,
+                                                            syn_ctx.tokens,
+                                                            cal_node.main_token,
+                                                        );
+                                                        if ((std.mem.eql(u8, cal_lex, "@forget") and val_arg_ord == 0) or
+                                                            (std.mem.eql(u8, cal_lex, "@ptr_write") and val_arg_ord == 1))
+                                                        {
+                                                            is_intrinsic_own_arg = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            val_arg_ord += 1;
+                                        }
+                                    }
+                                }
+
+                                // Also check CST preceding token for `own` keyword:
+                                if (!is_already_wrapped_own and recv_sp.start_byte >= 4) {
+                                    var scan_back: usize = recv_sp.start_byte;
+                                    while (scan_back > 0 and
+                                        (syn_ctx.source[scan_back - 1] == ' ' or syn_ctx.source[scan_back - 1] == '\t'))
+                                    {
+                                        scan_back -= 1;
+                                    }
+                                    if (scan_back >= 3 and std.mem.eql(u8, syn_ctx.source[scan_back - 3 .. scan_back], "own")) {
+                                        const before_ok = scan_back == 3 or
+                                            (!std.ascii.isAlphanumeric(syn_ctx.source[scan_back - 4]) and
+                                                syn_ctx.source[scan_back - 4] != '_');
+                                        if (before_ok) is_already_wrapped_own = true;
+                                    }
+                                }
+
+                                const normal_bb = if (term.edge_len > 0 and term.edge_start < body.extra_edges.items.len)
+                                    body.extra_edges.items[term.edge_start].target_bb
+                                else
+                                    MirBlockId.none;
+                                var clone_ret_val: u32 = mir.NONE_U32;
+                                if (!normal_bb.isNone() and normal_bb.asInt() < body.blocks.items.len) {
+                                    const nb = body.blocks.items[normal_bb.asInt()];
+                                    if (nb.paramLen() >= 1 and nb.param_start < body.block_params.items.len) {
+                                        clone_ret_val = body.block_params.items[nb.param_start].asInt();
+                                    }
+                                }
+
+                                const needs_own_kw = !is_already_wrapped_own and is_direct_call_arg and
+                                    (is_intrinsic_own_arg or
+                                        (clone_ret_val != mir.NONE_U32 and
+                                            isCloneResultConsumedByOwnParam(body, normal_bb, clone_ret_val)));
+
+                                const edits = try out_arena.alloc(TextEdit, 1);
+                                if (needs_own_kw) {
+                                    const repl_txt = if (is_pipe_lhs_arg)
+                                        try std.fmt.allocPrint(out_arena, "(own {s})", .{loc_name})
+                                    else
+                                        try std.fmt.allocPrint(out_arena, "own {s}", .{loc_name});
+                                    edits[0] = .{
+                                        .file_id = body.file_id,
+                                        .start_byte = mc_sp.start_byte,
+                                        .end_byte = mc_sp.end_byte,
+                                        .replacement_id = try mut_interner.intern(repl_txt),
+                                    };
+                                } else {
+                                    edits[0] = .{
+                                        .file_id = body.file_id,
+                                        .start_byte = recv_sp.end_byte,
+                                        .end_byte = mc_sp.end_byte,
+                                        .replacement_id = .empty,
+                                    };
+                                }
+                                const fixes = try out_arena.alloc(SuggestedFix, 1);
+                                fixes[0] = .{
+                                    .message = if (needs_own_kw)
+                                        try std.fmt.allocPrint(out_arena, "move `{s}` directly with `own {s}`", .{ loc_name, loc_name })
+                                    else
+                                        try std.fmt.allocPrint(out_arena, "remove redundant `.clone()` and move `{s}`", .{loc_name}),
+                                    .applicability = .machine_applicable,
+                                    .priority = .lint_idiom,
+                                    .edits = edits,
+                                };
+                                fixes_slice = fixes;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        const labels = try out_arena.alloc(LabeledSpan, 1);
+        labels[0] = .{
+            .span = call_span,
+            .label = "owned value is never read again after this `.clone()`",
+            .style = .primary,
+        };
+        const notes = try out_arena.alloc([]const u8, 1);
+        notes[0] = "help: transfer ownership directly instead of cloning and immediately dropping the original";
+        try sink.emit(.{
+            .code = .w0334_redundant_move_clone,
+            .severity = .warning,
+            .primary_span = call_span,
+            .message = try std.fmt.allocPrint(
+                out_arena,
+                "redundant `.clone()` on owned value `{s}` before scope exit (`DR-25`)",
+                .{loc_name},
+            ),
+            .labels = labels,
+            .notes = notes,
+            .suggestions = fixes_slice,
+        });
+    }
+}
+
+/// Returns `true` if SSA `val_raw` derives from string concatenation (`+`/`str_concat`) or `f"…"` reading `target_lid`.
+fn isStringConcatOrFormatReadingLocal(
+    body: *const MirBody,
+    sym_table: *const SymbolTable,
+    val_raw: u32,
+    target_lid: u32,
+    depth: u8,
+) bool {
+    if (depth > 8 or val_raw >= body.insts.len) return false;
+    const peeled = peelCopyValId(body, val_raw);
+    if (peeled >= body.insts.len) return false;
+    const inst = body.getInst(MirValueId.fromInt(peeled));
+    switch (inst.op) {
+        .aggregate_make => {
+            const agg_k: AggregateKind = @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))));
+            if (agg_k == .str_concat or agg_k == .fmt_args_make) {
+                const elem_len: usize = inst.operands.rhs;
+                const end_i = @min(body.extra_args.items.len, @as(usize, inst.operands.lhs) + elem_len);
+                var local_set = DenseBitSet.EMPTY;
+                if (target_lid < 64) {
+                    for (body.extra_args.items[inst.operands.lhs..end_i]) |elem_v| {
+                        markValueDirectRootLocals(body, elem_v, 64, &local_set, 0);
+                    }
+                    if (local_set.isSet(target_lid)) return true;
+                }
+            }
+        },
+        .block_param => {
+            // Check incoming `.call` terminators producing this block parameter (`format`, `concat`, `add`):
+            const src_bb = inst.operands.lhs;
+            if (src_bb < body.blocks.items.len) {
+                for (body.getPredEdges(MirBlockId.fromInt(src_bb))) |pred_eid| {
+                    const edge = body.extra_edges.items[pred_eid.asInt()];
+                    const pterm = body.blocks.items[edge.src_bb.asInt()].terminator;
+                    if (pterm.kind == .call and pterm.cond_or_val < body.calls.items.len) {
+                        const cs = body.calls.items[pterm.cond_or_val];
+                        const mname = lookupCallSiteMethodName(sym_table, cs);
+                        if (std.mem.eql(u8, mname, "add") or
+                            std.mem.eql(u8, mname, "concat") or
+                            std.mem.eql(u8, mname, "format") or
+                            std.mem.eql(u8, mname, "fmt_to_string"))
+                        {
+                            for (0..cs.args_len) |ai| {
+                                const w = body.extra_args.items[cs.args_start + ai];
+                                if (isStringConcatOrFormatReadingLocal(body, sym_table, w, target_lid, depth + 1)) {
+                                    return true;
+                                }
+                                if (target_lid < 64) {
+                                    var lset = DenseBitSet.EMPTY;
+                                    markValueDirectRootLocals(body, w, 64, &lset, 0);
+                                    if (lset.isSet(target_lid)) return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        .place_load => {
+            if (inst.operands.lhs < body.places.items.len) {
+                const pl = body.places.items[inst.operands.lhs];
+                if (pl.base < body.locals.items.len and body.locals.items[pl.base].flags().is_synthetic_temp) {
+                    for (0..peeled) |prev_i| {
+                        const pinst = body.getInst(MirValueId.fromInt(@intCast(prev_i)));
+                        if (pinst.op == .place_store and pinst.operands.lhs < body.places.items.len and
+                            body.places.items[pinst.operands.lhs].base == pl.base)
+                        {
+                            if (isStringConcatOrFormatReadingLocal(
+                                body,
+                                sym_table,
+                                pinst.operands.rhs,
+                                target_lid,
+                                depth + 1,
+                            )) return true;
+                        }
+                    }
+                }
+            }
+        },
+        else => {},
+    }
+    return false;
+}
+
+/// Pass 2 post-convergence audit for `W0335` (`string-concat-in-loop`, `RuleId 28`, `Diag`).
+fn auditBodyStringConcatInLoopW0335(
+    arena_alloc: std.mem.Allocator,
+    body: *const MirBody,
+    dom: *const DominatorTree,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    config: SastConfig,
+    decl_fallback_span: Span,
+) !void {
+    const sink = config.diagnostic_sink orelse return;
+    if (!config.is_lint_target_file) return;
+    const pkg_id = sym_table.getFilePackageId(body.file_id);
+    if (pkg_id != .root and pkg_id != .std_core) return;
+
+    const block_count = body.blocks.items.len;
+    const local_count = body.locals.items.len;
+    if (block_count <= 1 or local_count <= 1) return;
+
+    // [1] Identify `String` locals and their definition block (`def_bb`):
+    var has_any_string_local = false;
+    const is_str_local = try arena_alloc.alloc(bool, local_count);
+    @memset(is_str_local, false);
+    const def_bb = try arena_alloc.alloc(u32, local_count);
+    @memset(def_bb, 0);
+
+    for (1..local_count) |lid| {
+        const loc = body.locals.items[lid];
+        if (loc.flags().is_synthetic_temp) continue;
+        const unwrapped = pool.unwrapUnderlyingType(loc.type_id);
+        const check_ty = if (!unwrapped.isError() and pool.getTag(unwrapped) == .mut_ref_ty)
+            TypeId.fromInt(pool.getNode(unwrapped).lhs)
+        else
+            unwrapped;
+        if (isNominalStringType(pool, sym_table, check_ty)) {
+            is_str_local[lid] = true;
+            has_any_string_local = true;
+        }
+    }
+    if (!has_any_string_local) return;
+
+    for (0..block_count) |b_i| {
+        for (body.getBlockInsts(MirBlockId.fromInt(@intCast(b_i)))) |iv| {
+            const inst = body.getInst(iv);
+            if (inst.op == .ghost_storage_init and inst.operands.lhs < local_count) {
+                def_bb[inst.operands.lhs] = @intCast(b_i);
+            }
+        }
+    }
+
+    // [2] Discover natural loops (`latch -> header` where `dom.dominates(header, latch)`):
+    const in_loop = try arena_alloc.alloc(bool, block_count);
+    const dfs_stack = try arena_alloc.alloc(u32, block_count);
+    var reported_pairs = std.AutoHashMapUnmanaged(u64, void){};
+
+    for (dom.rpo_blocks) |header_idx| {
+        const header_id = MirBlockId.fromInt(header_idx);
+        var has_backedge = false;
+        @memset(in_loop, false);
+        var sp_len: usize = 0;
+
+        for (body.getPredEdges(header_id)) |pred_eid| {
+            const edge = body.extra_edges.items[pred_eid.asInt()];
+            if (!dom.isReachable(edge.src_bb)) continue;
+            if (dom.isDominatorOf(header_id, edge.src_bb)) {
+                has_backedge = true;
+                in_loop[header_idx] = true;
+                const latch_idx = edge.src_bb.asInt();
+                if (!in_loop[latch_idx]) {
+                    in_loop[latch_idx] = true;
+                    dfs_stack[sp_len] = latch_idx;
+                    sp_len += 1;
+                }
+            }
+        }
+        if (!has_backedge) continue;
+
+        while (sp_len > 0) {
+            sp_len -= 1;
+            const cur = dfs_stack[sp_len];
+            for (body.getPredEdges(MirBlockId.fromInt(cur))) |peid| {
+                const src = body.extra_edges.items[peid.asInt()].src_bb.asInt();
+                if (src < block_count and dom.isReachable(MirBlockId.fromInt(src)) and !in_loop[src]) {
+                    in_loop[src] = true;
+                    dfs_stack[sp_len] = src;
+                    sp_len += 1;
+                }
+            }
+        }
+
+        // [3] Determine which outer `String` locals were pre-sized (`with_capacity`/`reserve`) vs unreserved (`new`):
+        const is_presized = try arena_alloc.alloc(bool, local_count);
+        @memset(is_presized, false);
+        const is_unreserved_init = try arena_alloc.alloc(bool, local_count);
+        @memset(is_unreserved_init, false);
+
+        for (dom.rpo_blocks) |out_bb| {
+            if (in_loop[out_bb]) continue;
+            const oterm = body.blocks.items[out_bb].terminator;
+            if (oterm.kind == .call and oterm.cond_or_val < body.calls.items.len) {
+                const ocs = body.calls.items[oterm.cond_or_val];
+                const omname = lookupCallSiteMethodName(sym_table, ocs);
+                const is_pre_call = STRING_PRESIZE_METHOD_SET.has(omname);
+                const is_unres_call = STRING_UNRESERVED_INIT_METHOD_SET.has(omname);
+                if (is_pre_call and ocs.args_len >= 1) {
+                    const m0 = body.call_arg_modes.items[ocs.modes_start];
+                    const w0 = body.extra_args.items[ocs.args_start];
+                    if (extractArgBaseLocal(body, m0, w0)) |b_loc| {
+                        if (b_loc < local_count) is_presized[b_loc] = true;
+                    }
+                }
+                if ((is_pre_call or is_unres_call) and oterm.edge_len > 0 and
+                    oterm.edge_start < body.extra_edges.items.len)
+                {
+                    const next_bb = body.extra_edges.items[oterm.edge_start].target_bb.asInt();
+                    if (next_bb < block_count) {
+                        for (body.getBlockInsts(MirBlockId.fromInt(next_bb))) |niv| {
+                            const ninst = body.getInst(niv);
+                            if (ninst.op == .place_store and ninst.operands.lhs < body.places.items.len) {
+                                const dst_l = body.places.items[ninst.operands.lhs].base;
+                                if (dst_l < local_count and is_str_local[dst_l]) {
+                                    if (is_pre_call) is_presized[dst_l] = true;
+                                    if (is_unres_call) is_unreserved_init[dst_l] = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // [4] Scan loop blocks in RPO order for `+=`, `s = s + …`, `s = f"{s}…"`, or unreserved `.push_str`/`.push_char`/`.write_fmt`:
+        for (dom.rpo_blocks) |loop_bb| {
+            if (!in_loop[loop_bb]) continue;
+
+            for (body.getBlockInsts(MirBlockId.fromInt(loop_bb))) |iv| {
+                const inst = body.getInst(iv);
+                if (inst.op == .place_store and inst.operands.lhs < body.places.items.len) {
+                    const pl = body.places.items[inst.operands.lhs];
+                    const lid = pl.base;
+                    if (pl.proj_len == 0 and lid >= 1 and lid < local_count and is_str_local[lid] and
+                        !in_loop[def_bb[lid]] and dom.isDominatorOf(MirBlockId.fromInt(def_bb[lid]), header_id))
+                    {
+                        if (isStringConcatOrFormatReadingLocal(body, sym_table, inst.operands.rhs, lid, 0)) {
+                            const pair_key = (@as(u64, lid) << 32) | @as(u64, header_idx);
+                            if (!reported_pairs.contains(pair_key)) {
+                                try reported_pairs.put(arena_alloc, pair_key, {});
+                                const site_tok = body.origin_tokens.items[iv.asInt()];
+                                const site_sp = resolveTokenSpan(body.file_id, site_tok, config, decl_fallback_span);
+                                const decl_sp = resolveTokenSpan(
+                                    body.file_id,
+                                    body.locals.items[lid].origin_token,
+                                    config,
+                                    decl_fallback_span,
+                                );
+                                try emitSastDiag(
+                                    sink,
+                                    .w0335_string_concat_in_loop,
+                                    .warning,
+                                    site_sp,
+                                    "repeated `String` reallocation/concatenation inside loop causes quadratic $O(N^2)$ copying",
+                                    "allocates a new `String` buffer on every loop iteration",
+                                    .{
+                                        .span = decl_sp,
+                                        .label = "outer `String` binding declared here",
+                                        .style = .secondary,
+                                    },
+                                    null,
+                                    "pre-allocate before the loop with `String.with_capacity(n)` and append via `.push_str(…)`",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            const lterm = body.blocks.items[loop_bb].terminator;
+            if (lterm.kind == .call and lterm.cond_or_val < body.calls.items.len) {
+                const lcs = body.calls.items[lterm.cond_or_val];
+                if (lcs.args_len >= 1) {
+                    const mname = lookupCallSiteMethodName(sym_table, lcs);
+                    const is_add_assign = std.mem.eql(u8, mname, "add_assign") or
+                        std.mem.eql(u8, mname, "concat_assign");
+                    const is_append = STRING_LOOP_APPEND_METHOD_SET.has(mname);
+                    if (is_add_assign or is_append) {
+                        const m0 = body.call_arg_modes.items[lcs.modes_start];
+                        const w0 = body.extra_args.items[lcs.args_start];
+                        if (extractArgBaseLocal(body, m0, w0)) |lid| {
+                            if (lid >= 1 and lid < local_count and is_str_local[lid] and
+                                !in_loop[def_bb[lid]] and dom.isDominatorOf(MirBlockId.fromInt(def_bb[lid]), header_id))
+                            {
+                                const should_flag = is_add_assign or
+                                    (!body.locals.items[lid].flags().is_arg and
+                                        is_unreserved_init[lid] and !is_presized[lid]);
+                                if (should_flag) {
+                                    const pair_key = (@as(u64, lid) << 32) | @as(u64, header_idx);
+                                    if (!reported_pairs.contains(pair_key)) {
+                                        try reported_pairs.put(arena_alloc, pair_key, {});
+                                        const site_sp = resolveTokenSpan(
+                                            body.file_id,
+                                            lcs.origin_token,
+                                            config,
+                                            decl_fallback_span,
+                                        );
+                                        const decl_sp = resolveTokenSpan(
+                                            body.file_id,
+                                            body.locals.items[lid].origin_token,
+                                            config,
+                                            decl_fallback_span,
+                                        );
+                                        try emitSastDiag(
+                                            sink,
+                                            .w0335_string_concat_in_loop,
+                                            .warning,
+                                            site_sp,
+                                            if (is_add_assign)
+                                                "`+=` string concatenation inside loop; write into a pre-allocated `String` builder"
+                                            else
+                                                "growing unreserved `String.new()` inside loop without prior `with_capacity` / `reserve`",
+                                            "loop string growth here",
+                                            .{
+                                                .span = decl_sp,
+                                                .label = "initialize with `String.with_capacity(…)` or call `.reserve(…)` before loop",
+                                                .style = .secondary,
+                                            },
+                                            null,
+                                            "pre-size the `String` before the loop using `String.with_capacity(…)` or `.reserve(…)`",
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Returns `true` if `body` contains at least one natural loop back-edge (`W0207` `O(1)` view check).
+fn hasAnyBackEdgeInBody(body: *const MirBody) bool {
+    for (body.extra_edges.items) |edge| {
+        if (edge.target_bb.asInt() <= edge.src_bb.asInt()) return true;
+    }
+    return false;
+}
+
+/// Post-Pass-4 inherent method check for `W0207` (`conversion-prefix-mismatch`, `RuleId 18`, `Unsafe`).
+fn emitConversionPrefixMismatchW0207(
+    body: *const MirBody,
+    sum: FnRegionSummary,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    resolved_sym_idx: SymbolIndex,
+    srec: SymbolRecord,
+    active_file_id: FileId,
+    config: SastConfig,
+) !void {
+    const sink = config.diagnostic_sink orelse return;
+    if (!config.is_lint_target_file) return;
+    if (resolved_sym_idx.isNone() or srec.kind != .fn_sym) return;
+    if (srec.flags.is_builtin or srec.flags.is_extern or srec.flags.is_prototype_only) return;
+    const pkg_id = sym_table.getFilePackageId(srec.decl_span.file_id);
+    if (pkg_id != .root and pkg_id != .std_core) return;
+    if (srec.contract_flags.is_export or srec.contract_flags.is_ifunc or
+        srec.contract_flags.has_link_name or srec.contract_flags.has_link_section or
+        srec.extra_flags.is_subscript or srec.extra_flags.is_constructor or
+        sym_table.impl_method_trait.contains(resolved_sym_idx.asInt()))
+    {
+        return;
+    }
+    if (sym_table.getFfiContract(resolved_sym_idx)) |ffi_c| {
+        if (ffi_c.wasm_export_name != .empty) return;
+    }
+
+    const param_specs = sym_table.getFnParamSpecs(resolved_sym_idx);
+    if (param_specs.len == 0 or body.param_count == 0 or body.locals.items.len <= 1) return;
+    const self_loc = body.locals.items[1];
+    const is_self_param = std.mem.eql(u8, param_specs[0].name_text, "self");
+    if (!is_self_param) return;
+
+    const name = srec.name_text;
+    const self_mode = self_loc.mode();
+    const self_ty = pool.unwrapUnderlyingType(self_loc.type_id);
+    if (self_ty.isError()) return;
+    const self_tag = pool.getTag(self_ty);
+    const is_self_ref = (self_tag == .ref_ty or self_tag == .mut_ref_ty or
+        self_mode == .inout_mode or self_mode == .set_mode);
+    const is_self_noncopy_owned = !is_self_ref and self_mode == .sink_mode and
+        !pool.getFlags(self_ty).has_type_vars and !isMirCopyType(pool, sym_table, self_ty);
+
+    const cs_mask = sum.contractsScratch();
+    var eff_alloc = sum.inferredEffects().alloc and !cs_mask.has_no_alloc;
+    if (srec.contract_flags.is_std_cap_boundary) {
+        const bmasks = extractBoundaryMasksForSymbol(srec, active_file_id, config);
+        if ((bmasks.clears & EffectCapabilityMask.ALLOC_BIT) != 0) eff_alloc = false;
+    }
+
+    const ret_ty = pool.unwrapUnderlyingType(body.ret_ty);
+    const ret_tag = if (!ret_ty.isError()) pool.getTag(ret_ty) else .primitive;
+    const is_borrowed_view_ret = ((sum.ret_provenance_mask & 1) != 0) and
+        (ret_tag == .ref_ty or ret_tag == .mut_ref_ty or ret_ty == .str_ty or
+            ret_tag == .slice_ty or ret_tag == .soa_slice_ty);
+
+    var target_prefix: []const u8 = "";
+    var stem: []const u8 = "";
+    var reason_msg: []const u8 = "";
+
+    if (std.mem.startsWith(u8, name, "as_") and name.len > 3) {
+        stem = name[3..];
+        if (is_self_noncopy_owned) {
+            target_prefix = "into_";
+            reason_msg = "`as_…` method consumes `own self` on a non-`Copy` type; use `into_…`";
+        } else if (eff_alloc) {
+            target_prefix = "to_";
+            reason_msg = "`as_…` method performs dynamic allocation; use `to_…` for allocating conversions";
+        }
+    } else if (std.mem.startsWith(u8, name, "to_") and name.len > 3 and !std.mem.endsWith(u8, name, "_into")) {
+        stem = name[3..];
+        if (is_self_noncopy_owned) {
+            target_prefix = "into_";
+            reason_msg = "`to_…` method consumes `own self` on a non-`Copy` type; use `into_…`";
+        } else if (body.param_count == 1 and self_tag == .ref_ty and !eff_alloc and
+            is_borrowed_view_ret and !hasAnyBackEdgeInBody(body))
+        {
+            target_prefix = "as_";
+            reason_msg = "zero-allocation borrowed view `&self` method uses `to_…`; prefer `as_…`";
+        }
+    } else if (std.mem.startsWith(u8, name, "into_") and name.len > 5) {
+        stem = name[5..];
+        if (is_self_ref) {
+            const pointee_ty = if (self_tag == .ref_ty or self_tag == .mut_ref_ty)
+                pool.unwrapUnderlyingType(TypeId.fromInt(pool.getNode(self_ty).lhs))
+            else
+                self_ty;
+            if (!pointee_ty.isError() and !pool.getFlags(pointee_ty).has_type_vars and
+                !isMirCopyType(pool, sym_table, pointee_ty))
+            {
+                if (body.param_count == 1 and !eff_alloc and is_borrowed_view_ret and !hasAnyBackEdgeInBody(body)) {
+                    target_prefix = "as_";
+                    reason_msg = "`into_…` method borrows `self` instead of consuming ownership; prefer `as_…`";
+                } else {
+                    target_prefix = "to_";
+                    reason_msg = "`into_…` method borrows `self` instead of taking `own self`; prefer `to_…`";
+                }
+            }
+        }
+    }
+
+    if (target_prefix.len == 0 or stem.len == 0) return;
+
+    const out_arena = sink.arena.asAllocator();
+    const target_name = try std.fmt.allocPrint(out_arena, "{s}{s}", .{ target_prefix, stem });
+    if (lexer.lookupKeywordOrPrim(target_name) != null) return;
+
+    // Collision guard in receiver type's scope:
+    if (!srec.scope_id.isNone()) {
+        for (sym_table.getScopeMembers(srec.scope_id)) |sib_idx| {
+            if (sib_idx != resolved_sym_idx and std.mem.eql(u8, sym_table.getSymbol(sib_idx).name_text, target_name)) {
+                return;
+            }
+        }
+    }
+
+    var fixes_slice: []const SuggestedFix = &.{};
+    if (resolveMutableInterner(config)) |mut_interner| {
+        if (!srec.decl_span.file_id.isNone() and srec.decl_span.end_byte > srec.decl_span.start_byte) {
+            const edits = try out_arena.alloc(TextEdit, 1);
+            edits[0] = .{
+                .file_id = srec.decl_span.file_id,
+                .start_byte = srec.decl_span.start_byte,
+                .end_byte = srec.decl_span.end_byte,
+                .replacement_id = try mut_interner.intern(target_name),
+            };
+            const fixes = try out_arena.alloc(SuggestedFix, 1);
+            fixes[0] = .{
+                .message = try std.fmt.allocPrint(out_arena, "rename `{s}` to `{s}`", .{ name, target_name }),
+                .applicability = .maybe_incorrect,
+                .priority = .lint_idiom,
+                .edits = edits,
+            };
+            fixes_slice = fixes;
+        }
+    }
+
+    const labels = try out_arena.alloc(LabeledSpan, 1);
+    labels[0] = .{
+        .span = srec.decl_span,
+        .label = try std.fmt.allocPrint(out_arena, "expected `{s}` prefix for this receiver/effect contract", .{target_prefix}),
+        .style = .primary,
+    };
+    const notes = try out_arena.alloc([]const u8, 1);
+    notes[0] = "help: use `as_…` for O(1) borrowed views, `to_…` for non-consuming conversions, and `into_…` for `own self`";
+    try sink.emit(.{
+        .code = .w0207_conversion_prefix_mismatch,
+        .severity = .warning,
+        .primary_span = srec.decl_span,
+        .message = reason_msg,
+        .labels = labels,
+        .notes = notes,
+        .suggestions = fixes_slice,
+    });
+}
+
+/// Post-Pass-4 check for `W0413` (`trivially-copy-pass-by-ref`, `RuleId 41`, `Auto` private / `Unsafe` `pub`).
+fn emitTriviallyCopyPassByRefW0413(
+    body: *const MirBody,
+    sum: FnRegionSummary,
+    store: *const FnSummaryStore,
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    interner_opt: ?*const StringInterner,
+    resolved_sym_idx: SymbolIndex,
+    srec: SymbolRecord,
+    active_file_id: FileId,
+    config: SastConfig,
+) !void {
+    const sink = config.diagnostic_sink orelse return;
+    if (!config.is_lint_target_file) return;
+    if (resolved_sym_idx.isNone() or srec.kind != .fn_sym) return;
+    if (srec.flags.is_builtin or srec.flags.is_extern or srec.flags.is_prototype_only) return;
+    const pkg_id = sym_table.getFilePackageId(srec.decl_span.file_id);
+    if (pkg_id != .root and pkg_id != .std_core) return;
+
+    // Guard 3: ABI, FFI, trait impl, test/bench, subscript, and function-pointer reification exemptions:
+    if (srec.contract_flags.is_export or srec.contract_flags.is_ifunc or
+        srec.contract_flags.has_link_name or srec.contract_flags.has_link_section or
+        srec.extra_flags.is_test or srec.extra_flags.is_bench or srec.extra_flags.is_subscript or
+        srec.isFnValueReified() or sym_table.impl_method_trait.contains(resolved_sym_idx.asInt()))
+    {
+        return;
+    }
+    if (sym_table.getFfiContract(resolved_sym_idx)) |ffi_c| {
+        if (ffi_c.wasm_export_name != .empty) return;
+    }
+    if (!srec.def_id.isNone()) {
+        const target_def_raw = srec.def_id.asInt();
+        for (store.edges) |edge| {
+            const ek = edge.meta().edge_kind;
+            if (edge.callee_def == target_def_raw and (ek == .reify_fn_addr or ek == .reify_vtable)) return;
+        }
+    }
+    if (body.param_count == 0) return;
+
+    const max_bytes: u64 = if (config.trivial_copy_max_bytes) |exp_b|
+        exp_b
+    else if (body.target_layout.ptr_byte_size <= 4)
+        4
+    else
+        8;
+
+    const param_specs = sym_table.getFnParamSpecs(resolved_sym_idx);
+    const syn_ctx_opt = resolveFileSyntaxCtx(srec.decl_span.file_id, active_file_id, config);
+    const mut_interner_opt = resolveMutableInterner(config);
+    const is_pub_boundary = sym_table.isEffectivePubBoundary(resolved_sym_idx);
+    const out_arena = sink.arena.asAllocator();
+
+    // Collect CST `.param` nodes in order for surgical `&T` -> `T` type edits:
+    var param_csts: [32]CstNodeIndex = @splat(.none);
+    var param_cst_count: usize = 0;
+    if (syn_ctx_opt) |syn_ctx| {
+        if (!srec.cst_node.isNone() and srec.cst_node.asInt() < syn_ctx.cst.countNodes()) {
+            const f_start: usize = srec.cst_node.asInt();
+            const f_end: usize = @min(
+                f_start + @max(@as(usize, syn_ctx.cst.getNode(srec.cst_node).subtree_size), 1),
+                syn_ctx.cst.countNodes(),
+            );
+            var cur = f_start + 1;
+            while (cur < f_end) {
+                const sub = syn_ctx.cst.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+                if (sub.kind == .block or sub.kind == .fn_expr_body) break;
+                if (sub.kind == .param_list) {
+                    const pl_end = @min(cur + @max(@as(usize, sub.subtree_size), 1), f_end);
+                    var pc = cur + 1;
+                    while (pc < pl_end and param_cst_count < param_csts.len) {
+                        const pn = syn_ctx.cst.getNode(CstNodeIndex.fromInt(@intCast(pc)));
+                        if (pn.kind == .fn_param) {
+                            param_csts[param_cst_count] = CstNodeIndex.fromInt(@intCast(pc));
+                            param_cst_count += 1;
+                            pc += @max(@as(usize, pn.subtree_size), 1);
+                            continue;
+                        }
+                        pc += 1;
+                    }
+                    break;
+                }
+                cur += 1;
+            }
+        }
+    }
+
+    var param_ord: usize = 0;
+    while (param_ord < body.param_count and param_ord < 64) : (param_ord += 1) {
+        const param_lid = 1 + param_ord;
+        if (param_lid >= body.locals.items.len) break;
+        const param_loc = body.locals.items[param_lid];
+        const param_name = if (param_ord < param_specs.len and param_specs[param_ord].name_text.len > 0)
+            param_specs[param_ord].name_text
+        else
+            lookupLocalNameText(param_loc, interner_opt);
+
+        // Guard 1: `&self` receiver is always exempt:
+        if (param_ord == 0 and std.mem.eql(u8, param_name, "self")) continue;
+        if (param_loc.mode() != .let_mode) continue;
+
+        const param_ty = pool.unwrapUnderlyingType(param_loc.type_id);
+        if (param_ty.isError() or pool.getTag(param_ty) != .ref_ty) continue;
+        const inner_ty = pool.unwrapUnderlyingType(TypeId.fromInt(pool.getNode(param_ty).lhs));
+        if (inner_ty.isError()) continue;
+        const inner_flags = pool.getFlags(inner_ty);
+        if (!inner_flags.is_sized or inner_flags.has_type_vars) continue;
+        const inner_tag = pool.getTag(inner_ty);
+        if (inner_tag == .slice_ty or inner_tag == .soa_slice_ty or
+            inner_tag == .dyn_trait_ty or inner_ty == .opaque_ty)
+        {
+            continue;
+        }
+        if (!isMirCopyType(pool, sym_table, inner_ty)) continue;
+
+        const lay = type_system.computeTypeLayoutWithPool(pool, sym_table, inner_ty, body.target_layout);
+        if (lay.byte_size > max_bytes) continue;
+
+        // Guard 4: Return/global/parameter-flow escape & raw-address identity checks:
+        if ((sum.ret_provenance_mask & (@as(u64, 1) << @intCast(param_ord))) != 0) continue;
+        if (param_ord < 32 and (sum.global_escape_mask & (@as(u32, 1) << @intCast(param_ord))) != 0) continue;
+        if (param_ord < 8 and ((sum.param_flow_matrix >> @intCast(param_ord * 8)) & 0xFF) != 0) continue;
+
+        var has_raw_or_subref = false;
+        for (0..body.insts.len) |inst_i| {
+            const inst = body.getInst(MirValueId.fromInt(@intCast(inst_i)));
+            if (inst.op == .place_addr and inst.operands.lhs < body.places.items.len) {
+                const pl = body.places.items[inst.operands.lhs];
+                if (pl.base == param_lid and inst.operands.rhs >= 2) {
+                    has_raw_or_subref = true;
+                    break;
+                }
+            }
+        }
+        if (has_raw_or_subref) continue;
+
+        var param_span = resolveTokenSpan(srec.decl_span.file_id, param_loc.origin_token, config, srec.decl_span);
+        var fixes_slice: []const SuggestedFix = &.{};
+
+        if (syn_ctx_opt != null and mut_interner_opt != null and param_ord < param_cst_count) {
+            const syn_ctx = syn_ctx_opt.?;
+            const mut_interner = mut_interner_opt.?;
+            const pcst = param_csts[param_ord];
+            if (!pcst.isNone()) {
+                if (symbol_resolver.computeCstSubtreeSpan(srec.decl_span.file_id, syn_ctx.tokens, syn_ctx.cst, pcst)) |psp| {
+                    param_span = psp;
+                }
+                // Find the `&` token inside `.ref_type` after `:` in `pcst`:
+                const p_start: usize = pcst.asInt();
+                const p_end: usize = @min(
+                    p_start + @max(@as(usize, syn_ctx.cst.getNode(pcst).subtree_size), 1),
+                    syn_ctx.cst.countNodes(),
+                );
+                var amp_tok: TokenIndex = .none;
+                var after_amp_byte: u32 = 0;
+                var seen_colon = false;
+                var pcur = p_start + 1;
+                while (pcur < p_end) : (pcur += 1) {
+                    const lf = syn_ctx.cst.getNode(CstNodeIndex.fromInt(@intCast(pcur)));
+                    if (lf.subtree_size <= 1 and !lf.token.isNone() and lf.token.asInt() < syn_ctx.tokens.countTokens()) {
+                        const tk = syn_ctx.tokens.getToken(lf.token);
+                        if (!seen_colon) {
+                            if (tk.kind == .colon) seen_colon = true;
+                        } else if (amp_tok.isNone() and tk.kind == .amp) {
+                            amp_tok = lf.token;
+                            after_amp_byte = tk.byte_offset + tk.byte_len;
+                            while (after_amp_byte < syn_ctx.source.len and
+                                (syn_ctx.source[after_amp_byte] == ' ' or syn_ctx.source[after_amp_byte] == '\t'))
+                            {
+                                after_amp_byte += 1;
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                // Scan body AST for uses of `param_name` (`p.*` -> `p`, `p.field` unchanged, bare `p` -> `(&p)` if non-recursive):
+                if (!amp_tok.isNone() and !sum.contractsScratch().is_scc_recursive) {
+                    if (syn_ctx.ast_opt) |ast_ar| {
+                        var body_edits: std.ArrayListUnmanaged(TextEdit) = .empty;
+                        const amp_start = syn_ctx.tokens.getToken(amp_tok).byte_offset;
+                        try body_edits.append(out_arena, .{
+                            .file_id = srec.decl_span.file_id,
+                            .start_byte = amp_start,
+                            .end_byte = after_amp_byte,
+                            .replacement_id = .empty,
+                        });
+
+                        const fn_full_sp = symbol_resolver.computeCstSubtreeSpan(
+                            srec.decl_span.file_id,
+                            syn_ctx.tokens,
+                            syn_ctx.cst,
+                            srec.cst_node,
+                        ) orelse srec.decl_span;
+
+                        const fn_win = computeFnAstNodeWindow(ast_ar, syn_ctx.cst, srec.cst_node);
+                        const win_len: usize = fn_win.end -| fn_win.start;
+                        var deref_dot_start_by_rel = try out_arena.alloc(u32, win_len);
+                        @memset(deref_dot_start_by_rel, std.math.maxInt(u32));
+                        var deref_end_by_rel = try out_arena.alloc(u32, win_len);
+                        @memset(deref_end_by_rel, 0);
+                        var is_recv_by_rel = try out_arena.alloc(bool, win_len);
+                        @memset(is_recv_by_rel, false);
+                        var has_standalone_hazard = false;
+
+                        var p_i: u32 = fn_win.start;
+                        while (p_i < fn_win.end) : (p_i += 1) {
+                            const pid = NodeIndex.fromInt(p_i);
+                            const pnode = ast_ar.getNode(pid);
+                            if (pnode.tag == .deref_expr and pnode.lhs.tag == .node) {
+                                const lhs_raw = pnode.lhs.payload;
+                                if (lhs_raw >= fn_win.start and lhs_raw < fn_win.end) {
+                                    const dcst = ast_ar.getCstOrigin(pid);
+                                    if (!dcst.isNone()) {
+                                        if (symbol_resolver.computeCstSubtreeSpan(
+                                            srec.decl_span.file_id,
+                                            syn_ctx.tokens,
+                                            syn_ctx.cst,
+                                            dcst,
+                                        )) |dsp| {
+                                            if (findPostfixDerefDotStartByte(syn_ctx.tokens, syn_ctx.cst, dcst)) |dot_byte| {
+                                                const rel = lhs_raw - fn_win.start;
+                                                deref_dot_start_by_rel[rel] = dot_byte;
+                                                deref_end_by_rel[rel] = dsp.end_byte;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if ((pnode.tag == .field_access or pnode.tag == .method_call or
+                                pnode.tag == .index_expr) and pnode.lhs.tag == .node)
+                            {
+                                const lhs_raw = pnode.lhs.payload;
+                                if (lhs_raw >= fn_win.start and lhs_raw < fn_win.end) {
+                                    is_recv_by_rel[lhs_raw - fn_win.start] = true;
+                                }
+                            } else if (pnode.tag == .bind_pat and !pnode.main_token.isNone() and
+                                pnode.main_token.asInt() < syn_ctx.tokens.countTokens())
+                            {
+                                const btok = syn_ctx.tokens.getToken(pnode.main_token);
+                                if (btok.byte_offset > param_span.end_byte and btok.byte_offset < fn_full_sp.end_byte) {
+                                    const blex = symbol_resolver.extractTokenSlice(syn_ctx.source, syn_ctx.tokens, pnode.main_token);
+                                    if (std.mem.eql(u8, blex, param_name)) has_standalone_hazard = true;
+                                }
+                            } else if (pnode.tag == .string_lit and !pnode.main_token.isNone() and
+                                pnode.main_token.asInt() < syn_ctx.tokens.countTokens())
+                            {
+                                const stok = syn_ctx.tokens.getToken(pnode.main_token);
+                                if (stok.kind == .fmt_string_lit and
+                                    stok.byte_offset > param_span.end_byte and stok.byte_offset < fn_full_sp.end_byte)
+                                {
+                                    const slex = symbol_resolver.extractTokenSlice(syn_ctx.source, syn_ctx.tokens, pnode.main_token);
+                                    if (std.mem.indexOf(u8, slex, param_name) != null) has_standalone_hazard = true;
+                                }
+                            }
+                        }
+
+                        // Also detect closure parameter bindings `|param_name|` inside `fn_cst`:
+                        if (!has_standalone_hazard and !srec.cst_node.isNone() and srec.cst_node.asInt() < syn_ctx.cst.countNodes()) {
+                            const cs_start: usize = srec.cst_node.asInt();
+                            const cs_end: usize = @min(
+                                cs_start + @max(@as(usize, syn_ctx.cst.getNode(srec.cst_node).subtree_size), 1),
+                                syn_ctx.cst.countNodes(),
+                            );
+                            var cs_cur = cs_start + 1;
+                            while (cs_cur < cs_end) : (cs_cur += 1) {
+                                const cnode = syn_ctx.cst.getNode(CstNodeIndex.fromInt(@intCast(cs_cur)));
+                                if (cnode.kind == .closure_param) {
+                                    const cp_end = @min(cs_cur + @max(@as(usize, cnode.subtree_size), 1), cs_end);
+                                    var cp_i = cs_cur + 1;
+                                    while (cp_i < cp_end) : (cp_i += 1) {
+                                        const lf = syn_ctx.cst.getNode(CstNodeIndex.fromInt(@intCast(cp_i)));
+                                        if (lf.subtree_size <= 1 and !lf.token.isNone() and lf.token.asInt() < syn_ctx.tokens.countTokens()) {
+                                            const tk = syn_ctx.tokens.getToken(lf.token);
+                                            if (symbol_resolver.isIdentifierToken(tk.kind)) {
+                                                const clex = symbol_resolver.extractTokenSlice(syn_ctx.source, syn_ctx.tokens, lf.token);
+                                                if (std.mem.eql(u8, clex, param_name)) has_standalone_hazard = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (!has_standalone_hazard) {
+                            var a_i: u32 = fn_win.start;
+                            while (a_i < fn_win.end) : (a_i += 1) {
+                                const aid = NodeIndex.fromInt(a_i);
+                                const anode = ast_ar.getNode(aid);
+                                if (anode.tag != .ident_expr) continue;
+                                if (anode.main_token.isNone() or anode.main_token.asInt() >= syn_ctx.tokens.countTokens()) continue;
+                                const id_tok = syn_ctx.tokens.getToken(anode.main_token);
+                                if (id_tok.byte_offset <= param_span.end_byte or id_tok.byte_offset >= fn_full_sp.end_byte) continue;
+                                const lex = symbol_resolver.extractTokenSlice(syn_ctx.source, syn_ctx.tokens, anode.main_token);
+                                if (!std.mem.eql(u8, lex, param_name)) continue;
+
+                                const rel = a_i - fn_win.start;
+                                if (deref_dot_start_by_rel[rel] != std.math.maxInt(u32)) {
+                                    try body_edits.append(out_arena, .{
+                                        .file_id = srec.decl_span.file_id,
+                                        .start_byte = deref_dot_start_by_rel[rel],
+                                        .end_byte = deref_end_by_rel[rel],
+                                        .replacement_id = .empty,
+                                    });
+                                } else if (!is_recv_by_rel[rel]) {
+                                    const ref_repl = try std.fmt.allocPrint(out_arena, "&{s}", .{param_name});
+                                    try body_edits.append(out_arena, .{
+                                        .file_id = srec.decl_span.file_id,
+                                        .start_byte = id_tok.byte_offset,
+                                        .end_byte = id_tok.byte_offset + id_tok.byte_len,
+                                        .replacement_id = try mut_interner.intern(ref_repl),
+                                    });
+                                }
+                            }
+                        }
+
+                        const fixes = try out_arena.alloc(SuggestedFix, 1);
+                        fixes[0] = .{
+                            .message = try std.fmt.allocPrint(out_arena, "pass `{s}` by value instead of shared reference", .{param_name}),
+                            .applicability = if (is_pub_boundary) .maybe_incorrect else .machine_applicable,
+                            .priority = .lint_idiom,
+                            .edits = if (has_standalone_hazard) &.{} else body_edits.items,
+                        };
+                        if (!has_standalone_hazard or config.has_db_lint_gate) {
+                            fixes_slice = fixes;
+                        }
+                    }
+                }
+            }
+        }
+
+        var ty_buf: [128]u8 = undefined;
+        const ty_str = pool.formatType(inner_ty, sym_table, &ty_buf);
+        const labels = try out_arena.alloc(LabeledSpan, 1);
+        labels[0] = .{
+            .span = param_span,
+            .label = try std.fmt.allocPrint(
+                out_arena,
+                "`{s}` is `{d}` B (`<= {d}` B `Copy` threshold); pass by value `{s}`",
+                .{ ty_str, lay.byte_size, max_bytes, ty_str },
+            ),
+            .style = .primary,
+        };
+        const notes = try out_arena.alloc([]const u8, 1);
+        notes[0] = "help: passing small `Copy` types by value avoids pointer indirection and improves register allocation";
+        try sink.emit(.{
+            .code = .w0413_trivially_copy_pass_by_ref,
+            .severity = .warning,
+            .primary_span = param_span,
+            .message = try std.fmt.allocPrint(
+                out_arena,
+                "trivially `Copy` parameter `{s}: &{s}` (`{d}` B) passed by reference (`DR-25`)",
+                .{ param_name, ty_str, lay.byte_size },
+            ),
+            .labels = labels,
+            .notes = notes,
+            .suggestions = fixes_slice,
+        });
+    }
+}
+
+/// Returns `true` if `body` / `srec_opt` is a `@test(sim)` / `@sim` item or `config.is_sim_mode` is active (`W0332`).
+fn isSimulationTargetBody(
+    body: *const MirBody,
+    srec_opt: ?SymbolRecord,
+    active_file_id: FileId,
+    config: SastConfig,
+) bool {
+    if (config.is_sim_mode) {
+        if (srec_opt) |srec| {
+            if (srec.extra_flags.is_test) return true;
+        }
+    }
+    const syn_ctx = resolveFileSyntaxCtx(body.file_id, active_file_id, config) orelse return false;
+    var root_cst: CstNodeIndex = if (srec_opt) |sr| sr.cst_node else .none;
+    if (root_cst.isNone()) return false;
+    if (root_cst.asInt() >= syn_ctx.cst.countNodes()) return false;
+
+    const start_i: usize = root_cst.asInt();
+    const end_i: usize = @min(
+        start_i + @max(@as(usize, syn_ctx.cst.getNode(root_cst).subtree_size), 1),
+        syn_ctx.cst.countNodes(),
+    );
+    var cur = start_i + 1;
+    while (cur < end_i) : (cur += 1) {
+        const sub = syn_ctx.cst.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+        if (sub.kind == .block or sub.kind == .fn_expr_body) break;
+        if (sub.kind == .attribute) {
+            const a_end = @min(cur + @max(@as(usize, sub.subtree_size), 1), end_i);
+            var has_test_or_sim = false;
+            var has_sim_ident = false;
+            var lc = cur + 1;
+            while (lc < a_end) : (lc += 1) {
+                const lf = syn_ctx.cst.getNode(CstNodeIndex.fromInt(@intCast(lc)));
+                if (lf.subtree_size <= 1 and !lf.token.isNone() and lf.token.asInt() < syn_ctx.tokens.countTokens()) {
+                    const lex = symbol_resolver.extractTokenSlice(syn_ctx.source, syn_ctx.tokens, lf.token);
+                    if (std.mem.eql(u8, lex, "sim")) {
+                        has_test_or_sim = true;
+                        has_sim_ident = true;
+                    } else if (std.mem.eql(u8, lex, "test")) {
+                        has_test_or_sim = true;
+                    }
+                }
+            }
+            if (has_test_or_sim and has_sim_ident) return true;
+        }
+    }
+    return false;
+}
+
+/// Checks whether `body` directly invokes a raw host clock/entropy/thread FFI symbol bypassing `sim_seam`.
+fn findDirectRawSimBypassInBody(
+    body: *const MirBody,
+    sym_table: *const SymbolTable,
+) ?struct { site_tok: TokenIndex, callee_name: []const u8 } {
+    for (body.blocks.items) |bb| {
+        if (bb.terminator.kind == .call and bb.terminator.cond_or_val < body.calls.items.len) {
+            const cs = body.calls.items[bb.terminator.cond_or_val];
+            if (!cs.direct_symbol.isNone() and cs.direct_symbol.asInt() < sym_table.symbols.items.len) {
+                const csym = sym_table.getSymbol(cs.direct_symbol).*;
+                if ((csym.flags.is_extern or csym.decl_span.file_id.asInt() >= 0x7000_0000) and
+                    !csym.contract_flags.is_std_cap_boundary and
+                    RAW_HOST_NONDETERMINISTIC_FFI_SET.has(csym.name_text))
+                {
+                    return .{ .site_tok = cs.origin_token, .callee_name = csym.name_text };
+                }
+            }
+        }
+    }
+    return null;
+}
+
+/// Post-Pass-4 check for `W0332` (`nondeterministic-sim-source`, `RuleId 25`, `Diag`).
+fn emitNondeterministicSimSourceW0332(
+    allocator: std.mem.Allocator,
+    bodies: []const MirBody,
+    slot_idx: u32,
+    store: *const FnSummaryStore,
+    sym_table: *const SymbolTable,
+    interner_opt: ?*const StringInterner,
+    srec_opt: ?SymbolRecord,
+    decl_span: Span,
+    config: SastConfig,
+) !void {
+    const sink = config.diagnostic_sink orelse return;
+    const body = &bodies[slot_idx];
+    const pkg_id = sym_table.getFilePackageId(body.file_id);
+    if (pkg_id != .root and pkg_id != .std_core) return;
+    if (config.has_db_lint_gate and !config.is_lint_target_file) return;
+    if (!isSimulationTargetBody(body, srec_opt, body.file_id, config)) return;
+
+    const sum = store.summaries[slot_idx];
+    if (sum.contractsScratch().is_std_cap_boundary) return;
+
+    const sim_forbidden_bits: u16 = CapabilityBits.CLOCK | CapabilityBits.ENTROPY | CapabilityBits.PROCESS;
+    const hit_cap_bits = sum.inferred_effects_bits & sim_forbidden_bits;
+
+    if (hit_cap_bits != 0) {
+        const steps = try store.reconstructShortestWitness(allocator, slot_idx, hit_cap_bits);
+        defer allocator.free(steps);
+        const note_opt = try formatWitnessChainNote(
+            allocator,
+            store,
+            sym_table,
+            interner_opt,
+            slot_idx,
+            steps,
+        );
+        defer if (note_opt) |ns| allocator.free(ns);
+        const cap_str = try formatEffectBitsList(allocator, hit_cap_bits);
+        defer allocator.free(cap_str);
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "deterministic simulation test reaches unrouted host `{s}` source bypassing `sim_seam`",
+            .{cap_str},
+        );
+        defer allocator.free(msg);
+        const prim_span = if (steps.len > 0)
+            resolveTokenSpan(body.file_id, steps[0].edge.site_token, config, decl_span)
+        else
+            decl_span;
+        const base_help = "route time, randomness, and tasks through `context` (`sim_seam` `ReactorVTable`)";
+        const full_note = if (note_opt) |wn|
+            try std.fmt.allocPrint(allocator, "{s}\nhelp: {s}", .{ wn, base_help })
+        else
+            try allocator.dupe(u8, base_help);
+        defer allocator.free(full_note);
+        try emitSastDiag(
+            sink,
+            .w0332_nondeterministic_sim_source,
+            .warning,
+            prim_span,
+            msg,
+            "nondeterministic host capability reachable in simulation test",
+            if (steps.len > 0) .{ .span = decl_span, .label = "simulation test declared here", .style = .secondary } else null,
+            null,
+            full_note,
+        );
+        return;
+    }
+
+    // BFS across module call graph for raw `extern "C"` clock/entropy/thread FFI calls without capability tags:
+    const fn_count = bodies.len;
+    const visited = try allocator.alloc(bool, fn_count);
+    defer allocator.free(visited);
+    @memset(visited, false);
+    const queue = try allocator.alloc(u32, fn_count);
+    defer allocator.free(queue);
+    const first_edge_tok = try allocator.alloc(TokenIndex, fn_count);
+    defer allocator.free(first_edge_tok);
+    @memset(first_edge_tok, .none);
+
+    var q_head: usize = 0;
+    var q_tail: usize = 0;
+    visited[slot_idx] = true;
+    queue[q_tail] = slot_idx;
+    q_tail += 1;
+
+    while (q_head < q_tail) : (q_head += 1) {
+        const cur_s = queue[q_head];
+        if (store.summaries[cur_s].contractsScratch().is_std_cap_boundary) continue;
+        if (findDirectRawSimBypassInBody(&bodies[cur_s], sym_table)) |hit| {
+            const root_tok = if (cur_s == slot_idx) hit.site_tok else first_edge_tok[cur_s];
+            const prim_span = resolveTokenSpan(body.file_id, root_tok, config, decl_span);
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "deterministic simulation test reaches raw host FFI `{s}` bypassing `sim_seam`",
+                .{hit.callee_name},
+            );
+            defer allocator.free(msg);
+            try emitSastDiag(
+                sink,
+                .w0332_nondeterministic_sim_source,
+                .warning,
+                prim_span,
+                msg,
+                "nondeterministic host FFI call reachable in simulation test",
+                if (cur_s != slot_idx) .{ .span = decl_span, .label = "simulation test declared here", .style = .secondary } else null,
+                null,
+                "route clock, PRNG, and concurrency operations through `context` (`sim_seam` `ReactorVTable`)",
+            );
+            return;
+        }
+        for (store.getEdges(cur_s)) |edge| {
+            const next_s = store.node_key_to_slot.get(edge.callee_def) orelse continue;
+            if (!visited[next_s]) {
+                visited[next_s] = true;
+                first_edge_tok[next_s] = if (cur_s == slot_idx) edge.site_token else first_edge_tok[cur_s];
+                queue[q_tail] = next_s;
+                q_tail += 1;
+            }
+        }
+    }
 }
 
 /// Emits `W0333` (`w0333_redundant_private_contract`, `ADR-24C`) for redundant `@no_alloc`/`@no_panic`/`@no_block` on non-`pub` functions.
@@ -2066,9 +4105,10 @@ fn emitRedundantPrivateContractsW0333(
     if (!srec.contract_flags.is_no_alloc and !srec.contract_flags.is_no_panic and !srec.contract_flags.is_no_block) {
         return;
     }
-    if (sym_table.getFilePackageId(srec.decl_span.file_id) != .root) return;
+    const pkg_id = sym_table.getFilePackageId(srec.decl_span.file_id);
+    if (pkg_id != .root and pkg_id != .std_core) return;
+    if (config.has_db_lint_gate and !config.is_lint_target_file) return;
     if (sym_table.isEffectivePubBoundary(resolved_sym_idx)) return;
-    if (isSymbolW0333Suppressed(sym_table, resolved_sym_idx, srec.scope_id)) return;
 
     const has_wasm_export = if (sym_table.getFfiContract(resolved_sym_idx)) |ffi_c|
         ffi_c.wasm_export_name != .empty
@@ -3463,7 +5503,11 @@ fn buildMovePathTrie(
             }
         }
 
-        place_map[pl_i] = .{ .id = cur_id, .is_partial = is_partial };
+        place_map[pl_i] = .{
+            .id = cur_id,
+            .is_partial = is_partial,
+            .is_behind_shared_ref = is_behind_shared,
+        };
         place_leaf_types[pl_i] = cur_ty;
     }
 
@@ -10954,7 +12998,8 @@ fn runPass2TypestateNllAndDrops(
                         }
 
                         // [c] `W0308` Unused local `Arena` / `BumpArena`:
-                        if (lid < local_count and lid < trie.direct_local_limit and
+                        if ((!eff_config.has_db_lint_gate or eff_config.is_lint_target_file) and
+                            lid < local_count and lid < trie.direct_local_limit and
                             !body.blocks.items[bb_idx].isCleanupPad() and
                             !body.locals.items[lid].flags().is_arg and
                             !body.locals.items[lid].flags().is_synthetic_temp and
@@ -11223,8 +13268,15 @@ fn runPass2TypestateNllAndDrops(
                             }
                             walk_anc = trie.nodes[walk_anc.asInt()].parent;
                         }
-                        // Also forbid moving out of a shared reference (`&T`) or dynamic index (`is_partial`) on non-`Copy`:
-                        if (!node_fl.is_copy and (has_custom_drop_anc or node_fl.is_behind_shared_ref or lookup.is_partial) and
+                        // Also forbid moving out of a shared reference (`&T` / `&[T]`) or dynamic index (`is_partial`) on non-`Copy`:
+                        const leaf_ty = trie.place_leaf_types[inst.operands.lhs];
+                        const is_leaf_copy = if (lookup.is_partial)
+                            (leaf_ty.isError() or
+                                type_system.classifyOwnershipTier(pool, sym_table, leaf_ty) == .copy_tier)
+                        else
+                            node_fl.is_copy;
+                        const is_shared_path = node_fl.is_behind_shared_ref or lookup.is_behind_shared_ref;
+                        if (!is_leaf_copy and (has_custom_drop_anc or is_shared_path or lookup.is_partial) and
                             !has_reported_path_diag[m_idx])
                         {
                             has_reported_path_diag[m_idx] = true;
@@ -11236,6 +13288,8 @@ fn runPass2TypestateNllAndDrops(
                                 inst_span,
                                 if (has_custom_drop_anc)
                                     "cannot move non-`Copy` field out of a type implementing custom `Drop`"
+                                else if (is_shared_path)
+                                    "cannot move non-`Copy` value out of a shared reference"
                                 else if (lookup.is_partial)
                                     "cannot move non-`Copy` element out of an indexed array or slice"
                                 else
@@ -12075,8 +14129,24 @@ fn runPass2TypestateNllAndDrops(
                     const mode = body.call_arg_modes.items[call_site.modes_start + arg_i];
                     const word = body.extra_args.items[call_site.args_start + arg_i];
                     if (extractArgBaseLocal(body, mode, word)) |arg_base| {
-                        if (arg_base < local_count and isArenaType(pool, sym_table, body.locals.items[arg_base].type_id)) {
-                            is_arena_local_used[arg_base] = true;
+                        if (arg_base < local_count) {
+                            if (isArenaType(pool, sym_table, body.locals.items[arg_base].type_id)) {
+                                is_arena_local_used[arg_base] = true;
+                            }
+                            const orig_loc = horizon.local_prov[arg_base].origin_local;
+                            if (!orig_loc.isNone() and orig_loc.asInt() < local_count and
+                                isOwnedArenaType(pool, sym_table, body.locals.items[orig_loc.asInt()].type_id))
+                            {
+                                is_arena_local_used[orig_loc.asInt()] = true;
+                            }
+                        }
+                    }
+                    if ((mode == .let_mode or mode == .sink_mode) and word < horizon.val_prov.len) {
+                        const orig_v = horizon.val_prov[word].origin_local;
+                        if (!orig_v.isNone() and orig_v.asInt() < local_count and
+                            isOwnedArenaType(pool, sym_table, body.locals.items[orig_v.asInt()].type_id))
+                        {
+                            is_arena_local_used[orig_v.asInt()] = true;
                         }
                     }
                 }
@@ -12553,6 +14623,33 @@ fn runPass2TypestateNllAndDrops(
     cur_contracts.ctx_alloc_slot_mask = ctx_alloc_slots;
     summary.setContractsScratch(cur_contracts);
     summaries[slot_idx] = summary;
+
+    // [2.22] Pass 2 single-pass lint rules (`W0334` redundant-move-clone & `W0335` string-concat-in-loop):
+    if (outcome.emitted_error_count == 0 and eff_config.diagnostic_sink != null and
+        !body.is_sast_default_probe and !body.is_sast_subscript_probe)
+    {
+        try auditBodyRedundantMoveCloneW0334(
+            arena_alloc,
+            body,
+            dom,
+            trie,
+            horizon,
+            pool,
+            sym_table,
+            interner_opt,
+            eff_config,
+            decl_fallback_span,
+        );
+        try auditBodyStringConcatInLoopW0335(
+            arena_alloc,
+            body,
+            dom,
+            pool,
+            sym_table,
+            eff_config,
+            decl_fallback_span,
+        );
+    }
 
     // [2.25] `SE-15` 3-Phase Parallel Assignment Pairwise Disjointness Verification (`E0305`):
     if (body.parallel_assign_groups.items.len > 0) {
@@ -21370,6 +23467,49 @@ fn runPass3SummaryContractsAndSandbox(
                     config,
                 );
             }
+            if (pass2_outcomes[s_usize].emitted_error_count == 0 and
+                pass4_outcomes[s_usize].emitted_error_count == 0 and
+                !body.is_sast_default_probe and !body.is_sast_subscript_probe)
+            {
+                try emitConversionPrefixMismatchW0207(
+                    body,
+                    sum,
+                    pool,
+                    sym_table,
+                    resolved_sym_idx,
+                    srec,
+                    body.file_id,
+                    config,
+                );
+                try emitTriviallyCopyPassByRefW0413(
+                    body,
+                    sum,
+                    &store,
+                    pool,
+                    sym_table,
+                    interner_opt,
+                    resolved_sym_idx,
+                    srec,
+                    body.file_id,
+                    config,
+                );
+            }
+        }
+        if (pass2_outcomes[s_usize].emitted_error_count == 0 and
+            pass4_outcomes[s_usize].emitted_error_count == 0 and
+            !body.is_sast_default_probe and !body.is_sast_subscript_probe)
+        {
+            try emitNondeterministicSimSourceW0332(
+                allocator,
+                bodies,
+                slot_idx,
+                &store,
+                sym_table,
+                interner_opt,
+                sym_opt,
+                decl_span,
+                config,
+            );
         }
 
         // Cross-thread `TaskGroup.spawn` (`is_local == 0`) `Send`/`Sync`, `@thread_local`, & opaque `Future` check (`E0309`):
@@ -22715,6 +24855,8 @@ pub fn lowerAndVerifySourceMirSast(
     if (merged_cfg.source_text == null) merged_cfg.source_text = source;
     if (merged_cfg.token_buffer == null) merged_cfg.token_buffer = &token_buffer;
     if (merged_cfg.cst_arena == null) merged_cfg.cst_arena = &cst_arena;
+    if (merged_cfg.ast_arena == null) merged_cfg.ast_arena = &ast_arena;
+    if (merged_cfg.interner_mut == null) merged_cfg.interner_mut = &interner;
 
     var sast_result = if (!active_sink.hasErrors())
         try analyzeAndElaborateMirModule(
@@ -22735,6 +24877,43 @@ pub fn lowerAndVerifySourceMirSast(
             .{},
         );
     errdefer if (!is_moved) sast_result.deinit();
+
+    // Filter standalone lint diagnostics through `SuppressionTable` so `@allow`/`@expect` work outside `CompilerDb`:
+    {
+        var line_idx = try lint_filter.LineIndex.build(allocator, source);
+        defer line_idx.deinit(allocator);
+        var sup_table = try lint_filter.extractFileSuppressionTable(
+            allocator,
+            file_id,
+            source,
+            &token_buffer,
+            &cst_arena,
+            &line_idx,
+        );
+        defer sup_table.deinit(allocator);
+        if (sup_table.any_suppressed_mask != 0) {
+            var tracker = try lint_filter.FulfillmentTracker.init(allocator, &sup_table);
+            defer tracker.deinit(allocator);
+            var write_idx: usize = 0;
+            for (active_sink.diagnostics.items) |diag_item| {
+                if (diag_item.code.asLintRuleId()) |rule_id| {
+                    if (lint_filter.isCandidateSuppressed(&sup_table, &tracker, .{
+                        .rule_id = rule_id,
+                        .start_byte = diag_item.primary_span.start_byte,
+                        .end_byte = diag_item.primary_span.end_byte,
+                    })) {
+                        if (diag_item.severity == .warning and active_sink.warning_count > 0) {
+                            active_sink.warning_count -= 1;
+                        }
+                        continue;
+                    }
+                }
+                active_sink.diagnostics.items[write_idx] = diag_item;
+                write_idx += 1;
+            }
+            active_sink.diagnostics.items.len = write_idx;
+        }
+    }
 
     is_moved = true;
     return .{

@@ -9520,6 +9520,156 @@ fn verifyAllConcreteBodiesMode(
 
 // ------------------------------------- PUBLIC API --------------------------------------
 
+/// Read-only O(N) audit of explicit `@inline` and `@inline(always)` functions for `W0501` (`inlining-budget-exceeded`)
+/// during `corex check` / `CompilerDb.verifySastMir` without cloning or splicing bodies (`DR-25` §2.2).
+pub fn auditInlineBudgetLintsForBodies(
+    allocator: std.mem.Allocator,
+    bodies: []const MirBody,
+    primary_count: usize,
+    sym_table: *const SymbolTable,
+    config: MirOptConfig,
+    sink: ?*DiagnosticSink,
+) !void {
+    const diag_sink = sink orelse return;
+    const limit = @min(primary_count, bodies.len);
+    if (limit == 0) return;
+
+    const directives = try allocator.alloc(InlineDirective, bodies.len);
+    defer allocator.free(directives);
+    var has_any_explicit = false;
+    for (bodies, 0..) |cand, idx| {
+        directives[idx] = extractInlineDirective(cand.def_id, cand.symbol_index, sym_table, config);
+        if (idx < limit and (directives[idx] == .inline_hint or directives[idx] == .inline_always)) {
+            has_any_explicit = true;
+        }
+    }
+    if (!has_any_explicit) return;
+
+    var body_map = try BodyDefMap.initFromBodies(allocator, bodies);
+    defer body_map.deinit(allocator);
+
+    for (bodies[0..limit], 0..) |*cand_body, idx| {
+        if (cand_body.is_sast_default_probe or cand_body.is_sast_subscript_probe) continue;
+        const dir = directives[idx];
+        if (dir != .inline_hint and dir != .inline_always) continue;
+        const pkg_id = sym_table.getFilePackageId(cand_body.file_id);
+        if (pkg_id != .root and pkg_id != .std_core) continue;
+
+        var resolved_sym = cand_body.symbol_index;
+        if (resolved_sym.isNone() and !cand_body.def_id.isNone()) {
+            resolved_sym = sym_table.def_to_symbol.get(cand_body.def_id.asInt()) orelse .none;
+        }
+        // Skip bare `@inline` functions already flagged as redundant by `W0333` (`!pub`, generic, or `= expr;`):
+        if (dir == .inline_hint and !resolved_sym.isNone() and resolved_sym.asInt() < sym_table.symbols.items.len) {
+            const srec = sym_table.getSymbol(resolved_sym).*;
+            if (!sym_table.isEffectivePubBoundary(resolved_sym) or
+                isGenericTemplateBody(cand_body, null, sym_table))
+            {
+                continue;
+            }
+            if (config.syntax_view) |syntax| {
+                if (!srec.cst_node.isNone() and srec.cst_node.asInt() < syntax.cst_arena.countNodes()) {
+                    const c_start: usize = srec.cst_node.asInt();
+                    const c_end: usize = @min(
+                        c_start + @max(@as(usize, syntax.cst_arena.getNode(srec.cst_node).subtree_size), 1),
+                        syntax.cst_arena.countNodes(),
+                    );
+                    var has_expr_body = false;
+                    var scan_c = c_start + 1;
+                    while (scan_c < c_end) : (scan_c += 1) {
+                        const sub_kind = syntax.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(scan_c))).kind;
+                        if (sub_kind == .fn_expr_body) {
+                            has_expr_body = true;
+                            break;
+                        }
+                        if (sub_kind == .block) break;
+                    }
+                    if (has_expr_body) continue;
+                }
+            }
+        }
+
+        const is_recursive = try hasCallGraphPath(allocator, bodies, &body_map, idx, idx, sym_table);
+        const cost = estimateInlineBodyCost(cand_body);
+        if (dir == .inline_always) {
+            if (!is_recursive) continue;
+        } else {
+            if (!is_recursive and cost <= INLINE_HINT_BUDGET) continue;
+        }
+
+        var span = if (!resolved_sym.isNone() and resolved_sym.asInt() < sym_table.symbols.items.len)
+            sym_table.getSymbol(resolved_sym).decl_span
+        else
+            Span.init(cand_body.file_id, 0, 0);
+        if (config.syntax_view) |syntax| {
+            if (!resolved_sym.isNone() and resolved_sym.asInt() < sym_table.symbols.items.len) {
+                const fn_sym = sym_table.getSymbol(resolved_sym).*;
+                if (!fn_sym.cst_node.isNone() and fn_sym.cst_node.asInt() < syntax.cst_arena.countNodes()) {
+                    const s_start: usize = fn_sym.cst_node.asInt();
+                    const s_end: usize = @min(
+                        s_start + @max(@as(usize, syntax.cst_arena.getNode(fn_sym.cst_node).subtree_size), 1),
+                        syntax.cst_arena.countNodes(),
+                    );
+                    var attr_cur = s_start + 1;
+                    while (attr_cur < s_end) : (attr_cur += 1) {
+                        const sub = syntax.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(attr_cur)));
+                        if (sub.kind == .fn_introducer or sub.kind == .block) break;
+                        if (sub.kind == .attribute) {
+                            const attr_end = @min(attr_cur + @max(@as(usize, sub.subtree_size), 1), s_end);
+                            var leaf_cur = attr_cur + 1;
+                            while (leaf_cur < attr_end) : (leaf_cur += 1) {
+                                const leaf = syntax.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(leaf_cur)));
+                                if (leaf.subtree_size <= 1 and !leaf.token.isNone() and
+                                    leaf.token.asInt() < syntax.tokens.countTokens())
+                                {
+                                    const lex = symbol_resolver.extractTokenSlice(syntax.source, syntax.tokens, leaf.token);
+                                    if (std.mem.eql(u8, lex, "inline")) {
+                                        if (symbol_resolver.computeCstSubtreeSpan(
+                                            cand_body.file_id,
+                                            syntax.tokens,
+                                            syntax.cst_arena,
+                                            CstNodeIndex.fromInt(@intCast(attr_cur)),
+                                        )) |attr_sp| {
+                                            span = attr_sp;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        const arena_alloc = diag_sink.arena.asAllocator();
+        const labels = try arena_alloc.alloc(LabeledSpan, 1);
+        labels[0] = .{
+            .span = span,
+            .label = if (dir == .inline_always)
+                "recursive `@inline(always)` function cannot be inlined"
+            else if (is_recursive)
+                "recursive `@inline` function cannot be inlined"
+            else
+                "`@inline` body exceeds instruction cost budget",
+            .style = .primary,
+        };
+        const notes = try arena_alloc.alloc([]const u8, 1);
+        notes[0] = "help: remove `@inline` or outline cold slow-path branches into a `@cold` helper";
+        try diag_sink.emit(.{
+            .code = .w0501_inlining_budget_exceeded,
+            .severity = .warning,
+            .primary_span = span,
+            .message = if (dir == .inline_always)
+                "cannot inline recursive `@inline(always)` function; keeping direct call"
+            else
+                "explicit `@inline` function exceeded inlining cost budget or recursion check",
+            .labels = labels,
+            .notes = notes,
+        });
+    }
+}
+
 /// Computes the canonical 16-byte `LayoutShapeKey` of `raw_ty` for `target_layout` (`DR-13` §5.3).
 pub fn computeLayoutShapeKey(
     pool: *const InternPool,
@@ -9776,7 +9926,7 @@ pub fn optimizeMirModule(
 
 // ---------------------------------------- MAIN -----------------------------------------
 
-test "LayoutShapeKey 16-byte layout invariant and pointer-shape classification" {
+test "test_mir_opt_layout_shape_key_16_byte_invariant_and_pointer_shape" {
     try std.testing.expectEqual(@as(usize, 1), @sizeOf(AbiPassClass));
     try std.testing.expectEqual(@as(usize, 1), @sizeOf(NicheKind));
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(LayoutShapeKey));
@@ -9802,7 +9952,7 @@ test "LayoutShapeKey 16-byte layout invariant and pointer-shape classification" 
     try std.testing.expectEqual(@as(u32, 4), shape_wasm.size_bytes);
 }
 
-test "mir_opt D1-D5 dev pipeline: @inline(always), unreachable 1/0 safety, ghost strip, and contextless promotion" {
+test "test_mir_opt_dev_pipeline_inline_always_div_zero_safety_ghost_strip_and_contextless" {
     const allocator = std.testing.allocator;
     const mir_vm = @import("mir_vm.zig");
 
@@ -9887,7 +10037,7 @@ test "mir_opt D1-D5 dev pipeline: @inline(always), unreachable 1/0 safety, ghost
     try std.testing.expectEqual(@as(i64, 27), out_val.slot.scalar_i64);
 }
 
-test "mir_opt R1-R6 release pipeline: W0501 budget warning, SROA, SCCP/GVN/DCE, and Wyhash ICF" {
+test "test_mir_opt_release_pipeline_w0501_budget_sroa_sccp_gvn_dce_and_wyhash_icf" {
     const allocator = std.testing.allocator;
     const mir_vm = @import("mir_vm.zig");
 

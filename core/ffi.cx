@@ -106,7 +106,7 @@ impl CStr {
     /| Constructs a `CStr` from a caller-proven non-null NUL-terminated byte pointer.
     @inline @no_alloc @no_panic
     pub unsafe fn from_ptr(ptr: *u8) -> CStr {
-        return CStr { ptr: ptr };
+        CStr { ptr }
     }
 
     /| Validates that `bytes` is non-empty and has its sole NUL byte at `bytes.len() - 1`.
@@ -126,19 +126,19 @@ impl CStr {
                 return .None;
             }
         }
-        return .Some(CStr { ptr: &raw bytes[0] });
+        .Some(CStr { ptr: &raw bytes[0] })
     }
 
     /| Returns the underlying raw `*u8` byte pointer.
     @inline @no_alloc @no_panic
     pub fn as_ptr(&self) -> *u8 {
-        return self.ptr;
+        self.ptr
     }
 
     /| Returns the underlying pointer typed as target `*c_char` (`const char*`).
     @inline @no_alloc @no_panic
     pub fn as_c_char_ptr(&self) -> *c_char {
-        return self.ptr as *c_char;
+        self.ptr as *c_char
     }
 
     /| Computes the byte length (`strlen`) preceding the trailing `0_u8` NUL byte.
@@ -154,7 +154,7 @@ impl CStr {
                 byte_count = byte_count +% 1;
             }
         }
-        return byte_count;
+        byte_count
     }
 
     /| Returns `true` when `self` has zero content bytes before the trailing NUL byte.
@@ -163,8 +163,8 @@ impl CStr {
         if self.ptr == @default_init[*u8]() {
             return true;
         }
-        return unsafe {
+        unsafe {
             self.ptr.* == CSTR_NUL_TERMINATOR
-        };
+        }
     }
 }

@@ -33,7 +33,7 @@ test "test_diagnostic_severity_and_catalog_code_resolution" {
     try std.testing.expectEqualStrings("note", Severity.info.asLabel());
     try std.testing.expectEqualStrings("help", Severity.help.asLabel());
 
-    try std.testing.expectEqual(@as(usize, 146), diag.DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 182), diag.DIAGNOSTIC_CATALOG.len);
     try std.testing.expectEqual(DiagnosticCode.w0119_useless_format_string, DiagnosticCode.fromCodeStr("W0119").?);
     try std.testing.expectEqual(DiagnosticCode.w0120_uninterpolated_fmt_placeholder, DiagnosticCode.fromCodeStr("W0120").?);
     try std.testing.expectEqual(DiagnosticCode.w0202_non_idiomatic_construct, DiagnosticCode.fromCodeStr("W0202").?);

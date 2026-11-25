@@ -259,12 +259,13 @@ pub const DiagnosticRenderer = struct {
 
     // Internal rendering helpers:
 
-    /// Writes the top-level `<glyph> <severity>[<code>]: <message>` line.
+    /// Writes the top-level `<glyph> <severity>[<code>[/<slug>]]: <message>` line.
     fn writeHeaderLine(
         self: DiagnosticRenderer,
         writer: *std.Io.Writer,
         diagnostic: Diagnostic,
     ) std.Io.Writer.Error!void {
+        const opt_rule_id = diagnostic.code.asLintRuleId();
         if (self.style_config.is_color_enabled) {
             try writer.writeAll(diagnostic.severity.asStyleRole().asAnsiPrefix());
             try writer.writeAll(diagnostic.severity.asStatusGlyph());
@@ -272,6 +273,10 @@ pub const DiagnosticRenderer = struct {
             try writer.writeAll(diagnostic.severity.asLabel());
             try writer.writeByte('[');
             try writer.writeAll(diagnostic.code.asCodeStr());
+            if (opt_rule_id) |rule_id| {
+                try writer.writeByte('/');
+                try writer.writeAll(rule_id.asSlug());
+            }
             try writer.writeByte(']');
             try writer.writeAll(style.Sgr.RESET);
             try writer.writeAll(style.Sgr.BOLD);
@@ -279,6 +284,14 @@ pub const DiagnosticRenderer = struct {
             try writer.writeAll(diagnostic.message);
             try writer.writeAll(style.Sgr.RESET);
             try writer.writeByte('\n');
+        } else if (opt_rule_id) |rule_id| {
+            try writer.print("{s} {s}[{s}/{s}]: {s}\n", .{
+                diagnostic.severity.asStatusGlyph(),
+                diagnostic.severity.asLabel(),
+                diagnostic.code.asCodeStr(),
+                rule_id.asSlug(),
+                diagnostic.message,
+            });
         } else {
             try writer.print("{s} {s}[{s}]: {s}\n", .{
                 diagnostic.severity.asStatusGlyph(),
@@ -515,9 +528,7 @@ pub const DiagnosticRenderer = struct {
                 try self.style_config.writeStyled(writer, .dim, "├╴ ");
                 try self.style_config.writeStyled(writer, .help, "help");
                 try writer.print(": {s}\n", .{fix_item.message});
-                for (fix_item.edits) |edit_item| {
-                    try self.renderEditDiffLines(writer, gutter_width, edit_item);
-                }
+                try self.renderFixDiffGroups(writer, gutter_width, fix_item.edits);
                 has_open_diff_box = true;
             } else {
                 try writer.splatByteAll(' ', gutter_width + 1);
@@ -544,6 +555,90 @@ pub const DiagnosticRenderer = struct {
             try writer.splatByteAll(' ', gutter_width + 1);
             try self.style_config.writeStyled(writer, .dim, "╰───────");
             try writer.writeByte('\n');
+        }
+    }
+
+    /// Coalesces non-overlapping `TextEdit`s targeting the same physical source line into a single `-`/`+` diff pair.
+    fn renderFixDiffGroups(
+        self: DiagnosticRenderer,
+        writer: *std.Io.Writer,
+        gutter_width: usize,
+        edits: []const TextEdit,
+    ) !void {
+        var idx: usize = 0;
+        while (idx < edits.len) {
+            const first_edit = edits[idx];
+            if (first_edit.file_id.isNone() or
+                first_edit.replacement_id.isNone() or
+                first_edit.replacement_id.asInt() >= self.interner.countStrings() or
+                first_edit.start_byte > first_edit.end_byte)
+            {
+                idx += 1;
+                continue;
+            }
+            const source = self.source_map.getFileSource(first_edit.file_id) orelse {
+                idx += 1;
+                continue;
+            };
+            const line_index = try self.source_map.getLineIndex(first_edit.file_id);
+            const start_loc = line_index.resolveLineCol(source, first_edit.start_byte);
+            const line_bounds = line_index.getLineBounds(source, start_loc.line - 1);
+
+            var run_end = idx + 1;
+            if (first_edit.end_byte <= line_bounds.end) {
+                var prev_end = first_edit.end_byte;
+                while (run_end < edits.len) {
+                    const next_ed = edits[run_end];
+                    if (next_ed.file_id != first_edit.file_id or
+                        next_ed.replacement_id.isNone() or
+                        next_ed.replacement_id.asInt() >= self.interner.countStrings() or
+                        next_ed.start_byte < prev_end or
+                        next_ed.start_byte > next_ed.end_byte or
+                        next_ed.end_byte > line_bounds.end)
+                    {
+                        break;
+                    }
+                    const next_loc = line_index.resolveLineCol(source, next_ed.start_byte);
+                    if (next_loc.line != start_loc.line) break;
+                    prev_end = next_ed.end_byte;
+                    run_end += 1;
+                }
+            }
+
+            if (run_end == idx + 1) {
+                try self.renderEditDiffLines(writer, gutter_width, first_edit);
+            } else {
+                const original_line = source[line_bounds.start..line_bounds.end];
+                const line_digits = countDigitsBase10(start_loc.line);
+                if (gutter_width > line_digits) {
+                    try writer.splatByteAll(' ', gutter_width - line_digits);
+                }
+                try writer.print("{d} ", .{start_loc.line});
+                try self.style_config.writeStyled(writer, .diff_remove, "- ");
+                try self.style_config.writeStyled(writer, .diff_remove, original_line);
+                try writer.writeByte('\n');
+
+                if (gutter_width > line_digits) {
+                    try writer.splatByteAll(' ', gutter_width - line_digits);
+                }
+                try writer.print("{d} ", .{start_loc.line});
+                try self.style_config.writeStyled(writer, .diff_add, "+ ");
+                var cursor_in_line: usize = 0;
+                for (edits[idx..run_end]) |ged| {
+                    const rel_s = @min(@as(usize, ged.start_byte -| line_bounds.start), original_line.len);
+                    const rel_e = @min(@as(usize, ged.end_byte -| line_bounds.start), original_line.len);
+                    if (rel_s > cursor_in_line) {
+                        try self.style_config.writeStyled(writer, .diff_add, original_line[cursor_in_line..rel_s]);
+                    }
+                    try self.style_config.writeStyled(writer, .diff_add, self.interner.get(ged.replacement_id));
+                    cursor_in_line = @max(cursor_in_line, rel_e);
+                }
+                if (cursor_in_line < original_line.len) {
+                    try self.style_config.writeStyled(writer, .diff_add, original_line[cursor_in_line..]);
+                }
+                try writer.writeByte('\n');
+            }
+            idx = run_end;
         }
     }
 
@@ -696,4 +791,39 @@ test "test_renderer_docs_skill_canonical_single_line_format" {
         "   │\n" ++
         "   ╰─▸ help: pass a borrowed view via `buffer.as_slice()` if `consume_payload` does not retain ownership\n";
     try std.testing.expectEqualStrings(expected, out_writer.buffered());
+}
+
+test "test_renderer_bijective_lint_slug_header_and_non_lint_warnings" {
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var source_map = VfsSourceMap.init(std.testing.allocator, &interner);
+    defer source_map.deinit(std.testing.io);
+
+    const renderer_inst = DiagnosticRenderer.init(&source_map, &interner, StyleConfig.MONOCHROME);
+
+    // [1] Built-in lint rule renders `[W0203/single-char-ident]`:
+    var lint_buf: [512]u8 = undefined;
+    var lint_writer = std.Io.Writer.fixed(&lint_buf);
+    try renderer_inst.renderDiagnostic(&lint_writer, .{
+        .code = .w0203_single_char_ident,
+        .severity = .warning,
+        .message = "single-letter identifier `c` obscures intent",
+    });
+    try std.testing.expectEqualStrings(
+        "⚠︎ warning[W0203/single-char-ident]: single-letter identifier `c` obscures intent\n",
+        lint_writer.buffered(),
+    );
+
+    // [2] Non-lint subsystem warning (`W0314`) preserves `[W0314]` without a slug:
+    var non_lint_buf: [512]u8 = undefined;
+    var non_lint_writer = std.Io.Writer.fixed(&non_lint_buf);
+    try renderer_inst.renderDiagnostic(&non_lint_writer, .{
+        .code = .w0314_unproven_bounds_access,
+        .severity = .warning,
+        .message = "bounds not statically discharged",
+    });
+    try std.testing.expectEqualStrings(
+        "⚠︎ warning[W0314]: bounds not statically discharged\n",
+        non_lint_writer.buffered(),
+    );
 }

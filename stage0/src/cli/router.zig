@@ -17,6 +17,7 @@ const diag = @import("../diag/diagnostic.zig");
 const renderer = @import("../diag/renderer.zig");
 const bench_harness = @import("../bench/harness.zig");
 const fmt_engine = @import("../fmt_engine.zig");
+const lint_filter = @import("../lint_filter.zig");
 const check_audit = @import("../check_audit.zig");
 const upgrade_engine = @import("../upgrade_engine.zig");
 const upgrade_rules = @import("../upgrade_rules.zig");
@@ -145,10 +146,18 @@ pub const CheckFlagId = enum(u8) {
     caps = 0,
     /// `--deny-warnings` – treat all compiler and lint warnings as fatal errors (`1`).
     deny_warnings = 1,
-    /// `--explain-caps[=<pkg[,cap]>]` – render shortest call-chain capability witnesses (`2`).
-    explain_caps = 2,
-    /// `--fix` – apply machine-applicable compiler and lint autofixes (`3`).
-    fix = 3,
+    /// `--disable=<rule,…>` – disable specific lint rules for this invocation (`2`).
+    disable = 2,
+    /// `--explain-caps[=<pkg[,cap]>]` – render shortest call-chain capability witnesses (`3`).
+    explain_caps = 3,
+    /// `--fix` – apply machine-applicable compiler and lint autofixes (`4`).
+    fix = 4,
+    /// `--fix-unsafe` – apply both machine-applicable and unsafe (`MaybeIncorrect`) autofixes (`5`).
+    fix_unsafe = 5,
+    /// `--only=<rule,…>` – run exclusively the specified lint rules (`6`).
+    only = 6,
+    /// `--unsafe-fixes` – include unsafe (`MaybeIncorrect`) autofixes when paired with `--fix` (`7`).
+    unsafe_fixes = 7,
 };
 
 /// Static metadata entry in `CHECK_FLAGS` describing `corex check` flags.
@@ -415,6 +424,10 @@ pub const ExecuteSubcommandAction = struct {
     explain_caps_pkg: ?[]const u8 = null,
     /// Optional `[cap]` filter extracted from `--explain-caps=<pkg[,cap]>`.
     explain_caps_cap: ?[]const u8 = null,
+    /// Whether unsafe (`MaybeIncorrect`) lint fixes are enabled (`--fix-unsafe` or `--fix --unsafe-fixes`).
+    allow_unsafe_fixes: bool = false,
+    /// Ephemeral `--only` / `--disable` lint rule bitmasks passed to `corex check` (`DR-25` §3.3).
+    cli_lint_filter: lint_filter.CliLintFilter = .{},
     /// Whether `corex upgrade --list` was requested.
     is_upgrade_list: bool = false,
     /// Optional rule ID passed to `corex upgrade --explain=<rule>`.
@@ -527,6 +540,10 @@ pub const ParsedCommand = struct {
     explain_caps_pkg: ?[]const u8 = null,
     /// Optional `[cap]` filter extracted from `--explain-caps=<pkg[,cap]>`.
     explain_caps_cap: ?[]const u8 = null,
+    /// Whether unsafe (`MaybeIncorrect`) lint fixes are enabled (`--fix-unsafe` or `--fix --unsafe-fixes`).
+    allow_unsafe_fixes: bool = false,
+    /// Ephemeral `--only` / `--disable` lint rule bitmasks passed to `corex check` (`DR-25` §3.3).
+    cli_lint_filter: lint_filter.CliLintFilter = .{},
     /// Whether `corex upgrade --list` was requested.
     is_upgrade_list: bool = false,
     /// Optional rule ID passed to `corex upgrade --explain=<rule>`.
@@ -670,7 +687,7 @@ pub const FMT_FLAGS = [_]FmtFlagDescriptor{
     },
 };
 
-/// Canonical alphabetical `corex check` option table (`DR-14` & `DR-17`).
+/// Canonical alphabetical `corex check` option table (`DR-14`, `DR-17`, & `DR-25` §3.3).
 pub const CHECK_FLAGS = [_]CheckFlagDescriptor{
     .{
         .id = .caps,
@@ -683,6 +700,12 @@ pub const CHECK_FLAGS = [_]CheckFlagDescriptor{
         .summary = "Treat all compiler and lint warnings as fatal errors",
     },
     .{
+        .id = .disable,
+        .long_flag = "--disable",
+        .value_suffix = "=<rule,…>",
+        .summary = "Disable specific lint rules (`kebab-case` slug or `W0xxx` code)",
+    },
+    .{
         .id = .explain_caps,
         .long_flag = "--explain-caps",
         .value_suffix = "[=<pkg[,cap]>]",
@@ -692,6 +715,22 @@ pub const CHECK_FLAGS = [_]CheckFlagDescriptor{
         .id = .fix,
         .long_flag = "--fix",
         .summary = "Apply machine-applicable compiler and lint autofixes",
+    },
+    .{
+        .id = .fix_unsafe,
+        .long_flag = "--fix-unsafe",
+        .summary = "Apply both machine-applicable and unsafe (`MaybeIncorrect`) autofixes",
+    },
+    .{
+        .id = .only,
+        .long_flag = "--only",
+        .value_suffix = "=<rule,…>",
+        .summary = "Run exclusively the specified lint rules (`kebab-case` slug or `W0xxx`)",
+    },
+    .{
+        .id = .unsafe_fixes,
+        .long_flag = "--unsafe-fixes",
+        .summary = "Include unsafe (`MaybeIncorrect`) autofixes when paired with `--fix`",
     },
 };
 
@@ -1610,6 +1649,58 @@ fn countWarningsInSink(sink: *const DiagnosticSink) u32 {
     return count;
 }
 
+/// Renders `sink` for non-`check` compile subcommands while honoring `EffectiveFileRules` and `SuppressionTable`.
+fn renderBuildSinkFiltered(
+    allocator: std.mem.Allocator,
+    db: *query_db.CompilerDb,
+    file_id: mem.FileId,
+    sink: *const DiagnosticSink,
+    diag_renderer: DiagnosticRenderer,
+    stderr_writer: *std.Io.Writer,
+    has_errors_io: *bool,
+    warning_count_io: *u32,
+) !void {
+    if (sink.diagnostics.items.len == 0) return;
+    if (!db.isLintTargetFile(file_id)) {
+        var non_lint_sink = DiagnosticSink.init(allocator);
+        defer non_lint_sink.deinit();
+        for (sink.diagnostics.items) |diag_item| {
+            if (diag_item.code.asLintRuleId() != null) continue;
+            try non_lint_sink.emit(diag_item);
+        }
+        if (non_lint_sink.diagnostics.items.len > 0) {
+            try diag_renderer.renderAll(stderr_writer, &non_lint_sink);
+            if (non_lint_sink.hasErrors()) has_errors_io.* = true;
+            warning_count_io.* +|= countWarningsInSink(&non_lint_sink);
+        }
+        return;
+    }
+
+    const eff_rules = try db.effectiveFileRules(file_id);
+    const sup_table = try db.suppressionTable(file_id);
+    var tracker = try lint_filter.FulfillmentTracker.init(allocator, sup_table);
+    defer tracker.deinit(allocator);
+    var filtered_sink = DiagnosticSink.init(allocator);
+    defer filtered_sink.deinit();
+
+    for (sink.diagnostics.items) |diag_item| {
+        if (diag_item.code.asLintRuleId()) |rule_id| {
+            if (!eff_rules.isEnabled(rule_id)) continue;
+            if (lint_filter.isCandidateSuppressed(sup_table, &tracker, .{
+                .rule_id = rule_id,
+                .start_byte = diag_item.primary_span.start_byte,
+                .end_byte = diag_item.primary_span.end_byte,
+            })) continue;
+        }
+        try filtered_sink.emit(diag_item);
+    }
+    if (filtered_sink.diagnostics.items.len > 0) {
+        try diag_renderer.renderAll(stderr_writer, &filtered_sink);
+        if (filtered_sink.hasErrors()) has_errors_io.* = true;
+        warning_count_io.* +|= countWarningsInSink(&filtered_sink);
+    }
+}
+
 /// Verifies all reachable module files from `root_files`, renders diagnostics, and returns `(has_errors, warning_count)`.
 fn verifyAndRenderModuleDiagnosticsWithWarnings(
     allocator: std.mem.Allocator,
@@ -1627,27 +1718,7 @@ fn verifyAndRenderModuleDiagnosticsWithWarnings(
 
     var has_errors = false;
     var warning_count: u32 = 0;
-    for (reachable_files.items) |mod_fid| {
-        const parsed_art = try db.parseCst(mod_fid);
-        if (parsed_art.diagnostics.diagnostics.items.len > 0) {
-            try diag_renderer.renderAll(stderr_writer, &parsed_art.diagnostics);
-            if (parsed_art.diagnostics.hasErrors()) has_errors = true;
-            warning_count +|= countWarningsInSink(&parsed_art.diagnostics);
-        }
 
-        const sig_err_count = (try db.resolveSignatures(mod_fid)).error_count;
-        if (db.getSignatureDiagnostics(mod_fid)) |sig_sink| {
-            if (sig_sink.diagnostics.items.len > 0) {
-                try diag_renderer.renderAll(stderr_writer, sig_sink);
-                warning_count +|= countWarningsInSink(sig_sink);
-            }
-            if (sig_sink.hasErrors()) has_errors = true;
-        }
-        if (sig_err_count > 0) has_errors = true;
-    }
-
-    var active_defs: std.ArrayListUnmanaged(query_db.DefId) = .empty;
-    defer active_defs.deinit(allocator);
     if (is_check_only) {
         var has_std_core_root = false;
         for (root_files) |rfid| {
@@ -1660,46 +1731,164 @@ fn verifyAndRenderModuleDiagnosticsWithWarnings(
             var explicit_files: std.ArrayListUnmanaged(mem.FileId) = .empty;
             defer explicit_files.deinit(allocator);
             try db.collectExplicitModSubtreeFiles(root_files, &explicit_files);
-            for (explicit_files.items) |target_fid| {
-                const tree = try db.extractItemTree(target_fid);
-                try active_defs.ensureUnusedCapacity(allocator, tree.entries.len);
-                for (tree.entries) |entry| {
-                    active_defs.appendAssumeCapacity(entry.def_id);
+            try db.setExplicitLintTargetFiles(explicit_files.items);
+        }
+
+        for (reachable_files.items) |mod_fid| {
+            if (has_std_core_root and !db.isLintTargetFile(mod_fid)) {
+                const parsed_art = try db.parseCst(mod_fid);
+                if (parsed_art.diagnostics.hasErrors()) {
+                    try diag_renderer.renderAll(stderr_writer, &parsed_art.diagnostics);
+                    has_errors = true;
                 }
+                const sig_err_count = (try db.resolveSignatures(mod_fid)).error_count;
+                if (db.getSignatureDiagnostics(mod_fid)) |sig_sink| {
+                    if (sig_sink.hasErrors()) {
+                        try diag_renderer.renderAll(stderr_writer, sig_sink);
+                        has_errors = true;
+                    }
+                }
+                if (sig_err_count > 0) has_errors = true;
+                continue;
             }
-        } else {
-            for (reachable_files.items) |mod_fid| {
-                if (db.getFilePackageId(mod_fid) == .std_core) continue;
-                const tree = try db.extractItemTree(mod_fid);
-                try active_defs.ensureUnusedCapacity(allocator, tree.entries.len);
-                for (tree.entries) |entry| {
-                    active_defs.appendAssumeCapacity(entry.def_id);
+            if (!has_std_core_root and db.getFilePackageId(mod_fid) == .std_core and !db.isLintTargetFile(mod_fid)) {
+                const parsed_art = try db.parseCst(mod_fid);
+                if (parsed_art.diagnostics.hasErrors()) {
+                    try diag_renderer.renderAll(stderr_writer, &parsed_art.diagnostics);
+                    has_errors = true;
+                }
+                const sig_err_count = (try db.resolveSignatures(mod_fid)).error_count;
+                if (db.getSignatureDiagnostics(mod_fid)) |sig_sink| {
+                    if (sig_sink.hasErrors()) {
+                        try diag_renderer.renderAll(stderr_writer, sig_sink);
+                        has_errors = true;
+                    }
+                }
+                if (sig_err_count > 0) has_errors = true;
+                continue;
+            }
+
+            const proj_sink = try db.projectFileDiagnostics(mod_fid);
+            if (proj_sink.diagnostics.items.len > 0) {
+                try diag_renderer.renderAll(stderr_writer, proj_sink);
+                warning_count +|= countWarningsInSink(proj_sink);
+            }
+            if (proj_sink.hasErrors()) {
+                has_errors = true;
+                continue;
+            }
+
+            var entry_idx: usize = 0;
+            while (entry_idx < (try db.extractItemTree(mod_fid)).entries.len) : (entry_idx += 1) {
+                const entry = (try db.extractItemTree(mod_fid)).entries[entry_idx];
+                if (entry.kind == .const_decl or entry.kind == .extern_block) {
+                    const ct_art_opt: ?query_db.ComptimeEvalArtifact =
+                        db.evalComptimeDef(entry.def_id) catch |ct_err| switch (ct_err) {
+                            error.OutOfMemory => return error.OutOfMemory,
+                            else => blk: {
+                                has_errors = true;
+                                break :blk null;
+                            },
+                        };
+                    if (db.getComptimeDiagnostics(entry.def_id)) |ct_sink| {
+                        if (ct_sink.diagnostics.items.len > 0) {
+                            try diag_renderer.renderAll(stderr_writer, ct_sink);
+                            warning_count +|= countWarningsInSink(ct_sink);
+                        }
+                        if (ct_sink.hasErrors()) has_errors = true;
+                    }
+                    if (ct_art_opt) |ct_art| {
+                        if (ct_art.has_errors) has_errors = true;
+                    }
                 }
             }
         }
-    } else {
-        try db.collectActiveModuleDefIds(allocator, root_files, reachable_files.items, &active_defs);
+        return .{ .has_errors = has_errors, .warning_count = warning_count };
     }
 
+    for (reachable_files.items) |mod_fid| {
+        const parsed_art = try db.parseCst(mod_fid);
+        try renderBuildSinkFiltered(
+            allocator,
+            db,
+            mod_fid,
+            &parsed_art.diagnostics,
+            diag_renderer,
+            stderr_writer,
+            &has_errors,
+            &warning_count,
+        );
+        if (parsed_art.diagnostics.hasErrors()) has_errors = true;
+
+        if (db.isLintTargetFile(mod_fid)) {
+            const sup_table = try db.suppressionTable(mod_fid);
+            if (sup_table.directive_errors.len > 0) {
+                has_errors = true;
+                var dir_err_sink = DiagnosticSink.init(allocator);
+                defer dir_err_sink.deinit();
+                try lint_filter.emitDirectiveErrorsIntoSink(
+                    try db.getSourceText(mod_fid),
+                    mod_fid,
+                    sup_table,
+                    &dir_err_sink,
+                );
+                try diag_renderer.renderAll(stderr_writer, &dir_err_sink);
+            }
+        }
+
+        const sig_err_count = (try db.resolveSignatures(mod_fid)).error_count;
+        if (db.getSignatureDiagnostics(mod_fid)) |sig_sink| {
+            try renderBuildSinkFiltered(
+                allocator,
+                db,
+                mod_fid,
+                sig_sink,
+                diag_renderer,
+                stderr_writer,
+                &has_errors,
+                &warning_count,
+            );
+            if (sig_sink.hasErrors()) has_errors = true;
+        }
+        if (sig_err_count > 0) has_errors = true;
+    }
+
+    var active_defs: std.ArrayListUnmanaged(query_db.DefId) = .empty;
+    defer active_defs.deinit(allocator);
+    try db.collectActiveModuleDefIds(allocator, root_files, reachable_files.items, &active_defs);
+
     for (active_defs.items) |active_def_id| {
-        const item_tree = try db.extractItemTree(active_def_id.fileId());
+        const def_fid = active_def_id.fileId();
+        const item_tree = try db.extractItemTree(def_fid);
         const entry = item_tree.getEntry(active_def_id) orelse continue;
         const body_err_count = (try db.typecheckBody(entry.def_id)).error_count;
         if (db.getBodyDiagnostics(entry.def_id)) |body_sink| {
-            if (body_sink.diagnostics.items.len > 0) {
-                try diag_renderer.renderAll(stderr_writer, body_sink);
-                warning_count +|= countWarningsInSink(body_sink);
-            }
+            try renderBuildSinkFiltered(
+                allocator,
+                db,
+                def_fid,
+                body_sink,
+                diag_renderer,
+                stderr_writer,
+                &has_errors,
+                &warning_count,
+            );
             if (body_sink.hasErrors()) has_errors = true;
         }
         if (body_err_count > 0) has_errors = true;
 
         const is_verified_sound = (try db.verifySastMir(entry.def_id)).is_verified_sound;
         if (db.getSastDiagnostics(entry.def_id)) |sast_sink| {
-            if (sast_sink.diagnostics.items.len > 0) {
-                try diag_renderer.renderAll(stderr_writer, sast_sink);
-                warning_count +|= countWarningsInSink(sast_sink);
-            }
+            try renderBuildSinkFiltered(
+                allocator,
+                db,
+                def_fid,
+                sast_sink,
+                diag_renderer,
+                stderr_writer,
+                &has_errors,
+                &warning_count,
+            );
             if (sast_sink.hasErrors()) has_errors = true;
         }
         if (!is_verified_sound) has_errors = true;
@@ -1714,10 +1903,16 @@ fn verifyAndRenderModuleDiagnosticsWithWarnings(
                     },
                 };
             if (db.getComptimeDiagnostics(entry.def_id)) |ct_sink| {
-                if (ct_sink.diagnostics.items.len > 0) {
-                    try diag_renderer.renderAll(stderr_writer, ct_sink);
-                    warning_count +|= countWarningsInSink(ct_sink);
-                }
+                try renderBuildSinkFiltered(
+                    allocator,
+                    db,
+                    def_fid,
+                    ct_sink,
+                    diag_renderer,
+                    stderr_writer,
+                    &has_errors,
+                    &warning_count,
+                );
                 if (ct_sink.hasErrors()) has_errors = true;
             }
             if (ct_art_opt) |ct_art| {
@@ -1797,10 +1992,11 @@ fn renderOptionLine(
         flag_writer.writeAll(suffix_str) catch unreachable;
     }
     const formatted_flag = flag_writer.buffered();
+    const visual_cols = std.unicode.utf8CountCodepoints(formatted_flag) catch formatted_flag.len;
     try writer.writeAll("  ");
     try style_config.writeStyled(writer, .bold, formatted_flag);
-    if (formatted_flag.len < col_width) {
-        try writer.splatByteAll(' ', col_width - formatted_flag.len);
+    if (visual_cols < col_width) {
+        try writer.splatByteAll(' ', col_width - visual_cols);
     } else {
         try writer.writeByte(' ');
     }
@@ -2501,6 +2697,14 @@ fn executePackageOrScriptWorkflow(
     db.setEmbedSandbox(manifest_bundle.workspace_root_dir, null);
     db.setEmbedIo(io);
     db.setTargetSpec(active_target);
+    db.setCliLintFilter(exec_info.cli_lint_filter);
+    try db.setPackageLintSemanticSettings(.root, manifest_bundle.root_manifest.lint.settings, interner);
+    try db.setPackageLintFilterConfig(
+        .root,
+        manifest_bundle.workspace_root_dir,
+        manifest_bundle.root_manifest.lint,
+        interner,
+    );
 
     if (exec_info.c_defines.len > 0 or exec_info.include_dirs.len > 0) {
         var raw_defs: std.ArrayListUnmanaged([]u8) = .empty;
@@ -3046,6 +3250,42 @@ fn executePackageOrScriptWorkflow(
             node_root_fid,
         );
         try db.symbol_table.markPackageDepsConfigured(pkg_node.pkg_id);
+
+        if (pkg_node.pkg_id == .root) {
+            var active_root_manifest: *const pkg_manifest.Manifest = &manifest_bundle.root_manifest;
+            if (active_root_manifest.package == null) {
+                for (manifest_bundle.members) |*ws_mem| {
+                    if (ws_mem.manifest.package) |mem_pkg| {
+                        if (std.mem.eql(u8, interner.get(mem_pkg.name_kebab), pkg_node.canonical_name)) {
+                            active_root_manifest = &ws_mem.manifest;
+                            break;
+                        }
+                    }
+                }
+            }
+            try db.setPackageLintSemanticSettings(.root, active_root_manifest.lint.settings, interner);
+            try db.setPackageLintFilterConfig(
+                .root,
+                pkg_node.package_root_path,
+                active_root_manifest.lint,
+                interner,
+            );
+        } else if (pkg_node.source_kind == .workspace_member) {
+            for (manifest_bundle.members) |*ws_mem| {
+                if (ws_mem.manifest.package) |mem_pkg| {
+                    if (std.mem.eql(u8, interner.get(mem_pkg.name_kebab), pkg_node.canonical_name)) {
+                        try db.setPackageLintSemanticSettings(pkg_node.pkg_id, ws_mem.manifest.lint.settings, interner);
+                        try db.setPackageLintFilterConfig(
+                            pkg_node.pkg_id,
+                            ws_mem.abs_dir,
+                            ws_mem.manifest.lint,
+                            interner,
+                        );
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     // Bind per-package dependency edges `(caller_pkg, alias_sym) -> target_root_fid` and build `WorkspacePackageEdge`s:
@@ -3124,12 +3364,20 @@ fn executePackageOrScriptWorkflow(
             }
         }
     }
+    var fix_candidate_slices: std.ArrayListUnmanaged(mem.FileId) = .empty;
+    defer fix_candidate_slices.deinit(allocator);
+    for (all_verify_slices.items) |cand_fid| {
+        if (db.isLintTargetFile(cand_fid)) {
+            try fix_candidate_slices.append(allocator, cand_fid);
+        }
+    }
     const check_fix_report: ?check_audit.CheckFixReport = if (exec_info.subcommand == .check and exec_info.is_fix_mode)
         try check_audit.applyCheckFixesOnDb(allocator, &db, .{
             .io = io,
             .vfs = source_map,
             .is_writing_to_disk = true,
-            .candidate_files = root_verify_slices.items,
+            .allow_unsafe_fixes = exec_info.allow_unsafe_fixes,
+            .candidate_files = fix_candidate_slices.items,
         })
     else
         null;
@@ -4849,6 +5097,116 @@ fn executeUpgradeSubcommand(
     };
 }
 
+/// Parses a comma-separated `--disable=<r1,r2>` or `--only=<r1,r2>` rule list into `filter_io` (`E0019` on error).
+fn parseCliLintSelectorCsv(
+    arena_alloc: std.mem.Allocator,
+    flag_name: []const u8,
+    raw_csv: []const u8,
+    is_only_mode: bool,
+    filter_io: *lint_filter.CliLintFilter,
+    sink: *DiagnosticSink,
+) !void {
+    var seg_iter = std.mem.splitScalar(u8, raw_csv, ',');
+    while (seg_iter.next()) |raw_seg| {
+        const seg = std.mem.trim(u8, raw_seg, " \t");
+        if (seg.len == 0) {
+            try sink.emit(.{
+                .code = .e0019_invalid_lint_rule_or_glob,
+                .severity = .err,
+                .message = try std.fmt.allocPrint(
+                    arena_alloc,
+                    "empty lint rule selector in `{s}`",
+                    .{flag_name},
+                ),
+            });
+            continue;
+        }
+        switch (diag.lookupLintRuleBySelector(seg)) {
+            .rule => |rule_id| {
+                if (is_only_mode) {
+                    filter_io.has_only = true;
+                    filter_io.only_mask |= rule_id.bit();
+                } else {
+                    filter_io.disable_mask |= rule_id.bit();
+                }
+            },
+            .forbidden_category_or_wildcard => {
+                try sink.emit(.{
+                    .code = .e0019_invalid_lint_rule_or_glob,
+                    .severity = .err,
+                    .message = try std.fmt.allocPrint(
+                        arena_alloc,
+                        "category or wildcard selector `{s}` is forbidden in `{s}`; list explicit rule slugs or `W0xxx` codes",
+                        .{ seg, flag_name },
+                    ),
+                });
+            },
+            .non_suppressible_error_code => {
+                try sink.emit(.{
+                    .code = .e0019_invalid_lint_rule_or_glob,
+                    .severity = .err,
+                    .message = try std.fmt.allocPrint(
+                        arena_alloc,
+                        "compiler error `{s}` cannot be filtered or disabled via `{s}`",
+                        .{ seg, flag_name },
+                    ),
+                });
+            },
+            .non_suppressible_subsystem_warning => {
+                try sink.emit(.{
+                    .code = .e0019_invalid_lint_rule_or_glob,
+                    .severity = .err,
+                    .message = try std.fmt.allocPrint(
+                        arena_alloc,
+                        "non-lint subsystem warning `{s}` cannot be filtered via `{s}`",
+                        .{ seg, flag_name },
+                    ),
+                });
+            },
+            .unknown => {
+                const notes_slice: []const []const u8 = if (diag.suggestClosestLintRule(seg)) |closest| blk: {
+                    const help_arr = try arena_alloc.alloc([]const u8, 1);
+                    help_arr[0] = try std.fmt.allocPrint(arena_alloc, "help: did you mean `{s}`?", .{closest});
+                    break :blk help_arr;
+                } else &.{};
+                try sink.emit(.{
+                    .code = .e0019_invalid_lint_rule_or_glob,
+                    .severity = .err,
+                    .message = try std.fmt.allocPrint(
+                        arena_alloc,
+                        "unknown lint rule `{s}` in `{s}`",
+                        .{ seg, flag_name },
+                    ),
+                    .notes = notes_slice,
+                });
+            },
+        }
+    }
+}
+
+/// Computes `file_path` relative to `base_dir` with `/` separators into `scratch_buf`.
+fn computePosixRelativePath(file_path: []const u8, base_dir: []const u8, scratch_buf: *[1024]u8) []const u8 {
+    const copy_len = @min(file_path.len, scratch_buf.len);
+    for (file_path[0..copy_len], 0..) |ch_b, i| {
+        scratch_buf[i] = if (ch_b == '\\') '/' else ch_b;
+    }
+    var view: []const u8 = scratch_buf[0..copy_len];
+    if (base_dir.len > 0 and !std.mem.eql(u8, base_dir, ".") and base_dir.len < 512) {
+        var root_buf: [512]u8 = undefined;
+        for (base_dir, 0..) |ch_b, i| {
+            root_buf[i] = if (ch_b == '\\') '/' else ch_b;
+        }
+        const root_trim = std.mem.trimEnd(u8, root_buf[0..base_dir.len], "/");
+        if (view.len > root_trim.len + 1 and view[root_trim.len] == '/' and
+            std.ascii.eqlIgnoreCase(view[0..root_trim.len], root_trim))
+        {
+            view = view[root_trim.len + 1 ..];
+        }
+    }
+    if (std.mem.startsWith(u8, view, "./")) view = view[2..];
+    return view;
+}
+
 // ------------------------------------- PUBLIC API --------------------------------------
 
 /// Resolves `COREX_HOME` and `COREX_HERMETIC=1` from `environ_map` (`DR-11` §3.5).
@@ -5070,6 +5428,9 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
     var is_explain_caps = false;
     var explain_caps_pkg: ?[]const u8 = null;
     var explain_caps_cap: ?[]const u8 = null;
+    var allow_unsafe_fixes = false;
+    var has_unsafe_fixes_flag = false;
+    var cli_lint_filter = lint_filter.CliLintFilter{};
     var is_upgrade_list = false;
     var upgrade_explain_rule: ?[]const u8 = null;
     var upgrade_rule_csv: ?[]const u8 = null;
@@ -5159,6 +5520,46 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                         });
                     }
                 }
+            } else if (selected_subcommand == .check and try tryExtractStringFlagValue(
+                raw_args,
+                &arg_idx,
+                "--disable",
+                "",
+                "missing lint rule selector(s) for `--disable`",
+                "help: pass `--disable=single-char-ident` or `--disable=W0202,unused-binding`",
+                sink,
+                &extracted_str,
+            )) {
+                if (extracted_str) |disable_csv| {
+                    try parseCliLintSelectorCsv(
+                        arena_alloc,
+                        "--disable",
+                        disable_csv,
+                        false,
+                        &cli_lint_filter,
+                        sink,
+                    );
+                }
+            } else if (selected_subcommand == .check and try tryExtractStringFlagValue(
+                raw_args,
+                &arg_idx,
+                "--only",
+                "",
+                "missing lint rule selector(s) for `--only`",
+                "help: pass `--only=unused-binding` or `--only=W0202,W0402`",
+                sink,
+                &extracted_str,
+            )) {
+                if (extracted_str) |only_csv| {
+                    try parseCliLintSelectorCsv(
+                        arena_alloc,
+                        "--only",
+                        only_csv,
+                        true,
+                        &cli_lint_filter,
+                        sink,
+                    );
+                }
             } else if (selected_subcommand == .check and blk_chk: {
                 if (matchCheckFlag(arg_text)) |chk_flag| {
                     switch (chk_flag) {
@@ -5166,6 +5567,12 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                         .deny_warnings => is_deny_warnings = true,
                         .explain_caps => is_explain_caps = true,
                         .fix => is_fix_mode = true,
+                        .fix_unsafe => {
+                            is_fix_mode = true;
+                            allow_unsafe_fixes = true;
+                        },
+                        .unsafe_fixes => has_unsafe_fixes_flag = true,
+                        .disable, .only => break :blk_chk false,
                     }
                     break :blk_chk true;
                 }
@@ -5537,6 +5944,19 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
         }
     }
 
+    if (has_unsafe_fixes_flag) {
+        if (!is_fix_mode) {
+            try sink.emit(.{
+                .code = .e0001_unknown_cli_flag,
+                .severity = .err,
+                .message = "`--unsafe-fixes` requires `--fix` (or use `--fix-unsafe`)",
+                .notes = &.{"help: run `corex check --fix --unsafe-fixes` or `corex check --fix-unsafe`"},
+            });
+        } else {
+            allow_unsafe_fixes = true;
+        }
+    }
+
     if (sink.hasErrors()) {
         return .{ .color_mode = color_mode, .action = .invalid };
     }
@@ -5586,6 +6006,8 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
             .is_explain_caps = is_explain_caps,
             .explain_caps_pkg = explain_caps_pkg,
             .explain_caps_cap = explain_caps_cap,
+            .allow_unsafe_fixes = allow_unsafe_fixes,
+            .cli_lint_filter = cli_lint_filter,
             .is_upgrade_list = is_upgrade_list,
             .upgrade_explain_rule = upgrade_explain_rule,
             .upgrade_rule_csv = upgrade_rule_csv,
@@ -5632,6 +6054,8 @@ pub fn parseArgs(raw_args: []const []const u8, sink: *DiagnosticSink) !ParsedCom
                     .is_explain_caps = is_explain_caps,
                     .explain_caps_pkg = explain_caps_pkg,
                     .explain_caps_cap = explain_caps_cap,
+                    .allow_unsafe_fixes = allow_unsafe_fixes,
+                    .cli_lint_filter = cli_lint_filter,
                     .is_upgrade_list = is_upgrade_list,
                     .upgrade_explain_rule = upgrade_explain_rule,
                     .upgrade_rule_csv = upgrade_rule_csv,
@@ -5948,11 +6372,68 @@ pub fn runCli(
                 );
             }
             if (exec_info.subcommand == .fmt) {
+                var fmt_bundle_opt: ?pkg_manifest.WorkspaceManifestBundle = null;
+                defer if (fmt_bundle_opt) |*b_ptr| b_ptr.deinit();
+                var effective_fmt_cfg = pkg_manifest.FmtConfig{};
+                var fmt_root_dir: []const u8 = ".";
+
+                const probe_start_dir: []const u8 = if (exec_info.positional_args.len > 0) blk_probe: {
+                    const first_arg = exec_info.positional_args[0];
+                    if (std.mem.endsWith(u8, first_arg, ".cx")) {
+                        break :blk_probe std.fs.path.dirname(first_arg) orelse ".";
+                    }
+                    break :blk_probe first_arg;
+                } else ".";
+
+                if (try discoverNearestManifestFromDirUpward(allocator, io, probe_start_dir)) |anc_toml_cfg| {
+                    defer allocator.free(anc_toml_cfg);
+                    if (try loadSourceFileIntoVfs(io, &source_map, anc_toml_cfg, &sink)) |toml_fid| {
+                        const fmt_target_cfg = symbol_resolver.CfgEnv.fromTargetSpec(codegen_abi.TargetSpec.host(), false);
+                        fmt_bundle_opt = try pkg_manifest.loadWorkspaceManifestBundle(
+                            io,
+                            allocator,
+                            &interner,
+                            anc_toml_cfg,
+                            toml_fid,
+                            &fmt_target_cfg,
+                            &sink,
+                        );
+                        if (sink.hasErrors()) {
+                            try DiagnosticRenderer.init(&source_map, &interner, stderr_style).renderAll(
+                                stderr_writer,
+                                &sink,
+                            );
+                            return 1;
+                        }
+                        if (fmt_bundle_opt) |*loaded_b| {
+                            effective_fmt_cfg = loaded_b.root_manifest.fmt;
+                            fmt_root_dir = loaded_b.workspace_root_dir;
+                        }
+                    }
+                } else {
+                    _ = try pkg_manifest.checkStrayToolConfigDotfiles(
+                        io,
+                        probe_start_dir,
+                        .none,
+                        &sink,
+                    );
+                    if (sink.hasErrors()) {
+                        try DiagnosticRenderer.init(&source_map, &interner, stderr_style).renderAll(
+                            stderr_writer,
+                            &sink,
+                        );
+                        return 1;
+                    }
+                }
+
                 var expanded_fmt_paths: std.ArrayListUnmanaged([]u8) = .empty;
                 defer {
                     for (expanded_fmt_paths.items) |owned_p| allocator.free(owned_p);
                     expanded_fmt_paths.deinit(allocator);
                 }
+                var expanded_from_dir_flags: std.ArrayListUnmanaged(bool) = .empty;
+                defer expanded_from_dir_flags.deinit(allocator);
+
                 if (exec_info.positional_args.len == 0) {
                     if (try discoverNearestManifestUpward(allocator, io)) |anc_toml| {
                         defer allocator.free(anc_toml);
@@ -5965,6 +6446,7 @@ pub fn runCli(
                     } else {
                         _ = try collectDirectoryCxPaths(allocator, io, ".", &expanded_fmt_paths);
                     }
+                    try expanded_from_dir_flags.appendNTimes(allocator, true, expanded_fmt_paths.items.len);
                     if (expanded_fmt_paths.items.len == 0) {
                         try emitMissingCliArgDiagnostic(
                             &sink,
@@ -5979,6 +6461,7 @@ pub fn runCli(
                     }
                 } else {
                     for (exec_info.positional_args) |raw_arg| {
+                        const prev_len = expanded_fmt_paths.items.len;
                         if (!(try collectDirectoryCxPaths(allocator, io, raw_arg, &expanded_fmt_paths))) {
                             if (!std.mem.endsWith(u8, raw_arg, ".cx")) {
                                 try sink.emit(.{
@@ -5995,6 +6478,13 @@ pub fn runCli(
                             const duped_arg = try allocator.dupe(u8, raw_arg);
                             errdefer allocator.free(duped_arg);
                             try expanded_fmt_paths.append(allocator, duped_arg);
+                            try expanded_from_dir_flags.append(allocator, false);
+                        } else {
+                            try expanded_from_dir_flags.appendNTimes(
+                                allocator,
+                                true,
+                                expanded_fmt_paths.items.len - prev_len,
+                            );
                         }
                     }
                     if (sink.hasErrors()) {
@@ -6007,7 +6497,19 @@ pub fn runCli(
                 }
 
                 var has_unformatted_or_error = false;
-                for (expanded_fmt_paths.items) |file_arg| {
+                var rel_scratch: [1024]u8 = undefined;
+                for (expanded_fmt_paths.items, expanded_from_dir_flags.items) |file_arg, is_dir_walk_file| {
+                    if (is_dir_walk_file) {
+                        const real_file_opt = std.Io.Dir.cwd().realPathFileAlloc(io, file_arg, allocator) catch null;
+                        defer if (real_file_opt) |real_f| allocator.free(real_f);
+                        const rel_posix = computePosixRelativePath(
+                            real_file_opt orelse file_arg,
+                            fmt_root_dir,
+                            &rel_scratch,
+                        );
+                        if (effective_fmt_cfg.isFileExcluded(rel_posix)) continue;
+                    }
+
                     const raw_source = std.Io.Dir.cwd().readFileAlloc(
                         io,
                         file_arg,
@@ -6026,6 +6528,10 @@ pub fn runCli(
                         continue;
                     };
                     defer allocator.free(raw_source);
+
+                    if (!effective_fmt_cfg.check_generated and lint_filter.isGeneratedSource(raw_source)) {
+                        continue;
+                    }
 
                     const file_id = try source_map.setOverlay(file_arg, raw_source, .root);
                     _ = try source_map.getLineIndex(file_id);
@@ -6229,6 +6735,21 @@ pub fn runCli(
             }
 
             if (isCompileSubcommand(effective_exec_info.subcommand) and cx_file_ids.items.len > 0) {
+                if (effective_exec_info.subcommand == .check) {
+                    _ = try pkg_manifest.checkStrayToolConfigDotfiles(
+                        io,
+                        embed_sandbox_root,
+                        .none,
+                        &sink,
+                    );
+                    if (sink.hasErrors()) {
+                        try DiagnosticRenderer.init(&source_map, &interner, stderr_style).renderAll(
+                            stderr_writer,
+                            &sink,
+                        );
+                        return 1;
+                    }
+                }
                 var db = try query_db.CompilerDb.init(allocator);
                 defer db.deinit();
                 db.setVfsSourceMap(&source_map);
@@ -6243,6 +6764,8 @@ pub fn runCli(
                 if (effective_exec_info.target_spec) |explicit_target| {
                     db.setTargetSpec(explicit_target);
                 }
+                db.setCliLintFilter(effective_exec_info.cli_lint_filter);
+                try db.setExplicitLintTargetFiles(cx_file_ids.items);
 
                 var visited_fids: std.AutoHashMapUnmanaged(u32, void) = .empty;
                 defer visited_fids.deinit(allocator);
@@ -6273,13 +6796,21 @@ pub fn runCli(
                     );
                 }
 
+                var explicit_lint_files: std.ArrayListUnmanaged(mem.FileId) = .empty;
+                defer explicit_lint_files.deinit(allocator);
+                if (cx_file_ids.items.len > 0) {
+                    try db.collectExplicitModSubtreeFiles(cx_file_ids.items, &explicit_lint_files);
+                }
+                try db.setExplicitLintTargetFiles(explicit_lint_files.items);
+
                 const check_fix_report: ?check_audit.CheckFixReport =
                     if (effective_exec_info.subcommand == .check and effective_exec_info.is_fix_mode)
                         try check_audit.applyCheckFixesOnDb(allocator, &db, .{
                             .io = io,
                             .vfs = &source_map,
                             .is_writing_to_disk = true,
-                            .candidate_files = cx_file_ids.items,
+                            .allow_unsafe_fixes = effective_exec_info.allow_unsafe_fixes,
+                            .candidate_files = explicit_lint_files.items,
                         })
                     else
                         null;
@@ -6688,7 +7219,7 @@ comptime {
             std.debug.assert(std.mem.order(u8, FMT_FLAGS[i - 1].long_flag, fmt_desc.long_flag) == .lt);
         }
     }
-    std.debug.assert(CHECK_FLAGS.len == 4);
+    std.debug.assert(CHECK_FLAGS.len == 8);
     for (CHECK_FLAGS, 0..) |chk_desc, i| {
         std.debug.assert(@backingInt(chk_desc.id) == i);
         if (i > 0) {
@@ -6734,7 +7265,7 @@ comptime {
 
 test "test_cli_router_subcommands_flags_and_typo_suggestions" {
     try std.testing.expectEqual(@as(usize, 9), CLI_SUBCOMMANDS.len);
-    try std.testing.expectEqual(@as(usize, 4), CHECK_FLAGS.len);
+    try std.testing.expectEqual(@as(usize, 8), CHECK_FLAGS.len);
     try std.testing.expectEqual(@as(usize, 6), UPGRADE_FLAGS.len);
     try std.testing.expectEqual(@as(usize, 2), LSP_FLAGS.len);
     try std.testing.expectEqual(@as(usize, 5), TRANSLATE_C_FLAGS.len);

@@ -80,6 +80,7 @@ type ActivePtrOps = PtrWidthOps64;
 type ActivePtrOps = PtrWidthOps32;
 
 /| Clone-on-write UTF-8 string holding either a borrowed `str` view or an owned 24-byte `String`.
+@expect(unused-pkg-visibility, reason: "reserved for cx.io and cx.serde in Phase 11.2–11.3")
 @repr(C, align: 8)
 pub(pkg) enum CowStr {
     /| Zero-allocation borrowed UTF-8 slice.
@@ -143,6 +144,7 @@ pub struct GraphemeIter {
 }
 
 /| Lazy `(byte_offset, cluster_str)` iterator over UAX #29 Extended Grapheme Clusters.
+@expect(unused-pkg-visibility, reason: "reserved for cx.io and cx.serde in Phase 11.2–11.3")
 @repr(C)
 pub(pkg) struct GraphemeIndicesIter {
     /| Remaining valid UTF-8 bytes.
@@ -1065,45 +1067,45 @@ const GRAPHEME_DFA: [u8; 234] = [
 // --------------- Shared 632 B POW5_SPLIT Table ----------------
 /| Exact normalized 64-bit significands of `5^r` in `[2^63, 2^64)` for `r in 0..=26` (`216 B`).
 const POW5_FINE: [u64; 27] = [
-    0x8000000000000000_u64, 0xA000000000000000_u64, 0xC800000000000000_u64,
-    0xFA00000000000000_u64, 0x9C40000000000000_u64, 0xC350000000000000_u64,
-    0xF424000000000000_u64, 0x9896800000000000_u64, 0xBEBC200000000000_u64,
-    0xEE6B280000000000_u64, 0x9502F90000000000_u64, 0xBA43B74000000000_u64,
-    0xE8D4A51000000000_u64, 0x9184E72A00000000_u64, 0xB5E620F480000000_u64,
-    0xE35FA931A0000000_u64, 0x8E1BC9BF04000000_u64, 0xB1A2BC2EC5000000_u64,
-    0xDE0B6B3A76400000_u64, 0x8AC7230489E80000_u64, 0xAD78EBC5AC620000_u64,
-    0xD8D726B7177A8000_u64, 0x878678326EAC9000_u64, 0xA968163F0A57B400_u64,
-    0xD3C21BCECCEDA100_u64, 0x84595161401484A0_u64, 0xA56FA5B99019A5C8_u64,
+    0x8000_0000_0000_0000_u64, 0xA000_0000_0000_0000_u64, 0xC800_0000_0000_0000_u64,
+    0xFA00_0000_0000_0000_u64, 0x9C40_0000_0000_0000_u64, 0xC350_0000_0000_0000_u64,
+    0xF424_0000_0000_0000_u64, 0x9896_8000_0000_0000_u64, 0xBEBC_2000_0000_0000_u64,
+    0xEE6B_2800_0000_0000_u64, 0x9502_F900_0000_0000_u64, 0xBA43_B740_0000_0000_u64,
+    0xE8D4_A510_0000_0000_u64, 0x9184_E72A_0000_0000_u64, 0xB5E6_20F4_8000_0000_u64,
+    0xE35F_A931_A000_0000_u64, 0x8E1B_C9BF_0400_0000_u64, 0xB1A2_BC2E_C500_0000_u64,
+    0xDE0B_6B3A_7640_0000_u64, 0x8AC7_2304_89E8_0000_u64, 0xAD78_EBC5_AC62_0000_u64,
+    0xD8D7_26B7_177A_8000_u64, 0x8786_7832_6EAC_9000_u64, 0xA968_163F_0A57_B400_u64,
+    0xD3C2_1BCE_CCED_A100_u64, 0x8459_5161_4014_84A0_u64, 0xA56F_A5B9_9019_A5C8_u64,
 ];
 
 /| Rounded-to-nearest 128-bit `(hi, lo)` significands of `5^(27 * c)` for `c in -13..=12` (`416 B`).
 const POW5_COARSE: [(u64, u64); 26] = [
-    (0x8049A4AC0C5811AE_u64, 0x205B896D777D6279_u64), // c = -13 (5^-351).
-    (0xCF42894A5DCE35EA_u64, 0x52064CAC828675B9_u64), // c = -12 (5^-324).
-    (0xA76C582338ED2621_u64, 0xAF2AF2B80AF6F24E_u64), // c = -11 (5^-297).
-    (0x873E4F75E2224E68_u64, 0x5A7744A6E804A292_u64), // c = -10 (5^-270).
-    (0xDA7F5BF590966848_u64, 0xAF39A475506A899F_u64), // c = -9 (5^-243).
-    (0xB080392CC4349DEC_u64, 0xBD8D794D96AACFB4_u64), // c = -8 (5^-216).
-    (0x8E938662882AF53E_u64, 0x547EB47B7282EE9C_u64), // c = -7 (5^-189).
-    (0xE65829B3046B0AFA_u64, 0x0CB4A5A3112A5113_u64), // c = -6 (5^-162).
-    (0xBA121A4650E4DDEB_u64, 0x92F34D62616CE413_u64), // c = -5 (5^-135).
-    (0x964E858C91BA2655_u64, 0x3A6A07F8D510F870_u64), // c = -4 (5^-108).
-    (0xF2D56790AB41C2A2_u64, 0xFAE27299423FB9C3_u64), // c = -3 (5^-81).
-    (0xC428D05AA4751E4C_u64, 0xAA97E14C3C26B887_u64), // c = -2 (5^-54).
-    (0x9E74D1B791E07E48_u64, 0x775EA264CF55347E_u64), // c = -1 (5^-27).
-    (0x8000000000000000_u64, 0x0000000000000000_u64), // c = +0 (5^0).
-    (0xCECB8F27F4200F3A_u64, 0x0000000000000000_u64), // c = +1 (5^27).
-    (0xA70C3C40A64E6C51_u64, 0x999090B65F67D924_u64), // c = +2 (5^54).
-    (0x86F0AC99B4E8DAFD_u64, 0x69A028BB3DED71A4_u64), // c = +3 (5^81).
-    (0xDA01EE641A708DE9_u64, 0xE80E6F4820CC9496_u64), // c = +4 (5^108).
-    (0xB01AE745B101E9E4_u64, 0x5EC05DCFF72E7F90_u64), // c = +5 (5^135).
-    (0x8E41ADE9FBEBC27D_u64, 0x14588F13BE847307_u64), // c = +6 (5^162).
-    (0xE5D3EF282A242E81_u64, 0x8F1668C8A86DA5FB_u64), // c = +7 (5^189).
-    (0xB9A74A0637CE2EE1_u64, 0x6D953E2BD7173693_u64), // c = +8 (5^216).
-    (0x95F83D0A1FB69CD9_u64, 0x4ABDAF101564F98E_u64), // c = +9 (5^243).
-    (0xF24A01A73CF2DCCF_u64, 0xBC633B39673C8CEC_u64), // c = +10 (5^270).
-    (0xC3B8358109E84F07_u64, 0x0A862F80EC4700C8_u64), // c = +11 (5^297).
-    (0x9E19DB92B4E31BA9_u64, 0x6C07A2C26A8346D1_u64), // c = +12 (5^324).
+    (0x8049_A4AC_0C58_11AE_u64, 0x205B_896D_777D_6279_u64), // c = -13 (5^-351).
+    (0xCF42_894A_5DCE_35EA_u64, 0x5206_4CAC_8286_75B9_u64), // c = -12 (5^-324).
+    (0xA76C_5823_38ED_2621_u64, 0xAF2A_F2B8_0AF6_F24E_u64), // c = -11 (5^-297).
+    (0x873E_4F75_E222_4E68_u64, 0x5A77_44A6_E804_A292_u64), // c = -10 (5^-270).
+    (0xDA7F_5BF5_9096_6848_u64, 0xAF39_A475_506A_899F_u64), // c = -9 (5^-243).
+    (0xB080_392C_C434_9DEC_u64, 0xBD8D_794D_96AA_CFB4_u64), // c = -8 (5^-216).
+    (0x8E93_8662_882A_F53E_u64, 0x547E_B47B_7282_EE9C_u64), // c = -7 (5^-189).
+    (0xE658_29B3_046B_0AFA_u64, 0x0CB4_A5A3_112A_5113_u64), // c = -6 (5^-162).
+    (0xBA12_1A46_50E4_DDEB_u64, 0x92F3_4D62_616C_E413_u64), // c = -5 (5^-135).
+    (0x964E_858C_91BA_2655_u64, 0x3A6A_07F8_D510_F870_u64), // c = -4 (5^-108).
+    (0xF2D5_6790_AB41_C2A2_u64, 0xFAE2_7299_423F_B9C3_u64), // c = -3 (5^-81).
+    (0xC428_D05A_A475_1E4C_u64, 0xAA97_E14C_3C26_B887_u64), // c = -2 (5^-54).
+    (0x9E74_D1B7_91E0_7E48_u64, 0x775E_A264_CF55_347E_u64), // c = -1 (5^-27).
+    (0x8000_0000_0000_0000_u64, 0x0000_0000_0000_0000_u64), // c = +0 (5^0).
+    (0xCECB_8F27_F420_0F3A_u64, 0x0000_0000_0000_0000_u64), // c = +1 (5^27).
+    (0xA70C_3C40_A64E_6C51_u64, 0x9990_90B6_5F67_D924_u64), // c = +2 (5^54).
+    (0x86F0_AC99_B4E8_DAFD_u64, 0x69A0_28BB_3DED_71A4_u64), // c = +3 (5^81).
+    (0xDA01_EE64_1A70_8DE9_u64, 0xE80E_6F48_20CC_9496_u64), // c = +4 (5^108).
+    (0xB01A_E745_B101_E9E4_u64, 0x5EC0_5DCF_F72E_7F90_u64), // c = +5 (5^135).
+    (0x8E41_ADE9_FBEB_C27D_u64, 0x1458_8F13_BE84_7307_u64), // c = +6 (5^162).
+    (0xE5D3_EF28_2A24_2E81_u64, 0x8F16_68C8_A86D_A5FB_u64), // c = +7 (5^189).
+    (0xB9A7_4A06_37CE_2EE1_u64, 0x6D95_3E2B_D717_3693_u64), // c = +8 (5^216).
+    (0x95F8_3D0A_1FB6_9CD9_u64, 0x4ABD_AF10_1564_F98E_u64), // c = +9 (5^243).
+    (0xF24A_01A7_3CF2_DCCF_u64, 0xBC63_3B39_673C_8CEC_u64), // c = +10 (5^270).
+    (0xC3B8_3581_09E8_4F07_u64, 0x0A86_2F80_EC47_00C8_u64), // c = +11 (5^297).
+    (0x9E19_DB92_B4E3_1BA9_u64, 0x6C07_A2C2_6A83_46D1_u64), // c = +12 (5^324).
 ];
 
 /| Exact powers `10^0 .. 10^22` representable with zero error in IEEE-754 `f64` (`184 B`).
@@ -1128,7 +1130,7 @@ const MAX_DEC_DIGITS: usize = 800;
 // --------------- Pointer, UTF-8 & ASCII Helpers ---------------
 /| Returns non-null sentinel byte pointer `1` for zero-capacity `HeapRepr` instances.
 fn dangling_u8_ptr() -> *mut u8 {
-    return 1_usize as *mut u8;
+    1_usize as *mut u8
 }
 
 @cfg(target.ptr_width == 64)
@@ -1136,12 +1138,12 @@ impl PtrWidthOps64 {
     /| Packs `(ptr, alloc, len, flagged_cap)` into the 24-byte 64-bit `HeapRepr64` overlay.
     fn pack_heap(self, ptr: *mut u8, alloc: AllocatorHandle, len: u32, flagged_cap: u32, /) -> HeapRepr {
         _ = self;
-        return HeapRepr64 {
-            ptr: ptr,
-            alloc: alloc,
-            len: len,
-            flagged_cap: flagged_cap,
-        };
+        HeapRepr64 {
+            ptr,
+            alloc,
+            len,
+            flagged_cap,
+        }
     }
 }
 
@@ -1150,14 +1152,14 @@ impl PtrWidthOps32 {
     /| Packs `(ptr, alloc, len, flagged_cap)` into the 24-byte `wasm32` `HeapRepr32` overlay (`_pad0 = 0, _pad1 = 0`).
     fn pack_heap(self, ptr: *mut u8, alloc: AllocatorHandle, len: u32, flagged_cap: u32, /) -> HeapRepr {
         _ = self;
-        return HeapRepr32 {
-            ptr: ptr,
+        HeapRepr32 {
+            ptr,
             _pad0: 0_u32,
-            alloc: alloc,
+            alloc,
             _pad1: 0_u32,
-            len: len,
-            flagged_cap: flagged_cap,
-        };
+            len,
+            flagged_cap,
+        }
     }
 }
 
@@ -1169,15 +1171,15 @@ fn string_ptr_ref(ptr: *String, /) -> &String {
             &ptr.*
         };
     }
-    return string_ptr_ref(8_usize as *String);
+    string_ptr_ref(8_usize as *String)
 }
 
 /| Reinterprets a validated Unicode scalar `codepoint` (`<= 0x10FFFF`, non-surrogate) as `char`.
 @std_cap_boundary(clears: [unsafe_op, may_panic]) @inline @no_alloc @no_panic
 fn u32_to_char_unchecked(codepoint: u32, /) -> char {
-    return unsafe {
+    unsafe {
         @ptr_read(&raw codepoint as *char)
-    };
+    }
 }
 
 /| Reads an unaligned 64-bit word from `ptr` safely across all targets.
@@ -1187,37 +1189,37 @@ fn read_u64_unaligned(ptr: *u8, /) -> u64 {
     unsafe {
         @memcpy(&raw mut raw[0] as *mut opaque, ptr as *opaque, 8);
     }
-    return @from_le_bytes[u64](raw);
+    @from_le_bytes[u64](raw)
 }
 
 /| Returns `true` if `byte` is NOT a UTF-8 continuation byte (`0b10xx_xxxx`).
 fn is_utf8_char_boundary_byte(byte: u8, /) -> bool {
-    return (byte & 0xC0_u8) != 0x80_u8;
+    (byte & 0xC0_u8) != 0x80_u8
 }
 
 /| Decodes the leading Unicode scalar `(char, byte_width)` from valid non-empty UTF-8 `bytes`.
 @std_cap_boundary(clears: [unsafe_op, may_panic]) @inline @no_alloc @no_panic
 fn decode_utf8_first(bytes: &[u8], /) -> (char, usize) {
-    let b0: u32 = bytes[0] as u32;
+    let b0 = bytes[0] as u32;
     if b0 < 0x80_u32 {
         return (u32_to_char_unchecked(b0), 1);
     }
     let len: usize = bytes.len();
     if b0 < 0xE0_u32 and len >= 2 {
-        let b1: u32 = (bytes[1] & 0x3F_u8) as u32;
+        let b1 = (bytes[1] & 0x3F_u8) as u32;
         let cp2: u32 = ((b0 & 0x1F_u32) << 6_u32) | b1;
         return (u32_to_char_unchecked(cp2), 2);
     }
     if b0 < 0xF0_u32 and len >= 3 {
-        let b1: u32 = (bytes[1] & 0x3F_u8) as u32;
-        let b2: u32 = (bytes[2] & 0x3F_u8) as u32;
+        let b1 = (bytes[1] & 0x3F_u8) as u32;
+        let b2 = (bytes[2] & 0x3F_u8) as u32;
         let cp3: u32 = ((b0 & 0x0F_u32) << 12_u32) | (b1 << 6_u32) | b2;
         return (u32_to_char_unchecked(cp3), 3);
     }
     if len >= 4 {
-        let b1: u32 = (bytes[1] & 0x3F_u8) as u32;
-        let b2: u32 = (bytes[2] & 0x3F_u8) as u32;
-        let b3: u32 = (bytes[3] & 0x3F_u8) as u32;
+        let b1 = (bytes[1] & 0x3F_u8) as u32;
+        let b2 = (bytes[2] & 0x3F_u8) as u32;
+        let b3 = (bytes[3] & 0x3F_u8) as u32;
         let cp4: u32 = ((b0 & 0x07_u32) << 18_u32) | (b1 << 12_u32) | (b2 << 6_u32) | b3;
         return (u32_to_char_unchecked(cp4), 4);
     }
@@ -1237,12 +1239,12 @@ fn decode_utf8_last(bytes: &[u8], /) -> (char, usize) {
         start = start -% 1;
     }
     let (ch, width) = decode_utf8_first(bytes[start..total]);
-    return (ch, width);
+    (ch, width)
 }
 
 /| Encodes `ch` into `out[0..4]`, returning its UTF-8 byte length (`1..=4`).
 fn encode_utf8_char(ch: char, out: &mut [u8; 4], /) -> usize {
-    let cp: u32 = ch as u32;
+    let cp = ch as u32;
     if cp < 0x80_u32 {
         out[0] = cp as u8;
         return 1;
@@ -1252,7 +1254,7 @@ fn encode_utf8_char(ch: char, out: &mut [u8; 4], /) -> usize {
         out[1] = (0x80_u32 | (cp & 0x3F_u32)) as u8;
         return 2;
     }
-    if cp < 0x10000_u32 {
+    if cp < 0x1_0000_u32 {
         out[0] = (0xE0_u32 | (cp >> 12_u32)) as u8;
         out[1] = (0x80_u32 | ((cp >> 6_u32) & 0x3F_u32)) as u8;
         out[2] = (0x80_u32 | (cp & 0x3F_u32)) as u8;
@@ -1262,12 +1264,12 @@ fn encode_utf8_char(ch: char, out: &mut [u8; 4], /) -> usize {
     out[1] = (0x80_u32 | ((cp >> 12_u32) & 0x3F_u32)) as u8;
     out[2] = (0x80_u32 | ((cp >> 6_u32) & 0x3F_u32)) as u8;
     out[3] = (0x80_u32 | (cp & 0x3F_u32)) as u8;
-    return 4;
+    4
 }
 
 /| Returns `true` if `ch` has Unicode `White_Space=Yes` (`0` `.rodata` bytes).
 fn is_unicode_whitespace(ch: char, /) -> bool {
-    let cp: u32 = ch as u32;
+    let cp = ch as u32;
     if cp <= 0x20_u32 {
         return cp == 0x20_u32 or (cp >= 0x09_u32 and cp <= 0x0D_u32);
     }
@@ -1277,16 +1279,16 @@ fn is_unicode_whitespace(ch: char, /) -> bool {
     if cp <= 0x200A_u32 {
         return cp == 0x1680_u32 or cp >= 0x2000_u32;
     }
-    return cp == 0x2028_u32 or cp == 0x2029_u32 or cp == 0x202F_u32 or cp == 0x205F_u32 or cp == 0x3000_u32;
+    cp == 0x2028_u32 or cp == 0x2029_u32 or cp == 0x202F_u32 or cp == 0x205F_u32 or cp == 0x3000_u32
 }
 
 /| Returns `true` if `set_text` contains `target` (fast-pathing ASCII sets without decoding UTF-8).
 @std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
 fn is_char_in_trim_set(set_text: str, target: char, /) -> bool {
     let set_bytes: &[u8] = set_text.as_bytes();
-    let cp: u32 = target as u32;
+    let cp = target as u32;
     if cp < 0x80_u32 {
-        let needle_b: u8 = cp as u8;
+        let needle_b = cp as u8;
         var i: usize = 0;
         while i < set_bytes.len() {
             if set_bytes[i] == needle_b {
@@ -1304,7 +1306,7 @@ fn is_char_in_trim_set(set_text: str, target: char, /) -> bool {
         }
         rem = rem[width..rem.len()];
     }
-    return false;
+    false
 }
 
 // --------------- SIMD & Scalar Substring Search ---------------
@@ -1322,7 +1324,7 @@ fn is_bytes_equal_at(hay_ptr: *u8, pos: usize, needle_ptr: *u8, needle_len: usiz
         }
         i = i +% 1;
     }
-    return true;
+    true
 }
 
 @cfg(target.arch == "x86_64" or target.arch == "aarch64")
@@ -1359,7 +1361,7 @@ impl SimdStrOps {
                 @simd_and(@simd_eq(blk_first, first_vec), @simd_eq(blk_last, last_vec)),
             );
             while mask != 0_u16 {
-                let lane: usize = mask.trailing_zeros() as usize;
+                let lane = mask.trailing_zeros() as usize;
                 let cand: usize = pos +% lane;
                 if n_len <= 2 or is_bytes_equal_at(
                     hay_ptr,
@@ -1371,7 +1373,7 @@ impl SimdStrOps {
                 ) {
                     return .Some(cand);
                 }
-                mask = mask & (mask -% 1_u16);
+                mask &= mask -% 1_u16;
             }
             pos = pos +% 16;
         }
@@ -1396,7 +1398,7 @@ impl SimdStrOps {
             }
             pos = pos +% 1;
         }
-        return .None;
+        .None
     }
 }
 
@@ -1440,7 +1442,7 @@ impl SwarStrOps {
             }
             pos = pos +% 1;
         }
-        return .None;
+        .None
     }
 }
 
@@ -1555,20 +1557,20 @@ fn validate_utf8_detailed_from(bytes: &[u8], var pos: usize, /) -> Utf8Error? {
             return .Some(Utf8Error { valid_up_to: pos, error_len: .Some(1_u8) });
         }
     }
-    return .None;
+    .None
 }
 
 /| Returns `true` if `curr` ends with an incomplete multi-byte lead at lanes `13..=15`.
 @cfg(target.arch == "x86_64" or target.arch == "aarch64")
 fn has_incomplete_utf8_tail(curr: &[u8; 16], /) -> bool {
-    return curr[15] >= 0xC0_u8 or curr[14] >= 0xE0_u8 or curr[13] >= 0xF0_u8;
+    curr[15] >= 0xC0_u8 or curr[14] >= 0xE0_u8 or curr[13] >= 0xF0_u8
 }
 
 @cfg(target.arch == "x86_64" or target.arch == "aarch64")
 impl SimdStrOps {
     /| Keiser–Lemire 16-byte SIMD UTF-8 fast validator (`48 B` `.rodata`) on `x86_64` and `aarch64`.
     @std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
-    fn validate_utf8_fast(self, bytes: &[u8], /) -> bool {
+    fn is_valid_utf8_fast(self, bytes: &[u8], /) -> bool {
         _ = self;
         let len: usize = bytes.len();
         if len < 32 {
@@ -1597,7 +1599,7 @@ impl SimdStrOps {
         }
 
         var err_acc: [u8; 16] = zero_vec;
-        var prev_incomplete: bool = false;
+        var prev_incomplete = false;
         while off +% 16 <= len {
             let curr: [u8; 16] = unsafe {
                 @simd_load_unaligned[[u8; 16]](ptr.add(off))
@@ -1651,29 +1653,30 @@ impl SimdStrOps {
         } else {
             0
         };
-        return validate_utf8_detailed_from(bytes, off -% rewind) is .None;
+        validate_utf8_detailed_from(bytes, off -% rewind) is .None
     }
 }
 
 @cfg(not (target.arch == "x86_64" or target.arch == "aarch64"))
 impl SwarStrOps {
     /| Portable 8-byte SWAR + scalar UTF-8 validator on `wasm32` (`0 B` `.rodata`).
-    fn validate_utf8_fast(self, bytes: &[u8], /) -> bool {
+    fn is_valid_utf8_fast(self, bytes: &[u8], /) -> bool {
         _ = self;
-        return validate_utf8_detailed_from(bytes, 0) is .None;
+        validate_utf8_detailed_from(bytes, 0) is .None
     }
 }
 
 // ---------------------- UAX #29 DFA Step ----------------------
 /| Advances UAX #29 DFA `state` across `ch`, returning `(break_before_ch, next_state)`.
+@expect(unused-pkg-visibility, reason: "reserved for cx.io and cx.serde in Phase 11.2–11.3")
 pub(pkg) fn step_grapheme_dfa(state: u8, ch: char, /) -> (bool, u8) {
-    let cls: usize = grapheme_class(ch) as usize;
+    let cls = grapheme_class(ch) as usize;
     let raw_idx: usize = (state as usize) *% 18_usize +% cls;
     if raw_idx >= 234_usize {
         return (true, 1_u8);
     }
     let entry: u8 = GRAPHEME_DFA[raw_idx];
-    return ((entry & 0x80_u8) != 0_u8, entry & 0x7F_u8);
+    ((entry & 0x80_u8) != 0_u8, entry & 0x7F_u8)
 }
 
 // ------------- Float & Integer Conversion Kernels -------------
@@ -1683,31 +1686,31 @@ fn leading_zeros_u64(value: u64, /) -> u64 {
         return 64_u64;
     }
     var rem: u64 = value;
-    var count: u64 = 0_u64;
+    var count = 0_u64;
     if (rem >> 32_u64) == 0_u64 {
         count = count +% 32_u64;
-        rem = rem << 32_u64;
+        rem <<= 32_u64;
     }
     if (rem >> 48_u64) == 0_u64 {
         count = count +% 16_u64;
-        rem = rem << 16_u64;
+        rem <<= 16_u64;
     }
     if (rem >> 56_u64) == 0_u64 {
         count = count +% 8_u64;
-        rem = rem << 8_u64;
+        rem <<= 8_u64;
     }
     if (rem >> 60_u64) == 0_u64 {
         count = count +% 4_u64;
-        rem = rem << 4_u64;
+        rem <<= 4_u64;
     }
     if (rem >> 62_u64) == 0_u64 {
         count = count +% 2_u64;
-        rem = rem << 2_u64;
+        rem <<= 2_u64;
     }
     if (rem >> 63_u64) == 0_u64 {
         count = count +% 1_u64;
     }
-    return count;
+    count
 }
 
 /| Exact `floor(bin_exp * log10(2))` for `|bin_exp| <= 1650`.
@@ -1721,10 +1724,11 @@ fn floor_log10_pow2_minus_log10_4_over_3(bin_exp: i32, /) -> i32 =
 fn floor_log2_pow10(exp10: i32, /) -> i32 = (exp10 *% 1_741_647) >> 19;
 
 /| Reconstructs the normalized 128-bit `(hi, lo)` significand of `10^exp10` (`<= 1.52 ULP_128`) for `exp10 in -351..=350`.
+@expect(unused-pkg-visibility, reason: "reserved for cx.io and cx.serde in Phase 11.2–11.3")
 pub(pkg) fn pow10_sig128(exp10: i32, /) -> (u64, u64) {
-    let shifted: u32 = (exp10 +% 351) as u32;
-    let coarse_idx: usize = ((shifted *% 9710_u32) >> 18_u32) as usize;
-    let fine_idx: usize = (shifted % 27_u32) as usize;
+    let shifted = (exp10 +% 351) as u32;
+    let coarse_idx = ((shifted *% 9710_u32) >> 18_u32) as usize;
+    let fine_idx = (shifted % 27_u32) as usize;
     if coarse_idx >= 26_usize {
         return (0_u64, 0_u64);
     }
@@ -1750,13 +1754,13 @@ fn umul192_upper64_modified(pow_hi: u64, pow_lo: u64, scaled_sig: u64, beta: u64
     let (_, lo_hi) = widening_mul_u64(guard_lo, y_shifted);
     let (mid_lo, upper64) = widening_mul_u64(guard_hi, y_shifted);
     let (mid64, carry1) = carrying_add_u64(mid_lo, lo_hi, false);
-    return (upper64 +% (carry1 as u64)) | ((mid64 > 1_u64) as u64);
+    (upper64 +% (carry1 as u64)) | ((mid64 > 1_u64) as u64)
 }
 
 // ---------- Eisel-Lemire Subnormal & Stack Fallback -----------
 /| Resolves `eisel_lemire_f64` subnormals (`biased_exp in -52..=0`), returning `.None` on ambiguous ties.
 fn eisel_lemire_subnormal_f64(prod_hi: u64, prod_lo: u64, msb: i32, biased_exp: i32, /) -> u64? {
-    let total_sh: u64 = (((9 +% msb) +% (1 -% biased_exp)) as u32) as u64;
+    let total_sh = (((9 +% msb) +% (1 -% biased_exp)) as u32) as u64;
     if total_sh >= 64_u64 {
         return .None;
     }
@@ -1770,12 +1774,12 @@ fn eisel_lemire_subnormal_f64(prod_hi: u64, prod_lo: u64, msb: i32, biased_exp: 
         return .None;
     }
     let sticky: bool = rem_hi != 0_u64 or prod_lo > 16_u64;
-    let round_up: u64 = ((x_guard & 1_u64) == 1_u64 and (sticky or (x_guard & 2_u64) != 0_u64)) as u64;
+    let round_up = ((x_guard & 1_u64) == 1_u64 and (sticky or (x_guard & 2_u64) != 0_u64)) as u64;
     let sig: u64 = (x_guard >> 1_u64) +% round_up;
     if sig >= (1_u64 << 52_u64) {
         return .Some(1_u64 << 52_u64);
     }
-    return .Some(sig);
+    .Some(sig)
 }
 
 /| Shifts `val` left by `shift_amt & 63` in loop-free `u64` SSA so VRP proves `rhs < 64` without widening.
@@ -1795,7 +1799,7 @@ fn dec_buf_left_shift(
 ) {
     let k_masked: u32 = shift_k & 31_u32;
     let new_lead_u8: u8 = DEC_LSHIFT_NEW_DIGITS[(k_masked as usize) & 31_usize];
-    let new_lead: usize = new_lead_u8 as usize;
+    let new_lead = new_lead_u8 as usize;
     var read_pos: usize = num_digits.*;
     var write_pos: usize = num_digits.* +% new_lead;
     var acc: u64 = 0;
@@ -1804,7 +1808,7 @@ fn dec_buf_left_shift(
         write_pos = write_pos -% 1;
         acc = acc +% shl_digit_u64(digits[read_pos % 864_usize], shift_k);
         let quo: u64 = acc / 10_u64;
-        let rem: u8 = ((acc -% quo *% 10_u64) & 0xFF_u64) as u8;
+        let rem = ((acc -% quo *% 10_u64) & 0xFF_u64) as u8;
         let slot1: usize = write_pos;
         if slot1 < MAX_DEC_DIGITS {
             digits[slot1] = rem;
@@ -1816,7 +1820,7 @@ fn dec_buf_left_shift(
     while acc > 0 {
         write_pos = write_pos -% 1;
         let quo: u64 = acc / 10_u64;
-        let rem: u8 = ((acc -% quo *% 10_u64) & 0xFF_u64) as u8;
+        let rem = ((acc -% quo *% 10_u64) & 0xFF_u64) as u8;
         let slot2: usize = write_pos;
         if slot2 < MAX_DEC_DIGITS {
             digits[slot2] = rem;
@@ -1866,7 +1870,7 @@ fn dec_buf_right_shift(
     shift_k: u32,
     /,
 ) {
-    let k_clamped: u64 = (shift_k & 31_u32) as u64;
+    let k_clamped = (shift_k & 31_u32) as u64;
     let rem_mask: u64 = (1_u64 << k_clamped) -% 1_u64;
     var read_pos: usize = 0;
     var write_pos: usize = 0;
@@ -1890,8 +1894,8 @@ fn dec_buf_right_shift(
     }
     dec_pt.* = dec_pt.* -% ((read_pos as i32) -% 1);
     while read_pos < cur_len {
-        let out_dig: u8 = (acc >> k_clamped) as u8;
-        acc = acc & rem_mask;
+        let out_dig = (acc >> k_clamped) as u8;
+        acc &= rem_mask;
         if write_pos < MAX_DEC_DIGITS {
             digits[write_pos] = out_dig;
             write_pos = write_pos +% 1;
@@ -1901,8 +1905,8 @@ fn dec_buf_right_shift(
         acc = acc *% 10_u64 +% (digits[read_pos % 864_usize] as u64);
         read_pos = read_pos +% 1;
     }
-    let first_rem_dig: u8 = (acc >> k_clamped) as u8;
-    acc = acc & rem_mask;
+    let first_rem_dig = (acc >> k_clamped) as u8;
+    acc &= rem_mask;
     if write_pos < MAX_DEC_DIGITS {
         digits[write_pos] = first_rem_dig;
         write_pos = write_pos +% 1;
@@ -1911,8 +1915,8 @@ fn dec_buf_right_shift(
     }
     while acc > 0_u64 {
         acc = acc *% 10_u64;
-        let tail_dig: u8 = (acc >> k_clamped) as u8;
-        acc = acc & rem_mask;
+        let tail_dig = (acc >> k_clamped) as u8;
+        acc &= rem_mask;
         if write_pos < MAX_DEC_DIGITS {
             digits[write_pos] = tail_dig;
             write_pos = write_pos +% 1;
@@ -1928,13 +1932,14 @@ fn dec_buf_right_shift(
 }
 
 /| Converts positive finite `val` (`f64`) to its shortest round-trip `(decimal_significand, base10_exp)` pair via `Schubfach`.
+@expect(unused-pkg-visibility, reason: "reserved for cx.io and cx.serde in Phase 11.2–11.3")
 pub(pkg) fn schubfach_to_decimal_f64(val: f64, /) -> (u64, i32) {
     let bits: u64 = @bit_cast[u64](val);
-    let bin_exp: i32 = ((bits >> 52_u64) & 0x7FF_u64) as i32;
+    let bin_exp = ((bits >> 52_u64) & 0x7FF_u64) as i32;
     var bin_sig: u64 = bits & 0x000F_FFFF_FFFF_FFFF_u64;
     let is_regular: bool = bin_sig != 0_u64 or bin_exp <= 1;
     let q_exp: i32 = if bin_exp != 0 {
-        bin_sig = bin_sig | (1_u64 << 52_u64);
+        bin_sig |= 1_u64 << 52_u64;
         bin_exp -% 1075
     } else {
         -1074
@@ -1946,7 +1951,7 @@ pub(pkg) fn schubfach_to_decimal_f64(val: f64, /) -> (u64, i32) {
 
     let k: i32 = if is_regular => floor_log10_pow2(q_exp)
         else floor_log10_pow2_minus_log10_4_over_3(q_exp);
-    let beta: u64 = ((q_exp +% floor_log2_pow10(0 -% k) +% 1) as u32) as u64;
+    let beta = ((q_exp +% floor_log2_pow10(0 -% k) +% 1) as u32) as u64;
     let (pow_hi, pow_lo) = pow10_sig128(0 -% k);
 
     let lo_scaled: u64 = umul192_upper64_modified(pow_hi, pow_lo, lo_bound, beta);
@@ -1961,7 +1966,7 @@ pub(pkg) fn schubfach_to_decimal_f64(val: f64, /) -> (u64, i32) {
         var dec_sig: u64 = cand;
         var exp10: i32 = k +% 1;
         while dec_sig % 10_u64 == 0_u64 {
-            dec_sig = dec_sig / 10_u64;
+            dec_sig /= 10_u64;
             exp10 = exp10 +% 1;
         }
         return (dec_sig, exp10);
@@ -1977,20 +1982,21 @@ pub(pkg) fn schubfach_to_decimal_f64(val: f64, /) -> (u64, i32) {
     var dec_sig: u64 = if under_in and (not over_in or under_closer) => t_under else t_over;
     var exp10: i32 = k;
     while dec_sig % 10_u64 == 0_u64 {
-        dec_sig = dec_sig / 10_u64;
+        dec_sig /= 10_u64;
         exp10 = exp10 +% 1;
     }
     return (dec_sig, exp10);
 }
 
 /| Converts positive finite `val` (`f32`) to its shortest round-trip `(decimal_significand, base10_exp)` pair via `Schubfach`.
+@expect(unused-pkg-visibility, reason: "reserved for cx.io and cx.serde in Phase 11.2–11.3")
 pub(pkg) fn schubfach_to_decimal_f32(val: f32, /) -> (u32, i32) {
     let bits: u32 = @bit_cast[u32](val);
-    let bin_exp: i32 = ((bits >> 23_u32) & 0xFF_u32) as i32;
-    var bin_sig: u64 = (bits & 0x007F_FFFF_u32) as u64;
+    let bin_exp = ((bits >> 23_u32) & 0xFF_u32) as i32;
+    var bin_sig = (bits & 0x007F_FFFF_u32) as u64;
     let is_regular: bool = bin_sig != 0_u64 or bin_exp <= 1;
     let q_exp: i32 = if bin_exp != 0 {
-        bin_sig = bin_sig | (1_u64 << 23_u64);
+        bin_sig |= 1_u64 << 23_u64;
         bin_exp -% 150
     } else {
         -149
@@ -2002,7 +2008,7 @@ pub(pkg) fn schubfach_to_decimal_f32(val: f32, /) -> (u32, i32) {
 
     let k: i32 = if is_regular => floor_log10_pow2(q_exp)
         else floor_log10_pow2_minus_log10_4_over_3(q_exp);
-    let beta: u64 = ((q_exp +% floor_log2_pow10(0 -% k) +% 1) as u32) as u64;
+    let beta = ((q_exp +% floor_log2_pow10(0 -% k) +% 1) as u32) as u64;
     let (pow_hi, pow_lo) = pow10_sig128(0 -% k);
 
     let lo_scaled: u64 = umul192_upper64_modified(pow_hi, pow_lo, lo_bound, beta);
@@ -2017,7 +2023,7 @@ pub(pkg) fn schubfach_to_decimal_f32(val: f32, /) -> (u32, i32) {
         var dec_sig: u64 = cand;
         var exp10: i32 = k +% 1;
         while dec_sig % 10_u64 == 0_u64 {
-            dec_sig = dec_sig / 10_u64;
+            dec_sig /= 10_u64;
             exp10 = exp10 +% 1;
         }
         return (dec_sig as u32, exp10);
@@ -2033,13 +2039,14 @@ pub(pkg) fn schubfach_to_decimal_f32(val: f32, /) -> (u32, i32) {
     var dec_sig: u64 = if under_in and (not over_in or under_closer) => t_under else t_over;
     var exp10: i32 = k;
     while dec_sig % 10_u64 == 0_u64 {
-        dec_sig = dec_sig / 10_u64;
+        dec_sig /= 10_u64;
         exp10 = exp10 +% 1;
     }
     return (dec_sig as u32, exp10);
 }
 
 /| Fast `Eisel–Lemire` `u64 * 10^exp10 -> f64` converter; returns `.None` only on ambiguous halfway ties (`< 0.001%`).
+@expect(unused-pkg-visibility, reason: "reserved for cx.io and cx.serde in Phase 11.2–11.3")
 pub(pkg) fn eisel_lemire_f64(mantissa: u64, exp10: i32, /) -> f64? {
     if mantissa == 0_u64 or exp10 < -342 {
         return .Some(0.0);
@@ -2048,7 +2055,7 @@ pub(pkg) fn eisel_lemire_f64(mantissa: u64, exp10: i32, /) -> f64? {
         return .Some(@bit_cast[f64](0x7FF0_0000_0000_0000_u64));
     }
     if mantissa < (1_u64 << 53_u64) and exp10 >= -22 and exp10 <= 22 {
-        let flt_man: f64 = mantissa as f64;
+        let flt_man = mantissa as f64;
         if exp10 >= 0 {
             return .Some(flt_man * EXACT_POW10_F64[(exp10 as usize) & 0x1F_usize]);
         }
@@ -2070,7 +2077,7 @@ pub(pkg) fn eisel_lemire_f64(mantissa: u64, exp10: i32, /) -> f64? {
         prod_hi = prod_hi +% (carry_out as u64);
     }
 
-    let msb: i32 = (prod_hi >> 63_u64) as i32;
+    let msb = (prod_hi >> 63_u64) as i32;
     var biased_exp: i32 = (63 -% (clz as i32)) +% e2_pow10 +% msb +% 1023;
     if biased_exp <= 0 {
         if biased_exp < -52 {
@@ -2096,21 +2103,22 @@ pub(pkg) fn eisel_lemire_f64(mantissa: u64, exp10: i32, /) -> f64? {
         return .None;
     }
     let sticky: bool = rem_hi != 0_u64 or prod_lo > 16_u64;
-    let round_up: u64 = ((x54 & 1_u64) == 1_u64 and (sticky or (x54 & 2_u64) != 0_u64)) as u64;
+    let round_up = ((x54 & 1_u64) == 1_u64 and (sticky or (x54 & 2_u64) != 0_u64)) as u64;
     var x53: u64 = (x54 >> 1_u64) +% round_up;
     if x53 >= (1_u64 << 53_u64) {
-        x53 = x53 >> 1_u64;
+        x53 >>= 1_u64;
         biased_exp = biased_exp +% 1;
         if biased_exp >= 0x7FF {
             return .Some(@bit_cast[f64](0x7FF0_0000_0000_0000_u64));
         }
     }
-    return .Some(
+    .Some(
         @bit_cast[f64](((biased_exp as u64) << 52_u64) | (x53 & 0x000F_FFFF_FFFF_FFFF_u64)),
-    );
+    )
 }
 
 /| Fast `Eisel–Lemire` `u64 * 10^exp10 -> f32` converter; returns `.None` only on ambiguous halfway ties.
+@expect(unused-pkg-visibility, reason: "reserved for cx.io and cx.serde in Phase 11.2–11.3")
 pub(pkg) fn eisel_lemire_f32(mantissa: u64, exp10: i32, /) -> f32? {
     if mantissa == 0_u64 or exp10 < -65 {
         return .Some(0.0_f32);
@@ -2133,7 +2141,7 @@ pub(pkg) fn eisel_lemire_f32(mantissa: u64, exp10: i32, /) -> f32? {
         prod_hi = prod_hi +% (carry_out as u64);
     }
 
-    let msb: i32 = (prod_hi >> 63_u64) as i32;
+    let msb = (prod_hi >> 63_u64) as i32;
     var biased_exp: i32 = (63 -% (clz as i32)) +% e2_pow10 +% msb +% 127;
     if biased_exp <= 0 {
         if biased_exp < -23 {
@@ -2151,8 +2159,8 @@ pub(pkg) fn eisel_lemire_f32(mantissa: u64, exp10: i32, /) -> f32? {
             return .None;
         }
         let sub_sticky: bool = sub_rem != 0_u64 or prod_lo > 16_u64;
-        let sub_up: u64 = ((x_guard & 1_u64) == 1_u64 and (sub_sticky or (x_guard & 2_u64) != 0_u64)) as u64;
-        let sig32: u32 = ((x_guard >> 1_u64) +% sub_up) as u32;
+        let sub_up = ((x_guard & 1_u64) == 1_u64 and (sub_sticky or (x_guard & 2_u64) != 0_u64)) as u64;
+        let sig32 = ((x_guard >> 1_u64) +% sub_up) as u32;
         if sig32 >= (1_u32 << 23_u32) {
             return .Some(@bit_cast[f32](1_u32 << 23_u32));
         }
@@ -2172,18 +2180,18 @@ pub(pkg) fn eisel_lemire_f32(mantissa: u64, exp10: i32, /) -> f32? {
         return .None;
     }
     let sticky: bool = rem_hi != 0_u64 or prod_lo > 16_u64;
-    let round_up: u64 = ((x25 & 1_u64) == 1_u64 and (sticky or (x25 & 2_u64) != 0_u64)) as u64;
-    var x24: u32 = ((x25 >> 1_u64) +% round_up) as u32;
+    let round_up = ((x25 & 1_u64) == 1_u64 and (sticky or (x25 & 2_u64) != 0_u64)) as u64;
+    var x24 = ((x25 >> 1_u64) +% round_up) as u32;
     if x24 >= (1_u32 << 24_u32) {
-        x24 = x24 >> 1_u32;
+        x24 >>= 1_u32;
         biased_exp = biased_exp +% 1;
         if biased_exp >= 0xFF {
             return .Some(@bit_cast[f32](0x7F80_0000_u32));
         }
     }
-    return .Some(
+    .Some(
         @bit_cast[f32](((biased_exp as u32) << 23_u32) | (x24 & ((1_u32 << 23_u32) - 1_u32))),
-    );
+    )
 }
 
 /| Exact Nigel Tao `[u8; 864]` BCD shift-and-round IEEE-754 fallback (`mant_bits = 52` for `f64`, `23` for `f32`).
@@ -2198,9 +2206,9 @@ fn decimal_shift_and_round_bits(
     var buf: [u8; 864] = [0; 864];
     var num_digits: usize = 0;
     var dec_pt: i32 = decimal_point;
-    var is_trunc: bool = false;
+    var is_trunc = false;
 
-    var seen_nonzero: bool = false;
+    var seen_nonzero = false;
     var scan_idx: usize = 0;
     let ascii_len: usize = ascii_digits.len();
     while scan_idx < ascii_len {
@@ -2326,13 +2334,13 @@ fn decimal_shift_and_round_bits(
         return int_sig;
     }
     if int_sig >= shl_u64_masked(1_u64, mant_bits +% 1_u32) {
-        int_sig = int_sig >> 1_u64;
+        int_sig >>= 1_u64;
         biased_exp = biased_exp +% 1;
         if biased_exp >= max_biased_exp {
             return shl_u64_masked(max_biased_exp as u64, mant_bits);
         }
     }
-    return shl_u64_masked(biased_exp as u64, mant_bits) | (int_sig & mant_mask);
+    shl_u64_masked(biased_exp as u64, mant_bits) | (int_sig & mant_mask)
 }
 
 /| Writes two decimal digits `00`..`99` at `idx` from `DEC_DIGITS_LUT` into `dst`.
@@ -2345,9 +2353,11 @@ fn write_2digits(dst: *mut u8, idx: usize, /) {
 }
 
 /| Formats `val` (`u32`) in base 10 into `dst[0..10]` using James Anhalt's (`jeaiii`) division-free algorithm.
-@std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
+@expect(unused-pkg-visibility, reason: "reserved for cx.io and cx.serde in Phase 11.2–11.3")
+@std_cap_boundary(clears: [unsafe_op])
+@no_alloc @no_panic
 pub(pkg) fn format_u32_jeaiii(dst: *mut u8, val: u32, /) -> usize {
-    let wide: u64 = val as u64;
+    let wide = val as u64;
     if val < 100_u32 {
         if val < 10_u32 {
             unsafe {
@@ -2405,7 +2415,7 @@ pub(pkg) fn format_u32_jeaiii(dst: *mut u8, val: u32, /) -> usize {
         return lead6 +% 4;
     }
     if val < 100_000_000_u32 {
-        let mask47: u64 = 0x0000_7FFF_FFFF_FFFF_u64;
+        let mask47 = 0x0000_7FFF_FFFF_FFFF_u64;
         var prod8: u64 = wide *% 140_737_489_u64;
         let lead8: usize = if val < 10_000_000_u32 {
             unsafe {
@@ -2478,13 +2488,13 @@ pub(pkg) fn format_u32_jeaiii(dst: *mut u8, val: u32, /) -> usize {
         },
         (prod10 >> 32_u64) as usize,
     );
-    return lead10 +% 8;
+    lead10 +% 8
 }
 
 /| Formats `val` (`< 100_000_000`) as an exact zero-padded 8-digit decimal block into `dst`.
 @std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
 fn fmt_u32_fixed8(dst: *mut u8, val: u32, /) {
-    let mask47: u64 = 0x0000_7FFF_FFFF_FFFF_u64;
+    let mask47 = 0x0000_7FFF_FFFF_FFFF_u64;
     var prod: u64 = (val as u64) *% 140_737_489_u64;
     write_2digits(dst, (prod >> 47_u64) as usize);
     prod = (prod & mask47) *% 100_u64;
@@ -2511,13 +2521,15 @@ fn fmt_u32_fixed8(dst: *mut u8, val: u32, /) {
 }
 
 /| Formats `val` (`u64`) in base 10 into `dst[0..20]` via `jeaiii` 8-digit chunking.
-@std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
+@expect(unused-pkg-visibility, reason: "reserved for cx.io and cx.serde in Phase 11.2–11.3")
+@std_cap_boundary(clears: [unsafe_op])
+@no_alloc @no_panic
 pub(pkg) fn format_u64_jeaiii(dst: *mut u8, val: u64, /) -> usize {
     if val <= 0xFFFF_FFFF_u64 {
         return format_u32_jeaiii(dst, val as u32);
     }
     let hi_chunk: u64 = val / 100_000_000_u64;
-    let lo_chunk: u32 = (val % 100_000_000_u64) as u32;
+    let lo_chunk = (val % 100_000_000_u64) as u32;
     if hi_chunk <= 0xFFFF_FFFF_u64 {
         let lead_len: usize = format_u32_jeaiii(dst, hi_chunk as u32);
         fmt_u32_fixed8(
@@ -2528,8 +2540,8 @@ pub(pkg) fn format_u64_jeaiii(dst: *mut u8, val: u64, /) -> usize {
         );
         return lead_len +% 8;
     }
-    let top_chunk: u32 = (hi_chunk / 100_000_000_u64) as u32;
-    let mid_chunk: u32 = (hi_chunk % 100_000_000_u64) as u32;
+    let top_chunk = (hi_chunk / 100_000_000_u64) as u32;
+    let mid_chunk = (hi_chunk % 100_000_000_u64) as u32;
     let lead_len: usize = format_u32_jeaiii(dst, top_chunk);
     fmt_u32_fixed8(
         unsafe {
@@ -2543,7 +2555,7 @@ pub(pkg) fn format_u64_jeaiii(dst: *mut u8, val: u64, /) -> usize {
         },
         lo_chunk,
     );
-    return lead_len +% 16;
+    lead_len +% 16
 }
 
 /| Copies `literal` into `buf` or returns `.Err(.BufferFull)`.
@@ -2581,7 +2593,7 @@ fn render_schubfach_decimal(
     }
 
     if sci_exp >= 0 and sci_exp < max_fixed_int {
-        let int_len: usize = (sci_exp +% 1) as usize;
+        let int_len = (sci_exp +% 1) as usize;
         if int_len >= num_digits {
             var i: usize = 0;
             while i < num_digits {
@@ -2617,7 +2629,7 @@ fn render_schubfach_decimal(
         stage[pos] = b'0';
         stage[pos +% 1] = b'.';
         pos = pos +% 2;
-        var lead_z: usize = ((0 -% sci_exp) -% 1) as usize;
+        var lead_z = ((0 -% sci_exp) -% 1) as usize;
         while lead_z > 0 {
             stage[pos] = b'0';
             pos = pos +% 1;
@@ -2682,7 +2694,7 @@ fn eq_ascii_lower_pat(bytes: &[u8], pat_lower: &[u8], /) -> bool {
         }
         i = i +% 1;
     }
-    return true;
+    true
 }
 
 /| Parses IEEE-754 decimal/special string into raw 64-bit (`is_f64 == true`) or 32-bit (`is_f64 == false`) bit pattern.
@@ -2695,7 +2707,7 @@ fn parse_float_bits_core(text: str, is_f64: bool, /) -> u64!ParseFloatError {
     }
 
     var idx: usize = 0;
-    var sign_bit: u64 = 0_u64;
+    var sign_bit = 0_u64;
     if bytes[0] == b'-' {
         sign_bit = if is_f64 => 1_u64 << 63_u64 else 1_u64 << 31_u64;
         idx = 1;
@@ -2716,16 +2728,16 @@ fn parse_float_bits_core(text: str, is_f64: bool, /) -> u64!ParseFloatError {
         return .Ok(sign_bit | nan_bits);
     }
 
-    var mantissa_19: u64 = 0_u64;
+    var mantissa_19 = 0_u64;
     var sig_digits: usize = 0;
-    var extra_int_digits: i64 = 0_i64;
-    var frac_exp_adj: i64 = 0_i64;
-    var saw_any_digit: bool = false;
-    var saw_dot: bool = false;
+    var extra_int_digits = 0_i64;
+    var frac_exp_adj = 0_i64;
+    var saw_any_digit = false;
+    var saw_dot = false;
     var fallback_digits: [u8; 800] = [0_u8; 800];
     var fb_len: usize = 0;
-    var fb_dec_pt: i64 = 0_i64;
-    var fb_truncated_nonzero: bool = false;
+    var fb_dec_pt = 0_i64;
+    var fb_truncated_nonzero = false;
 
     while idx < total {
         let ch_b: u8 = bytes[idx];
@@ -2774,13 +2786,13 @@ fn parse_float_bits_core(text: str, is_f64: bool, /) -> u64!ParseFloatError {
         return .Err(.InvalidSyntax);
     }
 
-    var signed_exp64: i64 = 0_i64;
+    var signed_exp64 = 0_i64;
     if idx < total and (bytes[idx] == b'e' or bytes[idx] == b'E') {
         idx = idx +% 1;
         if idx >= total {
             return .Err(.InvalidSyntax);
         }
-        var exp_neg: bool = false;
+        var exp_neg = false;
         if bytes[idx] == b'-' {
             exp_neg = true;
             idx = idx +% 1;
@@ -2790,7 +2802,7 @@ fn parse_float_bits_core(text: str, is_f64: bool, /) -> u64!ParseFloatError {
         if idx >= total or bytes[idx] < b'0' or bytes[idx] > b'9' {
             return .Err(.InvalidSyntax);
         }
-        var raw_exp: i64 = 0_i64;
+        var raw_exp = 0_i64;
         while idx < total and bytes[idx] >= b'0' and bytes[idx] <= b'9' {
             if raw_exp < 1_000_000_000_000_i64 {
                 raw_exp = raw_exp *% 10_i64 +% ((bytes[idx] -% b'0') as i64);
@@ -2816,10 +2828,8 @@ fn parse_float_bits_core(text: str, is_f64: bool, /) -> u64!ParseFloatError {
             if eisel_lemire_f64(mantissa_19, exp10_fast) is .Some(fast_f64) {
                 return .Ok(sign_bit | @bit_cast[u64](fast_f64));
             }
-        } else {
-            if eisel_lemire_f32(mantissa_19, exp10_fast) is .Some(fast_f32) {
-                return .Ok(sign_bit | (@bit_cast[u32](fast_f32) as u64));
-            }
+        } else if eisel_lemire_f32(mantissa_19, exp10_fast) is .Some(fast_f32) {
+            return .Ok(sign_bit | (@bit_cast[u32](fast_f32) as u64));
         }
     }
 
@@ -2831,28 +2841,31 @@ fn parse_float_bits_core(text: str, is_f64: bool, /) -> u64!ParseFloatError {
     let total_dec_pt: i32 = if raw_total_dec_pt < -10_000_i64 => -10_000
         else if raw_total_dec_pt > 10_000_i64 => 10_000
         else raw_total_dec_pt as i32;
-    let exact_bits: u64 = if is_f64 => decimal_shift_and_round_bits(
-        fallback_digits[0..fb_len],
-        total_dec_pt,
-        52_u32,
-        1023,
-        0x7FF,
-    )
-        else decimal_shift_and_round_bits(
+    let exact_bits: u64 = if is_f64 {
+        decimal_shift_and_round_bits(
+            fallback_digits[0..fb_len],
+            total_dec_pt,
+            52_u32,
+            1023,
+            0x7FF,
+        )
+    } else {
+        decimal_shift_and_round_bits(
             fallback_digits[0..fb_len],
             total_dec_pt,
             23_u32,
             127,
             0xFF,
-        );
-    return .Ok(sign_bit | exact_bits);
+        )
+    };
+    .Ok(sign_bit | exact_bits)
 }
 
 // ------------------ FmtWriter Sink Callbacks ------------------
 /| Writes `chunk` into stack `SliceSink`, returning `.Err(.BufferFull)` if capacity is exceeded.
 @std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
 fn slice_sink_write(ctx: *mut opaque, chunk: &[u8], /) -> unit!FmtError {
-    let sink_ptr: *mut SliceSink = ctx as *mut SliceSink;
+    let sink_ptr = ctx as *mut SliceSink;
     if sink_ptr.is_null() {
         return .Ok(());
     }
@@ -2869,7 +2882,7 @@ fn slice_sink_write(ctx: *mut opaque, chunk: &[u8], /) -> unit!FmtError {
         }
         sink.pos = sink.pos +% n;
     }
-    return .Ok(());
+    .Ok(())
 }
 
 /| Appends raw unvalidated `chunk` bytes into `target` (UTF-8 validated once at `write_fmt` completion).
@@ -2908,7 +2921,7 @@ fn string_try_push_raw_bytes(target: &mut String, chunk: &[u8], /) -> unit!Alloc
         heap_cur.len = new_len as u32;
         @ptr_write(&raw mut target.raw_bytes as *mut HeapRepr, heap_cur);
     }
-    return .Ok(());
+    .Ok(())
 }
 
 /| Restores `target`'s raw byte length back to `prev_len` (`<= target.len()`) without UTF-8 checks on rollback.
@@ -2930,7 +2943,7 @@ fn string_rollback_len(target: &mut String, prev_len: usize, /) {
 /| Appends raw `chunk` bytes into `StringSink` during `String.fmt` / `String.write_fmt`.
 @std_cap_boundary(clears: [unsafe_op])
 fn string_sink_write(ctx: *mut opaque, chunk: &[u8], /) -> unit!FmtError {
-    let sink_ptr: *mut StringSink = ctx as *mut StringSink;
+    let sink_ptr = ctx as *mut StringSink;
     if sink_ptr.is_null() {
         return .Ok(());
     }
@@ -2947,7 +2960,7 @@ fn string_sink_write(ctx: *mut opaque, chunk: &[u8], /) -> unit!FmtError {
     string_try_push_raw_bytes(target, chunk) catch {
         return .Err(.BufferFull);
     };
-    return .Ok(());
+    .Ok(())
 }
 
 /| Computes the exact joined UTF-8 byte length of `parts` separated by `sep`, panicking on `usize` overflow.
@@ -2957,32 +2970,34 @@ fn checked_join_byte_len(parts: &[str], sep: str, /) -> usize {
     if count == 0_usize {
         return 0_usize;
     }
-    let max_bytes: usize = isize.MAX as usize;
+    let max_bytes = isize.MAX as usize;
     let sep_len: usize = sep.len();
     if sep_len != 0_usize and (count - 1_usize) > max_bytes / sep_len {
         panic("cx.str.join: byte length overflow");
     }
     var total_bytes: usize = sep_len * (count - 1_usize);
-    var i: usize = 0_usize;
+    var i = 0_usize;
     while i < count {
         let part_len: usize = parts[i].len();
         if part_len > max_bytes - total_bytes {
             panic("cx.str.join: byte length overflow");
         }
-        total_bytes = total_bytes + part_len;
+        total_bytes += part_len;
         i += 1_usize;
     }
-    return total_bytes;
+    total_bytes
 }
 
 /| Streams `args` (`FmtArgs`) into `out` without allocating via the `@fmt_write` compiler intrinsic.
+@expect(unused-pkg-visibility, reason: "reserved for cx.io and cx.serde in Phase 11.2–11.3")
 pub(pkg) fn render_fmt_args(out: &mut FmtWriter, args: FmtArgs, /) -> unit!FmtError {
-    return @fmt_write(out, args);
+    @fmt_write(out, args)
 }
 
 /| Looks up the UAX #29 runtime class (`0..=17`) of `ch` in $O(1)$ without bounds checks.
+@expect(unused-pkg-visibility, reason: "reserved for cx.io and cx.serde in Phase 11.2–11.3")
 pub(pkg) fn grapheme_class(ch: char, /) -> u8 {
-    let codepoint: u32 = ch as u32;
+    let codepoint = ch as u32;
     if codepoint < 0x80_u32 {
         if codepoint == 0x0D_u32 {
             return 1;
@@ -2994,10 +3009,10 @@ pub(pkg) fn grapheme_class(ch: char, /) -> u8 {
     if codepoint >= 0xAC00_u32 and codepoint <= 0xD7A3_u32 {
         return if (codepoint -% 0xAC00_u32) % 28_u32 == 0_u32 => 16 else 17;
     }
-    if codepoint >= 0x20000_u32 {
-        if codepoint >= 0xE0000_u32 and codepoint <= 0xE0FFF_u32 {
-            if (codepoint >= 0xE0020_u32 and codepoint <= 0xE007F_u32) or (
-                codepoint >= 0xE0100_u32 and codepoint <= 0xE01EF_u32
+    if codepoint >= 0x2_0000_u32 {
+        if codepoint >= 0xE_0000_u32 and codepoint <= 0xE_0FFF_u32 {
+            if (codepoint >= 0xE_0020_u32 and codepoint <= 0xE_007F_u32) or (
+                codepoint >= 0xE_0100_u32 and codepoint <= 0xE_01EF_u32
             ) {
                 return 5;
             }
@@ -3005,32 +3020,32 @@ pub(pkg) fn grapheme_class(ch: char, /) -> u8 {
         }
         return 0;
     }
-    let byte_idx: usize = ((codepoint >> 1_u32) & 0xFFFF_u32) as usize;
-    let s2_blk: usize = GCB_S1[(byte_idx >> 6_usize) & 0x3FF_usize] as usize;
+    let byte_idx = ((codepoint >> 1_u32) & 0xFFFF_u32) as usize;
+    let s2_blk = GCB_S1[(byte_idx >> 6_usize) & 0x3FF_usize] as usize;
     let raw_s2_idx: usize = (s2_blk << 3_usize) | ((byte_idx >> 3_usize) & 0x7_usize);
     if raw_s2_idx >= 1152_usize {
         return 0;
     }
-    let pool_off: usize = GCB_S2[raw_s2_idx] as usize;
+    let pool_off = GCB_S2[raw_s2_idx] as usize;
     let raw_pool_idx: usize = pool_off +% (byte_idx & 0x7_usize);
     if raw_pool_idx >= 1163_usize {
         return 0;
     }
     let packed_byte: u8 = GCB_POOL[raw_pool_idx];
-    return if (codepoint & 1_u32) != 0_u32 => (packed_byte >> 4_u8) & 0x0F_u8
-        else packed_byte & 0x0F_u8;
+    if (codepoint & 1_u32) != 0_u32 => (packed_byte >> 4_u8) & 0x0F_u8 else packed_byte & 0x0F_u8
 }
 
 // ------------------- Clone-on-Write CowStr --------------------
+@expect(unused-pkg-visibility, reason: "reserved for cx.io and cx.serde in Phase 11.2–11.3")
 impl CowStr {
     /| Wraps a borrowed `str` slice without allocating.
     pub(pkg) fn from_borrowed(text: str, /) -> Self {
-        return .Borrowed(text);
+        .Borrowed(text)
     }
 
     /| Wraps an owned `String` without copying.
     pub(pkg) fn from_owned(owned_str: own String, /) -> Self {
-        return .Owned(own owned_str);
+        .Owned(own owned_str)
     }
 
     /| Borrows the underlying UTF-8 `str` view in place without copying inline `String` bytes onto the stack.
@@ -3043,42 +3058,42 @@ impl CowStr {
         let owned_ptr: *String = unsafe {
             ((&raw self.* as *u8).add(payload_off)) as *String
         };
-        return string_ptr_ref(owned_ptr).as_str();
+        string_ptr_ref(owned_ptr).as_str()
     }
 
     /| Borrows the underlying UTF-8 bytes `&[u8]`.
     pub(pkg) fn as_bytes(&self) -> &[u8] {
-        return self.as_str().as_bytes();
+        self.as_str().as_bytes()
     }
 
     /| Returns the UTF-8 byte length of `self`.
     pub(pkg) fn len(&self) -> usize {
-        return self.as_str().len();
+        self.as_str().len()
     }
 
     /| Returns `true` if `self` is empty.
     pub(pkg) fn is_empty(&self) -> bool {
-        return self.len() == 0;
+        self.len() == 0
     }
 
     /| Returns `true` if `self` is `.Borrowed`.
     pub(pkg) fn is_borrowed(&self) -> bool {
-        return self is .Borrowed(_);
+        self is .Borrowed(_)
     }
 
     /| Converts `self` into an owned `String`, allocating only if `.Borrowed` and `> 23` bytes.
     pub(pkg) fn into_owned(own self) -> String {
-        return match own self {
+        match own self {
             .Borrowed(view) => String.from_str(view),
             .Owned(buf) => buf,
-        };
+        }
     }
 }
 
 impl GraphemeIndicesIter {
     /| Segments and returns the next `(byte_offset, grapheme_str)` pair, or `.None` when empty.
     @std_cap_boundary(clears: [unsafe_op, may_panic]) @no_alloc @no_panic
-    pub(pkg) fn next(&mut self) -> (usize, str)? {
+    fn next(&mut self) -> (usize, str)? {
         if self.rem.is_empty() {
             return .None;
         }
@@ -3104,7 +3119,7 @@ impl GraphemeIndicesIter {
         };
         self.rem = self.rem[cluster_len..total];
         self.offset = start_off +% cluster_len;
-        return .Some((start_off, cluster_str));
+        .Some((start_off, cluster_str))
     }
 }
 
@@ -3117,13 +3132,13 @@ impl String {
     /| Constructs an empty inline `String` (`[0_u8; 24]`; callable at both runtime and `comptime`).
     @inline @no_alloc @no_panic
     pub fn new() -> Self {
-        return Self {
+        Self {
             raw_bytes: [0_u8; 24],
-        };
+        }
     }
 
     /| Constructs a `String` from static `text` (`<= 23 B` inline SSO, `> 23 B` zero-alloc `STATIC_RODATA` view).
-    @std_cap_boundary(clears: [unsafe_op, may_panic]) @inline @no_alloc @no_panic
+    @std_cap_boundary(clears: [unsafe_op, may_panic]) @no_alloc @no_panic
     pub fn from_static(comptime text: str, /) -> Self {
         let byte_len: usize = text.len();
         if byte_len <= STRING_INLINE_CAP {
@@ -3149,14 +3164,14 @@ impl String {
                 ),
             );
         }
-        return static_out;
+        static_out
     }
 
     /| Constructs an owned `String` copying `text` (inline when `<= 23 B`, else allocated via `context.allocator`).
     pub fn from_str(text: str, /) -> Self {
-        var out: Self = Self.new();
+        var out = Self.new();
         out.push_str(text);
-        return out;
+        out
     }
 
     /| Constructs a `String` immediately in `HeapRepr` mode backed by `arena` so inline writes never clobber `alloc`.
@@ -3190,14 +3205,14 @@ impl String {
                 ),
             );
         }
-        return out;
+        out
     }
 
     /| Pre-allocates at least `cap` UTF-8 bytes (staying inline when `cap <= 23`), panicking on `AllocError`.
     pub fn with_capacity(cap: usize, /) -> Self {
-        return Self.try_with_capacity(cap) catch {
+        Self.try_with_capacity(cap) catch {
             panic(f"String.with_capacity({cap=}) out of memory");
-        };
+        }
     }
 
     /| Fallibly pre-allocates at least `cap` UTF-8 bytes (staying inline when `cap <= 23`).
@@ -3223,7 +3238,7 @@ impl String {
                 ),
             );
         }
-        return .Ok(own out);
+        .Ok(own out)
     }
 
     /| Validates `bytes` as UTF-8 and transfers ownership into `String` in $O(1)$ without copying when `cap <= 2 GiB`.
@@ -3255,7 +3270,7 @@ impl String {
             let valid_view: str = unsafe {
                 @str_from_utf8_unchecked(@slice_from_raw_parts(ptr as *u8, len))
             };
-            let copied: Self = Self.from_str(valid_view);
+            let copied = Self.from_str(valid_view);
             if not alloc.is_arena_or_static() {
                 alloc.dealloc(ptr, Layout { size: cap, alignment: 1 });
             }
@@ -3273,21 +3288,21 @@ impl String {
                 ),
             );
         }
-        return .Ok(own out);
+        .Ok(own out)
     }
 
     /| Formats `args` into a new `String` (staying 100% stack/SSO-resident when output `<= 23` bytes).
     @overload
     pub fn fmt(args: FmtArgs, /) -> Self {
-        var out: Self = Self.new();
+        var out = Self.new();
         out.write_fmt(args);
-        return out;
+        out
     }
 
     /| Returns `true` if `self` currently stores its bytes inline (`raw_bytes[23] < 0x80`).
     @inline @no_alloc @no_panic
     pub fn is_inline(&self) -> bool {
-        return (self.raw_bytes[23] & STRING_HEAP_FLAG_U8) == 0_u8;
+        (self.raw_bytes[23] & STRING_HEAP_FLAG_U8) == 0_u8
     }
 
     /| Returns the UTF-8 byte length of `self`.
@@ -3300,7 +3315,7 @@ impl String {
         let heap: HeapRepr = unsafe {
             @ptr_read(&raw self.raw_bytes as *HeapRepr)
         };
-        return heap.len as usize;
+        heap.len as usize
     }
 
     /| Returns the UTF-8 byte capacity (`23` when inline, `0` for static `.rodata`, or heap capacity).
@@ -3312,13 +3327,13 @@ impl String {
         let heap: HeapRepr = unsafe {
             @ptr_read(&raw self.raw_bytes as *HeapRepr)
         };
-        return (heap.flagged_cap & STRING_CAP_MASK_U32) as usize;
+        (heap.flagged_cap & STRING_CAP_MASK_U32) as usize
     }
 
     /| Returns `true` if `self` has byte length `0`.
     @inline @no_alloc @no_panic
     pub fn is_empty(&self) -> bool {
-        return self.len() == 0;
+        self.len() == 0
     }
 
     /| Borrows `self` as a zero-allocation `str` slice.
@@ -3335,15 +3350,15 @@ impl String {
         let heap: HeapRepr = unsafe {
             @ptr_read(&raw self.raw_bytes as *HeapRepr)
         };
-        return unsafe {
+        unsafe {
             @str_from_utf8_unchecked(@slice_from_raw_parts(heap.ptr as *u8, heap.len as usize))
-        };
+        }
     }
 
     /| Borrows `self` as a UTF-8 byte slice `&[u8]`.
     @inline @no_alloc @no_panic
     pub fn as_bytes(&self) -> &[u8] {
-        return self.as_str().as_bytes();
+        self.as_str().as_bytes()
     }
 
     /| Ensures non-inline `HeapRepr` with mutable capacity `>= required_len`, preserving `arena` handles.
@@ -3353,7 +3368,7 @@ impl String {
             return .Err(.OutOfMemory);
         }
         if self.is_inline() {
-            let cur_len: usize = self.raw_bytes[23] as usize;
+            let cur_len = self.raw_bytes[23] as usize;
             var next_cap: usize = 32;
             if next_cap < required_len {
                 next_cap = required_len;
@@ -3382,7 +3397,7 @@ impl String {
         let heap: HeapRepr = unsafe {
             @ptr_read(&raw self.raw_bytes as *HeapRepr)
         };
-        let old_cap: usize = (heap.flagged_cap & STRING_CAP_MASK_U32) as usize;
+        let old_cap = (heap.flagged_cap & STRING_CAP_MASK_U32) as usize;
         let is_rodata: bool = heap.alloc.raw_tagged_ptr == 2_usize;
         if not is_rodata and old_cap >= required_len {
             return .Ok(());
@@ -3421,7 +3436,30 @@ impl String {
                 ),
             );
         }
-        return .Ok(());
+        .Ok(())
+    }
+
+    /| Reserves capacity for at least `additional` more UTF-8 bytes, panicking on `AllocError`.
+    pub fn reserve(&mut self, additional: usize, /) {
+        self.try_reserve(additional) catch {
+            panic(f"String.reserve({additional=}) out of memory");
+        };
+    }
+
+    /| Fallibly reserves capacity for at least `additional` more UTF-8 bytes.
+    pub fn try_reserve(&mut self, additional: usize, /) -> unit!AllocError {
+        if additional == 0 {
+            return .Ok(());
+        }
+        let cur_len = self.len();
+        if additional > (STRING_CAP_MASK_U32 as usize) -| cur_len {
+            return .Err(.OutOfMemory);
+        }
+        let needed = cur_len +% additional;
+        if self.is_inline() and needed <= STRING_INLINE_CAP {
+            return .Ok(());
+        }
+        self.reserve_non_inline(needed)
     }
 
     /| Appends `extra` to `self`, panicking on `AllocError`.
@@ -3434,7 +3472,7 @@ impl String {
     /| Fallibly appends `extra` to `self` without panicking on `AllocError`.
     @inline
     pub fn try_push_str(&mut self, extra: str, /) -> unit!AllocError {
-        return string_try_push_raw_bytes(self, extra.as_bytes());
+        string_try_push_raw_bytes(self, extra.as_bytes())
     }
 
     /| Encodes and appends Unicode scalar `ch` to `self`.
@@ -3449,12 +3487,12 @@ impl String {
     pub fn try_push_char(&mut self, ch: char, /) -> unit!AllocError {
         var encoded: [u8; 4] = [0_u8; 4];
         let width: usize = encode_utf8_char(ch, &mut encoded);
-        return string_try_push_raw_bytes(
+        string_try_push_raw_bytes(
             self,
             unsafe {
                 @slice_from_raw_parts(&raw encoded[0], width)
             },
-        );
+        )
     }
 
     /| Appends formatted `args` directly into `self`, verifying UTF-8 validity on the appended span.
@@ -3484,7 +3522,7 @@ impl String {
             let appended: &[u8] = unsafe {
                 @slice_from_raw_parts(base_ptr.add(old_len), new_len -% old_len)
             };
-            if not validate_utf8(appended) {
+            if not is_valid_utf8(appended) {
                 string_rollback_len(self, old_len);
                 panic("invalid UTF-8 written to FmtWriter");
             }
@@ -3535,7 +3573,7 @@ impl String {
     @std_cap_boundary(clears: [unsafe_op])
     pub fn into_bytes(own self) -> Vec[u8] {
         if self.is_inline() {
-            let inline_len: usize = self.raw_bytes[23] as usize;
+            let inline_len = self.raw_bytes[23] as usize;
             if inline_len == 0 {
                 @forget(own self);
                 return ByteVec.new();
@@ -3557,11 +3595,11 @@ impl String {
             @forget(own self);
             return ByteVec.from_slice(view);
         }
-        let cap: usize = (heap.flagged_cap & STRING_CAP_MASK_U32) as usize;
+        let cap = (heap.flagged_cap & STRING_CAP_MASK_U32) as usize;
         @forget(own self);
-        return unsafe {
+        unsafe {
             ByteVec.from_raw_parts(heap.ptr, heap.len as usize, cap, heap.alloc)
-        };
+        }
     }
 }
 
@@ -3573,7 +3611,7 @@ impl AutoDrop for String {
             let heap: HeapRepr = unsafe {
                 @ptr_read(&raw self.raw_bytes as *HeapRepr)
             };
-            let cap: usize = (heap.flagged_cap & STRING_CAP_MASK_U32) as usize;
+            let cap = (heap.flagged_cap & STRING_CAP_MASK_U32) as usize;
             if cap != 0 and not heap.alloc.is_arena_or_static() {
                 heap.alloc.dealloc(heap.ptr, Layout { size: cap, alignment: 1 });
             }
@@ -3586,7 +3624,7 @@ impl Default for String {
     /| Returns an empty inline `String`.
     @inline @no_alloc @no_panic
     pub fn default() -> Self {
-        return Self.new();
+        Self.new()
     }
 }
 
@@ -3603,7 +3641,7 @@ impl Clone for String {
         if heap.alloc.raw_tagged_ptr == 2_usize {
             return Self { raw_bytes: self.raw_bytes };
         }
-        return Self.from_str(self.as_str());
+        Self.from_str(self.as_str())
     }
 }
 
@@ -3611,7 +3649,7 @@ impl Equatable for String {
     /| Compares two `String` values by UTF-8 byte content.
     @inline @no_alloc @no_panic
     pub fn eq(&self, other: &Self, /) -> bool {
-        return self.as_str() == other.as_str();
+        self.as_str() == other.as_str()
     }
 }
 
@@ -3646,7 +3684,7 @@ impl Comparable for String {
         } else if lhs_len > rhs_len {
             return .Greater;
         }
-        return .Equal;
+        .Equal
     }
 }
 
@@ -3662,7 +3700,7 @@ impl Display for String {
     /| Streams `self.as_str()` into `out` honoring padding in `spec`.
     @overload @inline @no_alloc
     pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
-        return out.write_padded(self.as_bytes(), spec);
+        out.write_padded(self.as_bytes(), spec)
     }
 }
 
@@ -3671,7 +3709,7 @@ impl Debug for String {
     @no_alloc
     pub fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
         _ = spec;
-        return @fmt_write(out, f"{self.as_str():?}");
+        @fmt_write(out, f"{self.as_str():?}")
     }
 }
 
@@ -3680,17 +3718,17 @@ impl Default for CowStr {
     /| Returns `.Borrowed("")`.
     @no_alloc @no_panic
     pub fn default() -> Self {
-        return .Borrowed("");
+        .Borrowed("")
     }
 }
 
 impl Clone for CowStr {
     /| Clones `self` (`0` allocs when `.Borrowed` or inline `.Owned`).
     pub fn clone(&self) -> Self {
-        return match self {
+        match self {
             .Borrowed(view) => .Borrowed(view),
-            .Owned(buf) => .Owned(buf.clone()),
-        };
+            .Owned(&buf) => .Owned(buf.clone()),
+        }
     }
 }
 
@@ -3698,7 +3736,7 @@ impl Equatable for CowStr {
     /| Compares two `CowStr` values by UTF-8 content.
     @no_alloc @no_panic
     pub fn eq(&self, other: &Self, /) -> bool {
-        return self.as_str() == other.as_str();
+        self.as_str() == other.as_str()
     }
 }
 
@@ -3713,7 +3751,7 @@ impl Comparable for CowStr {
         } else if lhs_view > rhs_view {
             return .Greater;
         }
-        return .Equal;
+        .Equal
     }
 }
 
@@ -3729,7 +3767,7 @@ impl Display for CowStr {
     /| Formats `self.as_str()` with `spec`.
     @no_alloc
     pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
-        return out.write_padded(self.as_bytes(), spec);
+        out.write_padded(self.as_bytes(), spec)
     }
 }
 
@@ -3738,7 +3776,7 @@ impl Debug for CowStr {
     @no_alloc
     pub fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
         _ = spec;
-        return @fmt_write(out, f"{self.as_str():?}");
+        @fmt_write(out, f"{self.as_str():?}")
     }
 }
 
@@ -3752,7 +3790,7 @@ impl str {
         if pre.len() > hay.len() {
             return false;
         }
-        return is_bytes_equal_at(hay.as_ptr(), 0, pre.as_ptr(), pre.len());
+        is_bytes_equal_at(hay.as_ptr(), 0, pre.as_ptr(), pre.len())
     }
 
     /| Returns `true` if `self` ends with `suffix`.
@@ -3763,7 +3801,7 @@ impl str {
         if suf.len() > hay.len() {
             return false;
         }
-        return is_bytes_equal_at(hay.as_ptr(), hay.len() -% suf.len(), suf.as_ptr(), suf.len());
+        is_bytes_equal_at(hay.as_ptr(), hay.len() -% suf.len(), suf.as_ptr(), suf.len())
     }
 
     /| Strips `prefix` from the start of `self`, returning `.Some(rest)` or `.None`.
@@ -3774,13 +3812,13 @@ impl str {
         }
         let p_len: usize = prefix.len();
         let s_len: usize = self.len();
-        return .Some(
+        .Some(
             unsafe {
                 @str_from_utf8_unchecked(
                     @slice_from_raw_parts(self.as_ptr().add(p_len), s_len -% p_len),
                 )
             },
-        );
+        )
     }
 
     /| Strips `suffix` from the end of `self`, returning `.Some(head)` or `.None`.
@@ -3790,23 +3828,23 @@ impl str {
             return .None;
         }
         let keep_len: usize = self.len() -% suffix.len();
-        return .Some(
+        .Some(
             unsafe {
                 @str_from_utf8_unchecked(@slice_from_raw_parts(self.as_ptr(), keep_len))
             },
-        );
+        )
     }
 
     /| Returns the first byte index of `needle` inside `self` (16-byte SIMD filter + scalar tail), or `.None`.
     @no_alloc @no_panic
     pub fn find(self, needle: str, /) -> usize? {
-        return (ActiveStrOps {}).find_bytes(self.as_bytes(), needle.as_bytes());
+        (ActiveStrOps {}).find_bytes(self.as_bytes(), needle.as_bytes())
     }
 
     /| Returns `true` if `needle` occurs anywhere inside `self`.
     @inline @no_alloc @no_panic
     pub fn contains(self, needle: str, /) -> bool {
-        return self.find(needle) is .Some(_);
+        self.find(needle) is .Some(_)
     }
 
     /| Returns the last byte index of `needle` inside `self`, or `.None`.
@@ -3847,7 +3885,7 @@ impl str {
                 return .Some(pos);
             }
         }
-        return .None;
+        .None
     }
 
     /| Compares `self` and `other` for ASCII case-insensitive equality (`A..Z` == `a..z`).
@@ -3876,7 +3914,7 @@ impl str {
             }
             i = i +% 1;
         }
-        return true;
+        true
     }
 
     /| Returns `true` if every byte in `self` is `< 0x80` (`8`-byte `u64` `0x8080…` SWAR scan).
@@ -3906,7 +3944,7 @@ impl str {
             }
             i = i +% 1;
         }
-        return true;
+        true
     }
 
     /| Trims leading characters present in `chars` (default `" \t\r\n"`), returning a zero-alloc `str` sub-slice.
@@ -3925,9 +3963,9 @@ impl str {
             }
             start = start +% width;
         }
-        return unsafe {
+        unsafe {
             @str_from_utf8_unchecked(@slice_from_raw_parts(self.as_ptr().add(start), total -% start))
-        };
+        }
     }
 
     /| Trims trailing characters present in `chars` (default `" \t\r\n"`), returning a zero-alloc `str` sub-slice.
@@ -3945,32 +3983,32 @@ impl str {
             }
             end_idx = end_idx -% width;
         }
-        return unsafe {
+        unsafe {
             @str_from_utf8_unchecked(@slice_from_raw_parts(self.as_ptr(), end_idx))
-        };
+        }
     }
 
     /| Trims both leading and trailing characters present in `chars` (default `" \t\r\n"`).
     @std_cap_boundary(clears: [may_panic]) @no_alloc @no_panic
     pub fn trim(self, *, chars: str = " \t\r\n") -> str {
-        return self.trim_start(chars: chars).trim_end(chars: chars);
+        self.trim_start(chars: chars).trim_end(chars: chars)
     }
 
     /| Returns a lazy zero-allocation iterator splitting `self` around `sep`.
     @inline @no_alloc @no_panic
     pub fn split(self, sep: str = " ", /, *, keep_empty: bool = true) -> SplitIter {
-        return SplitIter {
+        SplitIter {
             text: self,
-            sep: sep,
-            keep_empty: keep_empty,
+            sep,
+            keep_empty,
             done: false,
-        };
+        }
     }
 
     /| Returns a lazy zero-allocation iterator yielding non-empty Unicode-whitespace-separated words.
     @inline @no_alloc @no_panic
     pub fn split_whitespace(self) -> SplitWhitespaceIter {
-        return SplitWhitespaceIter { rem: self };
+        SplitWhitespaceIter { rem: self }
     }
 
     /| Splits `self` on the first occurrence of `sep`, returning `(before, after)` or `.None`.
@@ -3989,7 +4027,7 @@ impl str {
             };
             return .Some((head, tail));
         }
-        return .None;
+        .None
     }
 
     /| Splits `self` on the last occurrence of `sep`, returning `(before, after)` or `.None`.
@@ -4008,57 +4046,57 @@ impl str {
             };
             return .Some((head, tail));
         }
-        return .None;
+        .None
     }
 
     /| Returns a lazy line iterator stripping `\n` and `\r\n` endings.
     @inline @no_alloc @no_panic
     pub fn lines(self) -> LinesIter {
-        return LinesIter { rem: self };
+        LinesIter { rem: self }
     }
 
     /| Returns a lazy iterator over the decoded `char` Unicode scalars of `self`.
     @inline @no_alloc @no_panic
     pub fn chars(self) -> CharsIter {
-        return CharsIter { rem: self.as_bytes() };
+        CharsIter { rem: self.as_bytes() }
     }
 
     /| Returns a lazy iterator yielding `(byte_offset, char)` pairs across `self`.
     @inline @no_alloc @no_panic
     pub fn char_indices(self) -> CharIndicesIter {
-        return CharIndicesIter {
+        CharIndicesIter {
             rem: self.as_bytes(),
             offset: 0,
-        };
+        }
     }
 
     /| Returns a lazy iterator yielding UAX #29 Extended Grapheme Cluster `str` slices.
     @inline @no_alloc @no_panic
     pub fn graphemes(self) -> GraphemeIter {
-        return GraphemeIter { rem: self.as_bytes() };
+        GraphemeIter { rem: self.as_bytes() }
     }
 
     /| Returns a lazy iterator yielding `(byte_offset, grapheme_str)` pairs across `self`.
     pub(pkg) fn grapheme_indices(self) -> GraphemeIndicesIter {
-        return GraphemeIndicesIter {
+        GraphemeIndicesIter {
             rem: self.as_bytes(),
             offset: 0,
-        };
+        }
     }
 
     /| Computes terminal display columns using ONLY `WCWIDTH_*` + scalar RI/ZWJ/VS16/skin-tone state (`0` `GCB_*` refs!).
     @std_cap_boundary(clears: [may_panic]) @no_alloc @no_panic
     pub fn display_width(self) -> usize {
         var total_cols: usize = 0;
-        var prev_was_zwj: bool = false;
-        var ri_odd: bool = false;
+        var prev_was_zwj = false;
+        var ri_odd = false;
         var prev_base_cols: usize = 0;
         var rem: &[u8] = self.as_bytes();
 
         while rem.len() > 0 {
             let (ch, width) = decode_utf8_first(rem);
             rem = rem[width..rem.len()];
-            let codepoint: u32 = ch as u32;
+            let codepoint = ch as u32;
             if codepoint == 0x200D_u32 {
                 prev_was_zwj = true;
                 ri_odd = false;
@@ -4074,14 +4112,14 @@ impl str {
                     prev_base_cols = 1;
                 }
                 prev_was_zwj = false;
-            } else if codepoint >= 0x1F3FB_u32 and codepoint <= 0x1F3FF_u32 {
+            } else if codepoint >= 0x1_F3FB_u32 and codepoint <= 0x1_F3FF_u32 {
                 if prev_base_cols == 0 {
                     total_cols = total_cols +% 2;
                     prev_base_cols = 2;
                 }
                 prev_was_zwj = false;
                 ri_odd = false;
-            } else if codepoint >= 0x1F1E6_u32 and codepoint <= 0x1F1FF_u32 {
+            } else if codepoint >= 0x1_F1E6_u32 and codepoint <= 0x1_F1FF_u32 {
                 if ri_odd {
                     ri_odd = false;
                 } else {
@@ -4102,13 +4140,13 @@ impl str {
                 }
             }
         }
-        return total_cols;
+        total_cols
     }
 
     /| Returns a new `String` with ASCII `A..Z` mapped to `a..z` in place (`0` heap allocs when `<= 23` bytes).
     @std_cap_boundary(clears: [unsafe_op])
     pub fn to_ascii_lowercase(self) -> String {
-        var out: String = String.from_str(self);
+        var out = String.from_str(self);
         let len: usize = out.len();
         if len == 0 {
             return out;
@@ -4137,13 +4175,13 @@ impl str {
             }
             i += 1;
         }
-        return out;
+        out
     }
 
     /| Returns a new `String` with ASCII `a..z` mapped to `A..Z` in place (`0` heap allocs when `<= 23` bytes).
     @std_cap_boundary(clears: [unsafe_op])
     pub fn to_ascii_uppercase(self) -> String {
-        var out: String = String.from_str(self);
+        var out = String.from_str(self);
         let len: usize = out.len();
         if len == 0 {
             return out;
@@ -4172,7 +4210,7 @@ impl str {
             }
             i += 1;
         }
-        return out;
+        out
     }
 
     /| Replaces up to `max_count` non-overlapping occurrences of `from` with `to`, returning an SSO `String`.
@@ -4181,7 +4219,7 @@ impl str {
         if max_count == 0 {
             return String.from_str(self);
         }
-        var out: String = String.with_capacity(self.len());
+        var out = String.with_capacity(self.len());
         if from.is_empty() {
             var count: usize = 0;
             var rem: &[u8] = self.as_bytes();
@@ -4228,7 +4266,7 @@ impl str {
             }
         }
         out.push_str(cursor);
-        return out;
+        out
     }
 
     /| Replaces up to `max_count` occurrences of `from` with `to` directly inside `arena`, returning `str`.
@@ -4245,7 +4283,11 @@ impl str {
         if max_count == 0 {
             return self;
         }
-        var builder: String = String.in_arena(arena);
+        if not from.is_empty() and self.find(from) is .None {
+            return self;
+        }
+        var builder = String.in_arena(arena);
+        builder.reserve(self.len());
         if from.is_empty() {
             var count: usize = 0;
             var rem: &[u8] = self.as_bytes();
@@ -4305,23 +4347,23 @@ impl str {
         let heap_done: HeapRepr = unsafe {
             @ptr_read(&raw builder.raw_bytes as *HeapRepr)
         };
-        return unsafe {
+        unsafe {
             @str_from_utf8_unchecked(
                 @slice_from_raw_parts(heap_done.ptr as *u8, heap_done.len as usize),
             )
-        };
+        }
     }
 
     /| Convenience method forwarding `self.parse_int[T](radix: …)` to `cx.str.parse_int`.
     @std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
     pub fn parse_int[T: Integer](self, *, radix: u8 is 2..=36 = DEFAULT_RADIX) -> T!ParseIntError {
-        return parse_int[T](self, radix: radix);
+        parse_int[T](self, radix: radix)
     }
 
     /| Convenience method forwarding `self.parse_float[T]()` to `cx.str.parse_float`.
     @no_alloc @no_panic
     pub fn parse_float[T: Float](self) -> T!ParseFloatError {
-        return parse_float[T](self);
+        parse_float[T](self)
     }
 }
 
@@ -4335,7 +4377,7 @@ impl CharsIter {
         }
         let (ch, width) = decode_utf8_first(self.rem);
         self.rem = self.rem[width..self.rem.len()];
-        return .Some(ch);
+        .Some(ch)
     }
 }
 
@@ -4350,7 +4392,7 @@ impl CharIndicesIter {
         let (ch, width) = decode_utf8_first(self.rem);
         self.rem = self.rem[width..self.rem.len()];
         self.offset = cur_off +% width;
-        return .Some((cur_off, ch));
+        .Some((cur_off, ch))
     }
 }
 
@@ -4381,7 +4423,7 @@ impl GraphemeIter {
             @str_from_utf8_unchecked(@slice_from_raw_parts(self.rem.as_ptr(), cluster_len))
         };
         self.rem = self.rem[cluster_len..total];
-        return .Some(cluster_str);
+        .Some(cluster_str)
     }
 }
 
@@ -4429,7 +4471,7 @@ impl SplitIter {
                 }
             }
         }
-        return .None;
+        .None
     }
 }
 
@@ -4466,7 +4508,7 @@ impl SplitWhitespaceIter {
         self.rem = unsafe {
             @str_from_utf8_unchecked(@slice_from_raw_parts(ptr.add(end_idx), total -% end_idx))
         };
-        return .Some(word);
+        .Some(word)
     }
 }
 
@@ -4489,7 +4531,7 @@ impl LinesIter {
         if final_line.strip_suffix("\r") is .Some(trimmed_final) {
             return .Some(trimmed_final);
         }
-        return .Some(final_line);
+        .Some(final_line)
     }
 }
 
@@ -4501,7 +4543,7 @@ pub fn join(parts: &[str], sep: str = "", /) -> String {
         return String.new();
     }
     let total_bytes: usize = checked_join_byte_len(parts, sep);
-    var out: String = String.with_capacity(total_bytes);
+    var out = String.with_capacity(total_bytes);
     var idx: usize = 0;
     while idx < count {
         if idx > 0 and not sep.is_empty() {
@@ -4510,7 +4552,7 @@ pub fn join(parts: &[str], sep: str = "", /) -> String {
         out.push_str(parts[idx]);
         idx += 1;
     }
-    return out;
+    out
 }
 
 /| Concatenates `parts` separated by `sep` directly inside `arena`, returning a borrowed `str`.
@@ -4550,21 +4592,21 @@ pub fn join_in(arena: &mut Arena, parts: &[str], sep: str = "", /) -> str {
         }
         idx += 1;
     }
-    return unsafe {
+    unsafe {
         @str_from_utf8_unchecked(@slice_from_raw_parts(buf_ptr as *u8, total_bytes))
-    };
+    }
 }
 
 /| Validates `bytes` as well-formed UTF-8 using Keiser–Lemire SIMD + 8-byte SWAR.
 @inline @no_alloc @no_panic
-pub fn validate_utf8(bytes: &[u8], /) -> bool {
-    return (ActiveStrOps {}).validate_utf8_fast(bytes);
+pub fn is_valid_utf8(bytes: &[u8], /) -> bool {
+    (ActiveStrOps {}).is_valid_utf8_fast(bytes)
 }
 
 /| Validates `bytes` as UTF-8 and borrows it as `str` (`0` allocs), or returns exact `Utf8Error`.
 @std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
 pub fn from_utf8(bytes: &[u8], /) -> str!Utf8Error {
-    if (ActiveStrOps {}).validate_utf8_fast(bytes) {
+    if (ActiveStrOps {}).is_valid_utf8_fast(bytes) {
         return .Ok(
             unsafe {
                 @str_from_utf8_unchecked(bytes)
@@ -4574,17 +4616,17 @@ pub fn from_utf8(bytes: &[u8], /) -> str!Utf8Error {
     if validate_utf8_detailed_from(bytes, 0) is .Some(err) {
         return .Err(err);
     }
-    return .Ok(
+    .Ok(
         unsafe {
             @str_from_utf8_unchecked(bytes)
         },
-    );
+    )
 }
 
 /| Returns the Markus Kuhn / Unicode 16.0 terminal column width of `ch` (`-1` for C0/C1 controls, `0`, `1`, or `2`).
-@inline @no_alloc @no_panic
+@no_alloc @no_panic
 pub fn char_width(ch: char, /) -> i8 {
-    let codepoint: u32 = ch as u32;
+    let codepoint = ch as u32;
     if codepoint < 0xA0_u32 {
         if codepoint == 0_u32 {
             return 0;
@@ -4596,28 +4638,28 @@ pub fn char_width(ch: char, /) -> i8 {
     ) or (codepoint >= 0xAC00_u32 and codepoint <= 0xD7A3_u32) {
         return 2;
     }
-    if codepoint >= 0x20000_u32 {
-        if codepoint <= 0x3FFFD_u32 {
+    if codepoint >= 0x2_0000_u32 {
+        if codepoint <= 0x3_FFFD_u32 {
             return 2;
-        } else if codepoint >= 0xE0000_u32 and codepoint <= 0xE0FFF_u32 {
+        } else if codepoint >= 0xE_0000_u32 and codepoint <= 0xE_0FFF_u32 {
             return 0;
         }
         return 1;
     }
-    let byte_idx: usize = ((codepoint >> 2_u32) & 0x7FFF_u32) as usize;
-    let s2_blk: usize = WCWIDTH_S1[(byte_idx >> 6_usize) & 0x1FF_usize] as usize;
+    let byte_idx = ((codepoint >> 2_u32) & 0x7FFF_u32) as usize;
+    let s2_blk = WCWIDTH_S1[(byte_idx >> 6_usize) & 0x1FF_usize] as usize;
     let raw_s2_idx: usize = (s2_blk << 3_usize) | ((byte_idx >> 3_usize) & 0x7_usize);
     if raw_s2_idx >= 824_usize {
         return 1;
     }
-    let pool_off: usize = WCWIDTH_S2[raw_s2_idx] as usize;
+    let pool_off = WCWIDTH_S2[raw_s2_idx] as usize;
     let raw_pool_idx: usize = pool_off +% (byte_idx & 0x7_usize);
     if raw_pool_idx >= 1042_usize {
         return 1;
     }
     let packed_byte: u8 = WCWIDTH_POOL[raw_pool_idx];
     let crumb_shift: u8 = (((codepoint & 3_u32) << 1_u32) as u8) & 7_u8;
-    return ((packed_byte >> crumb_shift) & 0x3_u8) as i8;
+    ((packed_byte >> crumb_shift) & 0x3_u8) as i8
 }
 
 /| Parses `text` in base `radix` (`2..=36`, keyword-only) into integer `T` without overflow traps.
@@ -4631,7 +4673,7 @@ pub fn parse_int[T: Integer](text: str, /, *, radix: u8 is 2..=36 = DEFAULT_RADI
 
     let is_signed: bool = @implements[T, Signed]();
     var idx: usize = 0;
-    var is_neg: bool = false;
+    var is_neg = false;
     if bytes[0] == b'-' {
         if not is_signed {
             return .Err(.InvalidDigit);
@@ -4655,11 +4697,11 @@ pub fn parse_int[T: Integer](text: str, /, *, radix: u8 is 2..=36 = DEFAULT_RADI
         (1_u128 << (bit_width & 127_u128)) -% 1_u128
     };
     let raw_radix: u8 = radix;
-    let rad_128: u128 = raw_radix as u128;
+    let rad_128 = raw_radix as u128;
     let pre_mul_cap: u128 = max_mag / rad_128;
     let pre_add_rem: u128 = max_mag % rad_128;
 
-    var acc: u128 = 0_u128;
+    var acc = 0_u128;
     while idx < total {
         let ch_b: u8 = bytes[idx];
         let dig_val: u8 = if ch_b >= b'0' and ch_b <= b'9' => ch_b -% b'0'
@@ -4669,7 +4711,7 @@ pub fn parse_int[T: Integer](text: str, /, *, radix: u8 is 2..=36 = DEFAULT_RADI
         if dig_val >= raw_radix {
             return .Err(.InvalidDigit);
         }
-        let dig_128: u128 = dig_val as u128;
+        let dig_128 = dig_val as u128;
         if acc > pre_mul_cap or (acc == pre_mul_cap and dig_128 > pre_add_rem) {
             return .Err(.Overflow);
         }
@@ -4680,7 +4722,7 @@ pub fn parse_int[T: Integer](text: str, /, *, radix: u8 is 2..=36 = DEFAULT_RADI
     if is_neg {
         return .Ok(((0_u128 -% acc) as i128) as T);
     }
-    return .Ok(acc as T);
+    .Ok(acc as T)
 }
 
 /| Parses IEEE-754 `f32` or `f64` from `text` via `Eisel–Lemire` + Nigel Tao's `[u8; 864]` exact fallback.
@@ -4694,12 +4736,12 @@ pub fn parse_float[T: Float](text: str, /) -> T!ParseFloatError {
             },
         );
     }
-    let bits32: u32 = parse_float_bits_core(text, false)? as u32;
-    return .Ok(
+    let bits32 = parse_float_bits_core(text, false)? as u32;
+    .Ok(
         unsafe {
             @ptr_read(&raw bits32 as *T)
         },
-    );
+    )
 }
 
 /| Formats `value` into `buf` in base `radix` (`2..=36`), using `jeaiii` 2-digit fast path for base 10.
@@ -4741,7 +4783,7 @@ pub fn format_int[T: Integer](
 
     var rev_buf: [u8; 130] = [0_u8; 130];
     var write_cursor: usize = 130;
-    let rad_128: u128 = raw_radix as u128;
+    let rad_128 = raw_radix as u128;
     let alpha_base: u8 = if upper => b'A' else b'a';
     var rem_val: u128 = abs_mag;
     if rem_val == 0_u128 {
@@ -4750,7 +4792,7 @@ pub fn format_int[T: Integer](
     } else {
         while rem_val > 0_u128 {
             let quo: u128 = rem_val / rad_128;
-            let dig: u8 = (rem_val -% (quo *% rad_128)) as u8;
+            let dig = (rem_val -% (quo *% rad_128)) as u8;
             write_cursor = write_cursor -% 1;
             rev_buf[write_cursor % 130_usize] = if dig < 10_u8 => b'0' +% dig
                 else alpha_base +% (dig -% 10_u8);
@@ -4828,7 +4870,7 @@ pub fn format_float[T: Float](buf: &mut [u8], value: T, /) -> str!FmtError {
         );
     }
     let (dec_sig32, exp10_32) = schubfach_to_decimal_f32(@bit_cast[f32](bits32 & 0x7FFF_FFFF_u32));
-    return render_schubfach_decimal(buf, is_neg32, dec_sig32 as u64, exp10_32, 9);
+    render_schubfach_decimal(buf, is_neg32, dec_sig32 as u64, exp10_32, 9)
 }
 
 /| Formats `args` directly into stack/caller byte slice `buf` (`@no_alloc`), returning `.Err(.IoFailure)` on invalid UTF-8.
@@ -4847,12 +4889,12 @@ pub fn format_into(buf: &mut [u8], args: FmtArgs, /) -> str!FmtError {
     let written: &[u8] = unsafe {
         @slice_from_raw_parts(buf.as_ptr(), sink.pos)
     };
-    if not validate_utf8(written) {
+    if not is_valid_utf8(written) {
         return .Err(.IoFailure);
     }
-    return .Ok(
+    .Ok(
         unsafe {
             @str_from_utf8_unchecked(written)
         },
-    );
+    )
 }

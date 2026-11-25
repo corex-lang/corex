@@ -243,7 +243,7 @@ fn encode_fill_utf8(raw_cp: u32, out_buf: &mut [u8; 4], /) -> usize {
     out_buf[1] = (0x80_u32 | ((cp >> 12_u32) & 0x3F_u32)) as u8;
     out_buf[2] = (0x80_u32 | ((cp >> 6_u32) & 0x3F_u32)) as u8;
     out_buf[3] = (0x80_u32 | (cp & 0x3F_u32)) as u8;
-    return 4_usize;
+    4_usize
 }
 
 /| Emits `repeat_count` copies of `encoded_fill` into `writer` in stack-batched chunks.
@@ -269,12 +269,12 @@ fn write_repeated_fill(
         }
         return .Ok(());
     }
-    var idx: usize = 0_usize;
+    var idx = 0_usize;
     while idx < repeat_count {
         (writer.write_fn)(writer.ctx, encoded_fill)?;
         idx += 1_usize;
     }
-    return .Ok(());
+    .Ok(())
 }
 
 /| Direct unbuffered standard-error sink callback (`fd = 2`) used by `dbg`.
@@ -284,53 +284,53 @@ fn stderr_fmt_write_cb(ctx: *mut opaque, chunk: &[u8]) -> unit!FmtError {
     if not chunk.is_empty() {
         _ = @sys_write(2, chunk);
     }
-    return .Ok(());
+    .Ok(())
 }
 
 // ------------------------------------- PUBLIC API --------------------------------------
 // -------------------- Comparison & Hashing --------------------
 impl Ordering {
     /| Returns `true` when `self` is `.Equal`.
-    @inline @no_alloc @no_panic
+    @no_alloc @no_panic
     pub fn is_eq(self) -> bool = self == .Equal;
 
     /| Returns `true` when `self` is not `.Equal`.
-    @inline @no_alloc @no_panic
+    @no_alloc @no_panic
     pub fn is_ne(self) -> bool = self != .Equal;
 
     /| Returns `true` when `self` is `.Less`.
-    @inline @no_alloc @no_panic
+    @no_alloc @no_panic
     pub fn is_lt(self) -> bool = self == .Less;
 
     /| Returns `true` when `self` is `.Less` or `.Equal`.
-    @inline @no_alloc @no_panic
+    @no_alloc @no_panic
     pub fn is_le(self) -> bool = self != .Greater;
 
     /| Returns `true` when `self` is `.Greater`.
-    @inline @no_alloc @no_panic
+    @no_alloc @no_panic
     pub fn is_gt(self) -> bool = self == .Greater;
 
     /| Returns `true` when `self` is `.Greater` or `.Equal`.
-    @inline @no_alloc @no_panic
+    @no_alloc @no_panic
     pub fn is_ge(self) -> bool = self != .Less;
 
     /| Inverts `.Less` <-> `.Greater`, leaving `.Equal` unchanged.
     @inline @no_alloc @no_panic
     pub fn reverse(self) -> Ordering {
-        return match self {
+        match self {
             .Less => .Greater,
             .Equal => .Equal,
             .Greater => .Less,
-        };
+        }
     }
 
     /| Lexicographically chains `self` with `tie_breaker` when `self` is `.Equal`.
     @inline @no_alloc @no_panic
     pub fn then(self, tie_breaker: Ordering, /) -> Ordering {
-        return match self {
+        match self {
             .Equal => tie_breaker,
             _ => self,
-        };
+        }
     }
 }
 
@@ -481,30 +481,30 @@ impl FmtSpec {
         if raw_cp < 0x80_u32 {
             return (raw_cp as u8) as char;
         }
-        return unsafe {
+        unsafe {
             ((&raw_cp) as *char).read()
-        };
+        }
     }
 
     /| Extracts the decoded `FmtAlign` mode (`bits 21..22`).
     @inline @no_alloc @no_panic
     pub fn align_mode(self) -> FmtAlign {
-        return match (self.flags_and_fill >> 21_u32) & 0x3_u32 {
+        match (self.flags_and_fill >> 21_u32) & 0x3_u32 {
             1_u32 => .Left,
             2_u32 => .Center,
             3_u32 => .Right,
             _ => .Default,
-        };
+        }
     }
 
     /| Extracts the decoded `FmtSign` mode (`bits 23..24`).
     @inline @no_alloc @no_panic
     pub fn sign_mode(self) -> FmtSign {
-        return match (self.flags_and_fill >> 23_u32) & 0x3_u32 {
+        match (self.flags_and_fill >> 23_u32) & 0x3_u32 {
             1_u32 => .Plus,
             2_u32 => .Minus,
             _ => .Default,
-        };
+        }
     }
 
     /| Returns `true` when the alternate `#` flag (`bit 25`) is set.
@@ -518,7 +518,7 @@ impl FmtSpec {
     /| Extracts the presentation `FmtVerb` (`bits 27..30`).
     @inline @no_alloc @no_panic
     pub fn verb(self) -> FmtVerb {
-        return match (self.flags_and_fill >> 27_u32) & 0xF_u32 {
+        match (self.flags_and_fill >> 27_u32) & 0xF_u32 {
             1_u32 => .Debug,
             2_u32 => .LowerHex,
             3_u32 => .UpperHex,
@@ -529,7 +529,7 @@ impl FmtSpec {
             8_u32 => .Fixed,
             9_u32 => .Pointer,
             _ => .Display,
-        };
+        }
     }
 
     /| Returns `true` when `{expr=}` self-debugging output (`bit 31`) was requested.
@@ -539,14 +539,13 @@ impl FmtSpec {
     /| Returns the explicit minimum field width, or `.None` when omitted (`0xFFFF`).
     @inline @no_alloc @no_panic
     pub fn width(self) -> u16? {
-        return if self.width_or_none == FMT_SPEC_NONE => .None else .Some(self.width_or_none);
+        if self.width_or_none == FMT_SPEC_NONE => .None else .Some(self.width_or_none)
     }
 
     /| Returns the explicit precision, or `.None` when omitted (`0xFFFF`).
     @inline @no_alloc @no_panic
     pub fn precision(self) -> u16? {
-        return if self.precision_or_none == FMT_SPEC_NONE => .None
-            else .Some(self.precision_or_none);
+        if self.precision_or_none == FMT_SPEC_NONE => .None else .Some(self.precision_or_none)
     }
 }
 
@@ -554,13 +553,13 @@ impl FmtWriter {
     /| Streams raw `bytes` into the underlying sink callback.
     @std_cap_boundary(clears: [alloc, may_panic, blocking_sync]) @inline
     pub fn write_bytes(&mut self, bytes: &[u8], /) -> unit!FmtError {
-        return (self.write_fn)(self.ctx, bytes);
+        (self.write_fn)(self.ctx, bytes)
     }
 
     /| Streams UTF-8 `text` into the underlying sink callback.
     @std_cap_boundary(clears: [alloc, may_panic, blocking_sync]) @inline
     pub fn write_str(&mut self, text: str, /) -> unit!FmtError {
-        return (self.write_fn)(self.ctx, text.as_bytes());
+        (self.write_fn)(self.ctx, text.as_bytes())
     }
 
     /| Streams `raw` padded to `spec.width()` UTF-8 codepoints according to `spec.align_mode()`.
@@ -570,7 +569,7 @@ impl FmtWriter {
             .Some(width_u16) => width_u16 as usize,
             .None => return (self.write_fn)(self.ctx, raw),
         };
-        var cp_count: usize = 0_usize;
+        var cp_count = 0_usize;
         for byte_val in raw {
             if (byte_val & 0xC0_u8) != 0x80_u8 {
                 cp_count += 1_usize;
@@ -586,7 +585,7 @@ impl FmtWriter {
             return .Ok(());
         }
         let fill_slice: &[u8] = fill_buf[0..fill_len];
-        return match spec.align_mode() {
+        match spec.align_mode() {
             .Left => {
                 (self.write_fn)(self.ctx, raw)?;
                 write_repeated_fill(self, fill_slice, pad_total)
@@ -601,7 +600,7 @@ impl FmtWriter {
                 write_repeated_fill(self, fill_slice, pad_total)?;
                 (self.write_fn)(self.ctx, raw)
             },
-        };
+        }
     }
 }
 
@@ -609,8 +608,7 @@ impl Display for SourceLoc {
     /| Formats `self` as `<file>:<line>:<col>` into `out`.
     @no_alloc
     pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
-        spec;
-        return @fmt_write(out, f"{self.file}:{self.line}:{self.col}");
+        @fmt_write(out, f"{self.file}:{self.line}:{self.col}")
     }
 }
 
@@ -618,8 +616,7 @@ impl Debug for SourceLoc {
     /| Formats `self` in debug mode as `<file>:<line>:<col> (<fn_name>)` into `out`.
     @no_alloc
     pub fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
-        spec;
-        return @fmt_write(out, f"{self.file}:{self.line}:{self.col} ({self.fn_name})");
+        @fmt_write(out, f"{self.file}:{self.line}:{self.col} ({self.fn_name})")
     }
 }
 
@@ -627,8 +624,7 @@ impl Display for FmtArgs {
     /| Streams pre-packaged `FmtArgs` directly into `out`.
     @no_alloc
     pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
-        spec;
-        return @fmt_write(out, self.*);
+        @fmt_write(out, self.*)
     }
 }
 
@@ -689,5 +685,5 @@ pub fn dbg[T: Debug](value: own T, /, *, loc: SourceLoc = @caller_location()) ->
         write_fn: stderr_fmt_write_cb,
     };
     @fmt_write(&mut writer, f"[{loc.file}:{loc.line}] = {value:?}\n") catch {};
-    return own value;
+    own value
 }

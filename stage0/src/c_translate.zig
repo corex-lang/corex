@@ -37,7 +37,7 @@ pub const TranslateOptions = struct {
     is_internal_core: bool = false,
     /// Emits a 3-part `/#` module header comment at the top of the translated `.cx` buffer.
     has_header_comment: bool = false,
-    /// Preserves original C nominal/symbol identifiers (adding `@allow(non_canonical_case)` where needed).
+    /// Preserves original C nominal/symbol identifiers (adding `@allow(non-canonical-case, reason: "C FFI binding")` where needed).
     is_preserving_c_names: bool = true,
     /// Runs `fmt_engine.formatSource` over the generated `.cx` output for guaranteed `corex fmt` idempotency.
     is_formatted: bool = true,
@@ -808,7 +808,7 @@ const CTranslator = struct {
         // [1] Incomplete forward-declared `struct Handle;` -> opaque zero-sized nominal struct:
         if (!rec.is_complete) {
             if (!isCanonicalPascalTypeIdent(cx_name)) {
-                try writer.writeAll("@allow(non_canonical_case)\n");
+                try writer.writeAll("@allow(non-canonical-case, reason: \"C FFI binding\")\n");
             }
             try writer.writeSlices(&.{
                 "@repr(C)\npub ",
@@ -901,7 +901,7 @@ const CTranslator = struct {
 
         const writer = self.bodyWriter();
         if (!isCanonicalPascalTypeIdent(cx_name)) {
-            try writer.writeAll("@allow(non_canonical_case)\n");
+            try writer.writeAll("@allow(non-canonical-case, reason: \"C FFI binding\")\n");
         }
         const union_align: u64 = if (layout_attrs.explicit_align > 1 or
             (has_raw_bytes_layout and summary.align_bytes > 1))
@@ -933,7 +933,7 @@ const CTranslator = struct {
             const fname = try self.dedupMemberName(raw_fname, &used_field_names);
             const fty = try self.lowerType(fld.type_id, fld.contract.nullability, false, 0);
             if (!isCanonicalSnakeValueIdent(fname)) {
-                try writer.writeAll("    @allow(non_canonical_case)\n");
+                try writer.writeAll("    @allow(non-canonical-case, reason: \"C FFI binding\")\n");
             }
             try self.emitInlineFieldContractAttrs(fld.contract);
             try writer.writeSlices(&.{ "    pub ", fname, ": ", fty, ",\n" });
@@ -983,7 +983,7 @@ const CTranslator = struct {
     ) !void {
         const writer = self.bodyWriter();
         if (!isCanonicalPascalTypeIdent(cx_name)) {
-            try writer.writeAll("@allow(non_canonical_case)\n");
+            try writer.writeAll("@allow(non-canonical-case, reason: \"C FFI binding\")\n");
         }
         const eff_packed_cap: u32 = if (layout_attrs.is_packed or layout_attrs.pragma_pack == 1)
             1
@@ -1017,7 +1017,7 @@ const CTranslator = struct {
             const fname = try self.dedupMemberName(raw_fname, &used_field_names);
             const fty = try self.lowerType(fld.type_id, fld.contract.nullability, false, 0);
             if (!isCanonicalSnakeValueIdent(fname)) {
-                try writer.writeAll("    @allow(non_canonical_case)\n");
+                try writer.writeAll("    @allow(non-canonical-case, reason: \"C FFI binding\")\n");
             }
             try self.emitInlineFieldContractAttrs(fld.contract);
             try writer.writeSlices(&.{ "    pub ", fname, ": ", fty, ",\n" });
@@ -1179,7 +1179,7 @@ const CTranslator = struct {
         // [2] Emit struct header and physical fields (`_bf_N`, `_pad_N`, and regular members):
         const writer = self.bodyWriter();
         if (!isCanonicalPascalTypeIdent(cx_name)) {
-            try writer.writeAll("@allow(non_canonical_case)\n");
+            try writer.writeAll("@allow(non-canonical-case, reason: \"C FFI binding\")\n");
         }
         try emitReprCAttr(writer, if (is_packed_struct_needed) 1 else 0, if (max_align > 1) max_align else 0);
         try writer.writeSlices(&.{ "pub struct ", cx_name, " {\n" });
@@ -1276,7 +1276,7 @@ const CTranslator = struct {
                     const fname = try self.dedupMemberName(raw_fname, &used_field_names);
                     const fty = try self.lowerType(reg.field.type_id, reg.field.contract.nullability, false, 0);
                     if (!isCanonicalSnakeValueIdent(fname)) {
-                        try writer.writeAll("    @allow(non_canonical_case)\n");
+                        try writer.writeAll("    @allow(non-canonical-case, reason: \"C FFI binding\")\n");
                     }
                     try self.emitInlineFieldContractAttrs(reg.field.contract);
                     try writer.writeSlices(&.{ "    pub ", fname, ": ", fty, ",\n" });
@@ -1328,7 +1328,7 @@ const CTranslator = struct {
 
             // Getter (`pub fn <field>(&self) -> <FieldTy>`):
             if (!isCanonicalSnakeValueIdent(acc.field_cx_name)) {
-                try writer.writeAll("    @allow(non_canonical_case)\n");
+                try writer.writeAll("    @allow(non-canonical-case, reason: \"C FFI binding\")\n");
             }
             try writer.writeAll("    @inline @no_alloc @no_panic\n");
             try writer.writeSlices(&.{
@@ -1421,7 +1421,7 @@ const CTranslator = struct {
                 .{acc.field_cx_name},
             );
             if (!isCanonicalSnakeValueIdent(setter_name)) {
-                try writer.writeAll("    @allow(non_canonical_case)\n");
+                try writer.writeAll("    @allow(non-canonical-case, reason: \"C FFI binding\")\n");
             }
             try writer.writeAll("    @inline @no_alloc @no_panic\n");
             try writer.writeSlices(&.{
@@ -1539,14 +1539,14 @@ const CTranslator = struct {
         // Incomplete or empty enum -> integer type alias:
         if (!en_item.is_complete or variants.len == 0) {
             if (!isCanonicalPascalTypeIdent(cx_name)) {
-                try writer.writeAll("@allow(non_canonical_case)\n");
+                try writer.writeAll("@allow(non-canonical-case, reason: \"C FFI binding\")\n");
             }
             try writer.writeSlices(&.{ "pub type ", cx_name, " = ", backing_ty, ";\n\n" });
             return;
         }
 
         if (!isCanonicalPascalTypeIdent(cx_name)) {
-            try writer.writeAll("@allow(non_canonical_case)\n");
+            try writer.writeAll("@allow(non-canonical-case, reason: \"C FFI binding\")\n");
         }
         try writer.writeSlices(&.{ "@repr(C)\npub enum ", cx_name, ": ", backing_ty, " {\n" });
 
@@ -1644,7 +1644,7 @@ const CTranslator = struct {
 
         const writer = self.bodyWriter();
         if (!isCanonicalPascalTypeIdent(cx_name)) {
-            try writer.writeAll("@allow(non_canonical_case)\n");
+            try writer.writeAll("@allow(non-canonical-case, reason: \"C FFI binding\")\n");
         }
         try writer.writeSlices(&.{ "pub type ", cx_name, " = ", target_cx, ";\n\n" });
     }

@@ -565,3 +565,124 @@ test "test_symbol_resolver_dr24_repr_link_allow_masks_and_retired_e0239" {
     }
     try std.testing.expectEqual(@as(usize, 3), e0239_hits);
 }
+
+test "test_phase111c_w0402_exempts_positional_trait_impl_params_and_flags_locals" {
+    const trait_src =
+        \\pub struct FmtSpec {
+        \\    pub width: u32,
+        \\}
+        \\pub trait CustomFmt {
+        \\    fn render(&self, spec: FmtSpec) -> u32;
+        \\}
+        \\pub struct Metric {
+        \\    pub count: u32,
+        \\}
+        \\impl CustomFmt for Metric {
+        \\    pub fn render(&self, spec: FmtSpec) -> u32 {
+        \\        let unused_local = 7_u32;
+        \\        self.count
+        \\    }
+        \\}
+        \\impl Metric {
+        \\    pub fn inherent_render(&self, unused_param: FmtSpec) -> u32 {
+        \\        self.count
+        \\    }
+        \\}
+    ;
+    var check_res = try runResolveAndTypecheck(std.testing.allocator, trait_src);
+    defer check_res.deinit();
+    try std.testing.expect(!check_res.diagnostics.hasErrors());
+
+    var flagged_spec = false;
+    var flagged_unused_local = false;
+    var flagged_unused_param = false;
+    for (check_res.diagnostics.diagnostics.items) |diag_item| {
+        if (diag_item.code != .w0402_unused_binding) continue;
+        if (std.mem.indexOf(u8, diag_item.message, "`spec`") != null) flagged_spec = true;
+        if (std.mem.indexOf(u8, diag_item.message, "`unused_local`") != null) flagged_unused_local = true;
+        if (std.mem.indexOf(u8, diag_item.message, "`unused_param`") != null) flagged_unused_param = true;
+    }
+    try std.testing.expect(!flagged_spec);
+    try std.testing.expect(flagged_unused_local);
+    try std.testing.expect(flagged_unused_param);
+
+    // [2] `pub trait` methods without explicit `pub` inherit enclosing trait visibility across modules:
+    const cross_mod_trait_src =
+        \\pub mod traits {
+        \\    pub trait Digest {
+        \\        fn write_word(&mut self, word: u64);
+        \\        fn finish(&self) -> u64 {
+        \\            0_u64
+        \\        }
+        \\    }
+        \\}
+        \\pub fn hash_once[D: traits.Digest](state: &mut D, value: u64) -> u64 {
+        \\    state.write_word(value);
+        \\    state.finish()
+        \\}
+    ;
+    var cross_trait_res = try runResolveAndTypecheck(std.testing.allocator, cross_mod_trait_src);
+    defer cross_trait_res.deinit();
+    try std.testing.expect(!cross_trait_res.diagnostics.hasErrors());
+    try std.testing.expect(!hasDiagnosticCode(&cross_trait_res.diagnostics, .e0409_private_symbol_access));
+}
+
+// ---------- Forward Const Array Lengths & Glob W0404 ----------
+
+test "test_symbol_resolver_forward_const_array_length_and_glob_w0404" {
+    // [1] Struct array fields in `TYPES` referencing `const` items declared below in `CONSTS`:
+    const forward_const_src =
+        \\@repr(C)
+        \\pub struct TlsBinState {
+        \\    pub free_heads: [*mut u8; BIN_COUNT],
+        \\    pub bump_rem: [u16; BIN_COUNT],
+        \\}
+        \\
+        \\const BIN_COUNT: usize = 12_usize;
+        \\
+        \\pub fn tls_state_bytes() -> usize {
+        \\    @size_of[TlsBinState]()
+        \\}
+    ;
+    var fwd_res = try runResolveAndTypecheck(std.testing.allocator, forward_const_src);
+    defer fwd_res.deinit();
+    try std.testing.expect(!fwd_res.diagnostics.hasErrors());
+    try std.testing.expectEqual(@as(u32, 0), fwd_res.diagnostics.warning_count);
+
+    const root_scope = fwd_res.symbol_table.file_module_scopes.get(FileId.fromInt(1).asInt()).?;
+    const tls_sym_idx = fwd_res.symbol_table.lookupInScopeDirect(
+        root_scope,
+        try fwd_res.interner.intern("TlsBinState"),
+        NamespaceMask.TYPE_ONLY,
+    );
+    const tls_scope = fwd_res.symbol_table.getSymbol(tls_sym_idx).target_scope;
+    const heads_sym_idx = fwd_res.symbol_table.lookupInScopeDirect(
+        tls_scope,
+        try fwd_res.interner.intern("free_heads"),
+        NamespaceMask.VALUE_ONLY,
+    );
+    const heads_ty = fwd_res.symbol_table.getSymbol(heads_sym_idx).type_id;
+    try std.testing.expect(!heads_ty.isError());
+    try std.testing.expectEqual(@as(u32, 12), fwd_res.type_pool.getNode(heads_ty).rhs);
+
+    // [2] `CompilerDb` glob `use` (`use extra.*;`) keeps `leaf_tree_cst` intact across `typecheckBody` (`0` `W0404`):
+    var db = try CompilerDb.init(std.testing.allocator);
+    defer db.deinit();
+    const glob_src =
+        \\pub mod extra {
+        \\    pub const BONUS: i32 = 5;
+        \\}
+        \\use extra.*;
+        \\pub fn compute_bonus(seed: i32) -> i32 {
+        \\    seed + BONUS
+        \\}
+    ;
+    const fid = FileId.fromInt(77);
+    try db.setFilePath(fid, "glob_used_check.cx");
+    _ = try db.setInput(fid, glob_src, .low);
+    const explicit_fids = [_]FileId{fid};
+    try db.setExplicitLintTargetFiles(&explicit_fids);
+    const proj_sink = try db.projectFileDiagnostics(fid);
+    try std.testing.expect(!hasDiagnosticCode(proj_sink, .w0404_unused_import));
+    try std.testing.expect(!proj_sink.hasErrors());
+}

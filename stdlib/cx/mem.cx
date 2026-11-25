@@ -156,7 +156,7 @@ pub struct OwnPtr[T] {
 
 /| Backing page-slab header linked into `Pool[T].slab_head` and thread-local `pool_slab_head`.
 @repr(C, align: 16)
-pub(pkg) struct PoolSlabHeader {
+struct PoolSlabHeader {
     /| Previous slab in this `Pool[T]` instance's LIFO allocation order.
     pub prev: *mut PoolSlabHeader,
     /| Next active `Pool` slab registered on this thread (`0` at tail).
@@ -173,7 +173,7 @@ pub(pkg) struct PoolSlabHeader {
 
 /| Intrusive freelist link stored at offset `0` of vacant `Pool[T]` and `System` slots.
 @repr(C)
-pub(pkg) struct PoolFreeNode {
+struct PoolFreeNode {
     /| Next vacant slot in the intrusive freelist (`0` when empty).
     pub next: *mut PoolFreeNode,
 }
@@ -220,11 +220,11 @@ struct OverAlignedHeader {
 @repr(C)
 struct SystemTlsState {
     /| Intrusive LIFO heads for `16 B .. 32 KiB` (`12` power-of-two bins).
-    free_heads: [*mut PoolFreeNode; 12],
+    free_heads: [*mut PoolFreeNode; SYS_BIN_COUNT],
     /| Active page bump cursors per size class.
-    bump_cur: [*mut u8; 12],
+    bump_cur: [*mut u8; SYS_BIN_COUNT],
     /| Remaining uncarved bytes (`<= 65,520`) in each class's active `64 KiB` slab.
-    bump_rem: [u16; 12],
+    bump_rem: [u16; SYS_BIN_COUNT],
     /| Intrusive doubly linked list head of all live `PoolSlabHeader` slabs on this thread.
     pool_slab_head: *mut PoolSlabHeader,
 }
@@ -300,14 +300,14 @@ fn ceil_log2_usize(val: usize, /) -> u32 {
     if val <= 1_usize {
         return 0_u32;
     }
-    return usize.BITS -% (val -% 1_usize).leading_zeros();
+    usize.BITS -% (val -% 1_usize).leading_zeros()
 }
 
 /| Computes the `0..11` `System` size-class index for `needed in 1..=32_768`.
 @std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
 fn system_bin_index(needed: usize, /) -> usize {
     let clamped: usize = if needed <= 16_usize => 16_usize else needed;
-    return (ceil_log2_usize(clamped) -% SYS_MIN_BIN_LOG2) as usize;
+    (ceil_log2_usize(clamped) -% SYS_MIN_BIN_LOG2) as usize
 }
 
 /| Allocates zero-filled `64 KiB`-granularity OS virtual pages on native / WASI targets.
@@ -321,7 +321,7 @@ fn os_alloc_pages(byte_len: usize, /) -> *mut u8!AllocError {
     if raw_ptr.is_null() {
         return .Err(.OutOfMemory);
     }
-    return .Ok(raw_ptr);
+    .Ok(raw_ptr)
 }
 
 /| Releases `64 KiB`-granularity OS virtual pages on native / WASI targets.
@@ -360,7 +360,7 @@ fn os_alloc_pages(byte_len: usize, /) -> *mut u8!AllocError {
             unsafe {
                 slot_ptr.* = head_node.*.next;
             }
-            let raw_bytes: *mut u8 = head_node as *mut u8;
+            let raw_bytes = head_node as *mut u8;
             unsafe {
                 @memset(raw_bytes as *mut opaque, 0_u8, pow2_pages * PAGE_GRANULARITY);
             }
@@ -371,7 +371,7 @@ fn os_alloc_pages(byte_len: usize, /) -> *mut u8!AllocError {
     if prev_pages == usize.MAX {
         return .Err(.OutOfMemory);
     }
-    return .Ok((prev_pages * PAGE_GRANULARITY) as *mut u8);
+    .Ok((prev_pages * PAGE_GRANULARITY) as *mut u8)
 }
 
 /| Pushes freed `64 KiB` bigpages onto `wasm32`'s power-of-two bigpage freelist (`offset 144..208` in TLS).
@@ -393,7 +393,7 @@ fn os_free_pages(ptr: *mut u8, byte_len: usize, /) {
     if slot_ptr.is_null() {
         return;
     }
-    let node_ptr: *mut PoolFreeNode = ptr as *mut PoolFreeNode;
+    let node_ptr = ptr as *mut PoolFreeNode;
     if node_ptr.is_null() {
         return;
     }
@@ -420,15 +420,15 @@ fn system_alloc(layout: Layout, /) -> *mut u8!AllocError {
                 os_free_pages(raw_base, map_bytes);
                 return .Err(.OutOfMemory);
             };
-        let hdr_ptr: *mut OverAlignedHeader = (aligned_addr -% hdr_sz) as *mut OverAlignedHeader;
+        let hdr_ptr = (aligned_addr -% hdr_sz) as *mut OverAlignedHeader;
         if hdr_ptr.is_null() {
             os_free_pages(raw_base, map_bytes);
             return .Err(.OutOfMemory);
         }
         unsafe {
             hdr_ptr.* = OverAlignedHeader {
-                raw_base: raw_base,
-                map_bytes: map_bytes,
+                raw_base,
+                map_bytes,
             };
         }
         return .Ok(aligned_addr as *mut u8);
@@ -437,7 +437,7 @@ fn system_alloc(layout: Layout, /) -> *mut u8!AllocError {
     if needed <= SYS_MAX_BIN_BYTES {
         let cls: usize = system_bin_index(needed);
         let slot_sz: usize = 16_usize << (cls & 15_usize);
-        let state_ptr: *mut SystemTlsState = @tls_alloc_state() as *mut SystemTlsState;
+        let state_ptr = @tls_alloc_state() as *mut SystemTlsState;
         if state_ptr.is_null() {
             return .Err(.OutOfMemory);
         }
@@ -466,7 +466,7 @@ fn system_alloc(layout: Layout, /) -> *mut u8!AllocError {
         state.bump_rem[cls] = (PAGE_GRANULARITY -% slot_sz) as u16;
         return .Ok(page_ptr);
     }
-    return os_alloc_pages(layout.size);
+    os_alloc_pages(layout.size)
 }
 
 /| Checks whether `ptr` in `System` can resize in place from `old_layout` to `new_size`.
@@ -476,7 +476,7 @@ fn system_resize(ptr: *mut u8, old_layout: Layout, new_size: usize, /) -> bool {
         return false;
     }
     if old_layout.alignment > SYS_OS_MIN_PAGE_ALIGN {
-        let hdr_ptr: *OverAlignedHeader = ((ptr as usize) -% @size_of[OverAlignedHeader]()) as *OverAlignedHeader;
+        let hdr_ptr = ((ptr as usize) -% @size_of[OverAlignedHeader]()) as *OverAlignedHeader;
         if hdr_ptr.is_null() {
             return false;
         }
@@ -505,7 +505,7 @@ fn system_resize(ptr: *mut u8, old_layout: Layout, new_size: usize, /) -> bool {
     }
     let old_pages: usize = align_up(old_layout.size, PAGE_GRANULARITY) orelse return false;
     let new_pages: usize = align_up(new_size, PAGE_GRANULARITY) orelse return false;
-    return new_pages == old_pages;
+    new_pages == old_pages
 }
 
 /| Returns `ptr` to `System`'s `16 B .. 32 KiB` thread-local bin or unmaps OS pages.
@@ -515,7 +515,7 @@ fn system_dealloc(ptr: *mut u8, layout: Layout, /) {
         return;
     }
     if layout.alignment > SYS_OS_MIN_PAGE_ALIGN {
-        let hdr_ptr: *OverAlignedHeader = ((ptr as usize) -% @size_of[OverAlignedHeader]()) as *OverAlignedHeader;
+        let hdr_ptr = ((ptr as usize) -% @size_of[OverAlignedHeader]()) as *OverAlignedHeader;
         if hdr_ptr.is_null() {
             return;
         }
@@ -528,11 +528,11 @@ fn system_dealloc(ptr: *mut u8, layout: Layout, /) {
     let needed: usize = if layout.size > layout.alignment => layout.size else layout.alignment;
     if needed <= SYS_MAX_BIN_BYTES {
         let cls: usize = system_bin_index(needed);
-        let state_ptr: *mut SystemTlsState = @tls_alloc_state() as *mut SystemTlsState;
+        let state_ptr = @tls_alloc_state() as *mut SystemTlsState;
         if state_ptr.is_null() {
             return;
         }
-        let node_ptr: *mut PoolFreeNode = ptr as *mut PoolFreeNode;
+        let node_ptr = ptr as *mut PoolFreeNode;
         if node_ptr.is_null() {
             return;
         }
@@ -551,7 +551,7 @@ fn system_dealloc(ptr: *mut u8, layout: Layout, /) {
 /| Links newly mapped `slab_hdr` at the head of this thread's active `PoolSlabHeader` list.
 @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
 fn tls_register_pool_slab(slab_hdr: *mut PoolSlabHeader, /) {
-    let state_ptr: *mut SystemTlsState = @tls_alloc_state() as *mut SystemTlsState;
+    let state_ptr = @tls_alloc_state() as *mut SystemTlsState;
     if state_ptr.is_null() {
         return;
     }
@@ -575,7 +575,7 @@ fn tls_register_pool_slab(slab_hdr: *mut PoolSlabHeader, /) {
 /| Unlinks `slab_hdr` from this thread's active `PoolSlabHeader` list in `O(1)` before unmapping.
 @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
 fn tls_unregister_pool_slab(slab_hdr: *mut PoolSlabHeader, /) {
-    let state_ptr: *mut SystemTlsState = @tls_alloc_state() as *mut SystemTlsState;
+    let state_ptr = @tls_alloc_state() as *mut SystemTlsState;
     if state_ptr.is_null() {
         return;
     }
@@ -608,7 +608,7 @@ fn tls_unregister_pool_slab(slab_hdr: *mut PoolSlabHeader, /) {
 /| Returns `true` if `addr` lies inside any active `Pool` slab mapped on the current thread.
 @std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
 fn is_in_any_tls_pool_slab(addr: usize, /) -> bool {
-    let state_ptr: *mut SystemTlsState = @tls_alloc_state() as *mut SystemTlsState;
+    let state_ptr = @tls_alloc_state() as *mut SystemTlsState;
     if state_ptr.is_null() {
         return false;
     }
@@ -616,7 +616,7 @@ fn is_in_any_tls_pool_slab(addr: usize, /) -> bool {
         state_ptr.*.pool_slab_head
     };
     while not cur.is_null() {
-        let base_addr: usize = cur as usize;
+        let base_addr = cur as usize;
         let map_len: usize = unsafe {
             cur.*.map_bytes
         };
@@ -627,11 +627,10 @@ fn is_in_any_tls_pool_slab(addr: usize, /) -> bool {
             cur.*.tls_next
         };
     }
-    return false;
+    false
 }
 
 /| Computes `(slot_align, slot_stride)` for non-ZST `Pool[T]` slots.
-@no_alloc @no_panic
 fn pool_slot_geometry[T]() -> (usize, usize)? {
     let min_align: usize = @align_of[*mut PoolFreeNode]();
     let slot_align: usize = if @align_of[T]() > min_align => @align_of[T]() else min_align;
@@ -640,7 +639,7 @@ fn pool_slot_geometry[T]() -> (usize, usize)? {
     if align_up(raw_sz, slot_align) is .Some(stride) {
         return .Some((slot_align, stride));
     }
-    return .None;
+    .None
 }
 
 // ----------------- Slab Arena & Fixed Helpers -----------------
@@ -658,13 +657,13 @@ fn arena_resize_in_place(
     }
     let slab: *mut SlabHeader = arena.current_slab;
     if not slab.is_null() {
-        let slab_base: usize = slab as usize;
-        let ptr_addr: usize = ptr as usize;
+        let slab_base = slab as usize;
+        let ptr_addr = ptr as usize;
         if ptr_addr >= slab_base and ptr_addr +% old_layout.size == slab_base +% (
             arena.used_offset as usize
         ) {
             let rel_off: usize = ptr_addr -% slab_base;
-            let slab_cap: usize = unsafe {
+            let slab_cap = unsafe {
                 slab.*.cap
             } as usize;
             if new_size <= slab_cap -| rel_off and rel_off +% new_size <= slab_cap {
@@ -674,7 +673,7 @@ fn arena_resize_in_place(
             return false;
         }
     }
-    return new_size <= old_layout.size;
+    new_size <= old_layout.size
 }
 
 /| Appends formatted `chunk` bytes into an `ArenaFmtSink`, growing in place at the slab tip when possible.
@@ -683,7 +682,7 @@ fn arena_fmt_write_cb(ctx: *mut opaque, chunk: &[u8]) -> unit!FmtError {
     if chunk.is_empty() {
         return .Ok(());
     }
-    let sink_ptr: *mut ArenaFmtSink = ctx as *mut ArenaFmtSink;
+    let sink_ptr = ctx as *mut ArenaFmtSink;
     if sink_ptr.is_null() {
         return .Err(.BufferFull);
     }
@@ -733,7 +732,7 @@ fn arena_fmt_write_cb(ctx: *mut opaque, chunk: &[u8]) -> unit!FmtError {
         @memcpy(sink.ptr.add(sink.len) as *mut opaque, chunk.as_ptr() as *opaque, chunk.len());
     }
     sink.len = needed;
-    return .Ok(());
+    .Ok(())
 }
 
 /| Validates `bytes` as well-formed UTF-8 without depending on `cx.str` (8-byte SWAR + scalar).
@@ -741,7 +740,7 @@ fn arena_fmt_write_cb(ctx: *mut opaque, chunk: &[u8]) -> unit!FmtError {
 fn is_valid_utf8_bytes(bytes: &[u8], /) -> bool {
     let n: usize = bytes.len();
     let ptr: *u8 = bytes.as_ptr();
-    var i: usize = 0_usize;
+    var i = 0_usize;
     while i +% 8_usize <= n {
         var word_bytes: [u8; 8] = [0_u8; 8];
         unsafe {
@@ -790,20 +789,20 @@ fn is_valid_utf8_bytes(bytes: &[u8], /) -> bool {
             return false;
         }
     }
-    return true;
+    true
 }
 
 /| Type-erased `AllocatorHeader.alloc_fn` shim for `FixedBuffer`.
 @std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
 fn fixed_buffer_alloc_cb(ctx: *mut opaque, layout: Layout) -> *mut u8!AllocError {
-    let fb_ptr: *mut FixedBuffer = ctx as *mut FixedBuffer;
+    let fb_ptr = ctx as *mut FixedBuffer;
     if fb_ptr.is_null() {
         return .Err(.OutOfMemory);
     }
     let fb_ref: &mut FixedBuffer = unsafe {
         &mut fb_ptr.*
     };
-    return fb_ref.alloc(layout);
+    fb_ref.alloc(layout)
 }
 
 /| Type-erased `AllocatorHeader.resize_fn` shim for `FixedBuffer`.
@@ -814,14 +813,14 @@ fn fixed_buffer_resize_cb(
     old_layout: Layout,
     new_size: usize,
 ) -> bool {
-    let fb_ptr: *mut FixedBuffer = ctx as *mut FixedBuffer;
+    let fb_ptr = ctx as *mut FixedBuffer;
     if fb_ptr.is_null() {
         return false;
     }
     let fb_ref: &mut FixedBuffer = unsafe {
         &mut fb_ptr.*
     };
-    return fb_ref.resize(ptr, old_layout, new_size);
+    fb_ref.resize(ptr, old_layout, new_size)
 }
 
 /| Type-erased `AllocatorHeader.realloc_fn` shim for `FixedBuffer`.
@@ -832,20 +831,20 @@ fn fixed_buffer_realloc_cb(
     old_layout: Layout,
     new_size: usize,
 ) -> *mut u8!AllocError {
-    let fb_ptr: *mut FixedBuffer = ctx as *mut FixedBuffer;
+    let fb_ptr = ctx as *mut FixedBuffer;
     if fb_ptr.is_null() {
         return .Err(.OutOfMemory);
     }
     let fb_ref: &mut FixedBuffer = unsafe {
         &mut fb_ptr.*
     };
-    return fb_ref.realloc(ptr, old_layout, new_size);
+    fb_ref.realloc(ptr, old_layout, new_size)
 }
 
 /| Type-erased `AllocatorHeader.dealloc_fn` shim for `FixedBuffer`.
 @std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
 fn fixed_buffer_dealloc_cb(ctx: *mut opaque, ptr: *mut u8, layout: Layout) {
-    let fb_ptr: *mut FixedBuffer = ctx as *mut FixedBuffer;
+    let fb_ptr = ctx as *mut FixedBuffer;
     if fb_ptr.is_null() {
         return;
     }
@@ -864,20 +863,20 @@ impl Layout {
         if alignment == 0_usize or (alignment & (alignment -% 1_usize)) != 0_usize {
             return .Err(.InvalidLayout);
         }
-        let max_bytes: usize = isize.MAX as usize;
+        let max_bytes = isize.MAX as usize;
         if size > max_bytes -| (alignment -% 1_usize) {
             return .Err(.InvalidLayout);
         }
-        return .Ok(Layout { size: size, alignment: alignment });
+        .Ok(Layout { size, alignment })
     }
 
     /| Returns the exact compile-time/runtime `Layout` of `T`.
     @no_alloc @no_panic
     pub fn of[T]() -> Layout {
-        return Layout {
+        Layout {
             size: @size_of[T](),
             alignment: @align_of[T](),
-        };
+        }
     }
 
     /| Computes the contiguous `Layout` for `[T; count]`, guarding `count * @size_of[T]()` overflow.
@@ -885,26 +884,26 @@ impl Layout {
     pub fn array[T](count: usize, /) -> Layout!AllocError {
         let elem_sz: usize = @size_of[T]();
         let align_val: usize = @align_of[T]();
-        let max_bytes: usize = isize.MAX as usize;
+        let max_bytes = isize.MAX as usize;
         if elem_sz != 0_usize and count > (max_bytes -| (align_val -% 1_usize)) / elem_sz {
             return .Err(.InvalidLayout);
         }
-        return .Ok(
+        .Ok(
             Layout {
                 size: count *% elem_sz,
                 alignment: align_val,
             },
-        );
+        )
     }
 
     /| Rounds `self.size` upward to the nearest multiple of `self.alignment`.
     @inline @no_alloc @no_panic
     pub fn pad_to_align(self) -> Layout {
         let mask: usize = self.alignment -% 1_usize;
-        return Layout {
+        Layout {
             size: (self.size +% mask) & ~mask,
             alignment: self.alignment,
-        };
+        }
     }
 }
 
@@ -918,15 +917,15 @@ impl AllocatorHandle {
     /| Extracts the 3-bit `AllocTag` encoded in `self.raw_tagged_ptr`.
     @inline @no_alloc @no_panic
     pub fn tag(self) -> AllocTag {
-        return match self.raw_tagged_ptr & 0x7_usize {
+        match self.raw_tagged_ptr & 0x7_usize {
             1_usize => .BumpArenaNoFree,
             2_usize => .StaticRoData,
             _ => .GeneralAllocator,
-        };
+        }
     }
 
     /| Returns `true` when individual `dealloc` calls are no-ops (`BumpArenaNoFree` or `StaticRoData`).
-    @inline @no_alloc @no_panic
+    @no_alloc @no_panic
     pub fn is_arena_or_static(self) -> bool = (self.raw_tagged_ptr & 0x7_usize) != 0_usize;
 
     /| Allocates `layout` from the tagged `System`, `Arena`, or custom `AllocatorHeader` target.
@@ -940,7 +939,7 @@ impl AllocatorHandle {
         if kind == .StaticRoData {
             return .Err(.OutOfMemory);
         } else if kind == .BumpArenaNoFree {
-            let arena_ptr: *mut Arena = (self.raw_tagged_ptr & ~7_usize) as *mut Arena;
+            let arena_ptr = (self.raw_tagged_ptr & ~7_usize) as *mut Arena;
             if arena_ptr.is_null() {
                 return .Err(.OutOfMemory);
             }
@@ -952,7 +951,7 @@ impl AllocatorHandle {
         if self.raw_tagged_ptr == 0_usize {
             return system_alloc(valid_layout);
         }
-        let hdr_slot: **AllocatorHeader = self.raw_tagged_ptr as **AllocatorHeader;
+        let hdr_slot = self.raw_tagged_ptr as **AllocatorHeader;
         if hdr_slot.is_null() {
             return .Err(.OutOfMemory);
         }
@@ -968,7 +967,7 @@ impl AllocatorHandle {
         let alloc_cb = unsafe {
             header_ptr.*.alloc_fn
         };
-        return alloc_cb(self.raw_tagged_ptr as *mut opaque, valid_layout);
+        alloc_cb(self.raw_tagged_ptr as *mut opaque, valid_layout)
     }
 
     /| Attempts to grow or shrink `ptr` to `new_size` in place (`@no_alloc @no_panic`).
@@ -986,10 +985,10 @@ impl AllocatorHandle {
         if old_layout.size == 0_usize and new_size == 0_usize {
             return true;
         }
-        return match self.tag() {
+        match self.tag() {
             .StaticRoData => new_size <= old_layout.size,
             .BumpArenaNoFree => {
-                let arena_ptr: *mut Arena = (self.raw_tagged_ptr & ~7_usize) as *mut Arena;
+                let arena_ptr = (self.raw_tagged_ptr & ~7_usize) as *mut Arena;
                 if arena_ptr.is_null() {
                     return false;
                 }
@@ -1002,7 +1001,7 @@ impl AllocatorHandle {
                 if self.raw_tagged_ptr == 0_usize {
                     return system_resize(ptr, old_layout, new_size);
                 }
-                let hdr_slot: **AllocatorHeader = self.raw_tagged_ptr as **AllocatorHeader;
+                let hdr_slot = self.raw_tagged_ptr as **AllocatorHeader;
                 if hdr_slot.is_null() {
                     return false;
                 }
@@ -1030,7 +1029,7 @@ impl AllocatorHandle {
                     new_size,
                 )
             },
-        };
+        }
     }
 
     /| Reallocates `ptr` from `old_layout` to `new_size`, preserving `min(old_layout.size, new_size)` bytes.
@@ -1054,7 +1053,7 @@ impl AllocatorHandle {
             return .Ok(ptr);
         }
         if self.tag() == .GeneralAllocator and self.raw_tagged_ptr != 0_usize {
-            let hdr_slot: **AllocatorHeader = self.raw_tagged_ptr as **AllocatorHeader;
+            let hdr_slot = self.raw_tagged_ptr as **AllocatorHeader;
             if hdr_slot.is_null() {
                 return .Err(.OutOfMemory);
             }
@@ -1090,7 +1089,7 @@ impl AllocatorHandle {
             }
         }
         self.dealloc(ptr, old_layout);
-        return .Ok(next_ptr);
+        .Ok(next_ptr)
     }
 
     /| Releases `ptr` when backed by a `GeneralAllocator`; zero-cost no-op on arenas and `.rodata`.
@@ -1106,7 +1105,7 @@ impl AllocatorHandle {
             system_dealloc(ptr, layout);
             return;
         }
-        let hdr_slot: **AllocatorHeader = self.raw_tagged_ptr as **AllocatorHeader;
+        let hdr_slot = self.raw_tagged_ptr as **AllocatorHeader;
         if hdr_slot.is_null() {
             return;
         }
@@ -1145,13 +1144,13 @@ impl Arena {
             .Some(rounded) => if rounded > 0x4000_0000_usize => 0x4000_0000_usize else rounded,
             .None => 65_536_usize,
         };
-        return Self {
+        Self {
             current_slab: @default_init[*mut SlabHeader](),
             first_slab: @default_init[*mut SlabHeader](),
             bypass_head: @default_init[*mut BypassHeader](),
             used_offset: 0_u32,
             default_cap: aligned_cap as u32,
-        };
+        }
     }
 
     /| Constructs an `Arena` with an eagerly mapped initial slab holding at least `min_bytes`.
@@ -1168,7 +1167,7 @@ impl Arena {
             PAGE_GRANULARITY,
         ) orelse return .Err(.OutOfMemory);
         let raw_slab: *mut u8 = os_alloc_pages(needed_slab)?;
-        let hdr: *mut SlabHeader = raw_slab as *mut SlabHeader;
+        let hdr = raw_slab as *mut SlabHeader;
         if hdr.is_null() {
             return .Err(.OutOfMemory);
         }
@@ -1180,7 +1179,7 @@ impl Arena {
                 _pad: 0_u32,
             };
         }
-        return .Ok(
+        .Ok(
             Self {
                 current_slab: hdr,
                 first_slab: hdr,
@@ -1188,17 +1187,17 @@ impl Arena {
                 used_offset: SLAB_HDR_SIZE as u32,
                 default_cap: ARENA_DEFAULT_SLAB_BYTES as u32,
             },
-        );
+        )
     }
 
     /| Returns a bit-0 tagged `AllocatorHandle` (`AllocTag.BumpArenaNoFree`).
     @inline @no_alloc @no_panic
     pub fn as_handle(&mut self) -> AllocatorHandle {
-        return AllocatorHandle { raw_tagged_ptr: (self as usize) | 0x1_usize };
+        AllocatorHandle { raw_tagged_ptr: (self as usize) | 0x1_usize }
     }
 
     /| Fast-path 4-instruction bump allocation inside `current_slab` with cold slab/bypass fallback.
-    @std_cap_boundary(clears: [unsafe_op, may_panic]) @inline @no_panic
+    @std_cap_boundary(clears: [unsafe_op, may_panic]) @no_panic
     pub fn alloc_raw(&mut self, layout: Layout, /) -> *mut u8!AllocError {
         let valid: Layout = Layout.new(layout.size, layout.alignment)?;
         if valid.size == 0_usize {
@@ -1208,13 +1207,13 @@ impl Arena {
             else self.default_cap as usize;
         let slab: *mut SlabHeader = self.current_slab;
         if not slab.is_null() and valid.size <= eff_cap / 2_usize and valid.alignment <= 4_096_usize {
-            let slab_addr: usize = slab as usize;
+            let slab_addr = slab as usize;
             if align_up(slab_addr +% (self.used_offset as usize), valid.alignment) is .Some(
                 aligned_addr,
             ) {
                 let rel_off: usize = aligned_addr -% slab_addr;
                 if not slab.is_null() {
-                    let slab_cap: usize = unsafe {
+                    let slab_cap = unsafe {
                         slab.*.cap
                     } as usize;
                     if valid.size <= slab_cap -| rel_off and rel_off +% valid.size <= slab_cap {
@@ -1224,7 +1223,7 @@ impl Arena {
                 }
             }
         }
-        return self.alloc_slow(valid, eff_cap);
+        self.alloc_slow(valid, eff_cap)
     }
 
     /| Cold-path slab growth, cached-slab reuse, or dedicated `BypassHeader` mapping.
@@ -1245,12 +1244,12 @@ impl Arena {
             let map_bytes: usize = align_up(hdr_aligned + layout.size, PAGE_GRANULARITY)
                 orelse return .Err(.OutOfMemory);
             let raw_page: *mut u8 = os_alloc_pages(map_bytes)?;
-            let bypass: *mut BypassHeader = raw_page as *mut BypassHeader;
+            let bypass = raw_page as *mut BypassHeader;
             if bypass.is_null() {
                 return .Err(.OutOfMemory);
             }
             unsafe {
-                bypass.* = BypassHeader { prev: self.bypass_head, map_bytes: map_bytes };
+                bypass.* = BypassHeader { prev: self.bypass_head, map_bytes };
             }
             self.bypass_head = bypass;
             return .Ok(
@@ -1265,7 +1264,7 @@ impl Arena {
                 self.current_slab.*.next
             };
             if not next_slab.is_null() {
-                let next_cap: usize = unsafe {
+                let next_cap = unsafe {
                     next_slab.*.cap
                 } as usize;
                 unsafe {
@@ -1282,7 +1281,7 @@ impl Arena {
         } else {
             let head_slab: *mut SlabHeader = self.first_slab;
             if not head_slab.is_null() {
-                let head_cap: usize = unsafe {
+                let head_cap = unsafe {
                     head_slab.*.cap
                 } as usize;
                 unsafe {
@@ -1299,7 +1298,7 @@ impl Arena {
         }
 
         let raw_slab: *mut u8 = os_alloc_pages(eff_cap)?;
-        let hdr: *mut SlabHeader = raw_slab as *mut SlabHeader;
+        let hdr = raw_slab as *mut SlabHeader;
         if hdr.is_null() {
             return .Err(.OutOfMemory);
         }
@@ -1318,17 +1317,17 @@ impl Arena {
         }
         self.current_slab = hdr;
         self.used_offset = SLAB_HDR_SIZE as u32;
-        return self.alloc_raw(layout);
+        self.alloc_raw(layout)
     }
 
     /| Captures an `O(1)` `ArenaCheckpoint` snapshot of the current bump and bypass state.
     @inline @no_alloc @no_panic
     pub fn checkpoint(&self) -> ArenaCheckpoint {
-        return ArenaCheckpoint {
+        ArenaCheckpoint {
             slab_ptr: self.current_slab,
             bypass_head: self.bypass_head,
             used_offset: self.used_offset,
-        };
+        }
     }
 
     /| Rewinds `self` back to `cp`, unmapping newer bypass blocks and zero-wiping dirtied slab tail bytes.
@@ -1351,7 +1350,7 @@ impl Arena {
         if cp.slab_ptr.is_null() {
             let first: *mut SlabHeader = self.first_slab;
             if not first.is_null() {
-                let cap_bytes: usize = unsafe {
+                let cap_bytes = unsafe {
                     first.*.cap
                 } as usize;
                 unsafe {
@@ -1371,8 +1370,8 @@ impl Arena {
         }
         self.current_slab = cp.slab_ptr;
         self.used_offset = cp.used_offset;
-        let wipe_start: usize = cp.used_offset as usize;
-        let slab_cap: usize = unsafe {
+        let wipe_start = cp.used_offset as usize;
+        let slab_cap = unsafe {
             cp.slab_ptr.*.cap
         } as usize;
         if wipe_start < slab_cap {
@@ -1400,17 +1399,8 @@ impl Arena {
 
     /| Consumes `self` and releases all mapped slabs and bypass blocks back to `System`.
     @std_cap_boundary(clears: [unsafe_op, may_panic]) @no_panic
-    pub fn release(var own self) {
-        let Arena {
-            current_slab,
-            first_slab,
-            bypass_head,
-            used_offset,
-            default_cap,
-        } = self;
-        _ = current_slab;
-        _ = used_offset;
-        _ = default_cap;
+    pub fn release(own self) {
+        let Arena { first_slab, bypass_head, .. } = self;
 
         var cur_bypass: *mut BypassHeader = bypass_head;
         while not cur_bypass.is_null() {
@@ -1467,9 +1457,9 @@ impl Arena {
 
     /| Allocates a single `T` inside `self`, aborting via `panic` on out-of-memory.
     pub fn create[T](&mut self, value: own T, /) -> &mut T {
-        return self.try_create[T](own value) catch {
+        self.try_create[T](own value) catch {
             return panic("Arena.create: out of memory");
-        };
+        }
     }
 
     /| Fallibly allocates `&mut [T]` of length `count` inside `self` (`zeroed = true` by default).
@@ -1495,18 +1485,18 @@ impl Arena {
                 @memset(raw_ptr as *mut opaque, 0_u8, arr_layout.size);
             }
         }
-        return .Ok(
+        .Ok(
             unsafe {
                 @slice_from_raw_parts_mut(raw_ptr as *mut T, count)
             },
-        );
+        )
     }
 
     /| Allocates `&mut [T]` of length `count` inside `self`, aborting via `panic` on out-of-memory.
     pub fn alloc_slice[T: Copy](&mut self, count: usize, /, *, zeroed: bool = true) -> &mut [T] {
-        return self.try_alloc_slice[T](count, zeroed: zeroed) catch {
+        self.try_alloc_slice[T](count, zeroed: zeroed) catch {
             return panic("Arena.alloc_slice: out of memory");
-        };
+        }
     }
 
     /| Duplicates `src` into newly bumped `self` slab storage.
@@ -1530,9 +1520,9 @@ impl Arena {
         if text.is_empty() {
             return "";
         }
-        return unsafe {
+        unsafe {
             @str_from_utf8_unchecked(self.dupe[u8](text.as_bytes()))
-        };
+        }
     }
 
     /| Formats `args` directly at `self`'s active slab tip and returns the resulting `str`.
@@ -1572,22 +1562,22 @@ impl Arena {
             Layout { size: sink.cap, alignment: 1_usize },
             sink.len,
         );
-        return unsafe {
+        unsafe {
             @str_from_utf8_unchecked(written)
-        };
+        }
     }
 }
 
 /| Executes `body` on slot `0` of the thread-local ping-pong scratch ring (`DR-20` `D-04`, `E0328`).
 @overload
 pub fn with_scratch[R](body: |&mut Arena| -> R, /) -> R {
-    return with_scratch[R](HANDLE_STATIC_RODATA, body);
+    with_scratch[R](HANDLE_STATIC_RODATA, body)
 }
 
 /| Executes `body` with a temporary ping-pong scratch `Arena` disjoint from `conflict` (`DR-20` `D-04`, `E0328`).
 @overload @std_cap_boundary(clears: [unsafe_op])
 pub fn with_scratch[R](conflict: AllocatorHandle, body: |&mut Arena| -> R, /) -> R {
-    let pair_ptr: *mut [Arena; 2] = @tls_scratch_ptr() as *mut [Arena; 2];
+    let pair_ptr = @tls_scratch_ptr() as *mut [Arena; 2];
     if pair_ptr.is_null() {
         return panic("with_scratch: uninitialized TLS");
     }
@@ -1598,7 +1588,7 @@ pub fn with_scratch[R](conflict: AllocatorHandle, body: |&mut Arena| -> R, /) ->
         else 0_usize;
     let saved_cp: ArenaCheckpoint = pair[idx].checkpoint();
     defer pair[idx].restore(saved_cp);
-    return body(&mut pair[idx]);
+    body(&mut pair[idx])
 }
 
 // -------------- Owned Pointers, Pools & Buffers ---------------
@@ -1614,30 +1604,30 @@ impl[T] OwnPtr[T] {
         unsafe {
             @ptr_write(raw_ptr, own value);
         }
-        return .Ok(Self { ptr: raw_ptr });
+        .Ok(Self { ptr: raw_ptr })
     }
 
     /| Allocates `value` on the `System` heap, aborting via `panic` on out-of-memory.
     pub fn new(value: own T, /) -> Self {
-        return Self.try_new(own value) catch {
+        Self.try_new(own value) catch {
             return panic("OwnPtr.new: out of memory");
-        };
+        }
     }
 
     /| Borrows the owned `T` immutably in `O(1)`.
     @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn as_ref(&self) -> &T {
-        return unsafe {
+        unsafe {
             &self.ptr.*
-        };
+        }
     }
 
     /| Borrows the owned `T` mutably in `O(1)`.
     @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn as_mut(&mut self) -> &mut T {
-        return unsafe {
+        unsafe {
             &mut self.ptr.*
-        };
+        }
     }
 
     /| Returns the underlying non-null read-only `*T` pointer without consuming `self`.
@@ -1663,20 +1653,20 @@ impl[T] OwnPtr[T] {
         if @size_of[T]() != 0_usize {
             System.handle().dealloc(ptr as *mut u8, Layout.of[T]());
         }
-        return own inner_val;
+        own inner_val
     }
 
     /| Consumes `self` and leaks ownership into a raw non-null `*mut T` pointer.
     @no_alloc @no_panic
     pub fn into_raw(own self) -> *mut T {
         let OwnPtr { ptr } = self;
-        return ptr;
+        ptr
     }
 
     /| Reconstructs an `OwnPtr[T]` from a caller-proven non-null, uniquely owned `raw_ptr`.
     @no_alloc @no_panic
     pub unsafe fn from_raw(raw_ptr: *mut T, /) -> Self {
-        return Self { ptr: raw_ptr };
+        Self { ptr: raw_ptr }
     }
 
     /| Drops `*self` in place via `@drop_in_place` and deallocates backing memory via `System.handle()`.
@@ -1699,12 +1689,12 @@ impl[T] Pool[T] {
     /| Constructs an empty `@linear Pool[T]` (`0` OS page mappings until first `alloc`/`try_alloc`).
     @no_alloc @no_panic
     pub fn new(*, items_per_slab: u32 = 1_024_u32) -> Self {
-        return Self {
+        Self {
             slab_head: @default_init[*mut PoolSlabHeader](),
             free_head: @default_init[*mut PoolFreeNode](),
             slab_items: if items_per_slab == 0_u32 => 1_u32 else items_per_slab,
             live_count: 0_u32,
-        };
+        }
     }
 
     /| Fallibly allocates an `O(1)` slot from `self` initialized with `value`.
@@ -1743,7 +1733,7 @@ impl[T] Pool[T] {
         let map_bytes: usize = align_up(slots_end, PAGE_GRANULARITY)
             orelse return .Err(.OutOfMemory);
         let raw_slab: *mut u8 = os_alloc_pages(map_bytes)?;
-        let slab_hdr: *mut PoolSlabHeader = raw_slab as *mut PoolSlabHeader;
+        let slab_hdr = raw_slab as *mut PoolSlabHeader;
         if slab_hdr.is_null() {
             return .Err(.OutOfMemory);
         }
@@ -1752,9 +1742,9 @@ impl[T] Pool[T] {
                 prev: self.slab_head,
                 tls_next: @default_init[*mut PoolSlabHeader](),
                 tls_prev: @default_init[*mut PoolSlabHeader](),
-                map_bytes: map_bytes,
+                map_bytes,
                 data_off: hdr_off,
-                slots_end: slots_end,
+                slots_end,
             };
         }
         tls_register_pool_slab(slab_hdr);
@@ -1766,7 +1756,7 @@ impl[T] Pool[T] {
         var idx: usize = items_n;
         while idx > 1_usize {
             idx -= 1_usize;
-            let node_ptr: *mut PoolFreeNode = unsafe {
+            let node_ptr = unsafe {
                 first_slot.add(idx * stride)
             } as *mut PoolFreeNode;
             if not node_ptr.is_null() {
@@ -1781,14 +1771,14 @@ impl[T] Pool[T] {
             @ptr_write(out_ptr, own value);
         }
         self.live_count = self.live_count +% 1_u32;
-        return .Ok(OwnPtr[T] { ptr: out_ptr });
+        .Ok(OwnPtr[T] { ptr: out_ptr })
     }
 
     /| Allocates an `O(1)` slot from `self`, aborting via `panic` on out-of-memory.
     pub fn alloc(&mut self, value: own T, /) -> OwnPtr[T] {
-        return self.try_alloc(own value) catch {
+        self.try_alloc(own value) catch {
             return panic("Pool.alloc: out of memory");
-        };
+        }
     }
 
     /| Drops `item` in place and pushes its verified slot onto `self.free_head` (`@no_alloc @no_panic`).
@@ -1807,10 +1797,10 @@ impl[T] Pool[T] {
         }
         var verified_slot: *mut PoolFreeNode = @default_init[*mut PoolFreeNode]();
         if pool_slot_geometry[T]() is .Some((_, stride)) {
-            let ptr_addr: usize = raw_ptr as usize;
+            let ptr_addr = raw_ptr as usize;
             var cur_slab: *mut PoolSlabHeader = self.slab_head;
             while not cur_slab.is_null() {
-                let slab_addr: usize = cur_slab as usize;
+                let slab_addr = cur_slab as usize;
                 let data_off: usize = unsafe {
                     cur_slab.*.data_off
                 };
@@ -1853,16 +1843,8 @@ impl[T] Pool[T] {
 
     /| Consumes `self`, unlinks all slabs from TLS, and unmaps backing OS pages.
     @std_cap_boundary(clears: [unsafe_op]) @no_panic
-    pub fn release(var own self) {
-        let Pool {
-            slab_head,
-            free_head,
-            slab_items,
-            live_count,
-        } = self;
-        _ = free_head;
-        slab_items;
-        live_count;
+    pub fn release(own self) {
+        let Pool { slab_head, .. } = self;
 
         var cur_slab: *mut PoolSlabHeader = slab_head;
         while not cur_slab.is_null() {
@@ -1883,18 +1865,18 @@ impl FixedBuffer {
     /| Wraps `backing` in a stack/static bump allocator tagged with `FIXED_BUFFER_HDR_SENTINEL` (`0` TLS writes).
     @inline @no_alloc @no_panic
     pub fn init(backing: &mut [u8], /) -> Self {
-        return Self {
+        Self {
             header: FIXED_BUFFER_HDR_SENTINEL as *AllocatorHeader,
             buf: backing.as_mut_ptr(),
             cap: backing.len(),
             used: 0_usize,
-        };
+        }
     }
 
     /| Returns a `GeneralAllocator` `AllocatorHandle` pointing to `self`.
     @inline @no_alloc @no_panic
     pub fn as_handle(&mut self) -> AllocatorHandle {
-        return AllocatorHandle { raw_tagged_ptr: self as usize };
+        AllocatorHandle { raw_tagged_ptr: self as usize }
     }
 
     /| Rewinds the bump cursor to `0` in `O(1)`.
@@ -1904,7 +1886,7 @@ impl FixedBuffer {
     }
 
     /| Returns the unallocated byte count remaining in `self`.
-    @inline @no_alloc @no_panic
+    @no_alloc @no_panic
     pub fn remaining(&self) -> usize = self.cap -| self.used;
 }
 
@@ -1916,7 +1898,7 @@ impl Allocator for FixedBuffer {
         if valid.size == 0_usize {
             return .Ok(valid.alignment as *mut u8);
         }
-        let base_addr: usize = self.buf as usize;
+        let base_addr = self.buf as usize;
         let aligned_addr: usize = align_up(base_addr +% self.used, valid.alignment)
             orelse return .Err(.OutOfMemory);
         let rel_off: usize = aligned_addr -% base_addr;
@@ -1924,7 +1906,7 @@ impl Allocator for FixedBuffer {
             return .Err(.OutOfMemory);
         }
         self.used = rel_off +% valid.size;
-        return .Ok(aligned_addr as *mut u8);
+        .Ok(aligned_addr as *mut u8)
     }
 
     /| Resizes the most recent allocation in place in `O(1)` when `ptr` sits at `self.buf + self.used`.
@@ -1933,8 +1915,8 @@ impl Allocator for FixedBuffer {
         if ptr.is_null() {
             return false;
         }
-        let base_addr: usize = self.buf as usize;
-        let ptr_addr: usize = ptr as usize;
+        let base_addr = self.buf as usize;
+        let ptr_addr = ptr as usize;
         if ptr_addr < base_addr or ptr_addr +% old_layout.size != base_addr +% self.used {
             return false;
         }
@@ -1943,7 +1925,7 @@ impl Allocator for FixedBuffer {
             return false;
         }
         self.used = rel_off +% new_size;
-        return true;
+        true
     }
 
     /| Resizes `ptr` in place at the tip or bumps a fresh slice inside `self.buf` (`@no_alloc @no_panic`).
@@ -1973,7 +1955,7 @@ impl Allocator for FixedBuffer {
                 @memcpy(next_ptr as *mut opaque, ptr as *opaque, copy_len);
             }
         }
-        return .Ok(next_ptr);
+        .Ok(next_ptr)
     }
 
     /| Reclaims `old_layout.size` in `O(1)` when `ptr` sits at the active bump tip.
@@ -1982,8 +1964,8 @@ impl Allocator for FixedBuffer {
         if ptr.is_null() or layout.size == 0_usize {
             return;
         }
-        let base_addr: usize = self.buf as usize;
-        let ptr_addr: usize = ptr as usize;
+        let base_addr = self.buf as usize;
+        let ptr_addr = ptr as usize;
         if ptr_addr >= base_addr and ptr_addr +% layout.size == base_addr +% self.used {
             self.used = ptr_addr -% base_addr;
         }
@@ -1992,12 +1974,12 @@ impl Allocator for FixedBuffer {
 
 impl System {
     /| Returns the canonical zero-overhead `AllocatorHandle` for `System` (`AllocatorHandle.SYSTEM`).
-    @inline @no_alloc @no_panic
+    @no_alloc @no_panic
     pub fn handle() -> AllocatorHandle = HANDLE_SYSTEM;
 
     /| Maps zero-initialized `64 KiB`-granularity virtual memory pages directly from the OS / Wasm host.
     pub fn alloc_pages(byte_len: usize, /) -> *mut u8!AllocError {
-        return os_alloc_pages(byte_len);
+        os_alloc_pages(byte_len)
     }
 
     /| Releases `64 KiB`-granularity virtual memory pages back to the OS / Wasm bigpage freelist.
@@ -2020,7 +2002,7 @@ impl Span16 {
         ) <= end_idx {
             return .Some(buf[(self.off as usize)..end_idx]);
         }
-        return .None;
+        .None
     }
 }
 
@@ -2034,7 +2016,7 @@ pub fn align_up(addr: usize, alignment: usize, /) -> usize? {
     if addr > usize.MAX -% mask {
         return .None;
     }
-    return .Some((addr +% mask) & ~mask);
+    .Some((addr +% mask) & ~mask)
 }
 
 /| Exchanges `*lhs` and `*rhs` in place via safe MVS parallel assignment (`SE-15`).
@@ -2048,7 +2030,7 @@ pub fn swap[T](lhs: &mut T, rhs: &mut T, /) {
 pub fn replace[T](dest: &mut T, src: own T, /) -> T {
     var prev: T = own src;
     swap(dest, &mut prev);
-    return own prev;
+    own prev
 }
 
 /| Reinterprets the prefix of `buf` as `&T` (`T: FromBytes`) after verifying size and alignment (`D-01`).
@@ -2064,7 +2046,7 @@ pub fn view_bytes[T: FromBytes](buf: &[u8], /) -> (&T)!WireError {
     if @view_bytes[T](buf[0..elem_size]) is .Some(typed_ref) {
         return .Ok(typed_ref);
     }
-    return .Err(.MisalignedPtr);
+    .Err(.MisalignedPtr)
 }
 
 /| Reinterprets `buf` prefix as `&[T]` of length `count` (`T: FromBytes`), guarding `count * sizeof(T)` overflow.
@@ -2088,25 +2070,25 @@ pub fn view_slice_bytes[T: FromBytes](buf: &[u8], count: usize, /) -> (&[T])!Wir
     if ((buf.as_ptr() as usize) & (@align_of[T]() -% 1_usize)) != 0_usize {
         return .Err(.MisalignedPtr);
     }
-    return .Ok(
+    .Ok(
         unsafe {
             @slice_from_raw_parts(buf.as_ptr() as *T, count)
         },
-    );
+    )
 }
 
 /| Projects `&value` (`T: IntoBytes`, padding-free or `@zero_pad`) as `&[u8]` in `O(1)` (`D-01`).
 @no_alloc @no_panic
 pub fn as_bytes[T: IntoBytes](value: &T, /) -> &[u8] {
-    return @as_bytes(value);
+    @as_bytes(value)
 }
 
 /| Projects `&mut value` (`T: FromBytes + IntoBytes`) as `&mut [u8]` in `O(1)` (`D-01`).
 @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
 pub fn as_bytes_mut[T: FromBytes + IntoBytes](value: &mut T, /) -> &mut [u8] {
-    return unsafe {
+    unsafe {
         @slice_from_raw_parts_mut((value as *mut T) as *mut u8, @size_of[T]())
-    };
+    }
 }
 
 /| Reads an unaligned Little-Endian scalar `T` from `buf` at `offset` (`default = 0`).
@@ -2116,7 +2098,7 @@ pub fn read_le[T: Integer | Float](buf: &[u8], offset: usize = 0_usize, /) -> T!
     if offset > buf.len() or buf.len() -% offset < elem_size {
         return .Err(.UnexpectedEof);
     }
-    return .Ok(@from_le_bytes[T](buf[offset..(offset +% elem_size)]));
+    .Ok(@from_le_bytes[T](buf[offset..(offset +% elem_size)]))
 }
 
 /| Reads an unaligned Big-Endian scalar `T` from `buf` at `offset` (`default = 0`).
@@ -2126,7 +2108,7 @@ pub fn read_be[T: Integer | Float](buf: &[u8], offset: usize = 0_usize, /) -> T!
     if offset > buf.len() or buf.len() -% offset < elem_size {
         return .Err(.UnexpectedEof);
     }
-    return .Ok(@from_be_bytes[T](buf[offset..(offset +% elem_size)]));
+    .Ok(@from_be_bytes[T](buf[offset..(offset +% elem_size)]))
 }
 
 /| Writes scalar `value` in Little-Endian byte order into `buf` at `offset`.
@@ -2145,7 +2127,7 @@ pub fn write_le[T: Integer | Float](
     unsafe {
         @memcpy(buf.as_mut_ptr().add(offset) as *mut opaque, (&encoded) as *opaque, elem_size);
     }
-    return .Ok(());
+    .Ok(())
 }
 
 /| Writes scalar `value` in Big-Endian byte order into `buf` at `offset`.
@@ -2164,22 +2146,22 @@ pub fn write_be[T: Integer | Float](
     unsafe {
         @memcpy(buf.as_mut_ptr().add(offset) as *mut opaque, (&encoded) as *opaque, elem_size);
     }
-    return .Ok(());
+    .Ok(())
 }
 
 impl ByteCursor {
     /| Constructs a `ByteCursor` positioned at byte `0` of `buf`.
     @inline @no_alloc @no_panic
     pub fn new(buf: &[u8], /) -> Self {
-        return Self { buf: buf, pos: 0_usize };
+        Self { buf, pos: 0_usize }
     }
 
     /| Returns the unread byte count remaining in `self.buf`.
-    @inline @no_alloc @no_panic
+    @no_alloc @no_panic
     pub fn remaining(&self) -> usize = self.buf.len() -| self.pos;
 
     /| Returns `true` when `self` has reached the end of `self.buf`.
-    @inline @no_alloc @no_panic
+    @no_alloc @no_panic
     pub fn is_empty(&self) -> bool = self.pos >= self.buf.len();
 
     /| Advances `self.pos` by `n` bytes and returns the consumed sub-slice.
@@ -2190,7 +2172,7 @@ impl ByteCursor {
         }
         let start_pos: usize = self.pos;
         self.pos = start_pos +% n;
-        return .Ok(self.buf[start_pos..self.pos]);
+        .Ok(self.buf[start_pos..self.pos])
     }
 
     /| Reads a Little-Endian `T` (`Integer | Float`) and advances `self.pos` on success.
@@ -2202,7 +2184,7 @@ impl ByteCursor {
         }
         let start_pos: usize = self.pos;
         self.pos = start_pos +% elem_size;
-        return .Ok(@from_le_bytes[T](self.buf[start_pos..self.pos]));
+        .Ok(@from_le_bytes[T](self.buf[start_pos..self.pos]))
     }
 
     /| Reads a Big-Endian `T` (`Integer | Float`) and advances `self.pos` on success.
@@ -2214,7 +2196,7 @@ impl ByteCursor {
         }
         let start_pos: usize = self.pos;
         self.pos = start_pos +% elem_size;
-        return .Ok(@from_be_bytes[T](self.buf[start_pos..self.pos]));
+        .Ok(@from_be_bytes[T](self.buf[start_pos..self.pos]))
     }
 
     /| Views an aligned `&T` (`T: FromBytes`) at `self.pos` and advances `self.pos` on success.
@@ -2232,6 +2214,6 @@ impl ByteCursor {
             self.pos = self.pos +% elem_size;
             return .Ok(typed_ref);
         }
-        return .Err(.MisalignedPtr);
+        .Err(.MisalignedPtr)
     }
 }

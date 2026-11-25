@@ -32,7 +32,7 @@
    │
    ╰───────
 
-⚠︎ warning[W0501]: explicit `@inline` function exceeded inlining cost budget or recursion check
+⚠︎ warning[W0501/inlining-budget-exceeded]: explicit `@inline` function exceeded inlining cost budget or recursion check
    ╭─▸ src/comptime/phase5_errors.cx:30:31
    │
 30 │     return 1 + rec_inline_step(depth - 1);

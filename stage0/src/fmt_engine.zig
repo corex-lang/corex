@@ -1137,10 +1137,10 @@ const CANONICAL_ATTR_TIER_MAP = std.StaticStringMap(AttrSortRank).initComptime(.
     .{ "component", AttrSortRank{ .tier = 3, .sub_rank = 7 } },
     .{ "constructor", AttrSortRank{ .tier = 3, .sub_rank = 9 } },
     .{ "consumes", AttrSortRank{ .tier = 4, .sub_rank = 22 } },
-    .{ "deprecated", AttrSortRank{ .tier = 1, .sub_rank = 2 } },
+    .{ "deprecated", AttrSortRank{ .tier = 1, .sub_rank = 3 } },
     .{ "derive", AttrSortRank{ .tier = 3, .sub_rank = 1 } },
     .{ "escapes", AttrSortRank{ .tier = 4, .sub_rank = 14 } },
-    .{ "expect", AttrSortRank{ .tier = 1, .sub_rank = 3 } },
+    .{ "expect", AttrSortRank{ .tier = 1, .sub_rank = 2 } },
     .{ "export", AttrSortRank{ .tier = 2, .sub_rank = 3 } },
     .{ "extern", AttrSortRank{ .tier = 2, .sub_rank = 6 } },
     .{ "fbip", AttrSortRank{ .tier = 4, .sub_rank = 10 } },
@@ -1534,13 +1534,84 @@ inline fn isNewlineTrivia(kind: TriviaKind) bool {
     return kind == .newline_lf or kind == .newline_crlf;
 }
 
-/// Checks whether a `.line_comment` slice is a `// corex fmt: off` or `// corex fmt: on` directive.
-fn classifyFmtDirective(comment_slice: []const u8) enum { none, fmt_off, fmt_on } {
+/// Classification of `// corex fmt: …` comments (`DR-14` §1.3 & `DR-25` §1.3).
+const FmtDirectiveKind = enum(u8) {
+    none = 0,
+    fmt_off = 1,
+    fmt_on = 2,
+    fmt_file_off = 3,
+};
+
+/// Checks whether a `.line_comment` slice is `// corex fmt: (file-off | off | on) [-- <reason>]`.
+fn classifyFmtDirective(comment_slice: []const u8) FmtDirectiveKind {
     if (!std.mem.startsWith(u8, comment_slice, "//")) return .none;
-    const body = std.mem.trim(u8, comment_slice[2..], " \t\r\n");
-    if (std.mem.eql(u8, body, "corex fmt: off")) return .fmt_off;
-    if (std.mem.eql(u8, body, "corex fmt: on")) return .fmt_on;
+    var rest = std.mem.trimStart(u8, comment_slice[2..], " \t");
+    if (!std.mem.startsWith(u8, rest, "corex")) return .none;
+    rest = rest["corex".len..];
+    const before_ws_len = rest.len;
+    rest = std.mem.trimStart(u8, rest, " \t");
+    if (rest.len == before_ws_len or !std.mem.startsWith(u8, rest, "fmt:")) return .none;
+    rest = std.mem.trimStart(u8, rest["fmt:".len..], " \t");
+
+    var action_len: usize = 0;
+    var kind: FmtDirectiveKind = .none;
+    if (std.mem.startsWith(u8, rest, "file-off")) {
+        action_len = "file-off".len;
+        kind = .fmt_file_off;
+    } else if (std.mem.startsWith(u8, rest, "off")) {
+        action_len = "off".len;
+        kind = .fmt_off;
+    } else if (std.mem.startsWith(u8, rest, "on")) {
+        action_len = "on".len;
+        kind = .fmt_on;
+    } else {
+        return .none;
+    }
+
+    const tail = std.mem.trimEnd(u8, rest[action_len..], " \t\r\n");
+    if (tail.len == 0) return kind;
+    const trimmed_tail = std.mem.trimStart(u8, tail, " \t");
+    if (trimmed_tail.len < tail.len and std.mem.startsWith(u8, trimmed_tail, "--")) {
+        return kind;
+    }
     return .none;
+}
+
+/// Returns `true` if `token_buffer` carries a preamble `// corex fmt: file-off [-- <reason>]` directive.
+fn hasFmtFileOffPreambleDirective(source: []const u8, token_buffer: *const TokenBuffer) bool {
+    var first_code_byte: u32 = @intCast(source.len);
+    const tok_count = token_buffer.countTokens();
+    var tok_i: usize = 0;
+    while (tok_i < tok_count) : (tok_i += 1) {
+        const rec = token_buffer.getToken(TokenIndex.fromInt(@intCast(tok_i)));
+        if (rec.kind == .eof or rec.flags.is_synthesized) continue;
+        first_code_byte = rec.byte_offset;
+        break;
+    }
+
+    for (token_buffer.trivia.items) |piece| {
+        if (piece.byte_offset >= first_code_byte) continue;
+        const start: usize = piece.byte_offset;
+        const end: usize = @min(source.len, start + piece.byte_len);
+        if (start >= end) continue;
+        if ((piece.flags & syntax_arenas.TRIVIA_FLAG_COALESCED) == 0) {
+            if (piece.kind != .line_comment) continue;
+            if (classifyFmtDirective(source[start..end]) == .fmt_file_off) return true;
+        } else {
+            var cursor = start;
+            while (cursor < end) {
+                if (source[cursor] == '/' and cursor + 1 < end and source[cursor + 1] == '/') {
+                    var line_end = cursor + 2;
+                    while (line_end < end and source[line_end] != '\n' and source[line_end] != '\r') : (line_end += 1) {}
+                    if (classifyFmtDirective(source[cursor..line_end]) == .fmt_file_off) return true;
+                    cursor = line_end;
+                } else {
+                    cursor += 1;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 /// Extracts all `// corex fmt: off` … `// corex fmt: on` byte ranges from `trivia_slice`.
@@ -1574,7 +1645,7 @@ fn extractSuppressedRanges(
                     active_off_start = null;
                 }
             },
-            .none => {},
+            .fmt_file_off, .none => {},
         }
     }
     if (active_off_start) |off_byte| {
@@ -3275,6 +3346,72 @@ const CstFormatter = struct {
         }
     }
 
+    /// Returns `true` if `[off_start .. on_end]` lies strictly inside a `{ … }` body of `node_idx` that formats siblings.
+    fn isSuppressionStrictlyInsideBody(
+        self: *const CstFormatter,
+        node_idx: CstNodeIndex,
+        off_start: u32,
+        on_end: u32,
+    ) bool {
+        var has_inner_token = false;
+        const tok_total = self.token_buffer.countTokens();
+        var tok_i: usize = 0;
+        while (tok_i < tok_total) : (tok_i += 1) {
+            const rec = self.token_buffer.getToken(TokenIndex.fromInt(@intCast(tok_i)));
+            if (rec.kind == .eof or rec.flags.is_synthesized) continue;
+            if (rec.byte_offset >= off_start and rec.byte_offset < on_end) {
+                has_inner_token = true;
+                break;
+            }
+        }
+        if (!has_inner_token) return false;
+
+        const root = self.cst_arena.getNode(node_idx);
+        if (root.subtree_size <= 1) return false;
+        const sub_end: usize = @min(self.cst_arena.countNodes(), node_idx.asInt() + root.subtree_size);
+        var cur: usize = node_idx.asInt();
+        while (cur < sub_end) : (cur += 1) {
+            const cand_id = CstNodeIndex.fromInt(@intCast(cur));
+            const cand = self.cst_arena.getNode(cand_id);
+            const is_sibling_container = switch (cand.kind) {
+                .block,
+                .struct_item,
+                .enum_item,
+                .union_item,
+                .bit_field_item,
+                .trait_item,
+                .impl_item,
+                .mod_item,
+                .extern_block_item,
+                => true,
+                else => false,
+            };
+            if (!is_sibling_container or cand.subtree_size <= 1) continue;
+
+            const cand_end: usize = @min(self.cst_arena.countNodes(), cur + cand.subtree_size);
+            var open_tok: TokenIndex = .none;
+            var close_tok: TokenIndex = .none;
+            var child_cur: usize = cur + 1;
+            while (child_cur < cand_end) {
+                const child = self.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(child_cur)));
+                if (child.subtree_size == 1 and !child.token.isNone()) {
+                    const tk = self.token_buffer.getToken(child.token).kind;
+                    if (tk == .lbrace and open_tok.isNone()) open_tok = child.token;
+                    if (tk == .rbrace) close_tok = child.token;
+                }
+                child_cur += @max(@as(usize, 1), child.subtree_size);
+            }
+            if (!open_tok.isNone() and !close_tok.isNone()) {
+                const open_rec = self.token_buffer.getToken(open_tok);
+                const close_rec = self.token_buffer.getToken(close_tok);
+                const body_start = open_rec.byte_offset + open_rec.byte_len;
+                const body_end = close_rec.byte_offset;
+                if (off_start >= body_start and on_end <= body_end) return true;
+            }
+        }
+        return false;
+    }
+
     /// Checks if `siblings[index]` starts inside a `// corex fmt: off` range or has `@fmt_off`.
     fn tryEmitSuppressedSiblingSpan(
         self: *CstFormatter,
@@ -3302,6 +3439,7 @@ const CstFormatter = struct {
         for (self.suppressed_ranges.items) |*supp| {
             if (supp.is_emitted) continue;
             if (supp.off_start <= node_end_byte and supp.on_end >= node_lead_byte) {
+                if (self.isSuppressionStrictlyInsideBody(curr_node, supp.off_start, supp.on_end)) continue;
                 supp.is_emitted = true;
                 var max_on_end: u32 = supp.on_end;
                 var last_idx = index.*;
@@ -4260,7 +4398,7 @@ const CstFormatter = struct {
             if (child.subtree_size == 1 and !child.token.isNone()) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
                 if (prev_tok_kind) |prev_k| {
-                    if (prev_k == .comma) {
+                    if (prev_k == .comma and tok_kind != .rparen) {
                         try self.doc_arena.emitText(" ");
                     } else if (tok_kind == .eq or prev_k == .eq) {
                         try self.doc_arena.emitText(" ");
@@ -5946,7 +6084,14 @@ const CstFormatter = struct {
         }
         if (wrapper_kw_pos != null and inner_block_pos != null and wrapper_kw_pos.? < inner_block_pos.?) {
             const blk_idx = inner_block_pos.?;
-            const start_idx = try self.formatLeadingStackedAttributes(children.items[0..blk_idx]);
+            const kw_tok = self.cst_arena.getNode(children.items[wrapper_kw_pos.?]).token;
+            const is_stacked_wrapper_attr = !kw_tok.isNone() and
+                (self.token_meta[kw_tok.asInt()].has_leading_newline or
+                    self.hasUnconsumedLeadingComments(kw_tok));
+            const start_idx = if (is_stacked_wrapper_attr)
+                try self.formatLeadingStackedAttributes(children.items[0..blk_idx])
+            else
+                try self.formatLeadingInlineAttributes(children.items[0..blk_idx]);
             for (children.items[start_idx..blk_idx]) |prefix_id| {
                 const prefix = self.cst_arena.getNode(prefix_id);
                 if (prefix.subtree_size == 1 and !prefix.token.isNone()) {
@@ -5997,6 +6142,17 @@ const CstFormatter = struct {
         const rb_idx = rbrace_pos.?;
         const open_brace_tok = self.cst_arena.getNode(children.items[lb_idx]).token;
         const close_brace_tok = self.cst_arena.getNode(children.items[rb_idx]).token;
+
+        if (lb_idx > 0) {
+            const is_stacked_block_attr = !open_brace_tok.isNone() and
+                (self.token_meta[open_brace_tok.asInt()].has_leading_newline or
+                    self.hasUnconsumedLeadingComments(open_brace_tok));
+            if (is_stacked_block_attr) {
+                _ = try self.formatLeadingStackedAttributes(children.items[0..lb_idx]);
+            } else {
+                _ = try self.formatLeadingInlineAttributes(children.items[0..lb_idx]);
+            }
+        }
 
         // Filter out standalone `.empty_stmt` and bare `.semi` tokens while flushing their comments:
         var real_stmts: std.ArrayList(CstNodeIndex) = .empty;
@@ -7121,14 +7277,15 @@ const CstFormatter = struct {
         try self.emitTokenWithTrivia(close_brace_tok, "}", false);
     }
 
-    /// Formats a `.match_arm` (`pat [if guard] => body,`).
+    /// Formats a `.match_arm` (`[{ Attribute }] pat [if guard] => body,`).
     fn formatMatchArm(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var children: std.ArrayList(CstNodeIndex) = .empty;
         defer children.deinit(self.allocator);
         try self.collectDirectChildren(node_idx, &children);
 
+        const start_idx = try self.formatLeadingStackedAttributes(children.items);
         var has_emitted_comma = false;
-        for (children.items) |child_id| {
+        for (children.items[start_idx..]) |child_id| {
             const child = self.cst_arena.getNode(child_id);
             if (child.subtree_size == 1 and !child.token.isNone()) {
                 const tok_kind = self.token_buffer.getToken(child.token).kind;
@@ -9325,6 +9482,14 @@ fn formatMaskedTokensAndCstWithPrefix(
     cst_arena: *const LosslessCstArena,
     options: FormatOptions,
 ) !FormatResult {
+    if (hasFmtFileOffPreambleDirective(masked_source, token_buffer)) {
+        return .{
+            .formatted_text = try allocator.dupe(u8, original_source),
+            .is_changed = false,
+            .has_syntax_errors = false,
+        };
+    }
+
     const is_fix_mode = options.is_fix_mode;
     if (hasBlockingSyntaxErrors(token_buffer, cst_arena, is_fix_mode)) {
         return .{
@@ -9450,6 +9615,14 @@ pub fn formatTokensAndCst(
             cst_arena,
             options,
         );
+    }
+
+    if (hasFmtFileOffPreambleDirective(source, token_buffer)) {
+        return .{
+            .formatted_text = try allocator.dupe(u8, source),
+            .is_changed = false,
+            .has_syntax_errors = false,
+        };
     }
 
     const is_fix_mode = options.is_fix_mode;
@@ -9648,6 +9821,8 @@ pub fn formatByteRange(
         owned_masked_source = masked;
         break :blk masked;
     } else source;
+
+    if (hasFmtFileOffPreambleDirective(active_source, token_buffer)) return null;
 
     // Trim trailing `\r?\n` on whole-line selections ending at column 0 of the next line:
     var sel_end: u32 = clamped_end;
@@ -10950,6 +11125,85 @@ test "test_dr24_attributes_inline_if_fmt_strings_and_showcases" {
 
     var pass2 = try formatSource(std.testing.allocator, pass1.formatted_text, FileId.fromInt(0));
     defer pass2.deinit(std.testing.allocator);
+    try std.testing.expect(!pass2.has_syntax_errors);
+    try std.testing.expect(!pass2.is_changed);
+    try std.testing.expectEqualStrings(pass1.formatted_text, pass2.formatted_text);
+}
+
+test "test_fmt_dr25_expect_tier_sorting_file_off_and_attributed_constructs" {
+    const allocator = std.testing.allocator;
+
+    // [1] `// corex fmt: file-off -- reason` preserves file verbatim (`is_changed == false` & `formatByteRange == null`):
+    const file_off_src =
+        "// corex fmt: file-off -- hand-aligned lookup table\n" ++
+        "pub fn   unformatted_fn(  x: i32  ) -> i32 {   return   x+1; }\n";
+    var file_off_res = try formatSource(allocator, file_off_src, FileId.fromInt(0));
+    defer file_off_res.deinit(allocator);
+    try std.testing.expect(!file_off_res.has_syntax_errors);
+    try std.testing.expect(!file_off_res.is_changed);
+    try std.testing.expectEqualStrings(file_off_src, file_off_res.formatted_text);
+
+    var tok_buf = TokenBuffer.init(allocator);
+    defer tok_buf.deinit();
+    var cst_arena = LosslessCstArena.init(allocator);
+    defer cst_arena.deinit();
+    var ast_arena = AstArena.init(allocator);
+    defer ast_arena.deinit();
+    _ = try parser.parseSource(file_off_src, FileId.fromInt(0), &tok_buf, &cst_arena, &ast_arena, null, null);
+    var line_idx = try LineIndex.build(allocator, file_off_src);
+    defer line_idx.deinit(allocator);
+    const range_edit = try formatByteRange(
+        allocator,
+        file_off_src,
+        &tok_buf,
+        &cst_arena,
+        &line_idx,
+        0,
+        @intCast(file_off_src.len),
+        .{},
+    );
+    try std.testing.expect(range_edit == null);
+
+    // [2] `@expect` Tier-1 sorting (`@cfg` < `@allow` < `@expect` < `@deprecated`), `off -- reason`, & `// corex check:`:
+    const lint_src =
+        "// corex check: file-expect(single-char-ident, reason: \"math kernel\")\n\n" ++
+        "@deprecated(\"use v2\")\n" ++
+        "@expect(single-char-ident, collapsible-if, reason: \"matrix loop\")\n" ++
+        "@allow(non-canonical-case, reason: \"C FFI binding\")\n" ++
+        "@cfg(target_os: \"linux\")\n" ++
+        "pub fn KernelStep(n: i32) -> i32 {\n" ++
+        "    // corex fmt: off -- preserve aligned matrix weights\n" ++
+        "    let base = 1   +   2;\n" ++
+        "    // corex fmt: on\n" ++
+        "    @expect(non-idiomatic-syntax, reason: \"stmt attr\")\n" ++
+        "    let blk_val = @expect(non-idiomatic-syntax, reason: \"block attr\") { base + n };\n" ++
+        "    match blk_val {\n" ++
+        "        @expect(unreachable-pattern, reason: \"exhaustiveness probe\")\n" ++
+        "        0 => 0,\n" ++
+        "        other => other,\n" ++
+        "    }\n" ++
+        "}\n";
+    var pass1 = try formatSource(allocator, lint_src, FileId.fromInt(1));
+    defer pass1.deinit(allocator);
+    try std.testing.expect(!pass1.has_syntax_errors);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        pass1.formatted_text,
+        "// corex check: file-expect(single-char-ident, reason: \"math kernel\")\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        pass1.formatted_text,
+        "@cfg(target_os: \"linux\")\n" ++
+            "@allow(non-canonical-case, reason: \"C FFI binding\")\n" ++
+            "@expect(single-char-ident, collapsible-if, reason: \"matrix loop\")\n" ++
+            "@deprecated(\"use v2\")\n" ++
+            "pub fn KernelStep(",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "    let base = 1   +   2;\n") != null);
+
+    var pass2 = try formatSource(allocator, pass1.formatted_text, FileId.fromInt(1));
+    defer pass2.deinit(allocator);
     try std.testing.expect(!pass2.has_syntax_errors);
     try std.testing.expect(!pass2.is_changed);
     try std.testing.expectEqualStrings(pass1.formatted_text, pass2.formatted_text);

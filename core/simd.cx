@@ -51,113 +51,113 @@ pub struct Vec16u8 {
 /| Broadcasts `scalar_lane` across all 4 lanes of a `Vec4f32`.
 @inline @no_alloc @no_panic
 pub fn splat_v4f32(scalar_lane: f32) -> Vec4f32 {
-    return Vec4f32 { lanes: @simd_splat[[f32; 4]](scalar_lane) };
+    Vec4f32 { lanes: @simd_splat[[f32; 4]](scalar_lane) }
 }
 
 /| Computes lane-wise `left_vec + right_vec` (`Vec4f32`).
 @inline @no_alloc @no_panic
 pub fn add_v4f32(left_vec: Vec4f32, right_vec: Vec4f32) -> Vec4f32 {
-    return Vec4f32 { lanes: @simd_add(left_vec.lanes, right_vec.lanes) };
+    Vec4f32 { lanes: @simd_add(left_vec.lanes, right_vec.lanes) }
 }
 
 /| Computes lane-wise `left_vec - right_vec` (`Vec4f32`).
 @inline @no_alloc @no_panic
 pub fn sub_v4f32(left_vec: Vec4f32, right_vec: Vec4f32) -> Vec4f32 {
-    return Vec4f32 { lanes: @simd_sub(left_vec.lanes, right_vec.lanes) };
+    Vec4f32 { lanes: @simd_sub(left_vec.lanes, right_vec.lanes) }
 }
 
 /| Computes lane-wise `left_vec * right_vec` (`Vec4f32`).
 @inline @no_alloc @no_panic
 pub fn mul_v4f32(left_vec: Vec4f32, right_vec: Vec4f32) -> Vec4f32 {
-    return Vec4f32 { lanes: @simd_mul(left_vec.lanes, right_vec.lanes) };
+    Vec4f32 { lanes: @simd_mul(left_vec.lanes, right_vec.lanes) }
 }
 
 /| Computes the deterministic left-to-right horizontal sum of `vec_val` (`Vec4f32`).
 @inline @no_alloc @no_panic
 pub fn reduce_add_v4f32(vec_val: Vec4f32) -> f32 {
-    return @simd_reduce_add(vec_val.lanes);
+    @simd_reduce_add(vec_val.lanes)
 }
 
 /| Broadcasts `scalar_lane` across both lanes of a `Vec2f64`.
 @inline @no_alloc @no_panic
 pub fn splat_v2f64(scalar_lane: f64) -> Vec2f64 {
-    return Vec2f64 { lanes: @simd_splat[[f64; 2]](scalar_lane) };
+    Vec2f64 { lanes: @simd_splat[[f64; 2]](scalar_lane) }
 }
 
 /| Computes lane-wise `left_vec + right_vec` (`Vec2f64`).
 @inline @no_alloc @no_panic
 pub fn add_v2f64(left_vec: Vec2f64, right_vec: Vec2f64) -> Vec2f64 {
-    return Vec2f64 { lanes: @simd_add(left_vec.lanes, right_vec.lanes) };
+    Vec2f64 { lanes: @simd_add(left_vec.lanes, right_vec.lanes) }
 }
 
 /| Computes the deterministic horizontal sum of `vec_val` (`Vec2f64`).
 @inline @no_alloc @no_panic
 pub fn reduce_add_v2f64(vec_val: Vec2f64) -> f64 {
-    return @simd_reduce_add(vec_val.lanes);
+    @simd_reduce_add(vec_val.lanes)
 }
 
 /| Broadcasts `scalar_lane` across all 4 lanes of a `Vec4i32`.
 @inline @no_alloc @no_panic
 pub fn splat_v4i32(scalar_lane: i32) -> Vec4i32 {
-    return Vec4i32 { lanes: @simd_splat[[i32; 4]](scalar_lane) };
+    Vec4i32 { lanes: @simd_splat[[i32; 4]](scalar_lane) }
 }
 
 /| Computes lane-wise wrapping `left_vec + right_vec` (`Vec4i32`).
 @inline @no_alloc @no_panic
 pub fn add_v4i32(left_vec: Vec4i32, right_vec: Vec4i32) -> Vec4i32 {
-    return Vec4i32 { lanes: @simd_add(left_vec.lanes, right_vec.lanes) };
+    Vec4i32 { lanes: @simd_add(left_vec.lanes, right_vec.lanes) }
 }
 
 /| Computes lane-wise wrapping `left_vec - right_vec` (`Vec4i32`).
 @inline @no_alloc @no_panic
 pub fn sub_v4i32(left_vec: Vec4i32, right_vec: Vec4i32) -> Vec4i32 {
-    return Vec4i32 { lanes: @simd_sub(left_vec.lanes, right_vec.lanes) };
+    Vec4i32 { lanes: @simd_sub(left_vec.lanes, right_vec.lanes) }
 }
 
 /| Computes lane-wise wrapping `left_vec * right_vec` (`Vec4i32`).
 @inline @no_alloc @no_panic
 pub fn mul_v4i32(left_vec: Vec4i32, right_vec: Vec4i32) -> Vec4i32 {
-    return Vec4i32 { lanes: @simd_mul(left_vec.lanes, right_vec.lanes) };
+    Vec4i32 { lanes: @simd_mul(left_vec.lanes, right_vec.lanes) }
 }
 
 /| Computes the horizontal wrapping sum across all 4 lanes of `vec_val` (`Vec4i32`).
 @inline @no_alloc @no_panic
 pub fn reduce_add_v4i32(vec_val: Vec4i32) -> i32 {
-    return @simd_reduce_add(vec_val.lanes);
+    @simd_reduce_add(vec_val.lanes)
 }
 
 /| Broadcasts `scalar_lane` across all 8 lanes of a `Vec8i32`.
 @inline @no_alloc @no_panic
 pub fn splat_v8i32(scalar_lane: i32) -> Vec8i32 {
-    return Vec8i32 { lanes: @simd_splat[[i32; 8]](scalar_lane) };
+    Vec8i32 { lanes: @simd_splat[[i32; 8]](scalar_lane) }
 }
 
 /| Computes lane-wise wrapping `left_vec + right_vec` (`Vec8i32`).
 @inline @no_alloc @no_panic
 pub fn add_v8i32(left_vec: Vec8i32, right_vec: Vec8i32) -> Vec8i32 {
-    return Vec8i32 { lanes: @simd_add(left_vec.lanes, right_vec.lanes) };
+    Vec8i32 { lanes: @simd_add(left_vec.lanes, right_vec.lanes) }
 }
 
 /| Computes the horizontal wrapping sum across all 8 lanes of `vec_val` (`Vec8i32`).
 @inline @no_alloc @no_panic
 pub fn reduce_add_v8i32(vec_val: Vec8i32) -> i32 {
-    return @simd_reduce_add(vec_val.lanes);
+    @simd_reduce_add(vec_val.lanes)
 }
 
 /| Broadcasts `scalar_lane` across all 16 byte lanes of a `Vec16u8`.
 @inline @no_alloc @no_panic
 pub fn splat_v16u8(scalar_lane: u8) -> Vec16u8 {
-    return Vec16u8 { lanes: @simd_splat[[u8; 16]](scalar_lane) };
+    Vec16u8 { lanes: @simd_splat[[u8; 16]](scalar_lane) }
 }
 
 /| Computes lane-wise wrapping `left_vec + right_vec` (`Vec16u8`).
 @inline @no_alloc @no_panic
 pub fn add_v16u8(left_vec: Vec16u8, right_vec: Vec16u8) -> Vec16u8 {
-    return Vec16u8 { lanes: @simd_add(left_vec.lanes, right_vec.lanes) };
+    Vec16u8 { lanes: @simd_add(left_vec.lanes, right_vec.lanes) }
 }
 
 /| Computes the horizontal wrapping byte sum across all 16 lanes of `vec_val` (`Vec16u8`).
 @inline @no_alloc @no_panic
 pub fn reduce_add_v16u8(vec_val: Vec16u8) -> u8 {
-    return @simd_reduce_add(vec_val.lanes);
+    @simd_reduce_add(vec_val.lanes)
 }

@@ -30,6 +30,10 @@ pub const fmt_engine = @import("fmt_engine.zig");
 pub const upgrade_rules = @import("upgrade_rules.zig");
 /// Zero-legacy 3-tier CST/AST/semantic source and manifest migration engine (`corex upgrade`, `DR-14`).
 pub const upgrade_engine = @import("upgrade_engine.zig");
+/// Compact `UTS #39` / `UTS #55` confusable, `UAX #31` identifier, and Trojan control tables (`DR-25`).
+pub const unicode_confusables = @import("unicode_confusables.zig");
+/// Four-scope `RuleMask64` / laminar AST suppression matcher and `W0002`–`W0004` filter (`DR-25`).
+pub const lint_filter = @import("lint_filter.zig");
 /// Unified `W0202` idiom linter, `corex check --fix`, and `DR-17` `--caps` / `--explain-caps` auditor.
 pub const check_audit = @import("check_audit.zig");
 /// Built-in zero-dependency LSP 3.17 JSON-RPC 2.0 server (`corex lsp`, `DR-12` & `DR-17`).
@@ -842,6 +846,26 @@ pub const SuggestedFix = diagnostic.SuggestedFix;
 pub const LabeledSpan = diagnostic.LabeledSpan;
 /// Canonical non-overlapping diagnostic code enum.
 pub const DiagnosticCode = diagnostic.DiagnosticCode;
+/// Dense `0..43` identifier for the 44 built-in CoreX v1.0 warning lint rules (`DR-25`).
+pub const RuleId = diagnostic.RuleId;
+/// Single-register 64-bit bitset over the 44 built-in CoreX v1.0 lint rules (`DR-25`).
+pub const RuleMask64 = diagnostic.RuleMask64;
+/// Full 44-rule bitmask (`(1 << 44) - 1`).
+pub const ALL_RULES_MASK = diagnostic.ALL_RULES_MASK;
+/// Five-category built-in lint taxonomy (`DR-25` §1.1).
+pub const LintCategory = diagnostic.LintCategory;
+/// Compiler pipeline stage hosting a built-in lint rule (`DR-25` §1.1).
+pub const LintPassStage = diagnostic.LintPassStage;
+/// Static metadata entry in `DIAGNOSTIC_LINT_CATALOG`.
+pub const LintRuleMeta = diagnostic.LintRuleMeta;
+/// Canonical 44-rule CoreX v1.0 Built-In Lint Catalog (`DR-25` §2.2).
+pub const DIAGNOSTIC_LINT_CATALOG = diagnostic.DIAGNOSTIC_LINT_CATALOG;
+/// Classification returned by `lookupLintRuleBySelector`.
+pub const LintSelectorLookup = diagnostic.LintSelectorLookup;
+/// $O(1)$ bijective `W0xxx` / `kebab-case` rule selector classifier.
+pub const lookupLintRuleBySelector = diagnostic.lookupLintRuleBySelector;
+/// Zero-allocation Jaro-Winkler `>= 0.80` lint rule typo recommender.
+pub const suggestClosestLintRule = diagnostic.suggestClosestLintRule;
 /// Structured compiler diagnostic record.
 pub const Diagnostic = diagnostic.Diagnostic;
 /// Arena-backed diagnostic collector with 100-error cap.
@@ -862,6 +886,8 @@ test "test_root_module_references_all_phase0_submodules" {
     _ = fmt_engine;
     _ = upgrade_rules;
     _ = upgrade_engine;
+    _ = unicode_confusables;
+    _ = lint_filter;
     _ = check_audit;
     _ = lsp_server;
     _ = symbol_resolver;

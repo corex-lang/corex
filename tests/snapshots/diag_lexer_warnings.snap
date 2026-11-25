@@ -1,4 +1,4 @@
-⚠︎ warning[W0201]: identifier does not follow canonical CoreX casing
+⚠︎ warning[W0201/non-canonical-case]: identifier does not follow canonical CoreX casing
   ╭─▸ src/lexer/warnings.cx:1:5
   │
 1 │ let badCamel = "hello \'world";
@@ -9,7 +9,7 @@
 1 + let bad_camel = "hello \'world";
   ╰───────
 
-⚠︎ warning[W0101]: redundant character escape sequence in literal
+⚠︎ warning[W0101/redundant-escape-sequence]: redundant character escape sequence in literal
   ╭─▸ src/lexer/warnings.cx:1:23
   │
 1 │ let badCamel = "hello \'world";
@@ -20,7 +20,7 @@
 1 + let badCamel = "hello 'world";
   ╰───────
 
-⚠︎ warning[W0201]: identifier does not follow canonical CoreX casing
+⚠︎ warning[W0201/non-canonical-case]: identifier does not follow canonical CoreX casing
   ╭─▸ src/lexer/warnings.cx:2:8
   │
 2 │ struct Bad_Type {}
@@ -31,7 +31,7 @@
 2 + struct BadType {}
   ╰───────
 
-⚠︎ warning[W0201]: identifier does not follow canonical CoreX casing
+⚠︎ warning[W0201/non-canonical-case]: identifier does not follow canonical CoreX casing
   ╭─▸ src/lexer/warnings.cx:3:7
   │
 3 │ const MAX__LIMIT: u32 = 10;
@@ -42,7 +42,7 @@
 3 + const MAX_LIMIT: u32 = 10;
   ╰───────
 
-⚠︎ warning[W0119]: interpolated format string contains no `{…}` holes (`useless-format-string`)
+⚠︎ warning[W0119/useless-format-string]: interpolated format string contains no `{…}` holes (`useless-format-string`)
   ╭─▸ src/lexer/warnings.cx:4:16
   │
 4 │ let no_holes = f"plain {{ok}}";

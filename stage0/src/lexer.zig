@@ -11,6 +11,8 @@ const std = @import("std");
 const mem_foundation = @import("mem_foundation.zig");
 const syntax_arenas = @import("syntax_arenas.zig");
 const diagnostic = @import("diag/diagnostic.zig");
+const lint_filter = @import("lint_filter.zig");
+const unicode_confusables = @import("unicode_confusables.zig");
 
 const FileId = mem_foundation.FileId;
 const Span = mem_foundation.Span;
@@ -73,10 +75,14 @@ pub const IdentifierClassification = struct {
 pub const LexerOptions = struct {
     /// Maximum number of tokens (including `.eof`) permitted before emitting `E0104`.
     max_tokens: usize = syntax_arenas.MAX_TOKENS_PER_FILE,
-    /// Whether to emit `W0201` warnings on non-canonical identifier casing.
+    /// Whether to emit `W0201` warnings on non-canonical identifier casing in standalone mode.
     is_casing_warning_enabled: bool = true,
-    /// Whether to emit `W0101` warnings on redundant character/string escape sequences.
+    /// Whether to emit `W0101` warnings on redundant character/string escape sequences in standalone mode.
     is_escape_warning_enabled: bool = true,
+    /// Active semantic lint configuration (`[lint.settings]`, `DR-25` §3.1).
+    lint_settings: lint_filter.LintSettings = .{},
+    /// Optional Stage-1 `RawLintCandidate` output list (`null` in standalone mode emits directly to `sink`).
+    raw_lint_candidates_out: ?*std.ArrayListUnmanaged(lint_filter.RawLintCandidate) = null,
 };
 
 // --------------------- Format Specifiers ----------------------
@@ -1167,9 +1173,31 @@ pub inline fn lookupKeywordOrPrim(lexeme: []const u8) ?TokenKind {
     return KEYWORD_OR_PRIM_MAP.get(lexeme);
 }
 
-/// Classifies an identifier or keyword `lexeme` under the `DR-03` Section 5.2 disjoint casing invariant.
+/// Classifies an identifier or keyword `lexeme` under `DR-03` §5.2 and `DR-25` `UAX #31` rules.
 pub fn classifyIdentifierOrKeyword(lexeme: []const u8) IdentifierClassification {
-    if (lexeme.len == 0 or !isIdentStart(lexeme[0])) {
+    if (lexeme.len == 0) {
+        return .{
+            .kind = .invalid_token,
+            .expected_case = .reserved_or_wildcard,
+            .case_style = .reserved_or_wildcard,
+            .is_canonical = false,
+            .has_case_violation = true,
+        };
+    }
+
+    // [0] Non-ASCII `UAX #31` identifier path (zero overhead on pure ASCII `< 0x80` identifiers):
+    var has_non_ascii = false;
+    for (lexeme) |check_byte| {
+        if (check_byte >= 0x80) {
+            has_non_ascii = true;
+            break;
+        }
+    }
+    if (has_non_ascii) {
+        return classifyUnicodeIdentifier(lexeme);
+    }
+
+    if (!isIdentStart(lexeme[0])) {
         return .{
             .kind = .invalid_token,
             .expected_case = .reserved_or_wildcard,
@@ -1260,6 +1288,119 @@ pub fn classifyIdentifierOrKeyword(lexeme: []const u8) IdentifierClassification 
     }
 
     // [6] All-caps with `upper_count >= 2` or `_` (`MAX_SIZE`, `PI_2`, `IO`) -> `.const_ident` (`52`):
+    const is_valid_const = !has_consecutive_underscores and (lexeme[lexeme.len - 1] != '_');
+    return .{
+        .kind = .const_ident,
+        .expected_case = .screaming_snake_case,
+        .case_style = .screaming_snake_case,
+        .is_canonical = is_valid_const,
+        .has_case_violation = !is_valid_const,
+    };
+}
+
+/// Validates and classifies a UTF-8 `UAX #31` identifier containing at least one byte `>= 0x80` (`DR-25` `W0103`).
+fn classifyUnicodeIdentifier(lexeme: []const u8) IdentifierClassification {
+    const invalid_res = IdentifierClassification{
+        .kind = .invalid_token,
+        .expected_case = .reserved_or_wildcard,
+        .case_style = .reserved_or_wildcard,
+        .is_canonical = false,
+        .has_case_violation = true,
+    };
+
+    var upper_count: usize = 0;
+    var has_lower = false;
+    var has_underscore = false;
+    var has_consecutive_underscores = false;
+    var is_prev_underscore = false;
+    var is_first_upper = false;
+
+    var pos: usize = 0;
+    var is_first_cp = true;
+    while (pos < lexeme.len) {
+        const cur_byte = lexeme[pos];
+        if (cur_byte < 0x80) {
+            if (is_first_cp) {
+                if (!isIdentStart(cur_byte)) return invalid_res;
+                is_first_upper = isAsciiUpper(cur_byte);
+            } else if (!isIdentContinue(cur_byte)) {
+                return invalid_res;
+            }
+            if (isAsciiUpper(cur_byte)) {
+                upper_count += 1;
+                is_prev_underscore = false;
+            } else if (isAsciiLower(cur_byte)) {
+                has_lower = true;
+                is_prev_underscore = false;
+            } else if (cur_byte == '_') {
+                if (is_prev_underscore) has_consecutive_underscores = true;
+                has_underscore = true;
+                is_prev_underscore = true;
+            } else {
+                is_prev_underscore = false;
+            }
+            pos += 1;
+        } else {
+            const seq_len = std.unicode.utf8ByteSequenceLength(cur_byte) catch return invalid_res;
+            if (pos + seq_len > lexeme.len) return invalid_res;
+            const decoded_cp = std.unicode.utf8Decode(lexeme[pos .. pos + seq_len]) catch return invalid_res;
+            if (is_first_cp) {
+                if (!unicode_confusables.isUnicodeXidStart(decoded_cp)) return invalid_res;
+                is_first_upper = unicode_confusables.isUnicodeUppercase(decoded_cp);
+            } else if (!unicode_confusables.isUnicodeXidContinue(decoded_cp)) {
+                return invalid_res;
+            }
+            if (unicode_confusables.isUnicodeUppercase(decoded_cp)) {
+                upper_count += 1;
+            } else {
+                has_lower = true;
+            }
+            is_prev_underscore = false;
+            pos += seq_len;
+        }
+        is_first_cp = false;
+    }
+
+    // Scientific `Δ` (`U+0394`) prefix exemption (`Δt`, `Δx`, `_Δt`): canonical `.ident` (`snake_case`):
+    const core_lex = if (lexeme[0] == '_') lexeme[1..] else lexeme;
+    if (std.mem.startsWith(u8, core_lex, "\u{0394}") and core_lex.len > "\u{0394}".len) {
+        const delta_tail = core_lex["\u{0394}".len..];
+        if (delta_tail[0] != '_' and delta_tail[delta_tail.len - 1] != '_' and !has_consecutive_underscores) {
+            const tail_upper = upper_count -| @as(usize, 1);
+            if (tail_upper == 0) {
+                return .{
+                    .kind = .ident,
+                    .expected_case = .snake_case,
+                    .case_style = .snake_case,
+                    .is_canonical = true,
+                    .has_case_violation = false,
+                };
+            }
+        }
+    }
+
+    if (!is_first_upper) {
+        const is_valid_snake = (upper_count == 0) and !has_consecutive_underscores;
+        return .{
+            .kind = .ident,
+            .expected_case = .snake_case,
+            .case_style = .snake_case,
+            .is_canonical = is_valid_snake,
+            .has_case_violation = !is_valid_snake,
+        };
+    }
+
+    if (has_lower or (upper_count == 1 and !has_underscore)) {
+        const is_valid_pascal = !has_underscore;
+        return .{
+            .kind = .type_ident,
+            .expected_case = .pascal_case,
+            .case_style = .pascal_case,
+            .is_canonical = is_valid_pascal,
+            .has_case_violation = !is_valid_pascal,
+        };
+    }
+
     const is_valid_const = !has_consecutive_underscores and (lexeme[lexeme.len - 1] != '_');
     return .{
         .kind = .const_ident,
@@ -2368,7 +2509,35 @@ pub const Lexer = struct {
                         return;
                     }
                 },
-                else => return,
+                else => {
+                    if (byte_val >= 0x80) {
+                        if (std.unicode.utf8ByteSequenceLength(byte_val)) |seq_len| {
+                            if (self.cursor + seq_len <= self.source.len) {
+                                if (std.unicode.utf8Decode(self.source[self.cursor .. self.cursor + seq_len])) |trojan_cp| {
+                                    if (unicode_confusables.isTrojanControlCodepoint(trojan_cp, self.cursor)) {
+                                        const cp_start: u32 = @intCast(self.cursor);
+                                        self.cursor += seq_len;
+                                        try self.appendTriviaSpan(
+                                            .skipped_unexpected,
+                                            cp_start,
+                                            seq_len,
+                                            effective_max_tokens,
+                                        );
+                                        try self.recordOrEmitLexLintCandidate(.{
+                                            .rule_id = .unicode_trojan_control,
+                                            .fix_kind = 2,
+                                            .start_byte = cp_start,
+                                            .end_byte = @intCast(self.cursor),
+                                            .aux_payload = trojan_cp,
+                                        });
+                                        continue;
+                                    }
+                                } else |_| {}
+                            }
+                        } else |_| {}
+                    }
+                    return;
+                },
             }
         }
     }
@@ -2388,9 +2557,12 @@ pub const Lexer = struct {
 
     /// Advances `cursor` across a `//`, `/|`, or `/#` comment body, validating UTF-8 and rejecting `\t` (`E0116`).
     fn scanCommentBodyToEndOfLine(self: *Lexer, has_error: *bool) !void {
+        const body_start = self.cursor;
+        var saw_non_ascii = false;
+        var had_utf8_err = false;
         while (self.cursor < self.source.len) {
             const byte_val = self.source[self.cursor];
-            if (byte_val == '\n' or byte_val == '\r') return;
+            if (byte_val == '\n' or byte_val == '\r') break;
             if (byte_val == '\t') {
                 const tab_start: u32 = @intCast(self.cursor);
                 self.cursor += 1;
@@ -2402,8 +2574,18 @@ pub const Lexer = struct {
             } else if (byte_val < 0x80) {
                 self.cursor += 1;
             } else {
-                try self.validateAndAdvanceUtf8Codepoint(has_error);
+                saw_non_ascii = true;
+                var step_utf8_err = false;
+                try self.validateAndAdvanceUtf8Codepoint(&step_utf8_err);
+                if (step_utf8_err) {
+                    has_error.* = true;
+                    had_utf8_err = true;
+                }
             }
+        }
+        if (saw_non_ascii and !had_utf8_err) {
+            var dummy_raw_cook = false;
+            try self.scanTextSegmentUnicodeLints(body_start, self.cursor, 2, 1, null, null, &dummy_raw_cook);
         }
     }
 
@@ -2412,9 +2594,11 @@ pub const Lexer = struct {
         const open_idx: usize = self.cursor;
         const open_start: u32 = @intCast(open_idx);
         self.cursor += 2;
+        const body_start = self.cursor;
         var depth: u32 = 1;
         var has_newline = false;
         var had_inner_utf8_err = false;
+        var saw_non_ascii = false;
 
         while (self.cursor < self.source.len and depth > 0) {
             const byte_val = self.source[self.cursor];
@@ -2433,12 +2617,21 @@ pub const Lexer = struct {
             } else if (byte_val < 0x80) {
                 self.cursor += 1;
             } else {
+                saw_non_ascii = true;
                 var had_utf8_step_err = false;
                 try self.validateAndAdvanceUtf8Codepoint(&had_utf8_step_err);
                 if (had_utf8_step_err) {
                     has_error.* = true;
                     had_inner_utf8_err = true;
                 }
+            }
+        }
+
+        if (saw_non_ascii and !had_inner_utf8_err) {
+            const body_end = if (depth == 0 and self.cursor >= 2) self.cursor - 2 else self.cursor;
+            if (body_end > body_start) {
+                var dummy_raw_cook = false;
+                try self.scanTextSegmentUnicodeLints(body_start, body_end, 2, 1, null, null, &dummy_raw_cook);
             }
         }
 
@@ -3214,7 +3407,22 @@ pub const Lexer = struct {
                 break :blk .caret;
             },
             '#' => try self.scanHashDirectiveOrInvalid(&has_lexer_error),
-            else => try self.scanInvalidByteOrUtf8(&has_lexer_error),
+            else => blk_non_ascii: {
+                if (first_byte >= 0x80) {
+                    if (std.unicode.utf8ByteSequenceLength(first_byte)) |seq_len| {
+                        if (self.cursor + seq_len <= self.source.len) {
+                            if (std.unicode.utf8Decode(self.source[self.cursor .. self.cursor + seq_len])) |start_cp| {
+                                if (!unicode_confusables.isTrojanControlCodepoint(start_cp, self.cursor) and
+                                    unicode_confusables.isUnicodeXidStart(start_cp))
+                                {
+                                    break :blk_non_ascii try self.scanIdentifierOrKeyword(&has_lexer_error);
+                                }
+                            } else |_| {}
+                        }
+                    } else |_| {}
+                }
+                break :blk_non_ascii try self.scanInvalidByteOrUtf8(&has_lexer_error);
+            },
         };
 
         // Append the scanned token (chunking > 65,535-byte tokens losslessly if needed):
@@ -3256,19 +3464,47 @@ pub const Lexer = struct {
         self.prev_sig_kind = token_kind;
     }
 
-    /// Scans an identifier, keyword, primitive type, or `_`, checking the `DR-03` casing invariant.
+    /// Scans an identifier, keyword, primitive type, or `_`, checking `DR-03` casing and `UAX #31` (`DR-25`).
     fn scanIdentifierOrKeyword(self: *Lexer, has_lexer_error: *bool) !TokenKind {
         const start_offset = self.cursor;
-        self.cursor += 1;
-        while (self.cursor < self.source.len and isIdentContinue(self.source[self.cursor])) {
+        if (self.source[self.cursor] < 0x80) {
             self.cursor += 1;
+        } else {
+            const first_len = std.unicode.utf8ByteSequenceLength(self.source[self.cursor]) catch 1;
+            self.cursor += @min(first_len, self.source.len - self.cursor);
         }
+
+        while (self.cursor < self.source.len) {
+            const cur_byte = self.source[self.cursor];
+            if (cur_byte < 0x80) {
+                if (isIdentContinue(cur_byte)) {
+                    self.cursor += 1;
+                    continue;
+                }
+                break;
+            }
+            const seq_len = std.unicode.utf8ByteSequenceLength(cur_byte) catch break;
+            if (self.cursor + seq_len > self.source.len) break;
+            const cont_cp = std.unicode.utf8Decode(self.source[self.cursor .. self.cursor + seq_len]) catch break;
+            if (!unicode_confusables.isUnicodeXidContinue(cont_cp)) break;
+            if (unicode_confusables.isTrojanControlCodepoint(cont_cp, self.cursor)) {
+                try self.recordOrEmitLexLintCandidate(.{
+                    .rule_id = .unicode_trojan_control,
+                    .fix_kind = 0,
+                    .start_byte = @intCast(self.cursor),
+                    .end_byte = @intCast(self.cursor + seq_len),
+                    .aux_payload = cont_cp,
+                });
+            }
+            self.cursor += seq_len;
+        }
+
         const lexeme = self.source[start_offset..self.cursor];
         const classification = classifyIdentifierOrKeyword(lexeme);
 
         if (classification.has_case_violation) {
             has_lexer_error.* = true;
-            if (self.options.is_casing_warning_enabled) {
+            if (self.options.raw_lint_candidates_out == null and self.options.is_casing_warning_enabled) {
                 try self.emitIdentifierCasingWarning(
                     Span.init(self.file_id, @intCast(start_offset), @intCast(self.cursor)),
                     lexeme,
@@ -3277,6 +3513,51 @@ pub const Lexer = struct {
             }
         }
         return classification.kind;
+    }
+
+    /// Checks whether `int_slice` violates `W0122` (`ungrouped-numeric-literal`) for `radix`, returning group width.
+    fn checkNumericGroupingViolation(self: *const Lexer, int_slice: []const u8, radix: u8) ?u8 {
+        var digit_count: usize = 0;
+        var has_underscore = false;
+        for (int_slice) |byte_val| {
+            if (byte_val == '_') {
+                has_underscore = true;
+            } else {
+                digit_count += 1;
+            }
+        }
+        if (digit_count == 0) return null;
+
+        const canonical_width: u8 = if (radix == 16 or radix == 2) 4 else 3;
+        if (!has_underscore) {
+            const threshold: usize = switch (radix) {
+                10 => self.options.lint_settings.min_grouped_int_digits,
+                16 => self.options.lint_settings.min_grouped_hex_digits,
+                else => 5,
+            };
+            if (threshold > 0 and digit_count >= threshold) return canonical_width;
+            return null;
+        }
+
+        const is_consistent_width = struct {
+            fn check(slice: []const u8, width: usize) bool {
+                var group_iter = std.mem.splitScalar(u8, slice, '_');
+                const first_grp = group_iter.next() orelse return false;
+                if (first_grp.len == 0 or first_grp.len > width) return false;
+                while (group_iter.next()) |grp| {
+                    if (grp.len != width) return false;
+                }
+                return true;
+            }
+        }.check;
+
+        const is_valid_grouped = switch (radix) {
+            10, 8 => is_consistent_width(int_slice, 3),
+            16 => is_consistent_width(int_slice, 4) or is_consistent_width(int_slice, 2),
+            2 => is_consistent_width(int_slice, 4) or is_consistent_width(int_slice, 8),
+            else => true,
+        };
+        return if (is_valid_grouped) null else canonical_width;
     }
 
     /// Scans a decimal, hexadecimal (`0x`), binary (`0b`), or octal (`0o`) integer or float literal.
@@ -3318,8 +3599,10 @@ pub const Lexer = struct {
             };
             if (maybe_radix) |radix| {
                 self.cursor += 2;
+                const int_digits_start = self.cursor;
                 var digit_count: usize = 0;
                 var is_prev_underscore = false;
+                var has_lower_hex = false;
 
                 if (self.cursor < self.source.len and self.source[self.cursor] == '_') {
                     is_malformed = true;
@@ -3327,6 +3610,9 @@ pub const Lexer = struct {
                 while (self.cursor < self.source.len) {
                     const byte_val = self.source[self.cursor];
                     if (isValidDigitForRadix(byte_val, radix)) {
+                        if (radix == 16 and byte_val >= 'a' and byte_val <= 'f') {
+                            has_lower_hex = true;
+                        }
                         digit_count += 1;
                         is_prev_underscore = false;
                         self.cursor += 1;
@@ -3346,6 +3632,7 @@ pub const Lexer = struct {
                         break;
                     }
                 }
+                const int_digits_end = self.cursor;
                 if (digit_count == 0 or is_prev_underscore) {
                     is_malformed = true;
                 }
@@ -3376,6 +3663,38 @@ pub const Lexer = struct {
                 if (is_malformed) {
                     has_lexer_error.* = true;
                     try self.emitNumericLiteralError(start_offset, self.cursor);
+                } else {
+                    const tok_start_u32: u32 = @intCast(start_offset);
+                    const tok_end_u32: u32 = @intCast(self.cursor);
+                    const int_end_u32: u32 = @intCast(int_digits_end);
+                    const group_viol = self.checkNumericGroupingViolation(
+                        self.source[int_digits_start..int_digits_end],
+                        radix,
+                    );
+                    const has_hex_case_viol = (radix == 16) and
+                        (self.source[start_offset + 1] == 'X' or has_lower_hex);
+                    const is_standalone_fused = (self.options.raw_lint_candidates_out == null) and
+                        (group_viol != null) and has_hex_case_viol;
+
+                    if (group_viol) |grp_w| {
+                        try self.recordOrEmitLexLintCandidate(.{
+                            .rule_id = .ungrouped_numeric_literal,
+                            .fix_kind = if (is_standalone_fused) 2 else 1,
+                            .aux_u16 = (@as(u16, radix) << 8) | @as(u16, grp_w),
+                            .start_byte = tok_start_u32,
+                            .end_byte = tok_end_u32,
+                            .aux_payload = (@as(u64, @as(u32, @intCast(int_digits_start))) << 32) | @as(u64, int_end_u32),
+                        });
+                    }
+                    if (has_hex_case_viol) {
+                        try self.recordOrEmitLexLintCandidate(.{
+                            .rule_id = .non_upper_hex_literal,
+                            .fix_kind = if (is_standalone_fused) 0 else 1,
+                            .start_byte = tok_start_u32,
+                            .end_byte = tok_end_u32,
+                            .aux_payload = (@as(u64, int_end_u32) << 32) | @as(u64, tok_start_u32),
+                        });
+                    }
                 }
                 return .int_lit;
             }
@@ -3402,6 +3721,7 @@ pub const Lexer = struct {
                 break;
             }
         }
+        const dec_int_end = self.cursor;
         if (is_prev_underscore) {
             is_malformed = true;
         }
@@ -3518,6 +3838,16 @@ pub const Lexer = struct {
         if (is_malformed) {
             has_lexer_error.* = true;
             try self.emitNumericLiteralError(start_offset, self.cursor);
+        } else if (self.checkNumericGroupingViolation(self.source[start_offset..dec_int_end], 10)) |grp_w| {
+            try self.recordOrEmitLexLintCandidate(.{
+                .rule_id = .ungrouped_numeric_literal,
+                .fix_kind = 1,
+                .aux_u16 = (@as(u16, 10) << 8) | @as(u16, grp_w),
+                .start_byte = @intCast(start_offset),
+                .end_byte = @intCast(self.cursor),
+                .aux_payload = (@as(u64, @as(u32, @intCast(start_offset))) << 32) |
+                    @as(u64, @as(u32, @intCast(dec_int_end))),
+            });
         }
         return if (is_float) .float_lit else .int_lit;
     }
@@ -3814,6 +4144,7 @@ pub const Lexer = struct {
         self.cursor += 1;
         const is_multiline = self.consumeOptionalMultilineOpeningNewline();
         const body_start_offset: u32 = @intCast(self.cursor);
+        var saw_non_ascii = false;
 
         while (self.cursor < self.source.len) {
             const byte_val = self.source[self.cursor];
@@ -3827,6 +4158,18 @@ pub const Lexer = struct {
                         false,
                         false,
                         has_lexer_error,
+                    );
+                }
+                if (saw_non_ascii and !has_lexer_error.*) {
+                    var dummy_raw_cook = false;
+                    try self.scanTextSegmentUnicodeLints(
+                        @intCast(body_start_offset),
+                        close_quote_offset,
+                        1,
+                        3,
+                        null,
+                        null,
+                        &dummy_raw_cook,
                     );
                 }
                 return .string_lit;
@@ -3866,6 +4209,7 @@ pub const Lexer = struct {
             if (byte_val < 0x80) {
                 self.cursor += 1;
             } else {
+                saw_non_ascii = true;
                 try self.validateAndAdvanceUtf8Codepoint(has_lexer_error);
             }
         }
@@ -3930,7 +4274,12 @@ pub const Lexer = struct {
         var bracket_depth: u32 = 0;
         var is_in_fmt_spec = false;
         var has_emitted_depth_error = false;
-        const initial_diag_len: usize = if (self.diagnostic_sink) |sink| sink.asSlice().len else 0;
+        var lit_seg_start: usize = self.cursor;
+        var lit_seg_non_ascii = false;
+        var has_lit_quote = false;
+        var has_lit_backslash = false;
+        var max_lit_quote_hashes: usize = 0;
+        const initial_err_count: u32 = if (self.diagnostic_sink) |sink| sink.error_count else 0;
 
         while (self.cursor < self.source.len) {
             const byte_val = self.source[self.cursor];
@@ -3938,6 +4287,18 @@ pub const Lexer = struct {
                 if (byte_val == '"') {
                     if (hasExactHashesAt(self.source, self.cursor + 1, hash_count)) {
                         const close_quote_offset = self.cursor;
+                        if (lit_seg_non_ascii and !has_lexer_error.*) {
+                            var dummy_raw_cook = false;
+                            try self.scanTextSegmentUnicodeLints(
+                                lit_seg_start,
+                                close_quote_offset,
+                                1,
+                                if (hash_count > 0) 2 else 3,
+                                if (hash_count > 0) hash_count else null,
+                                null,
+                                &dummy_raw_cook,
+                            );
+                        }
                         self.cursor += 1 + hash_count;
                         if (hash_count > MAX_FMT_STRING_HASHES) {
                             try self.emitSimpleError(
@@ -3956,24 +4317,51 @@ pub const Lexer = struct {
                                 has_lexer_error,
                             );
                         }
-                        if (hole_count == 0 and hash_count <= MAX_FMT_STRING_HASHES) {
-                            const had_inner_diags = if (self.diagnostic_sink) |sink|
-                                sink.asSlice().len > initial_diag_len
+                        if (hole_count == 0 and hash_count <= MAX_FMT_STRING_HASHES and !has_lexer_error.*) {
+                            const had_inner_errors = if (self.diagnostic_sink) |sink|
+                                sink.error_count > initial_err_count
                             else
                                 false;
                             try self.emitUselessFormatStringWarning(
                                 @intCast(start_offset),
                                 @intCast(self.cursor),
                                 hash_count,
-                                !had_inner_diags,
+                                !had_inner_errors,
                             );
+                        } else if (hole_count > 0 and hash_count >= 1 and
+                            hash_count <= MAX_FMT_STRING_HASHES and !has_lexer_error.*)
+                        {
+                            const req_hashes: usize = if (!has_lit_quote and !has_lit_backslash)
+                                0
+                            else if (has_lit_quote)
+                                @max(@as(usize, 1), max_lit_quote_hashes)
+                            else
+                                1;
+                            if (hash_count > req_hashes) {
+                                try self.recordOrEmitLexLintCandidate(.{
+                                    .rule_id = .needless_raw_string_hashes,
+                                    .fix_kind = 5,
+                                    .aux_u16 = @intCast(req_hashes),
+                                    .start_byte = @intCast(start_offset),
+                                    .end_byte = @intCast(self.cursor),
+                                    .aux_payload = @intCast(hash_count),
+                                });
+                            }
                         }
                         return .fmt_string_lit;
                     }
+                    has_lit_quote = true;
+                    var q_hashes: usize = 0;
+                    var q_scan = self.cursor + 1;
+                    while (q_scan < self.source.len and self.source[q_scan] == '#') : (q_scan += 1) {
+                        q_hashes += 1;
+                    }
+                    if (q_hashes + 1 > max_lit_quote_hashes) max_lit_quote_hashes = q_hashes + 1;
                     self.cursor += 1;
                     continue;
                 }
                 if (byte_val == '\\') {
+                    has_lit_backslash = true;
                     try self.scanEscapeSequence(.fmt_string, has_lexer_error);
                     continue;
                 }
@@ -3982,6 +4370,19 @@ pub const Lexer = struct {
                         self.cursor += 2;
                         continue;
                     }
+                    if (lit_seg_non_ascii and !has_lexer_error.*) {
+                        var dummy_raw_cook = false;
+                        try self.scanTextSegmentUnicodeLints(
+                            lit_seg_start,
+                            self.cursor,
+                            1,
+                            if (hash_count > 0) 2 else 3,
+                            if (hash_count > 0) hash_count else null,
+                            null,
+                            &dummy_raw_cook,
+                        );
+                    }
+                    lit_seg_non_ascii = false;
                     hole_count += 1;
                     brace_depth = 1;
                     paren_depth = 0;
@@ -4032,6 +4433,7 @@ pub const Lexer = struct {
                 if (byte_val < 0x80) {
                     self.cursor += 1;
                 } else {
+                    lit_seg_non_ascii = true;
                     try self.validateAndAdvanceUtf8Codepoint(has_lexer_error);
                 }
             } else {
@@ -4051,8 +4453,12 @@ pub const Lexer = struct {
                     self.cursor += 1;
                 } else if (byte_val == '}') {
                     brace_depth -= 1;
-                    if (brace_depth == 0) is_in_fmt_spec = false;
                     self.cursor += 1;
+                    if (brace_depth == 0) {
+                        is_in_fmt_spec = false;
+                        lit_seg_start = self.cursor;
+                        lit_seg_non_ascii = false;
+                    }
                 } else if (is_in_fmt_spec) {
                     if ((byte_val == '\n' or byte_val == '\r') and !is_multiline) {
                         has_lexer_error.* = true;
@@ -4254,9 +4660,11 @@ pub const Lexer = struct {
             return;
         }
 
+        const open_quote_offset = self.cursor;
         self.cursor += 1;
         const is_multiline = self.consumeOptionalMultilineOpeningNewline();
         const body_start_offset: u32 = @intCast(self.cursor);
+        var saw_non_ascii = false;
 
         while (self.cursor < self.source.len) {
             const byte_val = self.source[self.cursor];
@@ -4280,6 +4688,49 @@ pub const Lexer = struct {
                             false,
                             has_lexer_error,
                         );
+                    }
+                    var has_emitted_raw_cook = false;
+                    if (!is_byte_mode and saw_non_ascii and !has_lexer_error.*) {
+                        try self.scanTextSegmentUnicodeLints(
+                            open_quote_offset + 1,
+                            close_quote_offset,
+                            3,
+                            2,
+                            hash_count,
+                            .{ .start = @intCast(start_offset), .end = @intCast(self.cursor) },
+                            &has_emitted_raw_cook,
+                        );
+                    }
+                    if (!has_lexer_error.* and hash_count <= MAX_RAW_STRING_HASHES and !has_emitted_raw_cook) {
+                        const raw_body = self.source[open_quote_offset + 1 .. close_quote_offset];
+                        const has_quote = std.mem.indexOfScalar(u8, raw_body, '"') != null;
+                        const has_backslash = std.mem.indexOfScalar(u8, raw_body, '\\') != null;
+                        const has_tab = std.mem.indexOfScalar(u8, raw_body, '\t') != null;
+                        if (!has_quote and !has_backslash and !has_tab) {
+                            try self.recordOrEmitLexLintCandidate(.{
+                                .rule_id = .needless_raw_string_hashes,
+                                .fix_kind = if (is_byte_mode) 3 else 1,
+                                .aux_u16 = 0,
+                                .start_byte = @intCast(start_offset),
+                                .end_byte = @intCast(self.cursor),
+                                .aux_payload = @intCast(hash_count),
+                            });
+                        } else {
+                            const req_hashes = if (has_quote)
+                                lint_filter.computeMinRawQuoteGuardHashes(raw_body)
+                            else
+                                0;
+                            if (hash_count > req_hashes) {
+                                try self.recordOrEmitLexLintCandidate(.{
+                                    .rule_id = .needless_raw_string_hashes,
+                                    .fix_kind = if (is_byte_mode) 4 else 2,
+                                    .aux_u16 = @intCast(req_hashes),
+                                    .start_byte = @intCast(start_offset),
+                                    .end_byte = @intCast(self.cursor),
+                                    .aux_payload = @intCast(hash_count),
+                                });
+                            }
+                        }
                     }
                     return;
                 }
@@ -4309,6 +4760,7 @@ pub const Lexer = struct {
                     );
                 }
             } else {
+                saw_non_ascii = true;
                 try self.validateAndAdvanceUtf8Codepoint(has_lexer_error);
             }
         }
@@ -4416,6 +4868,8 @@ pub const Lexer = struct {
         self.cursor += 2; // Advance past `"b'"`.
         var byte_unit_count: usize = 0;
         var has_closing_quote = false;
+        const initial_diag_len: usize = if (self.diagnostic_sink) |sink| sink.asSlice().len else 0;
+        const initial_cand_len: usize = if (self.options.raw_lint_candidates_out) |out| out.items.len else 0;
 
         while (self.cursor < self.source.len) {
             const byte_val = self.source[self.cursor];
@@ -4461,6 +4915,7 @@ pub const Lexer = struct {
         }
 
         if (!has_closing_quote or byte_unit_count != 1) {
+            self.rollbackRedundantEscapeWarningsSince(initial_diag_len, initial_cand_len);
             has_lexer_error.* = true;
             try self.emitSimpleError(
                 .e0102_unterminated_string_literal,
@@ -4481,9 +4936,12 @@ pub const Lexer = struct {
     fn scanCharLiteral(self: *Lexer, has_lexer_error: *bool) !TokenKind {
         const start_offset = self.cursor;
         self.cursor += 1; // Advance past opening `'\''`.
+        const inner_start = self.cursor;
         var codepoint_count: usize = 0;
         var has_closing_quote = false;
+        var saw_non_ascii = false;
         const initial_diag_len: usize = if (self.diagnostic_sink) |sink| sink.asSlice().len else 0;
+        const initial_cand_len: usize = if (self.options.raw_lint_candidates_out) |out| out.items.len else 0;
 
         while (self.cursor < self.source.len) {
             const byte_val = self.source[self.cursor];
@@ -4512,12 +4970,14 @@ pub const Lexer = struct {
                 self.cursor += 1;
                 codepoint_count += 1;
             } else {
+                saw_non_ascii = true;
                 try self.validateAndAdvanceUtf8Codepoint(has_lexer_error);
                 codepoint_count += 1;
             }
         }
 
         if (!has_closing_quote or codepoint_count != 1) {
+            self.rollbackRedundantEscapeWarningsSince(initial_diag_len, initial_cand_len);
             has_lexer_error.* = true;
             if (has_closing_quote and codepoint_count > 1) {
                 const had_inner_diags = if (self.diagnostic_sink) |sink|
@@ -4540,6 +5000,17 @@ pub const Lexer = struct {
                     "expected a single character or escape sequence enclosed in `'…'`",
                 );
             }
+        } else if (saw_non_ascii and !has_lexer_error.* and self.cursor >= inner_start + 1) {
+            var dummy_raw_cook = false;
+            try self.scanTextSegmentUnicodeLints(
+                inner_start,
+                self.cursor - 1,
+                1,
+                4,
+                null,
+                null,
+                &dummy_raw_cook,
+            );
         }
         return .char_lit;
     }
@@ -5352,6 +5823,189 @@ pub const Lexer = struct {
         });
     }
 
+    /// Appends `cand` to `raw_lint_candidates_out` (`CompilerDb`) or materializes directly into `diagnostic_sink`.
+    fn recordOrEmitLexLintCandidate(self: *Lexer, cand: lint_filter.RawLintCandidate) !void {
+        if (self.options.raw_lint_candidates_out) |out_list| {
+            try out_list.append(self.token_buffer.allocator, cand);
+            return;
+        }
+        const is_standalone_emitted = switch (cand.rule_id) {
+            .redundant_escape_sequence,
+            .unicode_trojan_control,
+            .ambiguous_unicode_text,
+            .useless_format_string,
+            => true,
+            else => false,
+        };
+        if (!is_standalone_emitted) return;
+        if (self.diagnostic_sink) |sink| {
+            try lint_filter.materializeLexCstLintCandidate(
+                self.source,
+                self.file_id,
+                self.interner,
+                cand,
+                sink,
+            );
+        }
+    }
+
+    /// Rolls back `W0101` candidates/warnings emitted inside a malformed or multi-char `'…'` / `b'…'` literal.
+    fn rollbackRedundantEscapeWarningsSince(
+        self: *Lexer,
+        initial_diag_len: usize,
+        initial_cand_len: usize,
+    ) void {
+        if (self.options.raw_lint_candidates_out) |out_list| {
+            var write_idx = initial_cand_len;
+            var read_idx = initial_cand_len;
+            while (read_idx < out_list.items.len) : (read_idx += 1) {
+                if (out_list.items[read_idx].rule_id != .redundant_escape_sequence) {
+                    out_list.items[write_idx] = out_list.items[read_idx];
+                    write_idx += 1;
+                }
+            }
+            out_list.items.len = write_idx;
+            return;
+        }
+        if (self.diagnostic_sink) |sink| {
+            var write_idx = initial_diag_len;
+            var read_idx = initial_diag_len;
+            while (read_idx < sink.diagnostics.items.len) : (read_idx += 1) {
+                const diag_item = sink.diagnostics.items[read_idx];
+                if (diag_item.code == .w0101_redundant_escape_sequence) {
+                    sink.warning_count -|= 1;
+                } else {
+                    sink.diagnostics.items[write_idx] = diag_item;
+                    write_idx += 1;
+                }
+            }
+            sink.diagnostics.items.len = write_idx;
+        }
+    }
+
+    /// Scans `source[seg_start .. seg_end]` (invoked only when `saw_non_ascii` is true) for `W0102` and `W0104`.
+    fn scanTextSegmentUnicodeLints(
+        self: *Lexer,
+        seg_start: usize,
+        seg_end: usize,
+        w0102_fix_kind: u8,
+        w0104_fix_kind: u8,
+        quote_guard_hashes: ?usize,
+        raw_lit_bounds: ?struct { start: u32, end: u32 },
+        has_emitted_raw_cook: *bool,
+    ) !void {
+        if (seg_start >= seg_end or seg_end > self.source.len) return;
+        const seg_slice = self.source[seg_start..seg_end];
+        var pure_word_skip_until: usize = 0;
+        var mixed_word_until: usize = 0;
+
+        var rel_pos: usize = 0;
+        while (rel_pos < seg_slice.len) {
+            const cur_byte = seg_slice[rel_pos];
+            if (cur_byte < 0x80) {
+                if (w0104_fix_kind >= 3 and cur_byte == '\\' and rel_pos + 1 < seg_slice.len) {
+                    rel_pos += 2;
+                    continue;
+                }
+                rel_pos += 1;
+                continue;
+            }
+            const seq_len = std.unicode.utf8ByteSequenceLength(cur_byte) catch {
+                rel_pos += 1;
+                continue;
+            };
+            if (rel_pos + seq_len > seg_slice.len) break;
+            const decoded_cp = std.unicode.utf8Decode(seg_slice[rel_pos .. rel_pos + seq_len]) catch {
+                rel_pos += seq_len;
+                continue;
+            };
+            const abs_start = seg_start + rel_pos;
+            const abs_end = abs_start + seq_len;
+
+            if (unicode_confusables.isTrojanControlCodepoint(decoded_cp, abs_start)) {
+                const eff_fix: u8 = if (w0102_fix_kind == 3) blk_raw: {
+                    if (has_emitted_raw_cook.*) break :blk_raw 0;
+                    has_emitted_raw_cook.* = true;
+                    break :blk_raw 3;
+                } else w0102_fix_kind;
+                const payload: u64 = if (eff_fix == 3 and raw_lit_bounds != null)
+                    (@as(u64, raw_lit_bounds.?.end) << 32) | @as(u64, decoded_cp)
+                else
+                    @as(u64, decoded_cp);
+                const tok_start_u32: u32 = if (eff_fix == 3 and raw_lit_bounds != null)
+                    raw_lit_bounds.?.start
+                else
+                    0;
+                try self.recordOrEmitLexLintCandidate(.{
+                    .rule_id = .unicode_trojan_control,
+                    .fix_kind = eff_fix,
+                    .start_byte = @intCast(abs_start),
+                    .end_byte = @intCast(abs_end),
+                    .node_or_tok = tok_start_u32,
+                    .aux_payload = payload,
+                });
+                rel_pos += seq_len;
+                continue;
+            }
+
+            if (!self.options.lint_settings.isAllowedConfusable(decoded_cp)) {
+                if (unicode_confusables.lookupConfusable(decoded_cp)) |entry| {
+                    if (entry.isStandaloneImpostor()) {
+                        const is_quote_guard_hazard = if (quote_guard_hashes) |guard_hashes|
+                            entry.skelByte0() == '"' and
+                                (hasExactHashesAt(self.source, abs_end, guard_hashes) or
+                                    (guard_hashes > 0 and abs_start == seg_start and
+                                        abs_end + 1 < self.source.len and
+                                        self.source[abs_end] == '"' and
+                                        (self.source[abs_end + 1] == '\n' or
+                                            (self.source[abs_end + 1] == '\r' and
+                                                abs_end + 2 < self.source.len and
+                                                self.source[abs_end + 2] == '\n'))))
+                        else
+                            false;
+                        const eff_w0104_fix: u8 = if (is_quote_guard_hazard)
+                            0
+                        else
+                            w0104_fix_kind;
+                        try self.recordOrEmitLexLintCandidate(.{
+                            .rule_id = .ambiguous_unicode_text,
+                            .fix_kind = eff_w0104_fix,
+                            .start_byte = @intCast(abs_start),
+                            .end_byte = @intCast(abs_end),
+                            .aux_payload = decoded_cp,
+                        });
+                    } else if (entry.isIdentConfusable() and rel_pos >= pure_word_skip_until) {
+                        var is_mixed = rel_pos < mixed_word_until;
+                        if (!is_mixed) {
+                            var word_end_rel: usize = rel_pos + seq_len;
+                            is_mixed = unicode_confusables.isMixedScriptWordAt(
+                                seg_slice,
+                                rel_pos,
+                                rel_pos + seq_len,
+                                &word_end_rel,
+                            );
+                            if (is_mixed) {
+                                mixed_word_until = word_end_rel;
+                            } else {
+                                pure_word_skip_until = word_end_rel;
+                            }
+                        }
+                        if (is_mixed) {
+                            try self.recordOrEmitLexLintCandidate(.{
+                                .rule_id = .ambiguous_unicode_text,
+                                .fix_kind = w0104_fix_kind,
+                                .start_byte = @intCast(abs_start),
+                                .end_byte = @intCast(abs_end),
+                                .aux_payload = decoded_cp,
+                            });
+                        }
+                    }
+                }
+            }
+            rel_pos += seq_len;
+        }
+    }
+
     /// Emits `W0119` (`w0119_useless_format_string`) on a 0-hole `f"…"` / `f#"…"#` literal (`ADR-24B`).
     fn emitUselessFormatStringWarning(
         self: *Lexer,
@@ -5360,160 +6014,23 @@ pub const Lexer = struct {
         hash_count: usize,
         can_emit_fix: bool,
     ) !void {
-        const sink = self.diagnostic_sink orelse return;
-        const lit_span = Span.init(self.file_id, lit_start, lit_end);
-        const primary_labels = [_]LabeledSpan{.{
-            .span = lit_span,
-            .label = "format string contains zero `{…}` interpolation holes; remove `f` prefix",
-            .style = .primary,
-        }};
-        const msg_text = "interpolated format string contains no `{…}` holes (`useless-format-string`)";
-
-        if (can_emit_fix) {
-            if (self.interner) |str_interner| {
-                const start_usize: usize = @intCast(lit_start);
-                const end_usize: usize = @intCast(lit_end);
-                const header_len: usize = 1 + hash_count + 1;
-                const footer_len: usize = 1 + hash_count;
-                if (end_usize >= start_usize + header_len + footer_len and end_usize <= self.source.len) {
-                    const arena_alloc = sink.arena.asAllocator();
-                    const inner_raw = self.source[start_usize + header_len .. end_usize - footer_len];
-                    const has_backslash = std.mem.indexOfScalar(u8, inner_raw, '\\') != null;
-                    const has_quote = std.mem.indexOfScalar(u8, inner_raw, '"') != null;
-
-                    var builder: std.ArrayListUnmanaged(u8) = .empty;
-                    if (hash_count > 0 and has_quote and !has_backslash) {
-                        try builder.append(arena_alloc, 'r');
-                        var h_idx: usize = 0;
-                        while (h_idx < hash_count) : (h_idx += 1) {
-                            try builder.append(arena_alloc, '#');
-                        }
-                        try builder.append(arena_alloc, '"');
-                        var idx: usize = 0;
-                        while (idx < inner_raw.len) {
-                            if ((inner_raw[idx] == '{' or inner_raw[idx] == '}') and
-                                idx + 1 < inner_raw.len and
-                                inner_raw[idx + 1] == inner_raw[idx])
-                            {
-                                try builder.append(arena_alloc, inner_raw[idx]);
-                                idx += 2;
-                            } else {
-                                try builder.append(arena_alloc, inner_raw[idx]);
-                                idx += 1;
-                            }
-                        }
-                        try builder.append(arena_alloc, '"');
-                        h_idx = 0;
-                        while (h_idx < hash_count) : (h_idx += 1) {
-                            try builder.append(arena_alloc, '#');
-                        }
-                    } else {
-                        try builder.append(arena_alloc, '"');
-                        var idx: usize = 0;
-                        while (idx < inner_raw.len) {
-                            if (inner_raw[idx] == '\\') {
-                                if (idx + 1 < inner_raw.len) {
-                                    try builder.appendSlice(arena_alloc, inner_raw[idx .. idx + 2]);
-                                    idx += 2;
-                                } else {
-                                    try builder.appendSlice(arena_alloc, "\\\\");
-                                    idx += 1;
-                                }
-                            } else if ((inner_raw[idx] == '{' or inner_raw[idx] == '}') and
-                                idx + 1 < inner_raw.len and
-                                inner_raw[idx + 1] == inner_raw[idx])
-                            {
-                                try builder.append(arena_alloc, inner_raw[idx]);
-                                idx += 2;
-                            } else if (inner_raw[idx] == '"') {
-                                try builder.appendSlice(arena_alloc, "\\\"");
-                                idx += 1;
-                            } else {
-                                try builder.append(arena_alloc, inner_raw[idx]);
-                                idx += 1;
-                            }
-                        }
-                        try builder.append(arena_alloc, '"');
-                    }
-
-                    const fix_edits = try arena_alloc.alloc(TextEdit, 1);
-                    fix_edits[0] = .{
-                        .file_id = self.file_id,
-                        .start_byte = lit_start,
-                        .end_byte = lit_end,
-                        .replacement_id = try str_interner.intern(builder.items),
-                    };
-                    const fixes = try arena_alloc.alloc(SuggestedFix, 1);
-                    fixes[0] = .{
-                        .message = "remove `f` prefix from static string literal",
-                        .applicability = .machine_applicable,
-                        .priority = .lint_idiom,
-                        .edits = fix_edits,
-                    };
-                    try sink.emit(.{
-                        .code = .w0119_useless_format_string,
-                        .severity = .warning,
-                        .primary_span = lit_span,
-                        .message = msg_text,
-                        .labels = &primary_labels,
-                        .suggestions = fixes,
-                    });
-                    return;
-                }
-            }
-        }
-
-        try sink.emit(.{
-            .code = .w0119_useless_format_string,
-            .severity = .warning,
-            .primary_span = lit_span,
-            .message = msg_text,
-            .labels = &primary_labels,
+        try self.recordOrEmitLexLintCandidate(.{
+            .rule_id = .useless_format_string,
+            .fix_kind = if (can_emit_fix) 1 else 0,
+            .aux_u16 = @intCast(hash_count),
+            .start_byte = lit_start,
+            .end_byte = lit_end,
         });
     }
 
     /// Emits `W0101` (`w0101_redundant_escape_sequence`) with a `.machine_applicable` fix replacing `\c` with `c`.
     fn emitRedundantEscapeWarning(self: *Lexer, escape_start: u32, escape_end: u32) !void {
-        const sink = self.diagnostic_sink orelse return;
-        const escape_span = Span.init(self.file_id, escape_start, escape_end);
-        const primary_labels = [_]LabeledSpan{.{
-            .span = escape_span,
-            .label = "unnecessary backslash escape; character stands for itself",
-            .style = .primary,
-        }};
-
-        if (self.interner) |str_interner| {
-            const fix_edits = [_]TextEdit{.{
-                .file_id = self.file_id,
-                .start_byte = escape_start,
-                .end_byte = escape_end,
-                .replacement_id = try str_interner.intern(
-                    self.source[@as(usize, escape_start) + 1 .. @as(usize, escape_end)],
-                ),
-            }};
-            const fixes = [_]SuggestedFix{.{
-                .message = "remove redundant backslash escape",
-                .applicability = .machine_applicable,
-                .priority = .syntax_canonicalization,
-                .edits = &fix_edits,
-            }};
-            try sink.emit(.{
-                .code = .w0101_redundant_escape_sequence,
-                .severity = .warning,
-                .primary_span = escape_span,
-                .message = "redundant character escape sequence in literal",
-                .labels = &primary_labels,
-                .suggestions = &fixes,
-            });
-        } else {
-            try sink.emit(.{
-                .code = .w0101_redundant_escape_sequence,
-                .severity = .warning,
-                .primary_span = escape_span,
-                .message = "redundant character escape sequence in literal",
-                .labels = &primary_labels,
-            });
-        }
+        try self.recordOrEmitLexLintCandidate(.{
+            .rule_id = .redundant_escape_sequence,
+            .fix_kind = 1,
+            .start_byte = escape_start,
+            .end_byte = escape_end,
+        });
     }
 
     /// Emits `W0201` (`w0201_non_canonical_identifier_case`) with a `.machine_applicable` casing fix.
@@ -5584,6 +6101,19 @@ pub fn tokenize(
     interner: ?*StringInterner,
 ) !void {
     var lexer_instance = Lexer.init(source, file_id, token_buffer, diagnostic_sink, interner);
+    try lexer_instance.tokenize();
+}
+
+/// Tokenizes `source` into `token_buffer` in a single linear pass with explicit `LexerOptions`.
+pub fn tokenizeWithOptions(
+    source: []const u8,
+    file_id: FileId,
+    token_buffer: *TokenBuffer,
+    diagnostic_sink: ?*DiagnosticSink,
+    interner: ?*StringInterner,
+    options: LexerOptions,
+) !void {
+    var lexer_instance = Lexer.initWithOptions(source, file_id, token_buffer, diagnostic_sink, interner, options);
     try lexer_instance.tokenize();
 }
 

@@ -17,7 +17,7 @@ It serves two roles:
 
 ## 2. Cross-Language Capability Matrix
 
-Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `stage0/` + `core/` + `stdlib/cx/` + `vscode-ext-corex` (`Phases 0–11.1b`); **`[v0.0.1]`** = scheduled in `Phases 11.1c–12` prior to initial release; **`[0.x]`** = scheduled in `Phase 13.0–13.4` prior to `v1.0.0`.
+Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `stage0/` + `core/` + `stdlib/cx/` + `vscode-ext-corex` (`Phases 0–11.1c`); **`[v0.0.1]`** = scheduled in `Phases 11.2–12` prior to initial release; **`[0.x]`** = scheduled in `Phase 13.0–13.4` prior to `v1.0.0`.
 
 | Dimension | CoreX | Rust | Zig | C23 / C++23 | Go | Python |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -36,6 +36,7 @@ Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `st
 | **Built-In Deterministic `--sim` & `--fuzz`** | **First-class `test` / `bench` + `--sim --seed` + `--fuzz`** `[Live]`/`[v0.0.1]` | External crates (`cargo-fuzz`, `loom`, `turmoil`) | `std.testing.fuzz` (no virtual-time sim) | External (`libFuzzer`, custom harnesses) | `go test -fuzz` (no deterministic sim) | `hypothesis` / `atheris` |
 | **Installed Toolchain Footprint** | **`< 1 MB` self-hosted binary + tree-shaken `cx.*` stdlib** `[v0.0.1]` | `~800 MB–1.5 GB` (`rustup` + `rustc` + `cargo` + std rlibs) | `~45–50 MB` compressed (`libclang`/C++ headers) | `~500 MB–2 GB` (Clang/GCC/MSVC SDKs) | `~70–150 MB` | `~50–120 MB` |
 | **Dev Rebuild & Stateful Hot-Reload** | **Incremental `CompilerDb` + `< 10 ms` `corex lsp` `[Live]` + `< 5 ms` `--watch` `[0.x]`** | Slow (`cargo check` / `rust-analyzer` RAM bloat) | Fast incremental builds under active work | Slow header reparsing / `clangd` index lag | Fast (`go build` / `gopls`) | Instant startup, slow runtime |
+| **Compiler-Integrated Linter & Hygiene** | **44 warning-only `W0xxx` rules (`26` `Auto` + `7` `Unsafe` fixes + self-cleaning `@expect`)** `[Live]` | Separate `clippy` pass (`#[allow]` rots unless `#[expect]`) | Minimal compiler warnings (no built-in linter) | External `clang-tidy` (slow AST reparse, noisy `#pragma`s) | `go vet` + external `golangci-lint` | External `ruff` / `pylint` (`# noqa` drift) |
 | **Legacy Syntax Baggage** | **Zero** (`corex fmt` + `corex upgrade` 3-tier CST/type rewriter) `[Live]` | Editions accumulate (`2015`–`2024`, async/pin tech debt) | Pre-1.0 churn (manual upgrades) | 40+ years of legacy footguns | Minimal (`gofmt` / `go fix`) | Python 2→3 scars, typing legacy |
 
 ---
@@ -101,7 +102,7 @@ CoreX systematically adopts the highest-leverage ergonomic wins from Python, Swi
 ### 3.9 Built-In `< 10 ms` Language Server, Capability Auditor & Zero-Legacy Migration Suite (`[Live]`)
 
 -   **Sub-Millisecond `corex lsp` Over `CompilerDb` (`DR-12`, `DR-17`):** Built directly into the single `corex` binary with zero external daemons, delivering `< 10 ms` P99 keystroke-to-diagnostic, completion, semantic-token delta, hygienic cross-file rename, and `DR-17` hover cards showing inferred capabilities (`[fs, net, unsafe_op]` or `none (pure)`), `@no_alloc`/`@no_panic` verification status, and exact `@max_stack(N)` frame byte budgets on 100,000-LOC workspaces.
--   **Zero-False-Positive Linter & Supply-Chain Capability Auditor (`corex check`):** Unifies `W0202` idiom lints, `@deprecated(upgrade: "…")` (`W0403`) call-site rewrite templates, transactional `corex check --fix`, `--deny-warnings`, `corex check --caps` package capability matrices, and `corex check --explain-caps` shortest BFS call-chain witnesses.
+-   **Compiler-Integrated Linter & Supply-Chain Capability Auditor (`corex check`, `DR-25`):** Evaluates 44 zero-false-positive warning-only rules (`W00xx`–`W05xx`, bijectively mapped to `kebab-case` names) in the single shared `CompilerDb` pass with `26` `Auto` (`--fix`) and `7` `Unsafe` (`--fix-unsafe`) transactional multi-pass rewrites, self-cleaning 4-scope `@expect(rule, reason: "…")` (`W0002` when stale; `W0004` preferring `@expect` over unconditional `@allow`), `[lint]` `disable = […]` package opt-out, `--deny-warnings`, `corex check --caps` package capability matrices, and `corex check --explain-caps` shortest BFS call-chain witnesses (`[Live]`).
 -   **3-Tier Zero-Legacy `corex upgrade` Engine (`DR-14`, `UR-21-00`–`UR-24-06`):** Automatically rewrites legacy syntax, `TypeId`-resolved idioms, `@deprecated` / `@fix_inline` library calls, and `corex.toml` / `corex.lock` manifests (`--accept-caps` without ever overriding `deny_caps`) while preserving 100% of comments and rolling back atomically if syntax errors increase.
 -   **Zero-Dependency `< 25 KB` Official VS Code & OpenVSX Extension (`vscode-ext-corex` `v1.0.0`):** Ships a non-backtracking CoreX v1.0 TextMate grammar (highlighting `/#` & `/|` docstrings, bright-red `{placeholder}` spans in plain `"…"`, and nested `{expr}` scopes in `f"…"` / `f#"…"#`) paired with a zero-runtime-dependency `corex lsp` and `corex fmt` client featuring full `f"…"` hole IntelliSense, `1px` multiline strip-margin guides, `0.58` opacity dimming on `_ = ident;` discards and `_unused` bindings, custom MVS/SAST semantic token modifiers, and Workspace Trust gating (`[Live]` locally; Marketplace release in Stage `L1`).
 
@@ -177,10 +178,15 @@ pub fn longest_non_empty<'a>(primary: &'a str, fallback: &'a str) -> Option<&'a 
 
 ```cx
 /| Returns the first non-empty borrowed `str` with zero lifetime annotations.
-pub fn longest_non_empty(primary: str, fallback: str) -> str? =
-    if not primary.is_empty() => .Some(primary)
-    else if not fallback.is_empty() => .Some(fallback)
-    else .None;
+pub fn longest_non_empty(primary: str, fallback: str) -> str? {
+    if not primary.is_empty() {
+        .Some(primary)
+    } else if not fallback.is_empty() {
+        .Some(fallback)
+    } else {
+        .None
+    }
+}
 ```
 
 ### Showcase 2: Compile-Time Bounds, `&out` & `@linear` Safety vs. C Bugs (`[Live]`)
@@ -206,8 +212,7 @@ pub struct TxHandle {
 }
 
 pub fn commit_tx(tx: own TxHandle) {
-    let TxHandle { id } = tx;
-    _ = id;
+    let TxHandle { id: _id } = tx;
 }
 
 pub fn process_frame(buf: &[u8], out_crc: &out u32) -> u32!IoError {
@@ -218,9 +223,9 @@ pub fn process_frame(buf: &[u8], out_crc: &out u32) -> u32!IoError {
         out_crc.* = 0;
         return .Err(IoError { code: 1 });
     }
-    let tail: u8 = buf[$ - 1]; // Statically proven `< buf.len()`; zero runtime bounds check!
-    out_crc.* = tail as u32;   // Omitting `&out` initialization on any path triggers `E0422`!
-    return .Ok(out_crc.*);
+    let tail = buf[$-1]; // Statically proven `< buf.len()`; zero runtime bounds check!
+    out_crc.* = tail as u32; // Omitting `&out` initialization on any path triggers `E0422`!
+    .Ok(out_crc.*)
 }
 ```
 
@@ -240,7 +245,7 @@ pub fn load_endpoint(raw_env: str?, /, *, default_port: u16 = 8080) -> u16!Confi
     if port == 0 {
         return .Err(.InvalidPort(port));
     }
-    return .Ok(port);
+    .Ok(port)
 }
 ```
 
@@ -248,14 +253,14 @@ pub fn load_endpoint(raw_env: str?, /, *, default_port: u16 = 8080) -> u16!Confi
 
 ```cx
 // Statically proven: 0 heap allocations, <= 512 bytes stack across entire call graph:
-@no_alloc @max_stack(512)
+@max_stack(512) @no_alloc
 pub fn decode_register(raw_word: u32) -> u16 {
     let magic = raw_word >> 16;
     if magic != 0x4358_u32 {
         // Formatted `f"{magic=:#06x}"` builds `FmtArgs` on the stack with ZERO heap allocation:
         @panic(f"corrupt hardware register header: {magic=:#06x}");
     }
-    return (raw_word & 0xFFFF_u32) as u16;
+    raw_word as u16
 }
 ```
 
@@ -328,21 +333,21 @@ pub fn Item(list: &mut UiList, weight: u32 = 1) {
 pub fn Section(
     title: str,
     /,
-    @builder build_children: |&mut UiList| -> unit,
+    @builder build_children: |&mut UiList|,
 ) -> UiList {
     _ = title;
     var state = UiList { .. };
     build_children(&mut state);
-    return state;
+    state
 }
 
 pub fn build_toolbar() -> UiList {
     // Compiles to flat sequential stack mutations (`state.count == 3`, `total_weight == 7`):
-    return Section("Actions") {
+    Section("Actions") {
         Item(weight: 4);
         Item(weight: 2);
         Item();
-    };
+    }
 }
 ```
 
@@ -359,17 +364,21 @@ extern "C" {
 }
 
 pub async fn parallel_digest(label: CStr, payload: &[u8]) -> i32 {
-    return task_group(|grp| {
+    task_group(|grp| {
         // `spawn_local` runs on the current thread (`CStr` + `&[u8]` safe); dual `&mut` or cross-thread `spawn` fails with `E0309`:
-        let left = grp.spawn_local(own async {
-            yield_now().await;
-            c_hash_named(label.as_ptr(), payload.as_ptr(), payload.len())
-        });
-        let right = grp.spawn_local(own async {
-            c_hash_named(label.as_ptr(), payload.as_ptr(), payload.len())
-        });
+        let left = grp.spawn_local(
+            own async {
+                yield_now().await;
+                c_hash_named(label.as_ptr(), payload.as_ptr(), payload.len())
+            },
+        );
+        let right = grp.spawn_local(
+            own async {
+                c_hash_named(label.as_ptr(), payload.as_ptr(), payload.len())
+            },
+        );
         left.join().await + right.join().await
-    }).await;
+    }).await
 }
 ```
 
@@ -403,7 +412,7 @@ json-wire = { version = "1.4.0", allow_caps = [] }
 use json_wire.parse_counter;
 
 pub fn main() -> i32 {
-    return parse_counter(r#"{"ok":1}"#);
+    parse_counter(r#"{"ok":1}"#)
 }
 ```
 
@@ -413,18 +422,18 @@ pub fn main() -> i32 {
 // Library authors attach hazard-checked rewrite templates directly to `@deprecated`:
 @deprecated(since: "0.2.0", reason: "use connect_timeout", upgrade: "connect_timeout($0, timeout_ms: 5000)")
 pub fn connect_host(endpoint: str) -> i32 {
-    return connect_timeout(endpoint, timeout_ms: 5000);
+    connect_timeout(endpoint, timeout_ms: 5000)
 }
 
 pub fn connect_timeout(endpoint: str, *, timeout_ms: u32 = 5000) -> i32 {
     _ = endpoint;
-    return timeout_ms as i32;
+    timeout_ms as i32
 }
 
 // Running `corex check --fix` or `corex upgrade` rewrites `connect_host(addr)` ->
 // `connect_timeout(addr, timeout_ms: 5000)` automatically when `$0` is pure and comment-free!
 pub fn bootstrap_client(addr: str) -> i32 {
-    return connect_timeout(addr, timeout_ms: 5000);
+    connect_timeout(addr, timeout_ms: 5000)
 }
 ```
 
@@ -441,20 +450,20 @@ pub fn summarize_tokens(tokens: &[str]) -> String!AllocError {
     // nested same-slot `with_scratch` while `scratch` is live is rejected at compile time (`E0328`):
     var counts = Map[str, u32].in_arena(&mut arena);
     for token in tokens {
-        let prev: u32 = if counts.get(&token) is .Some(cnt) => cnt.* else 0_u32;
+        let prev = if counts.get(&token) is .Some(cnt) => cnt.* else 0_u32;
         _ = counts.try_insert(token, prev + 1_u32)?;
     }
 
-    let seen_len: usize = with_scratch(|scratch: &mut Arena| -> usize!AllocError {
+    let seen_len = with_scratch(|scratch: &mut Arena| -> usize!AllocError {
         var seen = Vec[str].in_arena(scratch);
         for token in tokens {
             seen.try_push(token)?;
         }
-        return .Ok(seen.len());
+        .Ok(seen.len())
     })?;
 
     // `<= 23`-byte UTF-8 stays 100% inline on the stack (`24B` SSO; `String?` is also `24B`):
-    return .Ok(String.fmt(f"u={counts.len()},n={seen_len}"));
+    .Ok(String.fmt(f"u={counts.len()},n={seen_len}"))
 }
 ```
 
@@ -481,12 +490,25 @@ pub struct FrameHeader {
 pub fn write_status(out: &mut Writer, hdr: FrameHeader?, node: str) -> unit!IoError {
     const EMPTY_META_SQL: str = "SELECT id FROM nodes WHERE meta != '{}'";
     _ = EMPTY_META_SQL;
-    let state: str = if hdr is .Some(active) and (active.flags & 1_u32) != 0_u32 => "UP" else "DOWN";
-    let seq_num: u64 = if hdr is .Some(active) => active.seq else 0_u64;
-    return out.print(
+    let state = if hdr is .Some(active) and (active.flags & 1_u32) != 0_u32 => "UP" else "DOWN";
+    let seq_num = if hdr is .Some(active) => active.seq else 0_u64;
+    out.print(
         f#"
         {"node": "{node}", "state": "{state}", "seq": {seq_num}}
         "#,
-    );
+    )
+}
+```
+
+### Showcase 12: Compiler-Integrated Linter, Transactional `--fix` & Self-Cleaning `@expect` (`[Live]`)
+
+```cx
+/# Self-Cleaning `@expect` Suppression Hygiene (`DR-25`)
+
+/| Reserves an internal cross-module hook until sibling `cx.io` lands; once called outside this module,
+/| `corex check` automatically flags the stale `@expect` via `W0002` with a 1-click removal fix!
+@expect(unused-pkg-visibility, reason: "reserved for sibling wire codec")
+pub(pkg) fn encode_varint_tail(word: u64) -> u8 {
+    (word & 0x7F_u64) as u8
 }
 ```

@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const mem_foundation = @import("mem_foundation.zig");
+const lexer = @import("lexer.zig");
 const vfs_sourcemap = @import("vfs_sourcemap.zig");
 const syntax_arenas = @import("syntax_arenas.zig");
 const symbol_resolver = @import("symbol_resolver.zig");
@@ -124,7 +125,7 @@ const CandidateFileSnapshot = struct {
     is_modified: bool = false,
 };
 
-/// Configuration options governing `applyCheckFixesOnDb` (`corex check --fix`).
+/// Configuration options governing `applyCheckFixesOnDb` (`corex check --fix` / `--fix-unsafe`).
 pub const CheckFixOptions = struct {
     /// Optional Zig `std.Io` handle (required when `is_writing_to_disk == true`).
     io: ?std.Io = null,
@@ -132,7 +133,9 @@ pub const CheckFixOptions = struct {
     vfs: ?*VfsSourceMap = null,
     /// When `true`, atomically persists converged modified files to disk via `writeArtifactAtomic`.
     is_writing_to_disk: bool = false,
-    /// Optional explicit candidate `FileId` slice (`null` auto-discovers all editable `.root` files).
+    /// When `true` (`--fix-unsafe` or `--fix --unsafe-fixes`), also applies `.maybe_incorrect` lint fixes.
+    allow_unsafe_fixes: bool = false,
+    /// Optional explicit candidate `FileId` slice (`null` auto-discovers all editable lint-target files).
     candidate_files: ?[]const FileId = null,
 };
 
@@ -446,13 +449,16 @@ fn scanOptionalScriptFrontmatter(
     return .{ .next_offset = start_offset, .has_generated_marker = false };
 }
 
-/// Returns `true` when `checker`'s file is an editable `.root` `.cx` source eligible for `W0202` linting.
+/// Returns `true` when `checker`'s file is a non-generated `.root` or targeted `.std_core` `.cx` source eligible for AST/CST linting.
 fn isEditableRootLintFile(checker: *const TypeChecker) bool {
-    if (checker.is_stdlib_file) return false;
     if (checker.file_id.isNone() or checker.file_id.asInt() >= query_db.VIRTUAL_C_IMPORT_FILE_ID_BASE) {
         return false;
     }
-    if (checker.sym_table.getFilePackageId(checker.file_id) != .root) return false;
+    const pkg_id = checker.sym_table.getFilePackageId(checker.file_id);
+    if (pkg_id != .root and pkg_id != .std_core) return false;
+    if (checker.db) |db_ptr| {
+        if (!db_ptr.isLintTargetFile(checker.file_id)) return false;
+    }
     return !isGeneratedSourceHeader(checker.source);
 }
 
@@ -462,13 +468,6 @@ inline fn getRecordedNodeType(checker: *const TypeChecker, node_id: NodeIndex) T
         return checker.node_types[node_id.asInt()];
     }
     return .err_ty;
-}
-
-/// Returns `true` if `W0202` (`has_allow_idiom_w0202`) is suppressed at `span` via `@allow(…)`.
-inline fn isW0202SuppressedAtSpan(checker: *const TypeChecker, span: Span) bool {
-    if (checker.active_allow_mask.has_allow_idiom_w0202) return true;
-    if (checker.sym_table.getScopeAllowMask(checker.current_scope).has_allow_idiom_w0202) return true;
-    return checker.getAllowedMaskAtSpan(span).has_allow_idiom_w0202;
 }
 
 /// Returns `true` if `kind` is a line, outer doc (`/|`), or module doc (`/#`) comment trivia piece.
@@ -886,6 +885,55 @@ fn hasIsBindingInExprAst(checker: *const TypeChecker, expr_id: NodeIndex, depth:
     return false;
 }
 
+/// Emits a warning for `code` with an optional `SuggestedFix` of `applicability` into `sink_opt` (cloning strings into `sink.arena`).
+fn emitAuditLintWarning(
+    sink_opt: ?*DiagnosticSink,
+    code: diagnostic.DiagnosticCode,
+    applicability: diagnostic.FixApplicability,
+    primary_span: Span,
+    message: []const u8,
+    label_text: []const u8,
+    fix_message: []const u8,
+    edits: []const TextEdit,
+) !void {
+    const sink = sink_opt orelse return;
+    const arena_alloc = sink.arena.asAllocator();
+    const dup_msg = try arena_alloc.dupe(u8, message);
+    const dup_lbl = try arena_alloc.dupe(u8, label_text);
+    const labels = try arena_alloc.alloc(diagnostic.LabeledSpan, 1);
+    labels[0] = .{
+        .span = primary_span,
+        .label = dup_lbl,
+        .style = .primary,
+    };
+    if (edits.len > 0) {
+        const dup_edits = try arena_alloc.dupe(TextEdit, edits);
+        const fixes = try arena_alloc.alloc(SuggestedFix, 1);
+        fixes[0] = .{
+            .message = try arena_alloc.dupe(u8, fix_message),
+            .applicability = applicability,
+            .priority = .lint_idiom,
+            .edits = dup_edits,
+        };
+        try sink.emit(.{
+            .code = code,
+            .severity = .warning,
+            .primary_span = primary_span,
+            .message = dup_msg,
+            .labels = labels,
+            .suggestions = fixes,
+        });
+    } else {
+        try sink.emit(.{
+            .code = code,
+            .severity = .warning,
+            .primary_span = primary_span,
+            .message = dup_msg,
+            .labels = labels,
+        });
+    }
+}
+
 /// Emits a `.w0202_non_idiomatic_construct` warning with an optional `.machine_applicable` `.lint_idiom` fix.
 fn emitIdiomWarning(
     sink_opt: ?*DiagnosticSink,
@@ -895,38 +943,16 @@ fn emitIdiomWarning(
     fix_message: []const u8,
     edits: []const TextEdit,
 ) !void {
-    const sink = sink_opt orelse return;
-    if (edits.len > 0) {
-        try sink.emit(.{
-            .code = .w0202_non_idiomatic_construct,
-            .severity = .warning,
-            .primary_span = primary_span,
-            .message = message,
-            .labels = &.{.{
-                .span = primary_span,
-                .label = label_text,
-                .style = .primary,
-            }},
-            .suggestions = &.{.{
-                .message = fix_message,
-                .applicability = .machine_applicable,
-                .priority = .lint_idiom,
-                .edits = edits,
-            }},
-        });
-    } else {
-        try sink.emit(.{
-            .code = .w0202_non_idiomatic_construct,
-            .severity = .warning,
-            .primary_span = primary_span,
-            .message = message,
-            .labels = &.{.{
-                .span = primary_span,
-                .label = label_text,
-                .style = .primary,
-            }},
-        });
-    }
+    return emitAuditLintWarning(
+        sink_opt,
+        .w0202_non_idiomatic_construct,
+        .machine_applicable,
+        primary_span,
+        message,
+        label_text,
+        fix_message,
+        edits,
+    );
 }
 
 /// Extracts `(lparen_tok, inner_cst, rparen_tok)` when `cand_cst` is a redundant `.tuple_or_paren_expr`.
@@ -1000,7 +1026,6 @@ fn lintRedundantHeaderParensInCst(
         checker.token_buffer,
         header_cst,
     ) orelse return;
-    if (isW0202SuppressedAtSpan(checker, paren_span)) return;
 
     const inner_span = getCstSubtreeSpan(
         checker.file_id,
@@ -1173,7 +1198,6 @@ fn lintRedundantBoolEqualityAst(
         checker.token_buffer,
         bin_cst,
     ) orelse checker.getAstNodeSpan(bin_ast_id);
-    if (isW0202SuppressedAtSpan(checker, bin_span)) return;
 
     const lit_node = if (is_rhs_bool_lit) rhs_node else lhs_node;
     const expr_id = if (is_rhs_bool_lit) lhs_id else rhs_id;
@@ -1194,8 +1218,10 @@ fn lintRedundantBoolEqualityAst(
         hasCommentsInByteRange(checker.source, checker.token_buffer, expr_span.end_byte, bin_span.end_byte);
 
     if (has_lost_comments) {
-        try emitIdiomWarning(
+        try emitAuditLintWarning(
             sink_opt,
+            .w0407_needless_bool_branch,
+            .machine_applicable,
             bin_span,
             "redundant comparison with boolean literal; use the boolean expression or `not` directly",
             "redundant boolean literal comparison",
@@ -1233,8 +1259,10 @@ fn lintRedundantBoolEqualityAst(
         try repl_buf.append(checker.allocator, ' ');
     }
 
-    try emitIdiomWarning(
+    try emitAuditLintWarning(
         sink_opt,
+        .w0407_needless_bool_branch,
+        .machine_applicable,
         bin_span,
         "redundant comparison with boolean literal; use the boolean expression or `not` directly",
         "redundant boolean literal comparison",
@@ -1243,6 +1271,142 @@ fn lintRedundantBoolEqualityAst(
             .file_id = checker.file_id,
             .start_byte = bin_span.start_byte,
             .end_byte = bin_span.end_byte,
+            .replacement_id = try checker.interner.intern(repl_buf.items),
+        }},
+    );
+}
+
+/// `W0407`: Lints `not (a == b)` -> `a != b` and `not (a != b)` -> `a == b` (skipping IEEE-754 floats for `NaN` soundness).
+fn lintNegatedComparisonAst(
+    checker: *TypeChecker,
+    not_ast_id: NodeIndex,
+    not_cst: CstNodeIndex,
+    parent_cst: CstNodeIndex,
+    suppressed_headers: *std.AutoHashMapUnmanaged(u32, void),
+    sink_opt: ?*DiagnosticSink,
+) !void {
+    if (not_ast_id.isNone() or not_ast_id.asInt() >= checker.ast_arena.countNodes()) return;
+    const not_node = checker.ast_arena.getNode(not_ast_id);
+    if (not_node.tag != .unary_expr or not_node.lhs.tag != .node or not_node.main_token.isNone()) return;
+    if (checker.token_buffer.getToken(not_node.main_token).kind != .kw_not) return;
+    if (getRecordedNodeType(checker, not_ast_id) != .bool_ty) return;
+
+    var inner_id = NodeIndex.fromInt(not_node.lhs.payload);
+    while (!inner_id.isNone() and inner_id.asInt() < checker.ast_arena.countNodes() and
+        checker.ast_arena.getNode(inner_id).tag == .tuple_lit)
+    {
+        const elems = checker.getNodeExtraSlice(inner_id, false);
+        if (elems.len == 1) {
+            inner_id = NodeIndex.fromInt(elems[0]);
+        } else {
+            break;
+        }
+    }
+    if (inner_id.isNone() or inner_id.asInt() >= checker.ast_arena.countNodes()) return;
+    const bin_node = checker.ast_arena.getNode(inner_id);
+    if (bin_node.tag != .binary_expr or bin_node.main_token.isNone() or
+        bin_node.lhs.tag != .node or bin_node.rhs.tag != .node)
+    {
+        return;
+    }
+    const op_tok = checker.token_buffer.getToken(bin_node.main_token);
+    if (op_tok.flags.is_synthesized or (op_tok.kind != .eqeq and op_tok.kind != .bang_eq)) return;
+
+    const lhs_id = NodeIndex.fromInt(bin_node.lhs.payload);
+    const rhs_id = NodeIndex.fromInt(bin_node.rhs.payload);
+    if (checker.ast_arena.getNode(lhs_id).tag == .bool_lit or
+        checker.ast_arena.getNode(rhs_id).tag == .bool_lit)
+    {
+        return;
+    }
+
+    // Enforce IEEE-754 float / SIMD / custom-trait `NaN` partial-order guard:
+    const raw_lhs_ty = getRecordedNodeType(checker, lhs_id);
+    if (raw_lhs_ty.isError() or checker.pool.getFlags(raw_lhs_ty).has_type_vars) return;
+    const base_ty = checker.pool.unwrapUnderlyingType(checker.pool.unwrapRefinementBase(raw_lhs_ty));
+    if (base_ty.isError() or base_ty.isFloatPrimitive() or base_ty == .group_float) return;
+    const base_tag = checker.pool.getNode(base_ty).tag;
+    const is_total_eq_scalar = base_ty == .bool_ty or base_ty.isIntegerPrimitive() or
+        base_ty == .char_ty or base_ty == .str_ty or
+        base_tag == .raw_ptr_ty or base_tag == .ref_ty or base_tag == .mut_ref_ty or
+        (base_tag == .enum_ty and checker.pool.getEnumBackingIntType(base_ty) != null);
+    if (!is_total_eq_scalar) return;
+
+    if (hasSyntaxErrorInSubtree(checker.cst_arena, checker.token_buffer, not_cst)) return;
+    const full_span = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, not_cst) orelse return;
+    const lhs_cst = checker.ast_arena.getCstOrigin(lhs_id);
+    const rhs_cst = checker.ast_arena.getCstOrigin(rhs_id);
+    const lhs_span = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, lhs_cst) orelse return;
+    const rhs_span = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, rhs_cst) orelse return;
+    if (lhs_span.start_byte < full_span.start_byte or rhs_span.end_byte > full_span.end_byte or
+        lhs_span.end_byte > rhs_span.start_byte)
+    {
+        return;
+    }
+    if (hasCommentsInByteRange(checker.source, checker.token_buffer, full_span.start_byte, lhs_span.start_byte) or
+        hasCommentsInByteRange(checker.source, checker.token_buffer, lhs_span.end_byte, rhs_span.start_byte) or
+        hasCommentsInByteRange(checker.source, checker.token_buffer, rhs_span.end_byte, full_span.end_byte))
+    {
+        return;
+    }
+
+    const bin_cst = checker.ast_arena.getCstOrigin(inner_id);
+    if (!bin_cst.isNone()) {
+        try suppressed_headers.put(checker.allocator, bin_cst.asInt(), {});
+    }
+
+    const need_outer_parens = if (!parent_cst.isNone() and parent_cst.asInt() < checker.cst_arena.countNodes()) blk_np: {
+        const pk = checker.cst_arena.getNode(parent_cst).kind;
+        if (pk == .infix_expr and parent_cst.asInt() < checker.cst_to_ast.len) {
+            const p_ast = checker.cst_to_ast[parent_cst.asInt()];
+            if (!p_ast.isNone() and p_ast.asInt() < checker.ast_arena.countNodes()) {
+                const p_node = checker.ast_arena.getNode(p_ast);
+                if (!p_node.main_token.isNone()) {
+                    const p_op = checker.token_buffer.getToken(p_node.main_token).kind;
+                    break :blk_np (p_op != .kw_and and p_op != .kw_or);
+                }
+            }
+        }
+        break :blk_np switch (pk) {
+            .prefix_expr,
+            .cast_expr,
+            .field_or_method_expr,
+            .call_expr,
+            .index_expr,
+            .postfix_try_expr,
+            .postfix_await_expr,
+            .postfix_deref_expr,
+            => true,
+            else => false,
+        };
+    } else false;
+
+    const inv_op: []const u8 = if (op_tok.kind == .eqeq) "!=" else "==";
+    const lhs_slice = checker.source[lhs_span.start_byte..lhs_span.end_byte];
+    const rhs_slice = checker.source[rhs_span.start_byte..rhs_span.end_byte];
+
+    var repl_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer repl_buf.deinit(checker.allocator);
+    if (need_outer_parens) try repl_buf.append(checker.allocator, '(');
+    try repl_buf.appendSlice(checker.allocator, lhs_slice);
+    try repl_buf.append(checker.allocator, ' ');
+    try repl_buf.appendSlice(checker.allocator, inv_op);
+    try repl_buf.append(checker.allocator, ' ');
+    try repl_buf.appendSlice(checker.allocator, rhs_slice);
+    if (need_outer_parens) try repl_buf.append(checker.allocator, ')');
+
+    try emitAuditLintWarning(
+        sink_opt,
+        .w0407_needless_bool_branch,
+        .machine_applicable,
+        full_span,
+        "negated equality comparison can be written directly with inverted operator",
+        "invert comparison operator instead of prefix `not (…)`",
+        if (op_tok.kind == .eqeq) "rewrite `not (a == b)` as `a != b`" else "rewrite `not (a != b)` as `a == b`",
+        &.{.{
+            .file_id = checker.file_id,
+            .start_byte = full_span.start_byte,
+            .end_byte = full_span.end_byte,
             .replacement_id = try checker.interner.intern(repl_buf.items),
         }},
     );
@@ -1582,7 +1746,6 @@ fn lintCanonicalGenericTypeCst(
         checker.token_buffer,
         cst_idx,
     ) orelse return;
-    if (isW0202SuppressedAtSpan(checker, full_span)) return;
 
     switch (matched) {
         .option => |opt_info| {
@@ -1707,25 +1870,76 @@ fn lintCanonicalGenericTypeCst(
     }
 }
 
-/// Idiom 4: Lints a redundant trailing bare `return;` at the end of a `unit`-returning `fn` block.
-fn lintTrailingUnitReturnFnDecl(
+/// Returns `true` if `cst_idx` carries any leading `@attribute` (excluding `@expect` / `@allow` on the audited node itself?
+/// Note: for `@cfg` or `@state`, `only_cfg` checks `@cfg` while `!only_cfg` checks any attribute).
+fn hasLeadingCstAttribute(
+    checker: *const TypeChecker,
+    cst_idx: CstNodeIndex,
+    only_cfg: bool,
+) bool {
+    if (cst_idx.isNone() or cst_idx.asInt() >= checker.cst_arena.countNodes()) return false;
+    const start_idx: usize = cst_idx.asInt();
+    const rec = checker.cst_arena.getNode(cst_idx);
+    const end_idx: usize = @min(start_idx + @max(@as(usize, rec.subtree_size), 1), checker.cst_arena.countNodes());
+    var cur: usize = start_idx + 1;
+    while (cur < end_idx) : (cur += 1) {
+        const sub = checker.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+        if (sub.kind == .attribute) {
+            if (!only_cfg) return true;
+            const a_end = @min(cur + @max(@as(usize, sub.subtree_size), 1), end_idx);
+            var a_cur: usize = cur + 1;
+            while (a_cur < a_end) : (a_cur += 1) {
+                const leaf = checker.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(a_cur)));
+                if (leaf.subtree_size <= 1 and !leaf.token.isNone() and
+                    leaf.token.asInt() < checker.token_buffer.countTokens() and
+                    symbol_resolver.isIdentifierToken(checker.token_buffer.getToken(leaf.token).kind))
+                {
+                    if (std.mem.eql(
+                        u8,
+                        symbol_resolver.extractTokenSlice(checker.source, checker.token_buffer, leaf.token),
+                        "cfg",
+                    )) {
+                        return true;
+                    }
+                    break;
+                }
+            }
+            if (sub.subtree_size > 1) cur += @as(usize, sub.subtree_size) - 1;
+            continue;
+        }
+        if (sub.subtree_size <= 1 and !sub.token.isNone()) break;
+    }
+    return false;
+}
+
+/// Returns `true` if removing `return` before `expr_slice` after `prev_stmt_ast` would create a continuation hazard.
+fn hasTailExprContinuationHazard(
+    checker: *const TypeChecker,
+    prev_stmt_ast: NodeIndex,
+    expr_slice: []const u8,
+) bool {
+    if (prev_stmt_ast.isNone() or expr_slice.len == 0) return false;
+    const prev_cst = checker.ast_arena.getCstOrigin(prev_stmt_ast);
+    const prev_last_tok = findLastRealTokenInSubtree(checker.cst_arena, checker.token_buffer, prev_cst);
+    if (prev_last_tok.isNone()) return true;
+    if (checker.token_buffer.getToken(prev_last_tok).kind == .semi) return false;
+    return switch (expr_slice[0]) {
+        '(', '[', '+', '-', '*', '&' => true,
+        '.' => !(expr_slice.len >= 2 and std.ascii.isUpper(expr_slice[1])),
+        else => false,
+    };
+}
+
+/// `W0209`: Lints needless trailing `return;` (in `unit` bodies) and `return expr;` -> `expr` at the tail of `fn` / closure blocks.
+fn lintNeedlessTrailingReturnBlockW0209(
     checker: *TypeChecker,
-    fn_sym_idx: SymbolIndex,
-    fn_ast_id: NodeIndex,
+    body_id: NodeIndex,
+    ret_ty: TypeId,
+    fused_tail_returns: *const std.AutoHashMapUnmanaged(u32, void),
     sink_opt: ?*DiagnosticSink,
 ) !void {
-    if (fn_sym_idx.isNone() or fn_sym_idx.asInt() >= checker.sym_table.countSymbols()) return;
-    if (fn_ast_id.isNone() or fn_ast_id.asInt() >= checker.ast_arena.countNodes()) return;
-
-    const fn_sym = checker.sym_table.getSymbol(fn_sym_idx).*;
-    if (fn_sym.flags.is_extern or fn_sym.flags.is_prototype_only) return;
-    const sig_view = checker.pool.getFnSignatureView(fn_sym.type_id) orelse return;
-    if (sig_view.ret_ty != .unit_ty) return;
-
-    const fn_node = checker.ast_arena.getNode(fn_ast_id);
-    if (fn_node.tag != .fn_decl or fn_node.rhs.tag != .node) return;
-    const body_id = NodeIndex.fromInt(fn_node.rhs.payload);
     if (body_id.isNone() or body_id.asInt() >= checker.ast_arena.countNodes()) return;
+    if (ret_ty.isError() or ret_ty == .never_ty) return;
 
     const body_node = checker.ast_arena.getNode(body_id);
     if (body_node.tag != .block or !body_node.rhs.isNone() or body_node.lhs.tag != .extra) return;
@@ -1734,17 +1948,19 @@ fn lintTrailingUnitReturnFnDecl(
     if (stmts.len == 0) return;
     const last_stmt_id = NodeIndex.fromInt(stmts[stmts.len - 1]);
     if (last_stmt_id.isNone() or last_stmt_id.asInt() >= checker.ast_arena.countNodes()) return;
+    if (fused_tail_returns.contains(last_stmt_id.asInt())) return;
 
     const last_stmt = checker.ast_arena.getNode(last_stmt_id);
-    if (last_stmt.tag != .return_stmt or !last_stmt.lhs.isNone()) return;
+    if (last_stmt.tag != .return_stmt) return;
 
     const ret_cst = checker.ast_arena.getCstOrigin(last_stmt_id);
     if (ret_cst.isNone() or hasSyntaxErrorInSubtree(checker.cst_arena, checker.token_buffer, ret_cst)) return;
+    if (hasLeadingCstAttribute(checker, ret_cst, false)) return;
 
     const body_cst = checker.ast_arena.getCstOrigin(body_id);
     if (body_cst.isNone() or body_cst.asInt() >= checker.cst_arena.countNodes()) return;
 
-    // Ensure no trailing empty `;` or recovery tokens sit between `return;` and closing `}`:
+    // Ensure no trailing empty `;` or recovery tokens sit between `return …;` and closing `}`:
     var block_children: std.ArrayListUnmanaged(CstNodeIndex) = .empty;
     defer block_children.deinit(checker.allocator);
     try collectDirectCstChildren(checker.allocator, checker.cst_arena, body_cst, &block_children);
@@ -1757,50 +1973,330 @@ fn lintTrailingUnitReturnFnDecl(
         checker.token_buffer,
         ret_cst,
     ) orelse return;
-    if (isW0202SuppressedAtSpan(checker, ret_span)) return;
 
     const first_tok = findFirstRealTokenInSubtree(checker.cst_arena, checker.token_buffer, ret_cst);
     const last_tok = findLastRealTokenInSubtree(checker.cst_arena, checker.token_buffer, ret_cst);
     if (first_tok.isNone() or last_tok.isNone()) return;
     if (checker.token_buffer.getToken(last_tok).kind != .semi) return;
+    if (hasCommentInTriviaSlice(checker.source, checker.token_buffer.getTrailingTrivia(last_tok))) return;
 
-    const has_inner_or_trailing_comments =
-        hasCommentsInByteRange(checker.source, checker.token_buffer, ret_span.start_byte, ret_span.end_byte) or
-        hasCommentInTriviaSlice(checker.source, checker.token_buffer.getTrailingTrivia(last_tok));
-    if (has_inner_or_trailing_comments) return;
+    // Case A: Bare `return;` in a `unit`-returning function/test/bench/closure block:
+    if (last_stmt.lhs.isNone()) {
+        if (ret_ty != .unit_ty) return;
+        if (hasCommentsInByteRange(checker.source, checker.token_buffer, ret_span.start_byte, ret_span.end_byte)) return;
 
-    var del_start: u32 = ret_span.start_byte;
-    var del_end: u32 = ret_span.end_byte;
-    if (!hasCommentInTriviaSlice(checker.source, checker.token_buffer.getLeadingTrivia(first_tok))) {
-        var line_scan: usize = ret_span.start_byte;
-        while (line_scan > 0 and (checker.source[line_scan - 1] == ' ' or checker.source[line_scan - 1] == '\t')) {
-            line_scan -= 1;
+        var del_start: u32 = ret_span.start_byte;
+        var del_end: u32 = ret_span.end_byte;
+        if (!hasCommentInTriviaSlice(checker.source, checker.token_buffer.getLeadingTrivia(first_tok))) {
+            var line_scan: usize = ret_span.start_byte;
+            while (line_scan > 0 and (checker.source[line_scan - 1] == ' ' or checker.source[line_scan - 1] == '\t')) {
+                line_scan -= 1;
+            }
+            const is_own_line = (line_scan == 0 or checker.source[line_scan - 1] == '\n');
+            if (is_own_line and del_end < checker.source.len) {
+                if (checker.source[del_end] == '\n') {
+                    del_start = @intCast(line_scan);
+                    del_end += 1;
+                } else if (del_end + 1 < checker.source.len and
+                    checker.source[del_end] == '\r' and checker.source[del_end + 1] == '\n')
+                {
+                    del_start = @intCast(line_scan);
+                    del_end += 2;
+                }
+            }
         }
-        const is_own_line = (line_scan == 0 or checker.source[line_scan - 1] == '\n');
-        if (is_own_line and del_end < checker.source.len) {
-            if (checker.source[del_end] == '\n') {
-                del_start = @intCast(line_scan);
-                del_end += 1;
-            } else if (del_end + 1 < checker.source.len and
-                checker.source[del_end] == '\r' and checker.source[del_end + 1] == '\n')
-            {
-                del_start = @intCast(line_scan);
-                del_end += 2;
+
+        try emitAuditLintWarning(
+            sink_opt,
+            .w0209_needless_trailing_return,
+            .machine_applicable,
+            ret_span,
+            "redundant trailing `return;` at the end of a `unit`-returning block",
+            "unnecessary trailing `return;`",
+            "remove redundant trailing `return;`",
+            &.{.{
+                .file_id = checker.file_id,
+                .start_byte = del_start,
+                .end_byte = del_end,
+                .replacement_id = try checker.interner.intern(""),
+            }},
+        );
+        return;
+    }
+
+    // Case B: `return expr;` at tail of value-returning `fn` or closure block:
+    if (ret_ty == .unit_ty or last_stmt.lhs.tag != .node) return;
+    const val_id = NodeIndex.fromInt(last_stmt.lhs.payload);
+    if (val_id.isNone() or val_id.asInt() >= checker.ast_arena.countNodes()) return;
+    const val_ty = getRecordedNodeType(checker, val_id);
+    if (val_ty.isError() or val_ty == .never_ty) return;
+
+    const val_cst = checker.ast_arena.getCstOrigin(val_id);
+    const val_span = getCstSubtreeSpan(
+        checker.file_id,
+        checker.cst_arena,
+        checker.token_buffer,
+        val_cst,
+    ) orelse checker.computeFullAstSubtreeSpan(val_id);
+    if (val_span.start_byte <= ret_span.start_byte or val_span.end_byte > ret_span.end_byte) return;
+    if (hasCommentsInByteRange(checker.source, checker.token_buffer, ret_span.start_byte, val_span.start_byte) or
+        hasCommentsInByteRange(checker.source, checker.token_buffer, val_span.end_byte, ret_span.end_byte))
+    {
+        return;
+    }
+
+    const expr_slice = std.mem.trim(u8, checker.source[val_span.start_byte..val_span.end_byte], " \t\r\n");
+    if (expr_slice.len == 0) return;
+    if (stmts.len >= 2 and hasTailExprContinuationHazard(
+        checker,
+        NodeIndex.fromInt(stmts[stmts.len - 2]),
+        expr_slice,
+    )) {
+        return;
+    }
+
+    const ret_edits = [2]TextEdit{
+        .{
+            .file_id = checker.file_id,
+            .start_byte = ret_span.start_byte,
+            .end_byte = val_span.start_byte,
+            .replacement_id = .empty,
+        },
+        .{
+            .file_id = checker.file_id,
+            .start_byte = val_span.end_byte,
+            .end_byte = ret_span.end_byte,
+            .replacement_id = .empty,
+        },
+    };
+    try emitAuditLintWarning(
+        sink_opt,
+        .w0209_needless_trailing_return,
+        .machine_applicable,
+        ret_span,
+        "needless `return` keyword on final tail expression; use an implicit tail expression (`DR-03`)",
+        "replace `return expr;` with tail expression `expr`",
+        "remove needless `return` and trailing `;`",
+        &ret_edits,
+    );
+}
+
+/// Returns `true` if `expr_id` is a pure $O(1)$ projection expression rooted in `self` (no loops or effectful calls).
+fn isPureSelfProjectionExpr(checker: *const TypeChecker, expr_id: NodeIndex, depth: u32) bool {
+    if (depth > 12 or expr_id.isNone() or expr_id.asInt() >= checker.ast_arena.countNodes()) return false;
+    const node = checker.ast_arena.getNode(expr_id);
+    return switch (node.tag) {
+        .self_val, .int_lit, .float_lit, .bool_lit, .char_lit, .byte_lit, .string_lit => true,
+        .ident_expr => blk: {
+            if (expr_id.asInt() < checker.node_symbols.len) {
+                const sym_idx = checker.node_symbols[expr_id.asInt()];
+                if (!sym_idx.isNone() and sym_idx.asInt() < checker.sym_table.countSymbols()) {
+                    const sk = checker.sym_table.getSymbol(sym_idx).kind;
+                    break :blk sk == .param_sym or sk == .const_sym;
+                }
+            }
+            break :blk false;
+        },
+        .field_access, .deref_expr, .cast_expr => node.lhs.tag == .node and
+            isPureSelfProjectionExpr(checker, NodeIndex.fromInt(node.lhs.payload), depth + 1),
+        .unary_expr => !node.main_token.isNone() and node.lhs.tag == .node and
+            isPureSelfProjectionExpr(checker, NodeIndex.fromInt(node.lhs.payload), depth + 1),
+        .binary_expr => !node.main_token.isNone() and node.lhs.tag == .node and node.rhs.tag == .node and
+            isPureSelfProjectionExpr(checker, NodeIndex.fromInt(node.lhs.payload), depth + 1) and
+            isPureSelfProjectionExpr(checker, NodeIndex.fromInt(node.rhs.payload), depth + 1),
+        .tuple_lit => blk: {
+            if (node.lhs.tag == .extra) {
+                for (checker.getNodeExtraSlice(expr_id, false)) |sub_raw| {
+                    if (!isPureSelfProjectionExpr(checker, NodeIndex.fromInt(sub_raw), depth + 1)) break :blk false;
+                }
+            }
+            break :blk true;
+        },
+        .struct_lit => blk: {
+            const cst_orig = checker.ast_arena.getCstOrigin(expr_id);
+            if (cst_orig.isNone() or cst_orig.asInt() >= checker.cst_arena.countNodes()) break :blk false;
+            const c_start: usize = cst_orig.asInt();
+            const c_end: usize = @min(
+                c_start + @max(@as(usize, checker.cst_arena.getNode(cst_orig).subtree_size), 1),
+                checker.cst_arena.countNodes(),
+            );
+            const path_id = if (node.lhs.tag == .node) NodeIndex.fromInt(node.lhs.payload) else NodeIndex.none;
+            var scan_c = c_start + 1;
+            while (scan_c < c_end) {
+                const sub_cst = CstNodeIndex.fromInt(@intCast(scan_c));
+                const sub_rec = checker.cst_arena.getNode(sub_cst);
+                if (scan_c < checker.cst_to_ast.len) {
+                    const mapped_ast = checker.cst_to_ast[scan_c];
+                    if (!mapped_ast.isNone() and mapped_ast != expr_id and mapped_ast != path_id) {
+                        if (!isPureSelfProjectionExpr(checker, mapped_ast, depth + 1)) break :blk false;
+                        scan_c += @max(@as(usize, sub_rec.subtree_size), 1);
+                        continue;
+                    }
+                }
+                scan_c += 1;
+            }
+            break :blk true;
+        },
+        .method_call => blk: {
+            if (node.lhs.tag != .node) break :blk false;
+            const recv_id = NodeIndex.fromInt(node.lhs.payload);
+            const mc_items = checker.getNodeExtraSlice(expr_id, true);
+            if (mc_items.len == 0) break :blk false;
+            const m_tok = TokenIndex.fromInt(mc_items[0]);
+            const m_name = symbol_resolver.extractTokenSlice(checker.source, checker.token_buffer, m_tok);
+            const is_builtin_o1 = std.mem.eql(u8, m_name, "len") or
+                std.mem.eql(u8, m_name, "capacity") or
+                std.mem.eql(u8, m_name, "is_empty") or
+                std.mem.eql(u8, m_name, "as_slice") or
+                std.mem.eql(u8, m_name, "as_str") or
+                std.mem.eql(u8, m_name, "as_bytes") or
+                std.mem.eql(u8, m_name, "as_ptr");
+            break :blk is_builtin_o1 and isPureSelfProjectionExpr(checker, recv_id, depth + 1);
+        },
+        else => false,
+    };
+}
+
+/// `W0206`: Lints inherent 0-arg `fn get_<stem>(&self) -> T` $O(1)$ property getters (`DR-03` C-GETTER).
+fn lintGetterPrefixNoiseW0206(
+    checker: *TypeChecker,
+    fn_sym_idx: SymbolIndex,
+    fn_ast_id: NodeIndex,
+    sink_opt: ?*DiagnosticSink,
+) !void {
+    if (fn_sym_idx.isNone() or fn_sym_idx.asInt() >= checker.sym_table.countSymbols()) return;
+    if (fn_ast_id.isNone() or fn_ast_id.asInt() >= checker.ast_arena.countNodes()) return;
+
+    const fn_sym = checker.sym_table.getSymbol(fn_sym_idx).*;
+    if (fn_sym.kind != .fn_sym or fn_sym.flags.is_extern or fn_sym.flags.is_prototype_only) return;
+    if (fn_sym.contract_flags.is_export or fn_sym.contract_flags.has_link_name or
+        fn_sym.contract_flags.has_link_section or fn_sym.extra_flags.is_constructor or
+        fn_sym.extra_flags.is_test)
+    {
+        return;
+    }
+    if (checker.sym_table.impl_method_trait.contains(fn_sym_idx.asInt())) return;
+    if (checker.sym_table.getFfiContract(fn_sym_idx)) |ffi_c| {
+        if (ffi_c.wasm_export_name != .empty) return;
+    }
+
+    const name = fn_sym.name_text;
+    if (!std.mem.startsWith(u8, name, "get_") or name.len <= 4) return;
+    if (std.mem.eql(u8, name, "get_mut") or
+        std.mem.startsWith(u8, name, "get_unchecked") or
+        std.mem.startsWith(u8, name, "get_or_") or
+        std.mem.eql(u8, name, "get_key_value") or
+        std.mem.eql(u8, name, "get_disjoint_mut") or
+        std.mem.eql(u8, name, "get_many_mut"))
+    {
+        return;
+    }
+
+    const stem = name[4..];
+    if (stem.len == 0 or std.ascii.isDigit(stem[0])) return;
+    if (lexer.lookupKeywordOrPrim(stem) != null or
+        std.mem.eql(u8, stem, "self") or
+        std.mem.eql(u8, stem, "Self"))
+    {
+        return;
+    }
+
+    const sig = checker.pool.getFnSignatureView(fn_sym.type_id) orelse return;
+    if (sig.is_async or sig.is_c_abi or sig.is_variadic or sig.paramCount() != 1) return;
+    if (sig.getParamMode(0) != .let_mode) return;
+
+    // Verify parameter 0 is `self` / `&self` (never `&mut self` or `*Self`):
+    var is_self_param = false;
+    const param_specs = checker.sym_table.getFnParamSpecs(fn_sym_idx);
+    if (param_specs.len >= 1) {
+        is_self_param = std.mem.eql(u8, param_specs[0].name_text, "self");
+    } else if (!fn_sym.target_scope.isNone()) {
+        for (checker.sym_table.getScopeMembers(fn_sym.target_scope)) |mem_idx| {
+            const mem = checker.sym_table.getSymbol(mem_idx).*;
+            if (mem.kind == .param_sym) {
+                is_self_param = std.mem.eql(u8, mem.name_text, "self");
+                break;
+            }
+        }
+    }
+    if (!is_self_param) return;
+
+    const self_param_ty = checker.pool.unwrapUnderlyingType(sig.getParamType(0));
+    const self_tag = checker.pool.getTag(self_param_ty);
+    if (self_tag == .mut_ref_ty or self_tag == .raw_ptr_ty) return;
+    const owner_ty = checker.pool.unwrapUnderlyingType(checker.unwrapRefType(self_param_ty));
+    if (self_tag != .ref_ty and !checker.isCopyType(owner_ty)) return;
+
+    const ret_ty = checker.pool.unwrapUnderlyingType(sig.ret_ty);
+    if (ret_ty.isError() or ret_ty == .unit_ty or ret_ty == .never_ty) return;
+    const ret_tag = checker.pool.getNode(ret_ty).tag;
+    if (ret_tag == .result_ty or ret_tag == .future_ty) return;
+
+    // Guard collisions against existing `<stem>` method/const or callable-typed field on `Self`:
+    const owner_node = checker.pool.getNode(owner_ty);
+    if (owner_node.tag == .struct_ty or owner_node.tag == .enum_ty or
+        owner_node.tag == .union_ty or owner_node.tag == .bit_field_ty)
+    {
+        const owner_sym = checker.sym_table.getSymbol(SymbolIndex.fromInt(owner_node.rhs)).*;
+        if (!owner_sym.target_scope.isNone()) {
+            if (checker.interner.lookup(stem)) |stem_id| {
+                for (checker.sym_table.getScopeMembers(owner_sym.target_scope)) |mem_idx| {
+                    const mem = checker.sym_table.getSymbol(mem_idx).*;
+                    if (mem.name != stem_id) continue;
+                    if (mem.kind == .fn_sym or mem.extra_flags.is_subscript or mem.kind == .const_sym) return;
+                    if (mem.kind == .field_sym) {
+                        const fld_tag = checker.pool.getTag(checker.pool.unwrapUnderlyingType(mem.type_id));
+                        if (fld_tag == .fn_ty or fld_tag == .closure_ty) return;
+                    }
+                }
             }
         }
     }
 
-    try emitIdiomWarning(
+    // Verify body is a single-expression $O(1)$ projection (`= expr;` or `{ [return] expr }`):
+    const fn_node = checker.ast_arena.getNode(fn_ast_id);
+    if (fn_node.tag != .fn_decl or fn_node.rhs.tag != .node) return;
+    const body_id = NodeIndex.fromInt(fn_node.rhs.payload);
+    if (body_id.isNone() or body_id.asInt() >= checker.ast_arena.countNodes()) return;
+    const body_node = checker.ast_arena.getNode(body_id);
+    const proj_expr_id: NodeIndex = if (body_node.tag == .block) blk_pe: {
+        const stmts = if (body_node.lhs.tag == .extra) checker.getNodeExtraSlice(body_id, false) else &[_]u32{};
+        if (stmts.len == 0 and body_node.rhs.tag == .node) {
+            break :blk_pe NodeIndex.fromInt(body_node.rhs.payload);
+        }
+        if (stmts.len == 1 and body_node.rhs.isNone()) {
+            const stmt0 = checker.ast_arena.getNode(NodeIndex.fromInt(stmts[0]));
+            if (stmt0.tag == .return_stmt and stmt0.lhs.tag == .node) {
+                break :blk_pe NodeIndex.fromInt(stmt0.lhs.payload);
+            }
+        }
+        return;
+    } else body_id;
+
+    if (!isPureSelfProjectionExpr(checker, proj_expr_id, 0)) return;
+
+    var msg_buf: [224]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &msg_buf,
+        "`get_` prefix on $O(1)$ property accessor `{s}` is noisy (`DR-03` C-GETTER); name it `{s}`",
+        .{ name, stem },
+    ) catch "`get_` prefix on $O(1)$ property accessor is noisy; omit `get_`";
+    var fix_buf: [128]u8 = undefined;
+    const fix_msg = std.fmt.bufPrint(&fix_buf, "rename `{s}` to `{s}`", .{ name, stem }) catch "strip `get_` prefix";
+
+    try emitAuditLintWarning(
         sink_opt,
-        ret_span,
-        "redundant trailing `return;` at the end of a `unit`-returning function",
-        "unnecessary trailing `return;`",
-        "remove redundant trailing `return;`",
+        .w0206_getter_prefix_noise,
+        .maybe_incorrect,
+        fn_sym.decl_span,
+        msg,
+        "omit `get_` prefix on $O(1)$ property accessor",
+        fix_msg,
         &.{.{
-            .file_id = checker.file_id,
-            .start_byte = del_start,
-            .end_byte = del_end,
-            .replacement_id = try checker.interner.intern(""),
+            .file_id = fn_sym.decl_span.file_id,
+            .start_byte = fn_sym.decl_span.start_byte,
+            .end_byte = fn_sym.decl_span.end_byte,
+            .replacement_id = try checker.interner.intern(stem),
         }},
     );
 }
@@ -2083,7 +2579,6 @@ fn lintTwoArmMatchToIfIs(
         checker.token_buffer,
         match_cst,
     ) orelse return false;
-    if (isW0202SuppressedAtSpan(checker, match_span)) return true;
 
     var clean_scrut_cst = scrut_cst;
     if (try matchRedundantOuterParenCst(checker, scrut_cst)) |unwrapped_scrut| {
@@ -2125,8 +2620,10 @@ fn lintTwoArmMatchToIfIs(
         hasCommentsInByteRange(checker.source, checker.token_buffer, body_span.end_byte, match_span.end_byte);
 
     if (has_lost_comments) {
-        try emitIdiomWarning(
+        try emitAuditLintWarning(
             sink_opt,
+            .w0409_simplifiable_match,
+            .machine_applicable,
             match_span,
             "single-arm `match` with empty wildcard `_ => {}` can be written as `if … is …`",
             "reducible to `if … is …`",
@@ -2155,8 +2652,10 @@ fn lintTwoArmMatchToIfIs(
     try repl_buf.append(checker.allocator, ' ');
     try repl_buf.appendSlice(checker.allocator, checker.source[body_span.start_byte..body_span.end_byte]);
 
-    try emitIdiomWarning(
+    try emitAuditLintWarning(
         sink_opt,
+        .w0409_simplifiable_match,
+        .machine_applicable,
         match_span,
         "single-arm `match` with empty wildcard `_ => {}` can be written as `if … is …`",
         "reducible to `if … is …`",
@@ -2169,6 +2668,660 @@ fn lintTwoArmMatchToIfIs(
         }},
     );
     return true;
+}
+
+/// Unwraps a 0-statement `{ expr }` block to `expr`, returning `arm_body_id` otherwise.
+fn unwrapZeroStmtArmBlock(checker: *const TypeChecker, arm_body_id: NodeIndex) NodeIndex {
+    if (arm_body_id.isNone() or arm_body_id.asInt() >= checker.ast_arena.countNodes()) return .none;
+    const node = checker.ast_arena.getNode(arm_body_id);
+    if (node.tag == .block) {
+        const stmts = if (node.lhs.tag == .extra) checker.getNodeExtraSlice(arm_body_id, false) else &[_]u32{};
+        if (stmts.len == 0 and node.rhs.tag == .node) return NodeIndex.fromInt(node.rhs.payload);
+        if (stmts.len == 1 and node.rhs.isNone()) {
+            const stmt0_id = NodeIndex.fromInt(stmts[0]);
+            const stmt0_tag = checker.ast_arena.getNode(stmt0_id).tag;
+            if (stmt0_tag == .return_stmt or stmt0_tag == .break_stmt or stmt0_tag == .continue_stmt) {
+                return stmt0_id;
+            }
+        }
+    }
+    return arm_body_id;
+}
+
+/// Returns `true` if `pat_cst` contains a `&` reference modifier.
+fn hasRefModifierInPatCst(checker: *const TypeChecker, pat_cst: CstNodeIndex) bool {
+    if (pat_cst.isNone() or pat_cst.asInt() >= checker.cst_arena.countNodes()) return false;
+    const start_idx: usize = pat_cst.asInt();
+    const rec = checker.cst_arena.getNode(pat_cst);
+    const end_idx: usize = @min(start_idx + @max(@as(usize, rec.subtree_size), 1), checker.cst_arena.countNodes());
+    var cur: usize = start_idx;
+    while (cur < end_idx) : (cur += 1) {
+        const sub = checker.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+        if (sub.subtree_size <= 1 and !sub.token.isNone() and
+            sub.token.asInt() < checker.token_buffer.countTokens() and
+            checker.token_buffer.getToken(sub.token).kind == .amp)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Extracts `v`'s `SymbolIndex` if `pat_id` is `.Variant(v)` (simple by-value `bind_pat` matching `expected_variant`).
+fn extractSingleValueVariantBind(
+    checker: *const TypeChecker,
+    pat_id: NodeIndex,
+    expected_variant: []const u8,
+) ?SymbolIndex {
+    if (pat_id.isNone() or pat_id.asInt() >= checker.ast_arena.countNodes()) return null;
+    const pat_node = checker.ast_arena.getNode(pat_id);
+    if (pat_node.tag != .variant_pat) return null;
+    const sub_pats = checker.getNodeExtraSlice(pat_id, false);
+    if (sub_pats.len != 1) return null;
+
+    // Verify variant name matches `expected_variant`:
+    const pat_cst = checker.ast_arena.getCstOrigin(pat_id);
+    if (hasRefModifierInPatCst(checker, pat_cst)) return null;
+    const var_tok = if (pat_node.lhs.tag == .token)
+        TokenIndex.fromInt(pat_node.lhs.payload)
+    else
+        pat_node.main_token;
+    var matched_name = false;
+    if (!var_tok.isNone() and var_tok.asInt() < checker.token_buffer.countTokens()) {
+        matched_name = std.mem.eql(
+            u8,
+            symbol_resolver.extractTokenSlice(checker.source, checker.token_buffer, var_tok),
+            expected_variant,
+        );
+    }
+    if (!matched_name and !pat_cst.isNone()) {
+        const p_sp = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, pat_cst) orelse return null;
+        const p_txt = checker.source[p_sp.start_byte..p_sp.end_byte];
+        const lparen_pos = std.mem.indexOfScalar(u8, p_txt, '(') orelse return null;
+        const head = std.mem.trim(u8, p_txt[0..lparen_pos], " \t.");
+        matched_name = std.mem.eql(u8, head, expected_variant) or
+            std.mem.endsWith(u8, head, expected_variant);
+    }
+    if (!matched_name) return null;
+
+    const bind_id = NodeIndex.fromInt(sub_pats[0]);
+    if (bind_id.isNone() or bind_id.asInt() >= checker.ast_arena.countNodes()) return null;
+    if (checker.ast_arena.getNode(bind_id).tag != .bind_pat or bind_id.asInt() >= checker.node_symbols.len) return null;
+    const sym_idx = checker.node_symbols[bind_id.asInt()];
+    if (sym_idx.isNone() or sym_idx.asInt() >= checker.sym_table.countSymbols()) return null;
+    const sym = checker.sym_table.getSymbol(sym_idx).*;
+    if (sym.flags.is_mut or sym.flags.is_mutated) return null;
+    return sym_idx;
+}
+
+/// Returns `true` if `pat_id` is unit `.None` (or `Option.None`).
+fn isUnitNoneVariantPat(checker: *const TypeChecker, pat_id: NodeIndex) bool {
+    if (pat_id.isNone() or pat_id.asInt() >= checker.ast_arena.countNodes()) return false;
+    const pat_node = checker.ast_arena.getNode(pat_id);
+    if (pat_node.tag == .wildcard_pat) return true;
+    if (pat_node.tag != .variant_pat and pat_node.tag != .contextual_variant and pat_node.tag != .path_expr) {
+        return false;
+    }
+    if (pat_node.tag == .variant_pat and checker.getNodeExtraSlice(pat_id, false).len != 0) return false;
+    const pat_cst = checker.ast_arena.getCstOrigin(pat_id);
+    const sp = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, pat_cst) orelse return false;
+    const txt = std.mem.trim(u8, checker.source[sp.start_byte..sp.end_byte], " \t");
+    return std.mem.eql(u8, txt, ".None") or std.mem.eql(u8, txt, "Option.None");
+}
+
+/// Returns `true` if `body_id` (unwrapped) is `.ident_expr` resolving to `target_sym` with total read count `1`.
+fn isSingleReadIdentityArmBody(checker: *const TypeChecker, raw_body_id: NodeIndex, target_sym: SymbolIndex) bool {
+    const inner_id = unwrapZeroStmtArmBlock(checker, raw_body_id);
+    if (inner_id.isNone() or inner_id.asInt() >= checker.ast_arena.countNodes()) return false;
+    if (checker.ast_arena.getNode(inner_id).tag != .ident_expr) return false;
+    if (inner_id.asInt() >= checker.node_symbols.len) return false;
+    return checker.node_symbols[inner_id.asInt()] == target_sym and checker.getLocalReadCount(target_sym) == 1;
+}
+
+/// Returns `true` if `raw_body_id` is `return .Err(err_sym)` (or `{ return .Err(err_sym); }`) with read count `1`.
+fn isReturnSameErrArmBody(checker: *const TypeChecker, raw_body_id: NodeIndex, err_sym: SymbolIndex) bool {
+    const stmt_id = unwrapZeroStmtArmBlock(checker, raw_body_id);
+    if (stmt_id.isNone() or stmt_id.asInt() >= checker.ast_arena.countNodes()) return false;
+    const ret_node = checker.ast_arena.getNode(stmt_id);
+    if (ret_node.tag != .return_stmt or ret_node.lhs.tag != .node) return false;
+    const val_id = NodeIndex.fromInt(ret_node.lhs.payload);
+    if (val_id.isNone() or val_id.asInt() >= checker.ast_arena.countNodes()) return false;
+    const val_node = checker.ast_arena.getNode(val_id);
+    if (val_node.tag == .contextual_variant) {
+        const var_tok = if (val_node.lhs.tag == .token) TokenIndex.fromInt(val_node.lhs.payload) else val_node.main_token;
+        if (var_tok.isNone() or !std.mem.eql(u8, symbol_resolver.extractTokenSlice(checker.source, checker.token_buffer, var_tok), "Err")) {
+            return false;
+        }
+        const args = checker.getNodeExtraSlice(val_id, true);
+        if (args.len != 1) return false;
+        const arg0 = NodeIndex.fromInt(args[0]);
+        return checker.ast_arena.getNode(arg0).tag == .ident_expr and
+            arg0.asInt() < checker.node_symbols.len and
+            checker.node_symbols[arg0.asInt()] == err_sym and
+            checker.getLocalReadCount(err_sym) == 1;
+    }
+    return false;
+}
+
+/// Returns `true` if `raw_body_id` is `return .None` (or `{ return .None; }`).
+fn isReturnNoneArmBody(checker: *const TypeChecker, raw_body_id: NodeIndex) bool {
+    const stmt_id = unwrapZeroStmtArmBlock(checker, raw_body_id);
+    if (stmt_id.isNone() or stmt_id.asInt() >= checker.ast_arena.countNodes()) return false;
+    const ret_node = checker.ast_arena.getNode(stmt_id);
+    if (ret_node.tag != .return_stmt or ret_node.lhs.tag != .node) return false;
+    const val_id = NodeIndex.fromInt(ret_node.lhs.payload);
+    if (val_id.isNone() or val_id.asInt() >= checker.ast_arena.countNodes()) return false;
+    const val_node = checker.ast_arena.getNode(val_id);
+    if (val_node.tag != .contextual_variant) return false;
+    if (checker.getNodeExtraSlice(val_id, true).len != 0) return false;
+    const var_tok = if (val_node.lhs.tag == .token) TokenIndex.fromInt(val_node.lhs.payload) else val_node.main_token;
+    return !var_tok.isNone() and
+        std.mem.eql(u8, symbol_resolver.extractTokenSlice(checker.source, checker.token_buffer, var_tok), "None");
+}
+
+/// `W0410`: Lints 2-arm `match` reducible to `opt orelse d` or `res?` / `opt?` (`Priority 1` over `W0409`).
+fn lintManualOrelseOrTryW0410(
+    checker: *TypeChecker,
+    match_ast_id: NodeIndex,
+    match_cst: CstNodeIndex,
+    parent_cst: CstNodeIndex,
+    enclosing_fn_ret_ty: TypeId,
+    is_inside_defer: bool,
+    sink_opt: ?*DiagnosticSink,
+) !bool {
+    if (match_ast_id.isNone() or match_ast_id.asInt() >= checker.ast_arena.countNodes()) return false;
+    const match_node = checker.ast_arena.getNode(match_ast_id);
+    if (match_node.tag != .match_expr or match_node.lhs.tag != .node or match_node.rhs.tag != .extra) return false;
+    if (match_cst.isNone() or hasSyntaxErrorInSubtree(checker.cst_arena, checker.token_buffer, match_cst)) return false;
+
+    // Skip `comptime match`:
+    if (!parent_cst.isNone() and parent_cst.asInt() < checker.cst_arena.countNodes() and
+        checker.cst_arena.getNode(parent_cst).kind == .prefix_expr)
+    {
+        const p_tok = findFirstRealTokenInSubtree(checker.cst_arena, checker.token_buffer, parent_cst);
+        if (!p_tok.isNone() and checker.token_buffer.getToken(p_tok).kind == .kw_comptime) return false;
+    }
+
+    const scrut_id = NodeIndex.fromInt(match_node.lhs.payload);
+    const raw_scrut_ty = checker.pool.unwrapUnderlyingType(getRecordedNodeType(checker, scrut_id));
+    if (raw_scrut_ty.isError()) return false;
+    const scrut_tag = checker.pool.getNode(raw_scrut_ty).tag;
+    // `orelse` and `?` require value `T?` / `T!E` (never `&T?` or `&Result`!):
+    if (scrut_tag != .optional_ty and scrut_tag != .result_ty) return false;
+
+    const arm_words = checker.getNodeExtraSlice(match_ast_id, true);
+    if (arm_words.len != 4) return false;
+    const arm0_pat = NodeIndex.fromInt(arm_words[0]);
+    const arm0_body = NodeIndex.fromInt(arm_words[1]);
+    const arm1_pat = NodeIndex.fromInt(arm_words[2]);
+    const arm1_body = NodeIndex.fromInt(arm_words[3]);
+
+    var match_children: std.ArrayListUnmanaged(CstNodeIndex) = .empty;
+    defer match_children.deinit(checker.allocator);
+    try collectDirectCstChildren(checker.allocator, checker.cst_arena, match_cst, &match_children);
+
+    var arm_csts: [2]CstNodeIndex = .{ .none, .none };
+    var arm_cnt: usize = 0;
+    var scrut_cst: CstNodeIndex = .none;
+    var seen_match = false;
+    var seen_lbrace = false;
+    for (match_children.items) |ch_cst| {
+        const ch = checker.cst_arena.getNode(ch_cst);
+        if (ch.kind == .loop_label) return false;
+        if (ch.kind == .match_introducer) {
+            seen_match = true;
+            continue;
+        }
+        if (ch.subtree_size == 1 and !ch.token.isNone() and checker.token_buffer.getToken(ch.token).kind == .lbrace) {
+            seen_lbrace = true;
+            continue;
+        }
+        if (seen_match and !seen_lbrace and scrut_cst.isNone()) {
+            scrut_cst = ch_cst;
+            continue;
+        }
+        if (ch.kind == .match_arm) {
+            if (arm_cnt >= 2) return false;
+            arm_csts[arm_cnt] = ch_cst;
+            arm_cnt += 1;
+        }
+    }
+    if (arm_cnt != 2 or scrut_cst.isNone()) return false;
+    if (hasMatchArmGuardCst(checker.cst_arena, checker.token_buffer, arm_csts[0]) or
+        hasMatchArmGuardCst(checker.cst_arena, checker.token_buffer, arm_csts[1]))
+    {
+        return false;
+    }
+
+    const match_span = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, match_cst) orelse return false;
+    if (hasCommentsInByteRange(checker.source, checker.token_buffer, match_span.start_byte, match_span.end_byte)) return false;
+
+    var clean_scrut_cst = scrut_cst;
+    if (try matchRedundantOuterParenCst(checker, scrut_cst)) |unw| {
+        clean_scrut_cst = unw.inner_cst;
+    }
+    const scrut_span = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, clean_scrut_cst) orelse return false;
+    const scrut_slice = std.mem.trim(u8, checker.source[scrut_span.start_byte..scrut_span.end_byte], " \t\r\n");
+    const need_postfix_parens = switch (checker.ast_arena.getNode(scrut_id).tag) {
+        .binary_expr, .unary_expr, .cast_expr, .if_expr, .match_expr, .range_expr, .is_expr, .walrus_expr, .pipe_expr => true,
+        else => false,
+    };
+
+    // Case 2a (`res?` on `T!E`):
+    if (scrut_tag == .result_ty and !is_inside_defer and !enclosing_fn_ret_ty.isError()) {
+        const fn_ret_unw = checker.pool.unwrapUnderlyingType(enclosing_fn_ret_ty);
+        if (checker.pool.getNode(fn_ret_unw).tag == .result_ty) {
+            const res_err_ty = checker.pool.unwrapUnderlyingType(TypeId.fromInt(checker.pool.getNode(raw_scrut_ty).rhs));
+            const fn_err_ty = checker.pool.unwrapUnderlyingType(TypeId.fromInt(checker.pool.getNode(fn_ret_unw).rhs));
+            if (res_err_ty == fn_err_ty) {
+                const ok0 = extractSingleValueVariantBind(checker, arm0_pat, "Ok");
+                const err1 = extractSingleValueVariantBind(checker, arm1_pat, "Err");
+                const ok1 = extractSingleValueVariantBind(checker, arm1_pat, "Ok");
+                const err0 = extractSingleValueVariantBind(checker, arm0_pat, "Err");
+                const is_try_match = (ok0 != null and err1 != null and
+                    isSingleReadIdentityArmBody(checker, arm0_body, ok0.?) and
+                    isReturnSameErrArmBody(checker, arm1_body, err1.?)) or
+                    (ok1 != null and err0 != null and
+                        isSingleReadIdentityArmBody(checker, arm1_body, ok1.?) and
+                        isReturnSameErrArmBody(checker, arm0_body, err0.?));
+                if (is_try_match) {
+                    var repl_buf: std.ArrayListUnmanaged(u8) = .empty;
+                    defer repl_buf.deinit(checker.allocator);
+                    if (need_postfix_parens) try repl_buf.append(checker.allocator, '(');
+                    try repl_buf.appendSlice(checker.allocator, scrut_slice);
+                    if (need_postfix_parens) try repl_buf.append(checker.allocator, ')');
+                    try repl_buf.append(checker.allocator, '?');
+
+                    try emitAuditLintWarning(
+                        sink_opt,
+                        .w0410_manual_orelse_or_try,
+                        .machine_applicable,
+                        match_span,
+                        "manual `Result` unwrap-or-propagate `match` can use postfix `?`",
+                        "replace `match` error propagation with `?`",
+                        "rewrite `match` to `?`",
+                        &.{.{
+                            .file_id = checker.file_id,
+                            .start_byte = match_span.start_byte,
+                            .end_byte = match_span.end_byte,
+                            .replacement_id = try checker.interner.intern(repl_buf.items),
+                        }},
+                    );
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Case 2b (`opt?` on `T?`) & Case 1 (`opt orelse d` on `T?`):
+    if (scrut_tag == .optional_ty) {
+        const some0 = extractSingleValueVariantBind(checker, arm0_pat, "Some");
+        const some1 = extractSingleValueVariantBind(checker, arm1_pat, "Some");
+        const fallback_body_opt: ?NodeIndex = if (some0 != null and
+            isSingleReadIdentityArmBody(checker, arm0_body, some0.?) and
+            isUnitNoneVariantPat(checker, arm1_pat))
+            arm1_body
+        else if (some1 != null and
+            isSingleReadIdentityArmBody(checker, arm1_body, some1.?) and
+            isUnitNoneVariantPat(checker, arm0_pat))
+            arm0_body
+        else
+            null;
+
+        if (fallback_body_opt) |raw_fb_id| {
+            if (!is_inside_defer and !enclosing_fn_ret_ty.isError() and
+                checker.pool.getTag(checker.pool.unwrapUnderlyingType(enclosing_fn_ret_ty)) == .optional_ty and
+                isReturnNoneArmBody(checker, raw_fb_id))
+            {
+                var repl_buf: std.ArrayListUnmanaged(u8) = .empty;
+                defer repl_buf.deinit(checker.allocator);
+                if (need_postfix_parens) try repl_buf.append(checker.allocator, '(');
+                try repl_buf.appendSlice(checker.allocator, scrut_slice);
+                if (need_postfix_parens) try repl_buf.append(checker.allocator, ')');
+                try repl_buf.append(checker.allocator, '?');
+
+                try emitAuditLintWarning(
+                    sink_opt,
+                    .w0410_manual_orelse_or_try,
+                    .machine_applicable,
+                    match_span,
+                    "manual optional `.None` propagation `match` can use postfix `?`",
+                    "replace `match` `.None` propagation with `?`",
+                    "rewrite `match` to `?`",
+                    &.{.{
+                        .file_id = checker.file_id,
+                        .start_byte = match_span.start_byte,
+                        .end_byte = match_span.end_byte,
+                        .replacement_id = try checker.interner.intern(repl_buf.items),
+                    }},
+                );
+                return true;
+            }
+
+            const fb_id = unwrapZeroStmtArmBlock(checker, raw_fb_id);
+            if (!fb_id.isNone() and fb_id.asInt() < checker.ast_arena.countNodes()) {
+                const fb_tag = checker.ast_arena.getNode(fb_id).tag;
+                if (fb_tag != .block and fb_tag != .match_expr and fb_tag != .if_expr and
+                    fb_tag != .for_stmt and fb_tag != .while_stmt and fb_tag != .loop_expr)
+                {
+                    const fb_sp = getCstSubtreeSpan(
+                        checker.file_id,
+                        checker.cst_arena,
+                        checker.token_buffer,
+                        checker.ast_arena.getCstOrigin(fb_id),
+                    ) orelse checker.computeFullAstSubtreeSpan(fb_id);
+                    var fb_slice = std.mem.trim(u8, checker.source[fb_sp.start_byte..fb_sp.end_byte], " \t\r\n");
+                    if ((fb_tag == .return_stmt or fb_tag == .break_stmt or fb_tag == .continue_stmt) and
+                        fb_slice.len > 0 and fb_slice[fb_slice.len - 1] == ';')
+                    {
+                        fb_slice = std.mem.trimEnd(u8, fb_slice[0 .. fb_slice.len - 1], " \t");
+                    }
+                    if (fb_slice.len > 0 and std.mem.indexOfScalar(u8, fb_slice, '\n') == null) {
+                        const wrap_outer = if (!parent_cst.isNone() and parent_cst.asInt() < checker.cst_arena.countNodes())
+                            switch (checker.cst_arena.getNode(parent_cst).kind) {
+                                .infix_expr,
+                                .prefix_expr,
+                                .cast_expr,
+                                .field_or_method_expr,
+                                .call_expr,
+                                .index_expr,
+                                .postfix_try_expr,
+                                .postfix_await_expr,
+                                .postfix_deref_expr,
+                                => true,
+                                else => false,
+                            }
+                        else
+                            false;
+                        const wrap_lhs = switch (checker.ast_arena.getNode(scrut_id).tag) {
+                            .binary_expr, .if_expr, .closure_expr, .is_expr, .walrus_expr, .pipe_expr => true,
+                            else => false,
+                        };
+                        const wrap_rhs = (fb_tag == .binary_expr or fb_tag == .is_expr or fb_tag == .walrus_expr);
+
+                        var repl_buf: std.ArrayListUnmanaged(u8) = .empty;
+                        defer repl_buf.deinit(checker.allocator);
+                        if (wrap_outer) try repl_buf.append(checker.allocator, '(');
+                        if (wrap_lhs) try repl_buf.append(checker.allocator, '(');
+                        try repl_buf.appendSlice(checker.allocator, scrut_slice);
+                        if (wrap_lhs) try repl_buf.append(checker.allocator, ')');
+                        try repl_buf.appendSlice(checker.allocator, " orelse ");
+                        if (wrap_rhs) try repl_buf.append(checker.allocator, '(');
+                        try repl_buf.appendSlice(checker.allocator, fb_slice);
+                        if (wrap_rhs) try repl_buf.append(checker.allocator, ')');
+                        if (wrap_outer) try repl_buf.append(checker.allocator, ')');
+
+                        try emitAuditLintWarning(
+                            sink_opt,
+                            .w0410_manual_orelse_or_try,
+                            .machine_applicable,
+                            match_span,
+                            "manual 2-arm optional `match` can be written with `orelse` (`SE-03`)",
+                            "simplify optional unwrap to `orelse`",
+                            "rewrite `match` to `orelse`",
+                            &.{.{
+                                .file_id = checker.file_id,
+                                .start_byte = match_span.start_byte,
+                                .end_byte = match_span.end_byte,
+                                .replacement_id = try checker.interner.intern(repl_buf.items),
+                            }},
+                        );
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/// Decodes a `bool` `match` arm pattern (`true`, `false`, or `_` wildcard).
+fn classifyBoolMatchPat(checker: *const TypeChecker, pat_id: NodeIndex) ?enum { lit_true, lit_false, wildcard } {
+    if (pat_id.isNone() or pat_id.asInt() >= checker.ast_arena.countNodes()) return null;
+    const node = checker.ast_arena.getNode(pat_id);
+    if (node.tag == .wildcard_pat) return .wildcard;
+    if ((node.tag == .bool_lit or node.tag == .lit_pat) and !node.main_token.isNone()) {
+        return switch (checker.token_buffer.getToken(node.main_token).kind) {
+            .kw_true => .lit_true,
+            .kw_false => .lit_false,
+            else => null,
+        };
+    }
+    return null;
+}
+
+/// `W0409`: Lints 2-arm unguarded `match b { true => x, false => y }` on `bool` -> `if b => x else y` / `if b { x } else { y }`.
+fn lintTwoArmBoolMatchW0409(
+    checker: *TypeChecker,
+    match_ast_id: NodeIndex,
+    match_cst: CstNodeIndex,
+    parent_cst: CstNodeIndex,
+    sink_opt: ?*DiagnosticSink,
+) !bool {
+    if (match_ast_id.isNone() or match_ast_id.asInt() >= checker.ast_arena.countNodes()) return false;
+    const match_node = checker.ast_arena.getNode(match_ast_id);
+    if (match_node.tag != .match_expr or match_node.lhs.tag != .node or match_node.rhs.tag != .extra) return false;
+    if (match_cst.isNone() or hasSyntaxErrorInSubtree(checker.cst_arena, checker.token_buffer, match_cst)) return false;
+
+    if (!parent_cst.isNone() and parent_cst.asInt() < checker.cst_arena.countNodes() and
+        checker.cst_arena.getNode(parent_cst).kind == .prefix_expr)
+    {
+        const p_tok = findFirstRealTokenInSubtree(checker.cst_arena, checker.token_buffer, parent_cst);
+        if (!p_tok.isNone() and checker.token_buffer.getToken(p_tok).kind == .kw_comptime) return false;
+    }
+
+    const scrut_id = NodeIndex.fromInt(match_node.lhs.payload);
+    if (checker.unwrapRefType(getRecordedNodeType(checker, scrut_id)) != .bool_ty) return false;
+
+    const arm_words = checker.getNodeExtraSlice(match_ast_id, true);
+    if (arm_words.len != 4) return false;
+    const pat0 = classifyBoolMatchPat(checker, NodeIndex.fromInt(arm_words[0])) orelse return false;
+    const pat1 = classifyBoolMatchPat(checker, NodeIndex.fromInt(arm_words[2])) orelse return false;
+
+    var true_body_id: NodeIndex = .none;
+    var false_body_id: NodeIndex = .none;
+    if (pat0 == .lit_true and (pat1 == .lit_false or pat1 == .wildcard)) {
+        true_body_id = NodeIndex.fromInt(arm_words[1]);
+        false_body_id = NodeIndex.fromInt(arm_words[3]);
+    } else if (pat0 == .lit_false and (pat1 == .lit_true or pat1 == .wildcard)) {
+        false_body_id = NodeIndex.fromInt(arm_words[1]);
+        true_body_id = NodeIndex.fromInt(arm_words[3]);
+    } else {
+        return false;
+    }
+
+    var match_children: std.ArrayListUnmanaged(CstNodeIndex) = .empty;
+    defer match_children.deinit(checker.allocator);
+    try collectDirectCstChildren(checker.allocator, checker.cst_arena, match_cst, &match_children);
+
+    var arm_csts: [2]CstNodeIndex = .{ .none, .none };
+    var arm_cnt: usize = 0;
+    var scrut_cst: CstNodeIndex = .none;
+    var seen_match = false;
+    var seen_lbrace = false;
+    for (match_children.items) |ch_cst| {
+        const ch = checker.cst_arena.getNode(ch_cst);
+        if (ch.kind == .loop_label) return false;
+        if (ch.kind == .match_introducer) {
+            seen_match = true;
+            continue;
+        }
+        if (ch.subtree_size == 1 and !ch.token.isNone() and checker.token_buffer.getToken(ch.token).kind == .lbrace) {
+            seen_lbrace = true;
+            continue;
+        }
+        if (seen_match and !seen_lbrace and scrut_cst.isNone()) {
+            scrut_cst = ch_cst;
+            continue;
+        }
+        if (ch.kind == .match_arm) {
+            if (arm_cnt >= 2) return false;
+            arm_csts[arm_cnt] = ch_cst;
+            arm_cnt += 1;
+        }
+    }
+    if (arm_cnt != 2 or scrut_cst.isNone()) return false;
+    if (hasMatchArmGuardCst(checker.cst_arena, checker.token_buffer, arm_csts[0]) or
+        hasMatchArmGuardCst(checker.cst_arena, checker.token_buffer, arm_csts[1]))
+    {
+        return false;
+    }
+    if (hasUnreachableArmWarning(
+        sink_opt,
+        getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, arm_csts[1]) orelse return false,
+    )) {
+        return false;
+    }
+
+    const match_span = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, match_cst) orelse return false;
+    if (hasCommentsInByteRange(checker.source, checker.token_buffer, match_span.start_byte, match_span.end_byte)) return false;
+
+    var clean_scrut_cst = scrut_cst;
+    if (try matchRedundantOuterParenCst(checker, scrut_cst)) |unw| {
+        clean_scrut_cst = unw.inner_cst;
+    }
+    const scrut_span = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, clean_scrut_cst) orelse return false;
+    const scrut_raw = std.mem.trim(u8, checker.source[scrut_span.start_byte..scrut_span.end_byte], " \t\r\n");
+    const scrut_ty_raw = getRecordedNodeType(checker, scrut_id);
+    const need_deref = checker.pool.getTag(checker.pool.unwrapUnderlyingType(scrut_ty_raw)) == .ref_ty or
+        checker.pool.getTag(checker.pool.unwrapUnderlyingType(scrut_ty_raw)) == .mut_ref_ty;
+
+    const match_ty = getRecordedNodeType(checker, match_ast_id);
+    const t_unw = unwrapZeroStmtArmBlock(checker, true_body_id);
+    const f_unw = unwrapZeroStmtArmBlock(checker, false_body_id);
+    const t_sp = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, checker.ast_arena.getCstOrigin(t_unw)) orelse
+        return false;
+    const f_sp = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, checker.ast_arena.getCstOrigin(f_unw)) orelse
+        return false;
+    const t_str = std.mem.trim(u8, checker.source[t_sp.start_byte..t_sp.end_byte], " \t\r\n");
+    const f_str = std.mem.trim(u8, checker.source[f_sp.start_byte..f_sp.end_byte], " \t\r\n");
+
+    const can_use_arrow = match_ty != .unit_ty and match_ty != .never_ty and !match_ty.isError() and
+        !isDisallowedFatArrowArmAstTag(checker.ast_arena.getNode(t_unw).tag) and
+        !isDisallowedFatArrowArmAstTag(checker.ast_arena.getNode(f_unw).tag) and
+        t_str.len > 0 and t_str[0] != '{' and std.mem.indexOfScalar(u8, t_str, '\n') == null and
+        f_str.len > 0 and f_str[0] != '{' and std.mem.indexOfScalar(u8, f_str, '\n') == null;
+
+    var repl_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer repl_buf.deinit(checker.allocator);
+    if (can_use_arrow) {
+        const wrap_outer = if (!parent_cst.isNone() and parent_cst.asInt() < checker.cst_arena.countNodes())
+            switch (checker.cst_arena.getNode(parent_cst).kind) {
+                .infix_expr,
+                .prefix_expr,
+                .cast_expr,
+                .field_or_method_expr,
+                .call_expr,
+                .index_expr,
+                .postfix_try_expr,
+                .postfix_await_expr,
+                .postfix_deref_expr,
+                => true,
+                else => false,
+            }
+        else
+            false;
+        if (wrap_outer) try repl_buf.append(checker.allocator, '(');
+        try repl_buf.appendSlice(checker.allocator, "if ");
+        try repl_buf.appendSlice(checker.allocator, scrut_raw);
+        if (need_deref) try repl_buf.appendSlice(checker.allocator, ".*");
+        try repl_buf.appendSlice(checker.allocator, " => ");
+        try repl_buf.appendSlice(checker.allocator, t_str);
+        try repl_buf.appendSlice(checker.allocator, " else ");
+        try repl_buf.appendSlice(checker.allocator, f_str);
+        if (wrap_outer) try repl_buf.append(checker.allocator, ')');
+    } else {
+        const t_blk_sp = getCstSubtreeSpan(
+            checker.file_id,
+            checker.cst_arena,
+            checker.token_buffer,
+            checker.ast_arena.getCstOrigin(true_body_id),
+        ) orelse return false;
+        const f_blk_sp = getCstSubtreeSpan(
+            checker.file_id,
+            checker.cst_arena,
+            checker.token_buffer,
+            checker.ast_arena.getCstOrigin(false_body_id),
+        ) orelse return false;
+        const t_raw = std.mem.trim(u8, checker.source[t_blk_sp.start_byte..t_blk_sp.end_byte], " \t\r\n");
+        const f_raw = std.mem.trim(u8, checker.source[f_blk_sp.start_byte..f_blk_sp.end_byte], " \t\r\n");
+
+        try repl_buf.appendSlice(checker.allocator, "if ");
+        try repl_buf.appendSlice(checker.allocator, scrut_raw);
+        if (need_deref) try repl_buf.appendSlice(checker.allocator, ".*");
+        if (checker.ast_arena.getNode(true_body_id).tag == .block) {
+            try repl_buf.append(checker.allocator, ' ');
+            try repl_buf.appendSlice(checker.allocator, t_raw);
+        } else {
+            try repl_buf.appendSlice(checker.allocator, " { ");
+            try repl_buf.appendSlice(checker.allocator, t_raw);
+            if (match_ty == .unit_ty and t_raw.len > 0 and t_raw[t_raw.len - 1] != ';') {
+                try repl_buf.append(checker.allocator, ';');
+            }
+            try repl_buf.appendSlice(checker.allocator, " }");
+        }
+        try repl_buf.appendSlice(checker.allocator, " else ");
+        if (checker.ast_arena.getNode(false_body_id).tag == .block) {
+            try repl_buf.appendSlice(checker.allocator, f_raw);
+        } else {
+            try repl_buf.appendSlice(checker.allocator, "{ ");
+            try repl_buf.appendSlice(checker.allocator, f_raw);
+            if (match_ty == .unit_ty and f_raw.len > 0 and f_raw[f_raw.len - 1] != ';') {
+                try repl_buf.append(checker.allocator, ';');
+            }
+            try repl_buf.appendSlice(checker.allocator, " }");
+        }
+    }
+
+    try emitAuditLintWarning(
+        sink_opt,
+        .w0409_simplifiable_match,
+        .machine_applicable,
+        match_span,
+        "2-arm `match` on `bool` can be written directly as an `if` / `else` expression",
+        "simplify `bool` `match` to `if` / `else`",
+        "rewrite `bool` `match` as `if` / `else`",
+        &.{.{
+            .file_id = checker.file_id,
+            .start_byte = match_span.start_byte,
+            .end_byte = match_span.end_byte,
+            .replacement_id = try checker.interner.intern(repl_buf.items),
+        }},
+    );
+    return true;
+}
+
+/// Runs `W0410` > `W0409` (`Ruling 4.1 #2`) on `match_ast_id`, marking `suppressed_headers` when matched.
+fn lintMatchHierarchy(
+    checker: *TypeChecker,
+    match_ast_id: NodeIndex,
+    match_cst: CstNodeIndex,
+    parent_cst: CstNodeIndex,
+    enclosing_fn_ret_ty: TypeId,
+    is_inside_defer: bool,
+    suppressed_headers: *std.AutoHashMapUnmanaged(u32, void),
+    sink_opt: ?*DiagnosticSink,
+) !void {
+    if (match_cst.isNone() or suppressed_headers.contains(match_cst.asInt())) return;
+    if (try lintManualOrelseOrTryW0410(
+        checker,
+        match_ast_id,
+        match_cst,
+        parent_cst,
+        enclosing_fn_ret_ty,
+        is_inside_defer,
+        sink_opt,
+    )) {
+        try suppressed_headers.put(checker.allocator, match_cst.asInt(), {});
+        return;
+    }
+    if (try lintTwoArmMatchToIfIs(checker, match_ast_id, sink_opt)) {
+        try suppressed_headers.put(checker.allocator, match_cst.asInt(), {});
+        return;
+    }
+    if (try lintTwoArmBoolMatchW0409(checker, match_ast_id, match_cst, parent_cst, sink_opt)) {
+        try suppressed_headers.put(checker.allocator, match_cst.asInt(), {});
+    }
 }
 
 /// Extracts `BoolReturnBranchInfo` when `block_ast_id` is a single-statement `{ return true/false; }` block.
@@ -2241,7 +3394,6 @@ fn lintBoolReturnIfElse(
         checker.token_buffer,
         if_cst,
     ) orelse return false;
-    if (isW0202SuppressedAtSpan(checker, if_span)) return true;
 
     var clean_cond_cst = cond_cst;
     if (!cond_cst.isNone()) {
@@ -2279,8 +3431,10 @@ fn lintBoolReturnIfElse(
         try repl_buf.append(checker.allocator, ';');
     }
 
-    try emitIdiomWarning(
+    try emitAuditLintWarning(
         sink_opt,
+        .w0407_needless_bool_branch,
+        .machine_applicable,
         if_span,
         "redundant `if … { return true; } else { return false; }`; return the boolean expression directly",
         "simplify boolean `return` branch",
@@ -2396,7 +3550,6 @@ fn lintBoolValueIfElse(
     if (hasIsBindingInExprAst(checker, cond_id, 0)) return false;
 
     const if_span = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, if_cst) orelse return false;
-    if (isW0202SuppressedAtSpan(checker, if_span)) return true;
 
     var clean_cond_cst = cond_cst;
     if (!cond_cst.isNone()) {
@@ -2444,8 +3597,10 @@ fn lintBoolValueIfElse(
         if (wrap_outer) try repl_buf.append(checker.allocator, ')');
     }
 
-    try emitIdiomWarning(
+    try emitAuditLintWarning(
         sink_opt,
+        .w0407_needless_bool_branch,
+        .machine_applicable,
         if_span,
         "redundant boolean `if`/`else` expression; use the boolean condition directly",
         "simplify redundant boolean `if`/`else`",
@@ -2458,6 +3613,357 @@ fn lintBoolValueIfElse(
         }},
     );
     return true;
+}
+
+/// Returns `true` if `block_cst` carries `@attr`, `unsafe`, or `async` modifiers.
+fn hasBlockModifiersOrAttrsCst(checker: *const TypeChecker, block_cst: CstNodeIndex) bool {
+    if (block_cst.isNone() or block_cst.asInt() >= checker.cst_arena.countNodes()) return true;
+    if (hasLeadingCstAttribute(checker, block_cst, false)) return true;
+    const start_idx: usize = block_cst.asInt();
+    const rec = checker.cst_arena.getNode(block_cst);
+    const end_idx: usize = @min(start_idx + @max(@as(usize, rec.subtree_size), 1), checker.cst_arena.countNodes());
+    var cur: usize = start_idx + 1;
+    while (cur < end_idx) : (cur += 1) {
+        const sub = checker.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+        if (sub.subtree_size > 1) break;
+        if (!sub.token.isNone() and sub.token.asInt() < checker.token_buffer.countTokens()) {
+            const tk = checker.token_buffer.getToken(sub.token).kind;
+            if (tk == .kw_unsafe or tk == .kw_async) return true;
+            if (tk == .lbrace) break;
+        }
+    }
+    return false;
+}
+
+/// Collects bound identifier names in `cond_id` (`is` pattern bindings and `:=` walrus bindings) into `names_out`,
+/// returning `false` on duplicate names (`W0408` binding-shadow guard).
+fn collectUniqueCondBoundNames(
+    checker: *const TypeChecker,
+    cond_id: NodeIndex,
+    names_out: *std.ArrayListUnmanaged([]const u8),
+    depth: u32,
+) !bool {
+    if (depth > 32 or cond_id.isNone() or cond_id.asInt() >= checker.ast_arena.countNodes()) return true;
+    const node = checker.ast_arena.getNode(cond_id);
+    switch (node.tag) {
+        .walrus_expr, .bind_pat, .at_pat => {
+            if (cond_id.asInt() < checker.node_symbols.len) {
+                const sym_idx = checker.node_symbols[cond_id.asInt()];
+                if (!sym_idx.isNone() and sym_idx.asInt() < checker.sym_table.countSymbols()) {
+                    const sym = checker.sym_table.getSymbol(sym_idx).*;
+                    if ((sym.kind == .local_let_sym or sym.kind == .local_var_sym) and
+                        sym.name_text.len > 0 and !std.mem.eql(u8, sym.name_text, "_"))
+                    {
+                        for (names_out.items) |prev_name| {
+                            if (std.mem.eql(u8, prev_name, sym.name_text)) return false;
+                        }
+                        try names_out.append(checker.allocator, sym.name_text);
+                    }
+                }
+            }
+        },
+        else => {},
+    }
+    if (node.lhs.tag == .node) {
+        if (!(try collectUniqueCondBoundNames(checker, NodeIndex.fromInt(node.lhs.payload), names_out, depth + 1))) {
+            return false;
+        }
+    }
+    if (node.rhs.tag == .node) {
+        if (!(try collectUniqueCondBoundNames(checker, NodeIndex.fromInt(node.rhs.payload), names_out, depth + 1))) {
+            return false;
+        }
+    }
+    if (node.lhs.tag == .extra) {
+        for (checker.getNodeExtraSlice(cond_id, false)) |sub_raw| {
+            if (!(try collectUniqueCondBoundNames(checker, NodeIndex.fromInt(sub_raw), names_out, depth + 1))) {
+                return false;
+            }
+        }
+    }
+    if (node.rhs.tag == .extra and node.lhs.tag != .extra) {
+        for (checker.getNodeExtraSlice(cond_id, true)) |sub_raw| {
+            if (!(try collectUniqueCondBoundNames(checker, NodeIndex.fromInt(sub_raw), names_out, depth + 1))) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// Returns `true` if `expr_id` invokes a call/method returning a non-`Copy` (`AutoDrop` / `@linear`) rvalue temporary.
+fn hasNonCopyTempCallInCondAst(checker: *const TypeChecker, expr_id: NodeIndex, depth: u32) bool {
+    if (depth > 32 or expr_id.isNone() or expr_id.asInt() >= checker.ast_arena.countNodes()) return true;
+    const node = checker.ast_arena.getNode(expr_id);
+    if (node.tag == .call_expr or node.tag == .generic_call or node.tag == .method_call or node.tag == .struct_lit) {
+        const res_ty = getRecordedNodeType(checker, expr_id);
+        if (res_ty.isError() or !checker.isCopyType(res_ty)) return true;
+    }
+    if (node.lhs.tag == .node and hasNonCopyTempCallInCondAst(checker, NodeIndex.fromInt(node.lhs.payload), depth + 1)) {
+        return true;
+    }
+    if (node.rhs.tag == .node and hasNonCopyTempCallInCondAst(checker, NodeIndex.fromInt(node.rhs.payload), depth + 1)) {
+        return true;
+    }
+    if (node.lhs.tag == .extra) {
+        for (checker.getNodeExtraSlice(expr_id, false)) |sub_raw| {
+            if (hasNonCopyTempCallInCondAst(checker, NodeIndex.fromInt(sub_raw), depth + 1)) return true;
+        }
+    }
+    if (node.rhs.tag == .extra and node.lhs.tag != .extra) {
+        for (checker.getNodeExtraSlice(expr_id, true)) |sub_raw| {
+            if (hasNonCopyTempCallInCondAst(checker, NodeIndex.fromInt(sub_raw), depth + 1)) return true;
+        }
+    }
+    return false;
+}
+
+/// `W0408`: Lints collapsible nested `if a { if b { … } }` -> `if a and b { … }` and `else { if b … }` -> `else if b …`.
+fn lintCollapsibleIfAst(
+    checker: *TypeChecker,
+    root_if_ast: NodeIndex,
+    root_if_cst: CstNodeIndex,
+    parent_cst: CstNodeIndex,
+    suppressed_headers: *std.AutoHashMapUnmanaged(u32, void),
+    sink_opt: ?*DiagnosticSink,
+) !bool {
+    if (root_if_ast.isNone() or root_if_ast.asInt() >= checker.ast_arena.countNodes()) return false;
+    if (root_if_cst.isNone() or hasSyntaxErrorInSubtree(checker.cst_arena, checker.token_buffer, root_if_cst)) return false;
+
+    // Skip `comptime if …` so inner runtime `if` guards are never hoisted into a `comptime` condition:
+    if (!parent_cst.isNone() and parent_cst.asInt() < checker.cst_arena.countNodes() and
+        checker.cst_arena.getNode(parent_cst).kind == .prefix_expr)
+    {
+        const prefix_tok = findFirstRealTokenInSubtree(checker.cst_arena, checker.token_buffer, parent_cst);
+        if (!prefix_tok.isNone() and checker.token_buffer.getToken(prefix_tok).kind == .kw_comptime) return false;
+    }
+
+    const root_node = checker.ast_arena.getNode(root_if_ast);
+    if (root_node.tag != .if_expr or root_node.lhs.tag != .node) return false;
+
+    // Form A: `if a { if b { body } }` (both without `else`), unrolling maximal chain `2..8`:
+    if (root_node.rhs.tag == .node) {
+        var cond_nodes: [8]NodeIndex = undefined;
+        var if_csts: [8]CstNodeIndex = undefined;
+        var chain_len: usize = 0;
+        var cur_if_ast = root_if_ast;
+        var innermost_body_ast: NodeIndex = .none;
+
+        while (!cur_if_ast.isNone() and chain_len < cond_nodes.len) {
+            const cur_if = checker.ast_arena.getNode(cur_if_ast);
+            if (cur_if.tag != .if_expr or cur_if.lhs.tag != .node or cur_if.rhs.tag != .node) break;
+            const cur_if_cst = checker.ast_arena.getCstOrigin(cur_if_ast);
+            if (cur_if_cst.isNone() or (chain_len > 0 and hasLeadingCstAttribute(checker, cur_if_cst, false))) break;
+
+            cond_nodes[chain_len] = NodeIndex.fromInt(cur_if.lhs.payload);
+            if_csts[chain_len] = cur_if_cst;
+            chain_len += 1;
+
+            const body_id = NodeIndex.fromInt(cur_if.rhs.payload);
+            innermost_body_ast = body_id;
+            if (body_id.isNone() or body_id.asInt() >= checker.ast_arena.countNodes()) break;
+            const body_node = checker.ast_arena.getNode(body_id);
+            if (body_node.tag != .block) break;
+            const body_cst = checker.ast_arena.getCstOrigin(body_id);
+            if (hasBlockModifiersOrAttrsCst(checker, body_cst)) break;
+
+            const stmts = if (body_node.lhs.tag == .extra) checker.getNodeExtraSlice(body_id, false) else &[_]u32{};
+            const single_child_id: NodeIndex = if (stmts.len == 1 and body_node.rhs.isNone())
+                NodeIndex.fromInt(stmts[0])
+            else if (stmts.len == 0 and body_node.rhs.tag == .node)
+                NodeIndex.fromInt(body_node.rhs.payload)
+            else
+                break;
+
+            if (single_child_id.isNone() or single_child_id.asInt() >= checker.ast_arena.countNodes()) break;
+            const next_node = checker.ast_arena.getNode(single_child_id);
+            if (next_node.tag != .if_expr or next_node.rhs.tag != .node) break;
+            const next_cst = checker.ast_arena.getCstOrigin(single_child_id);
+            if (hasLeadingCstAttribute(checker, next_cst, false)) break;
+            cur_if_ast = single_child_id;
+        }
+
+        if (chain_len >= 2 and !innermost_body_ast.isNone()) {
+            var bound_names: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer bound_names.deinit(checker.allocator);
+            var is_sound_chain = true;
+            for (cond_nodes[0..chain_len], 0..) |c_id, ci| {
+                if (!(try collectUniqueCondBoundNames(checker, c_id, &bound_names, 0))) {
+                    is_sound_chain = false;
+                    break;
+                }
+                if (ci + 1 < chain_len and hasNonCopyTempCallInCondAst(checker, c_id, 0)) {
+                    is_sound_chain = false;
+                    break;
+                }
+            }
+
+            const outer_span = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, root_if_cst) orelse
+                return false;
+            const inner_body_cst = checker.ast_arena.getCstOrigin(innermost_body_ast);
+            const inner_body_span = getCstSubtreeSpan(
+                checker.file_id,
+                checker.cst_arena,
+                checker.token_buffer,
+                inner_body_cst,
+            ) orelse return false;
+
+            if (is_sound_chain and
+                !hasCommentsInByteRange(checker.source, checker.token_buffer, outer_span.start_byte, inner_body_span.start_byte) and
+                !hasCommentsInByteRange(checker.source, checker.token_buffer, inner_body_span.end_byte, outer_span.end_byte))
+            {
+                var repl_buf: std.ArrayListUnmanaged(u8) = .empty;
+                defer repl_buf.deinit(checker.allocator);
+                try repl_buf.appendSlice(checker.allocator, "if ");
+
+                for (cond_nodes[0..chain_len], 0..) |c_id, ci| {
+                    if (ci > 0) try repl_buf.appendSlice(checker.allocator, " and ");
+                    const base_c_cst = checker.ast_arena.getCstOrigin(c_id);
+                    var clean_c_cst = findEnclosingGroupingParenInScope(checker, if_csts[ci], base_c_cst);
+                    if (try matchRedundantOuterParenCst(checker, clean_c_cst)) |unw| {
+                        clean_c_cst = unw.inner_cst;
+                    }
+                    const c_sp = getCstSubtreeSpan(
+                        checker.file_id,
+                        checker.cst_arena,
+                        checker.token_buffer,
+                        clean_c_cst,
+                    ) orelse return false;
+                    const c_txt = std.mem.trim(u8, checker.source[c_sp.start_byte..c_sp.end_byte], " \t\r\n");
+                    const c_node = checker.ast_arena.getNode(c_id);
+                    const need_and_parens = (c_node.tag == .binary_expr and !c_node.main_token.isNone() and
+                        (checker.token_buffer.getToken(c_node.main_token).kind == .kw_or or
+                            checker.token_buffer.getToken(c_node.main_token).kind == .pipepipe)) or
+                        c_node.tag == .if_expr or c_node.tag == .closure_expr or
+                        (c_node.tag == .walrus_expr and (c_txt.len == 0 or c_txt[0] != '(')) or
+                        (hasStructLitOrBlockInSubtree(checker.cst_arena, checker.token_buffer, clean_c_cst) and
+                            (c_txt.len == 0 or c_txt[0] != '('));
+                    if (need_and_parens) try repl_buf.append(checker.allocator, '(');
+                    try repl_buf.appendSlice(checker.allocator, c_txt);
+                    if (need_and_parens) try repl_buf.append(checker.allocator, ')');
+                }
+                try repl_buf.append(checker.allocator, ' ');
+                try repl_buf.appendSlice(checker.allocator, checker.source[inner_body_span.start_byte..inner_body_span.end_byte]);
+
+                for (if_csts[0..chain_len]) |icst| {
+                    try suppressed_headers.put(checker.allocator, icst.asInt(), {});
+                }
+                try emitAuditLintWarning(
+                    sink_opt,
+                    .w0408_collapsible_if,
+                    .machine_applicable,
+                    outer_span,
+                    "nested `if` statements without `else` can be collapsed using `and` (`AGENTS.md` §6)",
+                    "collapse nested `if` conditions with `and`",
+                    "collapse nested `if` statements with `and`",
+                    &.{.{
+                        .file_id = checker.file_id,
+                        .start_byte = outer_span.start_byte,
+                        .end_byte = outer_span.end_byte,
+                        .replacement_id = try checker.interner.intern(repl_buf.items),
+                    }},
+                );
+                return true;
+            }
+        }
+    }
+
+    // Form B: Walk `if / else if` chain for trailing `else { if b … }` -> `else if b …`:
+    var cur_if_ast = root_if_ast;
+    var walk_steps: usize = 0;
+    while (!cur_if_ast.isNone() and cur_if_ast.asInt() < checker.ast_arena.countNodes() and walk_steps < 64) : (walk_steps += 1) {
+        const cur_node = checker.ast_arena.getNode(cur_if_ast);
+        if (cur_node.tag != .if_expr or cur_node.rhs.tag != .extra) break;
+        const branches = checker.getNodeExtraSlice(cur_if_ast, true);
+        if (branches.len != 2) break;
+        const else_id = NodeIndex.fromInt(branches[1]);
+        if (else_id.isNone() or else_id.asInt() >= checker.ast_arena.countNodes()) break;
+        const else_node = checker.ast_arena.getNode(else_id);
+        if (else_node.tag == .if_expr) {
+            cur_if_ast = else_id;
+            continue;
+        }
+        if (else_node.tag != .block) break;
+        const else_blk_cst = checker.ast_arena.getCstOrigin(else_id);
+        if (hasBlockModifiersOrAttrsCst(checker, else_blk_cst)) break;
+
+        const e_stmts = if (else_node.lhs.tag == .extra) checker.getNodeExtraSlice(else_id, false) else &[_]u32{};
+        const inner_if_id: NodeIndex = if (e_stmts.len == 1 and else_node.rhs.isNone())
+            NodeIndex.fromInt(e_stmts[0])
+        else if (e_stmts.len == 0 and else_node.rhs.tag == .node)
+            NodeIndex.fromInt(else_node.rhs.payload)
+        else
+            break;
+        if (inner_if_id.isNone() or inner_if_id.asInt() >= checker.ast_arena.countNodes()) break;
+        if (checker.ast_arena.getNode(inner_if_id).tag != .if_expr) break;
+
+        const inner_if_cst = checker.ast_arena.getCstOrigin(inner_if_id);
+        if (hasLeadingCstAttribute(checker, inner_if_cst, false)) break;
+        if (isFatArrowIfCstNode(checker.cst_arena, checker.token_buffer, inner_if_cst)) break;
+
+        const cur_if_cst = checker.ast_arena.getCstOrigin(cur_if_ast);
+        if (isFatArrowIfCstNode(checker.cst_arena, checker.token_buffer, cur_if_cst)) break;
+
+        const else_blk_span = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, else_blk_cst) orelse break;
+        const inner_if_span = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, inner_if_cst) orelse break;
+        if (inner_if_span.start_byte <= else_blk_span.start_byte or inner_if_span.end_byte >= else_blk_span.end_byte) break;
+
+        // Locate the `else` keyword token immediately preceding `else_blk_span.start_byte`:
+        var else_kw_end: ?u32 = null;
+        if (!cur_if_cst.isNone()) {
+            const c_start: usize = cur_if_cst.asInt();
+            const c_rec = checker.cst_arena.getNode(cur_if_cst);
+            const c_end: usize = @min(c_start + @max(@as(usize, c_rec.subtree_size), 1), checker.cst_arena.countNodes());
+            var c_cur: usize = c_start + 1;
+            while (c_cur < c_end) : (c_cur += 1) {
+                const sub = checker.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(c_cur)));
+                if (sub.subtree_size <= 1 and !sub.token.isNone() and
+                    sub.token.asInt() < checker.token_buffer.countTokens() and
+                    checker.token_buffer.getToken(sub.token).kind == .kw_else)
+                {
+                    const kw_sp = checker.token_buffer.getTokenSpan(checker.file_id, sub.token);
+                    if (kw_sp.end_byte <= else_blk_span.start_byte) {
+                        else_kw_end = kw_sp.end_byte;
+                    }
+                }
+            }
+        }
+        const kw_end = else_kw_end orelse break;
+        if (hasCommentsInByteRange(checker.source, checker.token_buffer, kw_end, inner_if_span.start_byte) or
+            hasCommentsInByteRange(checker.source, checker.token_buffer, inner_if_span.end_byte, else_blk_span.end_byte))
+        {
+            break;
+        }
+
+        const primary_span = Span.init(checker.file_id, kw_end - 4, else_blk_span.end_byte);
+        const edits = [2]TextEdit{
+            .{
+                .file_id = checker.file_id,
+                .start_byte = kw_end,
+                .end_byte = inner_if_span.start_byte,
+                .replacement_id = try checker.interner.intern(" "),
+            },
+            .{
+                .file_id = checker.file_id,
+                .start_byte = inner_if_span.end_byte,
+                .end_byte = else_blk_span.end_byte,
+                .replacement_id = .empty,
+            },
+        };
+        try suppressed_headers.put(checker.allocator, root_if_cst.asInt(), {});
+        try emitAuditLintWarning(
+            sink_opt,
+            .w0408_collapsible_if,
+            .machine_applicable,
+            primary_span,
+            "`else { if … }` block can be flattened to `else if …` (`AGENTS.md` §6)",
+            "collapse `else { if … }` into `else if …`",
+            "rewrite `else { if … }` as `else if …`",
+            &edits,
+        );
+        return true;
+    }
+    return false;
 }
 
 /// Returns `true` when `expr_id` is a pure side-effect-free syntactic scrutinee (`ident`, `self`, field, index, deref).
@@ -2883,9 +4389,12 @@ fn lintConditionalIfHierarchy(
     const root_if_ast = checker.cst_to_ast[root_if_cst.asInt()];
     if (root_if_ast.isNone() or root_if_ast.asInt() >= checker.ast_arena.countNodes()) return;
 
-    // [0] Value boolean simplification (`if cond { true } else { false }` / `if cond => true else false`):
+    // [0] `W0407` > `W0408` > `W0202` priority order (`Ruling 4.1 #1`):
     if (try lintBoolValueIfElse(checker, root_if_ast, root_if_cst, parent_cst, sink_opt)) {
         try suppressed_headers.put(checker.allocator, root_if_cst.asInt(), {});
+        return;
+    }
+    if (try lintCollapsibleIfAst(checker, root_if_ast, root_if_cst, parent_cst, suppressed_headers, sink_opt)) {
         return;
     }
 
@@ -2987,7 +4496,6 @@ fn lintConditionalIfHierarchy(
             for (chain_csts.items) |c_cst| {
                 try suppressed_headers.put(checker.allocator, c_cst.asInt(), {});
             }
-            if (isW0202SuppressedAtSpan(checker, if_span)) return;
 
             if (has_interior_comments) {
                 try emitIdiomWarning(
@@ -3214,7 +4722,6 @@ fn lintConditionalIfHierarchy(
                     for (chain_csts.items) |c_cst| {
                         try suppressed_headers.put(checker.allocator, c_cst.asInt(), {});
                     }
-                    if (isW0202SuppressedAtSpan(checker, if_span)) return;
 
                     var arrow_buf: std.ArrayListUnmanaged(u8) = .empty;
                     defer arrow_buf.deinit(checker.allocator);
@@ -3295,7 +4802,6 @@ fn lintConditionalIfHierarchy(
             for (chain_csts.items) |c_cst| {
                 try suppressed_headers.put(checker.allocator, c_cst.asInt(), {});
             }
-            if (isW0202SuppressedAtSpan(checker, if_span)) return;
 
             if (has_interior_comments) {
                 try emitIdiomWarning(
@@ -3368,53 +4874,580 @@ fn isCfgGateableItemCstKind(kind: CstNodeKind) bool {
     };
 }
 
-/// Walks AST statements inside `block_ast_id` to lint statement-position Idioms 5 and 6, recording
-/// suppressed header `CstNodeIndex` nodes in `suppressed_headers` to prevent duplicate Idiom 1 hits.
-fn lintBlockStatementsAst(
-    checker: *TypeChecker,
-    block_ast_id: NodeIndex,
-    suppressed_headers: *std.AutoHashMapUnmanaged(u32, void),
-    sink_opt: ?*DiagnosticSink,
-) !void {
-    if (block_ast_id.isNone() or block_ast_id.asInt() >= checker.ast_arena.countNodes()) return;
-    const block_node = checker.ast_arena.getNode(block_ast_id);
-    if (block_node.tag != .block) return;
+/// Per-callable body context threaded through `walkAndLintCstSubtree` and `lintBlockStatementsAst`.
+const BodyAuditContext = struct {
+    /// Return `TypeId` of the innermost enclosing `fn_decl`, `test_decl`, `bench_decl`, or `closure_expr`.
+    callable_ret_ty: TypeId = .err_ty,
+    /// Root `.block` `NodeIndex` of the innermost enclosing callable body (`.none` otherwise).
+    callable_root_block: NodeIndex = .none,
+    /// `true` when inside a `defer` or `errdefer` block (`W0410` `?` and `W0411` guard).
+    is_inside_defer: bool = false,
+    /// `true` when an enclosing scope in the active callable already introduced a `defer`/`errdefer` or `AutoDrop` local.
+    has_enclosing_drop_or_defer: bool = false,
+    /// Set of `.return_stmt` `NodeIndex.asInt()` handles already fused by `W0411` (`Ruling 4.1 #3`).
+    fused_tail_returns: *std.AutoHashMapUnmanaged(u32, void),
+};
 
-    if (block_node.lhs.tag == .extra) {
-        for (checker.getNodeExtraSlice(block_ast_id, false)) |raw_stmt| {
-            const stmt_id = NodeIndex.fromInt(raw_stmt);
-            if (stmt_id.isNone() or stmt_id.asInt() >= checker.ast_arena.countNodes()) continue;
-            const stmt_tag = checker.ast_arena.getNode(stmt_id).tag;
-            if (stmt_tag == .match_expr) {
-                if (try lintTwoArmMatchToIfIs(checker, stmt_id, sink_opt)) {
-                    const m_cst = checker.ast_arena.getCstOrigin(stmt_id);
-                    if (!m_cst.isNone()) try suppressed_headers.put(checker.allocator, m_cst.asInt(), {});
-                }
-            } else if (stmt_tag == .if_expr) {
-                if (try lintBoolReturnIfElse(checker, stmt_id, sink_opt)) {
-                    const i_cst = checker.ast_arena.getCstOrigin(stmt_id);
-                    if (!i_cst.isNone()) try suppressed_headers.put(checker.allocator, i_cst.asInt(), {});
-                }
+/// Returns `true` if `decl_id` (`local_var_decl`) binds any non-`Copy` (`AutoDrop` / `@linear`) local variable.
+fn localDeclHasNonCopyBinding(checker: *const TypeChecker, decl_id: NodeIndex) bool {
+    if (decl_id.isNone() or decl_id.asInt() >= checker.ast_arena.countNodes()) return false;
+    const decl_node = checker.ast_arena.getNode(decl_id);
+    if (decl_node.tag != .local_var_decl or decl_node.lhs.tag != .node) return false;
+    const pat_id = NodeIndex.fromInt(decl_node.lhs.payload);
+    if (pat_id.isNone() or pat_id.asInt() >= checker.node_symbols.len) return false;
+    const sym_idx = checker.node_symbols[pat_id.asInt()];
+    if (!sym_idx.isNone() and sym_idx.asInt() < checker.sym_table.countSymbols()) {
+        const ty = checker.sym_table.getSymbol(sym_idx).type_id;
+        return ty.isError() or !checker.isCopyType(ty);
+    }
+    const rhs_ty = if (decl_node.rhs.tag == .node)
+        getRecordedNodeType(checker, NodeIndex.fromInt(decl_node.rhs.payload))
+    else
+        .err_ty;
+    return rhs_ty.isError() or !checker.isCopyType(rhs_ty);
+}
+
+/// Counts `\n` line breaks inside `text`.
+fn countNewlinesInSlice(text: []const u8) usize {
+    var count: usize = 0;
+    for (text) |ch_b| {
+        if (ch_b == '\n') count += 1;
+    }
+    return count;
+}
+
+/// Validated `let tmp = expr;` candidate for `W0411` (`single-use-temp`).
+const ValidSingleUseLetInfo = struct {
+    sym_idx: SymbolIndex,
+    init_id: NodeIndex,
+    init_cst: CstNodeIndex,
+    let_span: Span,
+    init_span: Span,
+    init_slice: []const u8,
+};
+
+/// Validates `stmt_id` as an inlineable `let tmp = expr;` (`< 4` lines, read count `1`, zero coercion).
+fn extractSingleUseLetCandidate(
+    checker: *const TypeChecker,
+    stmt_id: NodeIndex,
+) ?ValidSingleUseLetInfo {
+    if (stmt_id.isNone() or stmt_id.asInt() >= checker.ast_arena.countNodes()) return null;
+    const decl_node = checker.ast_arena.getNode(stmt_id);
+    if (decl_node.tag != .local_var_decl or decl_node.main_token.isNone()) return null;
+    if (checker.token_buffer.getToken(decl_node.main_token).kind != .kw_let) return null;
+    if (decl_node.main_token.asInt() + 1 < checker.token_buffer.countTokens() and
+        checker.token_buffer.getToken(TokenIndex.fromInt(decl_node.main_token.asInt() + 1)).kind == .kw_mut)
+    {
+        return null;
+    }
+    if (decl_node.lhs.tag != .node or decl_node.rhs.tag != .node) return null;
+
+    const decl_cst = checker.ast_arena.getCstOrigin(stmt_id);
+    if (decl_cst.isNone() or hasSyntaxErrorInSubtree(checker.cst_arena, checker.token_buffer, decl_cst)) return null;
+    if (hasLeadingCstAttribute(checker, decl_cst, false)) return null;
+
+    const pat_id = NodeIndex.fromInt(decl_node.lhs.payload);
+    const init_id = NodeIndex.fromInt(decl_node.rhs.payload);
+    if (pat_id.isNone() or init_id.isNone() or
+        pat_id.asInt() >= checker.ast_arena.countNodes() or
+        init_id.asInt() >= checker.ast_arena.countNodes())
+    {
+        return null;
+    }
+    if (checker.ast_arena.getNode(pat_id).tag != .bind_pat) return null;
+    const pat_cst = checker.ast_arena.getCstOrigin(pat_id);
+    if (hasRefModifierInPatCst(checker, pat_cst)) return null;
+
+    // Inspect `decl_cst` for `let … else` or explicit `: Type` coercion:
+    var has_colon_before_eq = false;
+    var has_eq_tok = false;
+    {
+        const start_i: usize = decl_cst.asInt();
+        const rec = checker.cst_arena.getNode(decl_cst);
+        const end_i: usize = @min(start_i + @max(@as(usize, rec.subtree_size), 1), checker.cst_arena.countNodes());
+        var cur: usize = start_i + 1;
+        while (cur < end_i) : (cur += 1) {
+            const sub = checker.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+            if (sub.kind == .let_else_branch) return null;
+            if (sub.subtree_size <= 1 and !sub.flags.is_bracketed and !sub.token.isNone() and
+                sub.token.asInt() < checker.token_buffer.countTokens())
+            {
+                const tk = checker.token_buffer.getToken(sub.token).kind;
+                if (tk == .colon and !has_eq_tok) has_colon_before_eq = true;
+                if (tk == .eq and !has_eq_tok) has_eq_tok = true;
             }
         }
     }
+    if (!has_eq_tok or has_colon_before_eq) return null;
+
+    if (pat_id.asInt() >= checker.node_symbols.len) return null;
+    const sym_idx = checker.node_symbols[pat_id.asInt()];
+    if (sym_idx.isNone() or sym_idx.asInt() >= checker.sym_table.countSymbols()) return null;
+    const sym = checker.sym_table.getSymbol(sym_idx).*;
+    if (sym.name_text.len == 0 or sym.name_text[0] == '_' or sym.flags.is_mut or sym.flags.is_mutated) return null;
+    if (sym.type_id.isError() or checker.getLocalReadCount(sym_idx) != 1) return null;
+
+    const init_node = checker.ast_arena.getNode(init_id);
+    switch (init_node.tag) {
+        .block, .with_expr, .loop_expr, .for_stmt, .while_stmt, .match_expr => return null,
+        .if_expr => {
+            if (!isFatArrowIfCstNode(checker.cst_arena, checker.token_buffer, checker.ast_arena.getCstOrigin(init_id))) {
+                return null;
+            }
+        },
+        else => {},
+    }
+
+    const let_span = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, decl_cst) orelse return null;
+    const init_cst = checker.ast_arena.getCstOrigin(init_id);
+    const init_span = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, init_cst) orelse return null;
+    if (init_span.start_byte <= let_span.start_byte or init_span.end_byte > let_span.end_byte) return null;
+
+    const init_slice = std.mem.trim(u8, checker.source[init_span.start_byte..init_span.end_byte], " \t\r\n");
+    if (init_slice.len == 0 or countNewlinesInSlice(init_slice) >= 3) return null;
+
+    return .{
+        .sym_idx = sym_idx,
+        .init_id = init_id,
+        .init_cst = init_cst,
+        .let_span = let_span,
+        .init_span = init_span,
+        .init_slice = init_slice,
+    };
+}
+
+/// Finds the leftmost `x is [not] Pat` condition in `cond_id` whose scrutinee is `.ident_expr` resolving to `target_sym`.
+fn findLeadingIsScrutineeForSym(
+    checker: *const TypeChecker,
+    cond_id: NodeIndex,
+    target_sym: SymbolIndex,
+    depth: u32,
+) ?struct { scrut_id: NodeIndex, pat_id: NodeIndex } {
+    if (depth > 16 or cond_id.isNone() or cond_id.asInt() >= checker.ast_arena.countNodes()) return null;
+    const node = checker.ast_arena.getNode(cond_id);
+    if (node.tag == .tuple_lit) {
+        const elems = checker.getNodeExtraSlice(cond_id, false);
+        if (elems.len == 1) {
+            return findLeadingIsScrutineeForSym(checker, NodeIndex.fromInt(elems[0]), target_sym, depth + 1);
+        }
+        return null;
+    }
+    const is_is_op = node.tag == .is_expr or
+        (node.tag == .binary_expr and !node.main_token.isNone() and
+            checker.token_buffer.getToken(node.main_token).kind == .kw_is);
+    if (is_is_op and node.lhs.tag == .node and node.rhs.tag == .node) {
+        const scrut_id = NodeIndex.fromInt(node.lhs.payload);
+        const pat_id = NodeIndex.fromInt(node.rhs.payload);
+        if (checker.ast_arena.getNode(scrut_id).tag == .ident_expr and
+            scrut_id.asInt() < checker.node_symbols.len and
+            checker.node_symbols[scrut_id.asInt()] == target_sym)
+        {
+            return .{ .scrut_id = scrut_id, .pat_id = pat_id };
+        }
+        return null;
+    }
+    if (node.tag == .binary_expr and !node.main_token.isNone() and
+        checker.token_buffer.getToken(node.main_token).kind == .kw_and and
+        node.lhs.tag == .node)
+    {
+        return findLeadingIsScrutineeForSym(checker, NodeIndex.fromInt(node.lhs.payload), target_sym, depth + 1);
+    }
+    return null;
+}
+
+/// Walks AST statements inside `block_ast_id` to lint statement-position `W0407`, `W0408`, `W0409`, `W0410`, and `W0411`
+/// (with `W0209` 1-pass tail fusion per `Ruling 4.1 #3`), recording `suppressed_headers` to prevent duplicate `W0202` hits.
+fn lintBlockStatementsAst(
+    checker: *TypeChecker,
+    block_ast_id: NodeIndex,
+    body_ctx: BodyAuditContext,
+    suppressed_headers: *std.AutoHashMapUnmanaged(u32, void),
+    sink_opt: ?*DiagnosticSink,
+) !bool {
+    if (block_ast_id.isNone() or block_ast_id.asInt() >= checker.ast_arena.countNodes()) return false;
+    const block_node = checker.ast_arena.getNode(block_ast_id);
+    if (block_node.tag != .block) return false;
+
+    const stmts = if (block_node.lhs.tag == .extra) checker.getNodeExtraSlice(block_ast_id, false) else &[_]u32{};
+    const is_callable_root = (block_ast_id == body_ctx.callable_root_block);
+    var has_seen_drop_or_defer = body_ctx.has_enclosing_drop_or_defer or body_ctx.is_inside_defer;
+
+    var idx: usize = 0;
+    while (idx < stmts.len) : (idx += 1) {
+        const stmt_id = NodeIndex.fromInt(stmts[idx]);
+        if (stmt_id.isNone() or stmt_id.asInt() >= checker.ast_arena.countNodes()) continue;
+        const stmt_node = checker.ast_arena.getNode(stmt_id);
+        const stmt_tag = stmt_node.tag;
+
+        if (stmt_tag == .defer_stmt) {
+            has_seen_drop_or_defer = true;
+            continue;
+        }
+
+        // [1] Adjacent `if cond { return true; } return false;` -> `return cond;` (`W0407`):
+        if (stmt_tag == .if_expr and stmt_node.rhs.tag == .node and idx + 1 < stmts.len) {
+            const next_stmt_id = NodeIndex.fromInt(stmts[idx + 1]);
+            if (!next_stmt_id.isNone() and next_stmt_id.asInt() < checker.ast_arena.countNodes() and
+                checker.ast_arena.getNode(next_stmt_id).tag == .return_stmt)
+            {
+                const then_bool_opt = extractSingleBoolReturnBlock(checker, NodeIndex.fromInt(stmt_node.rhs.payload));
+                const next_ret = checker.ast_arena.getNode(next_stmt_id);
+                const next_bool_opt: ?BoolReturnBranchInfo = if (next_ret.lhs.tag == .node) blk_nb: {
+                    const nv_id = NodeIndex.fromInt(next_ret.lhs.payload);
+                    const nv_node = checker.ast_arena.getNode(nv_id);
+                    if (nv_node.tag == .bool_lit and !nv_node.main_token.isNone()) {
+                        const nk = checker.token_buffer.getToken(nv_node.main_token).kind;
+                        if (nk == .kw_true) break :blk_nb .{ .is_true_literal = true };
+                        if (nk == .kw_false) break :blk_nb .{ .is_true_literal = false };
+                    }
+                    break :blk_nb null;
+                } else null;
+
+                if (then_bool_opt != null and next_bool_opt != null and
+                    then_bool_opt.?.is_true_literal != next_bool_opt.?.is_true_literal and
+                    stmt_node.lhs.tag == .node)
+                {
+                    const cond_id = NodeIndex.fromInt(stmt_node.lhs.payload);
+                    const cond_cst = checker.ast_arena.getCstOrigin(cond_id);
+                    const if_cst = checker.ast_arena.getCstOrigin(stmt_id);
+                    const next_cst = checker.ast_arena.getCstOrigin(next_stmt_id);
+                    if (getRecordedNodeType(checker, cond_id) == .bool_ty and
+                        !hasWalrusInSubtree(checker.cst_arena, checker.token_buffer, cond_cst) and
+                        !hasIsBindingInExprAst(checker, cond_id, 0) and
+                        !hasLeadingCstAttribute(checker, if_cst, false) and
+                        !hasLeadingCstAttribute(checker, next_cst, false))
+                    {
+                        const if_sp = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, if_cst);
+                        const next_sp = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, next_cst);
+                        var clean_c = cond_cst;
+                        if (!cond_cst.isNone()) {
+                            if (try matchRedundantOuterParenCst(checker, cond_cst)) |unw| clean_c = unw.inner_cst;
+                        }
+                        const c_sp = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, clean_c);
+                        if (if_sp != null and next_sp != null and c_sp != null and
+                            !hasCommentsInByteRange(checker.source, checker.token_buffer, if_sp.?.start_byte, c_sp.?.start_byte) and
+                            !hasCommentsInByteRange(checker.source, checker.token_buffer, c_sp.?.end_byte, next_sp.?.end_byte))
+                        {
+                            const pair_span = Span.init(checker.file_id, if_sp.?.start_byte, next_sp.?.end_byte);
+                            const c_slice = checker.source[c_sp.?.start_byte..c_sp.?.end_byte];
+                            var repl_buf: std.ArrayListUnmanaged(u8) = .empty;
+                            defer repl_buf.deinit(checker.allocator);
+                            if (then_bool_opt.?.is_true_literal) {
+                                try repl_buf.appendSlice(checker.allocator, "return ");
+                                try repl_buf.appendSlice(checker.allocator, c_slice);
+                                try repl_buf.append(checker.allocator, ';');
+                            } else if (isNotOperandNeedingParens(checker, cond_id)) {
+                                try repl_buf.appendSlice(checker.allocator, "return not (");
+                                try repl_buf.appendSlice(checker.allocator, c_slice);
+                                try repl_buf.appendSlice(checker.allocator, ");");
+                            } else {
+                                try repl_buf.appendSlice(checker.allocator, "return not ");
+                                try repl_buf.appendSlice(checker.allocator, c_slice);
+                                try repl_buf.append(checker.allocator, ';');
+                            }
+
+                            if (!if_cst.isNone()) try suppressed_headers.put(checker.allocator, if_cst.asInt(), {});
+                            try body_ctx.fused_tail_returns.put(checker.allocator, next_stmt_id.asInt(), {});
+                            try emitAuditLintWarning(
+                                sink_opt,
+                                .w0407_needless_bool_branch,
+                                .machine_applicable,
+                                pair_span,
+                                "redundant `if … { return true; } return false;` pair; return the boolean expression directly",
+                                "simplify boolean `return` branch",
+                                "simplify boolean `return` statements",
+                                &.{.{
+                                    .file_id = checker.file_id,
+                                    .start_byte = pair_span.start_byte,
+                                    .end_byte = pair_span.end_byte,
+                                    .replacement_id = try checker.interner.intern(repl_buf.items),
+                                }},
+                            );
+                            idx += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // [2] `W0411` (`single-use-temp`): `let res = expr; return res;` / `let res = expr; res` / `let x = expr; if x is Pat`:
+        if (stmt_tag == .local_var_decl and !has_seen_drop_or_defer) {
+            if (extractSingleUseLetCandidate(checker, stmt_id)) |let_cand| {
+                // Pattern A1: `let res = expr; return res;` at `stmts[idx], stmts[idx + 1]`:
+                if (idx + 1 < stmts.len) {
+                    const cons_id = NodeIndex.fromInt(stmts[idx + 1]);
+                    const cons_node = checker.ast_arena.getNode(cons_id);
+                    if (cons_node.tag == .return_stmt and cons_node.lhs.tag == .node) {
+                        const ret_val_id = NodeIndex.fromInt(cons_node.lhs.payload);
+                        if (checker.ast_arena.getNode(ret_val_id).tag == .ident_expr and
+                            ret_val_id.asInt() < checker.node_symbols.len and
+                            checker.node_symbols[ret_val_id.asInt()] == let_cand.sym_idx)
+                        {
+                            const ret_cst = checker.ast_arena.getCstOrigin(cons_id);
+                            if (!hasLeadingCstAttribute(checker, ret_cst, false)) {
+                                if (getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, ret_cst)) |ret_sp| {
+                                    const ret_last_tok = findLastRealTokenInSubtree(checker.cst_arena, checker.token_buffer, ret_cst);
+                                    const has_trailing_cmt = !ret_last_tok.isNone() and
+                                        hasCommentInTriviaSlice(checker.source, checker.token_buffer.getTrailingTrivia(ret_last_tok));
+                                    if (!has_trailing_cmt and
+                                        !hasCommentsInByteRange(
+                                            checker.source,
+                                            checker.token_buffer,
+                                            let_cand.let_span.start_byte,
+                                            let_cand.init_span.start_byte,
+                                        ) and
+                                        !hasCommentsInByteRange(
+                                            checker.source,
+                                            checker.token_buffer,
+                                            let_cand.init_span.end_byte,
+                                            ret_sp.end_byte,
+                                        ))
+                                    {
+                                        const can_fuse_w0209 = is_callable_root and
+                                            idx + 2 == stmts.len and
+                                            block_node.rhs.isNone() and
+                                            !body_ctx.callable_ret_ty.isError() and
+                                            body_ctx.callable_ret_ty != .unit_ty and
+                                            body_ctx.callable_ret_ty != .never_ty and
+                                            !(idx >= 1 and hasTailExprContinuationHazard(
+                                                checker,
+                                                NodeIndex.fromInt(stmts[idx - 1]),
+                                                let_cand.init_slice,
+                                            ));
+                                        const pair_span = Span.init(checker.file_id, let_cand.let_span.start_byte, ret_sp.end_byte);
+                                        var repl_buf: std.ArrayListUnmanaged(u8) = .empty;
+                                        defer repl_buf.deinit(checker.allocator);
+                                        if (can_fuse_w0209) {
+                                            try repl_buf.appendSlice(checker.allocator, let_cand.init_slice);
+                                            try body_ctx.fused_tail_returns.put(checker.allocator, cons_id.asInt(), {});
+                                        } else {
+                                            try repl_buf.appendSlice(checker.allocator, "return ");
+                                            try repl_buf.appendSlice(checker.allocator, let_cand.init_slice);
+                                            try repl_buf.append(checker.allocator, ';');
+                                        }
+                                        try emitAuditLintWarning(
+                                            sink_opt,
+                                            .w0411_single_use_temp,
+                                            .machine_applicable,
+                                            pair_span,
+                                            "single-use temporary variable returned immediately (`AGENTS.md` §6)",
+                                            "inline single-use temporary directly into return",
+                                            "inline single-use temporary variable",
+                                            &.{.{
+                                                .file_id = checker.file_id,
+                                                .start_byte = pair_span.start_byte,
+                                                .end_byte = pair_span.end_byte,
+                                                .replacement_id = try checker.interner.intern(repl_buf.items),
+                                            }},
+                                        );
+                                        idx += 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Pattern A2: `let res = expr; res` at end of block (`idx + 1 == stmts.len` and `block_node.rhs == res`):
+                if (idx + 1 == stmts.len and block_node.rhs.tag == .node) {
+                    const tail_id = NodeIndex.fromInt(block_node.rhs.payload);
+                    if (checker.ast_arena.getNode(tail_id).tag == .ident_expr and
+                        tail_id.asInt() < checker.node_symbols.len and
+                        checker.node_symbols[tail_id.asInt()] == let_cand.sym_idx and
+                        !(idx >= 1 and hasTailExprContinuationHazard(
+                            checker,
+                            NodeIndex.fromInt(stmts[idx - 1]),
+                            let_cand.init_slice,
+                        )))
+                    {
+                        const tail_cst = checker.ast_arena.getCstOrigin(tail_id);
+                        if (getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, tail_cst)) |tail_sp| {
+                            const tail_last_tok = findLastRealTokenInSubtree(checker.cst_arena, checker.token_buffer, tail_cst);
+                            const has_trailing_cmt = !tail_last_tok.isNone() and
+                                hasCommentInTriviaSlice(checker.source, checker.token_buffer.getTrailingTrivia(tail_last_tok));
+                            if (!has_trailing_cmt and
+                                !hasCommentsInByteRange(
+                                    checker.source,
+                                    checker.token_buffer,
+                                    let_cand.let_span.start_byte,
+                                    let_cand.init_span.start_byte,
+                                ) and
+                                !hasCommentsInByteRange(
+                                    checker.source,
+                                    checker.token_buffer,
+                                    let_cand.init_span.end_byte,
+                                    tail_sp.end_byte,
+                                ))
+                            {
+                                const pair_span = Span.init(checker.file_id, let_cand.let_span.start_byte, tail_sp.end_byte);
+                                try emitAuditLintWarning(
+                                    sink_opt,
+                                    .w0411_single_use_temp,
+                                    .machine_applicable,
+                                    pair_span,
+                                    "single-use temporary variable yielded immediately as tail expression (`AGENTS.md` §6)",
+                                    "inline single-use temporary as tail expression",
+                                    "inline single-use temporary variable",
+                                    &.{.{
+                                        .file_id = checker.file_id,
+                                        .start_byte = pair_span.start_byte,
+                                        .end_byte = pair_span.end_byte,
+                                        .replacement_id = try checker.interner.intern(let_cand.init_slice),
+                                    }},
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                // Pattern B: `let x = expr; if x is Pat …` (adjacent stmt or tail `if_expr`):
+                const next_if_opt: ?NodeIndex = if (idx + 1 < stmts.len)
+                    NodeIndex.fromInt(stmts[idx + 1])
+                else if (block_node.rhs.tag == .node)
+                    NodeIndex.fromInt(block_node.rhs.payload)
+                else
+                    null;
+                if (next_if_opt) |next_if_id| {
+                    if (!next_if_id.isNone() and next_if_id.asInt() < checker.ast_arena.countNodes()) {
+                        const if_node = checker.ast_arena.getNode(next_if_id);
+                        if (if_node.tag == .if_expr and if_node.lhs.tag == .node) {
+                            const cond_id = NodeIndex.fromInt(if_node.lhs.payload);
+                            if (findLeadingIsScrutineeForSym(checker, cond_id, let_cand.sym_idx, 0)) |is_hit| {
+                                const pat_cst = checker.ast_arena.getCstOrigin(is_hit.pat_id);
+                                const is_copy_val = checker.isCopyType(checker.sym_table.getSymbol(let_cand.sym_idx).type_id);
+                                const is_tail_if = (idx + 1 == stmts.len and
+                                    block_node.rhs.tag == .node and
+                                    NodeIndex.fromInt(block_node.rhs.payload) == next_if_id);
+                                if (!hasRefModifierInPatCst(checker, pat_cst) and (is_copy_val or is_tail_if)) {
+                                    const if_cst = checker.ast_arena.getCstOrigin(next_if_id);
+                                    const scrut_cst = checker.ast_arena.getCstOrigin(is_hit.scrut_id);
+                                    const if_sp = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, if_cst);
+                                    const scrut_sp = getCstSubtreeSpan(checker.file_id, checker.cst_arena, checker.token_buffer, scrut_cst);
+                                    if (if_sp != null and scrut_sp != null and
+                                        !hasLeadingCstAttribute(checker, if_cst, false) and
+                                        !hasCommentsInByteRange(
+                                            checker.source,
+                                            checker.token_buffer,
+                                            let_cand.let_span.start_byte,
+                                            let_cand.init_span.start_byte,
+                                        ) and
+                                        !hasCommentsInByteRange(
+                                            checker.source,
+                                            checker.token_buffer,
+                                            let_cand.init_span.end_byte,
+                                            if_sp.?.start_byte,
+                                        ))
+                                    {
+                                        const removal_let = symbol_resolver.computeAttributeRemovalSpan(
+                                            checker.source,
+                                            checker.file_id,
+                                            let_cand.let_span,
+                                        );
+                                        const wrap_scrut = isScrutineeNeedingParensForIs(
+                                            checker,
+                                            let_cand.init_id,
+                                            let_cand.init_cst,
+                                        );
+                                        var scrut_repl: std.ArrayListUnmanaged(u8) = .empty;
+                                        defer scrut_repl.deinit(checker.allocator);
+                                        if (wrap_scrut) try scrut_repl.append(checker.allocator, '(');
+                                        try scrut_repl.appendSlice(checker.allocator, let_cand.init_slice);
+                                        if (wrap_scrut) try scrut_repl.append(checker.allocator, ')');
+
+                                        const edits = [2]TextEdit{
+                                            .{
+                                                .file_id = checker.file_id,
+                                                .start_byte = removal_let.start_byte,
+                                                .end_byte = removal_let.end_byte,
+                                                .replacement_id = .empty,
+                                            },
+                                            .{
+                                                .file_id = checker.file_id,
+                                                .start_byte = scrut_sp.?.start_byte,
+                                                .end_byte = scrut_sp.?.end_byte,
+                                                .replacement_id = try checker.interner.intern(scrut_repl.items),
+                                            },
+                                        };
+                                        try emitAuditLintWarning(
+                                            sink_opt,
+                                            .w0411_single_use_temp,
+                                            .machine_applicable,
+                                            let_cand.let_span,
+                                            "single-use temporary variable tested immediately in `if … is …` (`AGENTS.md` §6)",
+                                            "inline single-use scrutinee directly into `if … is …`",
+                                            "inline single-use temporary into `if … is …`",
+                                            &edits,
+                                        );
+                                        if (!if_cst.isNone()) {
+                                            try suppressed_headers.put(checker.allocator, if_cst.asInt(), {});
+                                        }
+                                        if (idx + 1 < stmts.len) idx += 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (stmt_tag == .local_var_decl and localDeclHasNonCopyBinding(checker, stmt_id)) {
+            has_seen_drop_or_defer = true;
+        }
+
+        if (stmt_tag == .match_expr) {
+            const m_cst = checker.ast_arena.getCstOrigin(stmt_id);
+            try lintMatchHierarchy(
+                checker,
+                stmt_id,
+                m_cst,
+                checker.ast_arena.getCstOrigin(block_ast_id),
+                body_ctx.callable_ret_ty,
+                has_seen_drop_or_defer,
+                suppressed_headers,
+                sink_opt,
+            );
+        } else if (stmt_tag == .if_expr) {
+            const i_cst = checker.ast_arena.getCstOrigin(stmt_id);
+            if (try lintBoolReturnIfElse(checker, stmt_id, sink_opt)) {
+                if (!i_cst.isNone()) try suppressed_headers.put(checker.allocator, i_cst.asInt(), {});
+            } else if (!i_cst.isNone() and !suppressed_headers.contains(i_cst.asInt())) {
+                _ = try lintCollapsibleIfAst(checker, stmt_id, i_cst, .none, suppressed_headers, sink_opt);
+            }
+        }
+    }
+
     if (block_node.rhs.tag == .node) {
         const tail_id = NodeIndex.fromInt(block_node.rhs.payload);
         if (!tail_id.isNone() and tail_id.asInt() < checker.ast_arena.countNodes()) {
             const tail_tag = checker.ast_arena.getNode(tail_id).tag;
-            if (tail_tag == .match_expr and getRecordedNodeType(checker, block_ast_id) == .unit_ty) {
-                if (try lintTwoArmMatchToIfIs(checker, tail_id, sink_opt)) {
-                    const m_cst = checker.ast_arena.getCstOrigin(tail_id);
-                    if (!m_cst.isNone()) try suppressed_headers.put(checker.allocator, m_cst.asInt(), {});
-                }
+            if (tail_tag == .match_expr) {
+                const m_cst = checker.ast_arena.getCstOrigin(tail_id);
+                try lintMatchHierarchy(
+                    checker,
+                    tail_id,
+                    m_cst,
+                    checker.ast_arena.getCstOrigin(block_ast_id),
+                    body_ctx.callable_ret_ty,
+                    has_seen_drop_or_defer,
+                    suppressed_headers,
+                    sink_opt,
+                );
             } else if (tail_tag == .if_expr) {
+                const i_cst = checker.ast_arena.getCstOrigin(tail_id);
                 if (try lintBoolReturnIfElse(checker, tail_id, sink_opt)) {
-                    const i_cst = checker.ast_arena.getCstOrigin(tail_id);
                     if (!i_cst.isNone()) try suppressed_headers.put(checker.allocator, i_cst.asInt(), {});
+                } else if (!i_cst.isNone() and !suppressed_headers.contains(i_cst.asInt())) {
+                    _ = try lintCollapsibleIfAst(checker, tail_id, i_cst, .none, suppressed_headers, sink_opt);
                 }
             }
         }
     }
+    return has_seen_drop_or_defer;
 }
 
 /// Recursively lints a CST subtree (`is_signature_mode == true` skips `DefId`-owned item bodies).
@@ -3426,6 +5459,7 @@ fn walkAndLintCstSubtree(
     is_signature_mode: bool,
     is_inside_trait_item: bool,
     is_in_no_struct_lit_header: bool,
+    body_ctx: BodyAuditContext,
     suppressed_headers: *std.AutoHashMapUnmanaged(u32, void),
     sink_opt: ?*DiagnosticSink,
     depth: u32,
@@ -3440,11 +5474,37 @@ fn walkAndLintCstSubtree(
     if (isCfgGateableItemCstKind(node.kind) and !checker.isCstNodeCfgEnabled(cst_idx)) return;
     if (!checker.is_including_tests and (node.kind == .test_item or node.kind == .bench_item)) return;
 
-    // [1] In body mode, check `.block` statements and outermost `.if_expr` chains before Idiom 1 header parens:
+    var active_body_ctx = body_ctx;
+
+    // [1] In body mode, check `.block` statements, `.match_expr` (`W0410` > `W0409`), and `.if_expr` (`W0407` > `W0408` > `W0202`):
     if (!is_signature_mode and node.kind == .block and cst_idx.asInt() < checker.cst_to_ast.len) {
         const block_ast = checker.cst_to_ast[cst_idx.asInt()];
         if (!block_ast.isNone()) {
-            try lintBlockStatementsAst(checker, block_ast, suppressed_headers, sink_opt);
+            const block_has_drop_or_defer = try lintBlockStatementsAst(
+                checker,
+                block_ast,
+                active_body_ctx,
+                suppressed_headers,
+                sink_opt,
+            );
+            active_body_ctx.has_enclosing_drop_or_defer = block_has_drop_or_defer;
+        }
+    }
+    if (!is_signature_mode and node.kind == .match_expr and cst_idx.asInt() < checker.cst_to_ast.len and
+        !suppressed_headers.contains(cst_idx.asInt()))
+    {
+        const match_ast = checker.cst_to_ast[cst_idx.asInt()];
+        if (!match_ast.isNone()) {
+            try lintMatchHierarchy(
+                checker,
+                match_ast,
+                cst_idx,
+                parent_cst,
+                active_body_ctx.callable_ret_ty,
+                active_body_ctx.is_inside_defer,
+                suppressed_headers,
+                sink_opt,
+            );
         }
     }
     if (!is_signature_mode and node.kind == .if_expr and !suppressed_headers.contains(cst_idx.asInt())) {
@@ -3464,13 +5524,21 @@ fn walkAndLintCstSubtree(
         }
     }
 
-    // [2] Idiom 3; canonical `Option[T]` / `Result[T, E]` surface type annotations:
+    // [2] Idiom 3; canonical `Option[T]` / `Result[T, E]` surface type annotations (`W0202`):
     if (node.kind == .named_type) {
         try lintCanonicalGenericTypeCst(checker, cst_idx, parent_cst, grandparent_cst, sink_opt);
     }
 
-    // [3] Idiom 2; scalar `bool` literal equality/inequality (`x == true`, `x != false`, etc.):
-    if (node.kind == .infix_expr and cst_idx.asInt() < checker.cst_to_ast.len) {
+    // [3] `W0407`: `not (a == b)` / `not (a != b)` and scalar `bool` literal equality/inequality (`x == true`, etc.):
+    if (node.kind == .prefix_expr and cst_idx.asInt() < checker.cst_to_ast.len) {
+        const pref_ast = checker.cst_to_ast[cst_idx.asInt()];
+        if (!pref_ast.isNone()) {
+            try lintNegatedComparisonAst(checker, pref_ast, cst_idx, parent_cst, suppressed_headers, sink_opt);
+        }
+    }
+    if (node.kind == .infix_expr and cst_idx.asInt() < checker.cst_to_ast.len and
+        !suppressed_headers.contains(cst_idx.asInt()))
+    {
         const bin_ast = checker.cst_to_ast[cst_idx.asInt()];
         if (!bin_ast.isNone()) {
             try lintRedundantBoolEqualityAst(checker, bin_ast, parent_cst, sink_opt);
@@ -3515,6 +5583,33 @@ fn walkAndLintCstSubtree(
     }
 
     if (node.subtree_size <= 1) return;
+
+    // Detect closure callable boundary for `W0209` / `W0410` / `W0411`:
+    var clos_body_ast: NodeIndex = .none;
+    var clos_ret_ty: TypeId = .err_ty;
+    if (!is_signature_mode and node.kind == .closure_expr and cst_idx.asInt() < checker.cst_to_ast.len) {
+        const clos_ast = checker.cst_to_ast[cst_idx.asInt()];
+        if (!clos_ast.isNone() and clos_ast.asInt() < checker.ast_arena.countNodes()) {
+            const clos_ty = checker.pool.unwrapUnderlyingType(getRecordedNodeType(checker, clos_ast));
+            if (checker.pool.getFnSignatureView(clos_ty)) |csig| {
+                clos_ret_ty = csig.ret_ty;
+            }
+            const clos_node = checker.ast_arena.getNode(clos_ast);
+            if (clos_node.rhs.tag == .node) {
+                const cb_id = NodeIndex.fromInt(clos_node.rhs.payload);
+                if (!cb_id.isNone() and checker.ast_arena.getNode(cb_id).tag == .block) {
+                    clos_body_ast = cb_id;
+                }
+            }
+            active_body_ctx = .{
+                .callable_ret_ty = clos_ret_ty,
+                .callable_root_block = clos_body_ast,
+                .is_inside_defer = false,
+                .has_enclosing_drop_or_defer = false,
+                .fused_tail_returns = body_ctx.fused_tail_returns,
+            };
+        }
+    }
 
     // [5] Recurse into children while respecting signature vs. `DefId` body ownership boundaries:
     var children: std.ArrayListUnmanaged(CstNodeIndex) = .empty;
@@ -3599,6 +5694,11 @@ fn walkAndLintCstSubtree(
             else
                 is_in_no_struct_lit_header,
         };
+        var child_body_ctx = active_body_ctx;
+        if (child_node.kind == .defer_stmt) {
+            child_body_ctx.is_inside_defer = true;
+            child_body_ctx.has_enclosing_drop_or_defer = true;
+        }
         try walkAndLintCstSubtree(
             checker,
             child_cst,
@@ -3607,9 +5707,20 @@ fn walkAndLintCstSubtree(
             is_signature_mode,
             is_next_in_trait,
             next_in_no_struct_lit_header,
+            child_body_ctx,
             suppressed_headers,
             sink_opt,
             depth + 1,
+        );
+    }
+
+    if (!clos_body_ast.isNone()) {
+        try lintNeedlessTrailingReturnBlockW0209(
+            checker,
+            clos_body_ast,
+            clos_ret_ty,
+            body_ctx.fused_tail_returns,
+            sink_opt,
         );
     }
 }
@@ -3626,10 +5737,42 @@ fn lintSingleItemBodyAst(
     const item_cst = checker.ast_arena.getCstOrigin(item_ast_id);
     if (item_cst.isNone() or !checker.isCstNodeCfgEnabled(item_cst)) return;
 
+    var fused_tail_returns: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer fused_tail_returns.deinit(checker.allocator);
+
     const ast_node = checker.ast_arena.getNode(item_ast_id);
-    if (ast_node.tag == .fn_decl and !sym_idx.isNone()) {
-        try lintTrailingUnitReturnFnDecl(checker, sym_idx, item_ast_id, sink_opt);
+    var callable_ret_ty: TypeId = .err_ty;
+    var callable_root_block: NodeIndex = .none;
+
+    if (ast_node.tag == .fn_decl and !sym_idx.isNone() and sym_idx.asInt() < checker.sym_table.countSymbols()) {
+        try lintGetterPrefixNoiseW0206(checker, sym_idx, item_ast_id, sink_opt);
+        const fn_sym = checker.sym_table.getSymbol(sym_idx).*;
+        if (!fn_sym.flags.is_extern and !fn_sym.flags.is_prototype_only) {
+            if (checker.pool.getFnSignatureView(fn_sym.type_id)) |sig_view| {
+                callable_ret_ty = sig_view.ret_ty;
+            }
+            if (ast_node.rhs.tag == .node) {
+                const body_id = NodeIndex.fromInt(ast_node.rhs.payload);
+                if (!body_id.isNone() and checker.ast_arena.getNode(body_id).tag == .block) {
+                    callable_root_block = body_id;
+                }
+            }
+        }
+    } else if (ast_node.tag == .test_decl or ast_node.tag == .bench_decl) {
+        callable_ret_ty = .unit_ty;
+        if (ast_node.rhs.tag == .node) {
+            const body_id = NodeIndex.fromInt(ast_node.rhs.payload);
+            if (!body_id.isNone() and checker.ast_arena.getNode(body_id).tag == .block) {
+                callable_root_block = body_id;
+            }
+        }
     }
+
+    const base_ctx = BodyAuditContext{
+        .callable_ret_ty = callable_ret_ty,
+        .callable_root_block = callable_root_block,
+        .fused_tail_returns = &fused_tail_returns,
+    };
 
     if (ast_node.tag == .block) {
         try walkAndLintCstSubtree(
@@ -3640,6 +5783,7 @@ fn lintSingleItemBodyAst(
             false,
             false,
             false,
+            base_ctx,
             suppressed_headers,
             sink_opt,
             0,
@@ -3665,6 +5809,7 @@ fn lintSingleItemBodyAst(
                         false,
                         false,
                         false,
+                        base_ctx,
                         suppressed_headers,
                         sink_opt,
                         1,
@@ -3681,6 +5826,7 @@ fn lintSingleItemBodyAst(
                         false,
                         false,
                         false,
+                        base_ctx,
                         suppressed_headers,
                         sink_opt,
                         1,
@@ -3702,6 +5848,7 @@ fn lintSingleItemBodyAst(
                                 false,
                                 false,
                                 false,
+                                base_ctx,
                                 suppressed_headers,
                                 sink_opt,
                                 2,
@@ -3726,6 +5873,7 @@ fn lintSingleItemBodyAst(
                         false,
                         false,
                         false,
+                        base_ctx,
                         suppressed_headers,
                         sink_opt,
                         1,
@@ -3734,6 +5882,16 @@ fn lintSingleItemBodyAst(
             },
             else => {},
         }
+    }
+
+    if (!callable_root_block.isNone()) {
+        try lintNeedlessTrailingReturnBlockW0209(
+            checker,
+            callable_root_block,
+            callable_ret_ty,
+            &fused_tail_returns,
+            sink_opt,
+        );
     }
 }
 
@@ -3777,8 +5935,8 @@ fn collectEditableRootCandidates(
     for (candidate_ids.items) |fid| {
         const file_pkg_id = db.symbol_table.getFilePackageId(fid);
         if (!is_explicit_candidate) {
-            if (file_pkg_id != .root or db.isStdlibFile(fid)) continue;
-        } else if (file_pkg_id != .root and file_pkg_id != .std_core) {
+            if (file_pkg_id == .std_core or db.isStdlibFile(fid) or !db.isLintTargetFile(fid)) continue;
+        } else if (file_pkg_id != .root and file_pkg_id != .std_core and !db.isLintTargetFile(fid)) {
             continue;
         }
 
@@ -3788,8 +5946,12 @@ fn collectEditableRootCandidates(
         if (options.vfs) |vfs_ptr| {
             if (vfs_ptr.getFileEntry(fid)) |entry| {
                 if (entry.backing_kind == .cxtree_archive) continue;
-                if (!is_explicit_candidate and entry.package_id != .root) continue;
-                if (is_explicit_candidate and entry.package_id != .root and entry.package_id != .std_core) continue;
+                if (!is_explicit_candidate and (entry.package_id == .std_core or !db.isLintTargetFile(fid))) continue;
+                if (is_explicit_candidate and entry.package_id != .root and entry.package_id != .std_core and
+                    !db.isLintTargetFile(fid))
+                {
+                    continue;
+                }
                 is_open = entry.is_open_in_editor;
                 has_disk = entry.has_disk_backing;
                 const os_path = vfs_ptr.interner.get(entry.resolved_os_path);
@@ -3876,6 +6038,25 @@ fn runFullCheckAcrossSnapshots(
     var total_errors: u32 = 0;
     var has_new_syntax = false;
 
+    var snap_set: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer snap_set.deinit(db.allocator);
+    var snap_fids: std.ArrayListUnmanaged(FileId) = .empty;
+    defer snap_fids.deinit(db.allocator);
+    for (snapshots) |snap| {
+        try snap_set.put(db.allocator, snap.file_id.asInt(), {});
+        try snap_fids.append(db.allocator, snap.file_id);
+    }
+
+    var reachable_files: std.ArrayListUnmanaged(FileId) = .empty;
+    defer reachable_files.deinit(db.allocator);
+    if (snap_fids.items.len > 0) {
+        try db.collectReachableModuleFiles(snap_fids.items[0], snap_fids.items[1..], &reachable_files);
+    }
+    for (reachable_files.items) |dep_fid| {
+        if (snap_set.contains(dep_fid.asInt())) continue;
+        _ = try db.parseCst(dep_fid);
+    }
+
     for (snapshots) |*snap| {
         const parsed_art = try db.parseCst(snap.file_id);
         const has_syntax_err = parsed_art.cst_arena.has_parse_errors or parsed_art.diagnostics.hasErrors();
@@ -3885,9 +6066,23 @@ fn runFullCheckAcrossSnapshots(
             has_new_syntax = true;
         }
         total_errors +|= parsed_art.diagnostics.error_count;
+        if (db.isLintTargetFile(snap.file_id)) {
+            const sup_table = try db.suppressionTable(snap.file_id);
+            total_errors +|= @intCast(sup_table.directive_errors.len);
+        }
     }
 
+    var resolved_snap_sigs: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer resolved_snap_sigs.deinit(db.allocator);
+    for (reachable_files.items) |mod_fid| {
+        const sig_art = try db.resolveSignatures(mod_fid);
+        if (snap_set.contains(mod_fid.asInt())) {
+            total_errors +|= sig_art.error_count;
+            try resolved_snap_sigs.put(db.allocator, mod_fid.asInt(), {});
+        }
+    }
     for (snapshots) |snap| {
+        if (resolved_snap_sigs.contains(snap.file_id.asInt())) continue;
         const sig_art = try db.resolveSignatures(snap.file_id);
         total_errors +|= sig_art.error_count;
     }
@@ -3898,6 +6093,13 @@ fn runFullCheckAcrossSnapshots(
             const entry = (try db.extractItemTree(snap.file_id)).entries[entry_idx];
             const body_art = try db.typecheckBody(entry.def_id);
             total_errors +|= body_art.error_count;
+        }
+    }
+
+    for (snapshots) |snap| {
+        var entry_idx: usize = 0;
+        while (entry_idx < (try db.extractItemTree(snap.file_id)).entries.len) : (entry_idx += 1) {
+            const entry = (try db.extractItemTree(snap.file_id)).entries[entry_idx];
             const sast_art = try db.verifySastMir(entry.def_id);
             total_errors +|= sast_art.error_count;
         }
@@ -3909,17 +6111,18 @@ fn runFullCheckAcrossSnapshots(
     };
 }
 
-/// Appends `.machine_applicable` `SuggestedFix` items from `sink` targeting `file_id` into `out_fixes`.
-fn appendSinkMachineFixesForFile(
+/// Appends eligible `SuggestedFix` items from `proj_sink` targeting `file_id` into `out_fixes`.
+fn appendProjectedFixesForFile(
     allocator: std.mem.Allocator,
     db: *CompilerDb,
     file_id: FileId,
-    sink: *const DiagnosticSink,
-    is_parse_sink: bool,
+    proj_sink: *const DiagnosticSink,
+    allow_unsafe_fixes: bool,
     out_fixes: *std.ArrayListUnmanaged(SuggestedFix),
 ) !void {
-    for (sink.diagnostics.items) |diag_item| {
-        if (is_parse_sink and diag_item.code == .e0220_retired_bang_prefix and diag_item.suggestions.len == 0) {
+    const has_file_errors = proj_sink.hasErrors();
+    for (proj_sink.diagnostics.items) |diag_item| {
+        if (diag_item.code == .e0220_retired_bang_prefix and diag_item.suggestions.len == 0) {
             if (try db.resolveBangFixSuggestion(file_id, diag_item.primary_span)) |bang_fix| {
                 if (bang_fix.applicability == .machine_applicable and bang_fix.edits.len > 0) {
                     try out_fixes.append(allocator, bang_fix);
@@ -3927,8 +6130,14 @@ fn appendSinkMachineFixesForFile(
                 continue;
             }
         }
+        // Abort lint / stale-`@expect` (`W0002`) mutations on files with hard `E0xxx` compilation errors (`DR-25` §3.3):
+        if (has_file_errors and diag_item.code.asLintRuleId() != null) continue;
+
         for (diag_item.suggestions) |sug_item| {
-            if (sug_item.applicability != .machine_applicable or sug_item.edits.len == 0) continue;
+            const is_eligible = sug_item.applicability == .machine_applicable or
+                (allow_unsafe_fixes and sug_item.applicability == .maybe_incorrect);
+            if (!is_eligible or sug_item.edits.len == 0) continue;
+
             var is_all_same_file = true;
             for (sug_item.edits) |edit_item| {
                 if (edit_item.file_id != file_id) {
@@ -3937,7 +6146,9 @@ fn appendSinkMachineFixesForFile(
                 }
             }
             if (is_all_same_file) {
-                try out_fixes.append(allocator, sug_item);
+                var promoted_fix = sug_item;
+                promoted_fix.applicability = .machine_applicable;
+                try out_fixes.append(allocator, promoted_fix);
             }
         }
     }
@@ -3954,11 +6165,15 @@ fn updateFileOverlayAndDb(
         if (snap.file_path.len > 0) {
             const vpath = vfs_ptr.getFilePath(snap.file_id);
             const target_vpath = if (vpath.len > 0) vpath else snap.file_path;
+            const existing_pkg_id = if (vfs_ptr.getFileEntry(snap.file_id)) |entry|
+                entry.package_id
+            else
+                db.symbol_table.getFilePackageId(snap.file_id);
             _ = try vfs_ptr.setEditorOverlay(
                 options.io,
                 target_vpath,
                 new_bytes,
-                .root,
+                existing_pkg_id,
                 snap.is_open_in_editor,
             );
             _ = vfs_ptr.getLineIndex(snap.file_id) catch {};
@@ -4722,6 +6937,8 @@ pub fn lintFileSignaturesW0202(
 
     var suppressed_headers: std.AutoHashMapUnmanaged(u32, void) = .empty;
     defer suppressed_headers.deinit(checker.allocator);
+    var empty_fused: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer empty_fused.deinit(checker.allocator);
 
     try walkAndLintCstSubtree(
         checker,
@@ -4731,6 +6948,7 @@ pub fn lintFileSignaturesW0202(
         true,
         false,
         false,
+        .{ .fused_tail_returns = &empty_fused },
         &suppressed_headers,
         sink_opt,
         0,
@@ -4820,6 +7038,12 @@ pub fn applyCheckFixesOnDb(
     var total_applied_fixes: u32 = 0;
     var passes_executed: u8 = 0;
 
+    var snap_idx_by_fid: std.AutoHashMapUnmanaged(u32, usize) = .empty;
+    defer snap_idx_by_fid.deinit(allocator);
+    for (snapshots.items, 0..) |snap_item, idx| {
+        try snap_idx_by_fid.put(allocator, snap_item.file_id.asInt(), idx);
+    }
+
     var pass_idx: u8 = 0;
     while (pass_idx < MAX_CHECK_FIX_PASSES) : (pass_idx += 1) {
         if (pass_idx > 0) {
@@ -4827,60 +7051,113 @@ pub fn applyCheckFixesOnDb(
         }
         passes_executed += 1;
 
-        var pass_applied_fixes: u32 = 0;
-        for (snapshots.items) |*snap| {
-            var candidate_fixes: std.ArrayListUnmanaged(SuggestedFix) = .empty;
-            defer candidate_fixes.deinit(allocator);
+        var pass_arena = mem_foundation.BumpArena.init(allocator);
+        defer pass_arena.deinit();
+        const pass_alloc = pass_arena.asAllocator();
 
-            const parsed_art = try db.parseCst(snap.file_id);
-            try appendSinkMachineFixesForFile(
-                allocator,
+        const snap_count = snapshots.items.len;
+        const file_has_errors = try pass_alloc.alloc(bool, snap_count);
+        const per_file_fixes = try pass_alloc.alloc(std.ArrayListUnmanaged(SuggestedFix), snap_count);
+        for (snapshots.items, 0..) |snap_item, idx| {
+            const sink_ptr = try db.projectFileDiagnostics(snap_item.file_id);
+            file_has_errors[idx] = sink_ptr.hasErrors();
+            per_file_fixes[idx] = .empty;
+        }
+
+        // Collect multi-file atomic `SuggestedFix`es (`W0201`, `W0206`, `W0207`, `W0413`) and single-file fixes:
+        var multi_fixes: std.ArrayListUnmanaged(SuggestedFix) = .empty;
+        for (snapshots.items, 0..) |snap_item, idx| {
+            const proj_sink = try db.projectFileDiagnostics(snap_item.file_id);
+            try appendProjectedFixesForFile(
+                pass_alloc,
                 db,
-                snap.file_id,
-                &parsed_art.diagnostics,
-                true,
-                &candidate_fixes,
+                snap_item.file_id,
+                proj_sink,
+                options.allow_unsafe_fixes,
+                &per_file_fixes[idx],
             );
-            if (db.getSignatureDiagnostics(snap.file_id)) |sig_sink| {
-                try appendSinkMachineFixesForFile(
-                    allocator,
-                    db,
-                    snap.file_id,
-                    sig_sink,
-                    false,
-                    &candidate_fixes,
-                );
-            }
-            for ((try db.extractItemTree(snap.file_id)).entries) |entry| {
-                if (db.getBodyDiagnostics(entry.def_id)) |body_sink| {
-                    try appendSinkMachineFixesForFile(
-                        allocator,
-                        db,
-                        snap.file_id,
-                        body_sink,
-                        false,
-                        &candidate_fixes,
-                    );
-                }
-                if (db.getSastDiagnostics(entry.def_id)) |sast_sink| {
-                    try appendSinkMachineFixesForFile(
-                        allocator,
-                        db,
-                        snap.file_id,
-                        sast_sink,
-                        false,
-                        &candidate_fixes,
-                    );
+            if (file_has_errors[idx]) continue;
+            const refreshed_sink = try db.projectFileDiagnostics(snap_item.file_id);
+            for (refreshed_sink.diagnostics.items) |diag_item| {
+                for (diag_item.suggestions) |sug_item| {
+                    const is_eligible = sug_item.applicability == .machine_applicable or
+                        (options.allow_unsafe_fixes and sug_item.applicability == .maybe_incorrect);
+                    if (!is_eligible or sug_item.edits.len == 0) continue;
+                    var has_other_file = false;
+                    var all_targets_valid = true;
+                    for (sug_item.edits) |ed| {
+                        if (ed.file_id != snap_item.file_id) has_other_file = true;
+                        const t_idx = snap_idx_by_fid.get(ed.file_id.asInt()) orelse {
+                            all_targets_valid = false;
+                            break;
+                        };
+                        if (file_has_errors[t_idx]) {
+                            all_targets_valid = false;
+                            break;
+                        }
+                    }
+                    if (has_other_file and all_targets_valid) {
+                        try multi_fixes.append(pass_alloc, sug_item);
+                    }
                 }
             }
+        }
 
-            if (candidate_fixes.items.len == 0) continue;
+        // Accept non-overlapping multi-file fixes all-or-nothing across all touched files:
+        if (multi_fixes.items.len > 0) {
+            const accepted_spans = try pass_alloc.alloc(std.ArrayListUnmanaged(Span), snap_count);
+            for (accepted_spans) |*sp_list| sp_list.* = .empty;
+
+            for (multi_fixes.items) |m_fix| {
+                var has_conflict = false;
+                for (m_fix.edits, 0..) |ed_a, ea_i| {
+                    const t_idx = snap_idx_by_fid.get(ed_a.file_id.asInt()).?;
+                    for (accepted_spans[t_idx].items) |acc_sp| {
+                        if (!(ed_a.end_byte < acc_sp.start_byte or ed_a.start_byte > acc_sp.end_byte)) {
+                            has_conflict = true;
+                            break;
+                        }
+                    }
+                    if (has_conflict) break;
+                    for (m_fix.edits[0..ea_i]) |ed_b| {
+                        if (ed_a.file_id == ed_b.file_id and
+                            !(ed_a.end_byte <= ed_b.start_byte or ed_a.start_byte >= ed_b.end_byte))
+                        {
+                            has_conflict = true;
+                            break;
+                        }
+                    }
+                    if (has_conflict) break;
+                }
+                if (has_conflict) continue;
+
+                for (m_fix.edits) |ed_item| {
+                    const t_idx = snap_idx_by_fid.get(ed_item.file_id.asInt()).?;
+                    try accepted_spans[t_idx].append(
+                        pass_alloc,
+                        Span.init(ed_item.file_id, ed_item.start_byte, ed_item.end_byte),
+                    );
+                    const one_edit = try pass_alloc.alloc(TextEdit, 1);
+                    one_edit[0] = ed_item;
+                    try per_file_fixes[t_idx].insert(pass_alloc, 0, .{
+                        .message = m_fix.message,
+                        .applicability = .machine_applicable,
+                        .priority = .type_migration,
+                        .edits = one_edit,
+                    });
+                }
+            }
+        }
+
+        var pass_applied_fixes: u32 = 0;
+        for (snapshots.items, 0..) |*snap, idx| {
+            if (per_file_fixes[idx].items.len == 0) continue;
             const current_src = try db.getSourceText(snap.file_id);
             const patch_outcome = try TransactionalPatcher.apply(
                 allocator,
                 current_src,
                 snap.file_id,
-                candidate_fixes.items,
+                per_file_fixes[idx].items,
                 &db.interner,
             );
             defer allocator.free(patch_outcome.patched_source);
@@ -4906,6 +7183,7 @@ pub fn applyCheckFixesOnDb(
     }
 
     // [3] Canonicalize each modified file with `fmt_engine.formatSource`:
+    _ = try runFullCheckAcrossSnapshots(db, snapshots.items, false);
     for (snapshots.items) |snap| {
         if (!snap.is_modified) continue;
         const current_src = try db.getSourceText(snap.file_id);
@@ -4956,6 +7234,40 @@ pub fn applyCheckFixesOnDb(
         defer fmt_res.deinit(allocator);
         if (!fmt_res.has_syntax_errors and fmt_res.is_changed) {
             try updateFileOverlayAndDb(db, options, snap, fmt_res.formatted_text);
+        }
+    }
+
+    _ = try runFullCheckAcrossSnapshots(db, snapshots.items, false);
+    for (snapshots.items) |snap| {
+        if (!snap.is_modified or snap.disk_script_prefix != null) continue;
+        const post_fmt_sink = try db.projectFileDiagnostics(snap.file_id);
+        if (!post_fmt_sink.hasErrors()) {
+            var w0002_fixes: std.ArrayListUnmanaged(SuggestedFix) = .empty;
+            defer w0002_fixes.deinit(allocator);
+            for (post_fmt_sink.diagnostics.items) |diag_item| {
+                if (diag_item.code != .w0002_unused_suppression) continue;
+                if (std.mem.indexOf(u8, diag_item.message, "non-idiomatic-syntax") == null) continue;
+                for (diag_item.suggestions) |sug_item| {
+                    if (sug_item.edits.len == 0) continue;
+                    var promoted = sug_item;
+                    promoted.applicability = .machine_applicable;
+                    try w0002_fixes.append(allocator, promoted);
+                }
+            }
+            if (w0002_fixes.items.len > 0) {
+                const fmt_src = try db.getSourceText(snap.file_id);
+                const pruned = try TransactionalPatcher.apply(
+                    allocator,
+                    fmt_src,
+                    snap.file_id,
+                    w0002_fixes.items,
+                    &db.interner,
+                );
+                defer allocator.free(pruned.patched_source);
+                if (pruned.applied_count > 0 and !std.mem.eql(u8, pruned.patched_source, fmt_src)) {
+                    try updateFileOverlayAndDb(db, options, snap, pruned.patched_source);
+                }
+            }
         }
     }
 
@@ -5658,7 +7970,7 @@ test "test_check_audit_w0202_all_six_idioms_and_transactional_fix" {
         "    let _val: i32 = 1;\n" ++
         "    return;\n" ++
         "}\n\n" ++
-        "@allow(W0202)\n" ++
+        "@allow(W0202, W0209, W0407, reason: \"intentional idiomatic test fixture\")\n" ++
         "pub fn suppressed_fn(flag: bool) -> Option[i32] {\n" ++
         "    if (flag == true) {\n" ++
         "        return .Some(1);\n" ++
@@ -5682,9 +7994,9 @@ test "test_check_audit_w0202_all_six_idioms_and_transactional_fix" {
     const dep_sig = try db.resolveSignatures(dep_fid);
     try std.testing.expectEqual(@as(u32, 0), dep_sig.warning_count);
 
-    // Dedicated `@allow(W0202)` file must emit zero `W0202` warnings and remain 100% unedited:
+    // Dedicated `@expect(W0202, W0209, W0407, …)` file must emit zero warnings and remain 100% unedited:
     const sup_only_src =
-        "@allow(W0202)\n" ++
+        "@expect(W0202, W0209, W0407, reason: \"intentional idiomatic test fixture\")\n" ++
         "pub fn untouched_suppressed(flag: bool) -> Option[i32] {\n" ++
         "    if (flag == true) {\n" ++
         "        return .Some(1);\n" ++
@@ -5712,7 +8024,7 @@ test "test_check_audit_w0202_all_six_idioms_and_transactional_fix" {
     try std.testing.expect(std.mem.indexOf(u8, fixed_src, "pt_opt: Point?") != null);
     try std.testing.expect(std.mem.indexOf(u8, fixed_src, "while not flag") != null);
     try std.testing.expect(std.mem.indexOf(u8, fixed_src, "if pt_opt is (.Some(Point { x, y }))") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fixed_src, "return flag;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fixed_src, "\n    flag\n}") != null);
     try std.testing.expect(std.mem.indexOf(u8, fixed_src, "if flag == true") != null);
 
     const sup_only_after = try db.getSourceText(sup_only_fid);
@@ -5952,13 +8264,13 @@ test "test_script_frontmatter_check_fix_disk_preservation_and_coalesced_comments
     defer allocator.free(mode_c_after);
     try std.testing.expect(std.mem.startsWith(u8, mode_c_after, mode_c_shebang));
     try std.testing.expect(std.mem.indexOf(u8, mode_c_after, "opt: u8?") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mode_c_after, "return flag;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mode_c_after, "\n    flag\n}") != null);
 
     const mode_b_after = try std.Io.Dir.cwd().readFileAlloc(io, mode_b_path, allocator, .limited(64 * 1024));
     defer allocator.free(mode_b_after);
     try std.testing.expect(std.mem.startsWith(u8, mode_b_after, mode_b_prefix));
     try std.testing.expect(std.mem.indexOf(u8, mode_b_after, "opt: i32?") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mode_b_after, "return flag;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mode_b_after, "\n    flag\n}") != null);
 }
 
 test "test_check_audit_w0202_three_tier_conditional_match_hierarchy_non_oscillating" {
@@ -6032,4 +8344,285 @@ test "test_check_audit_w0202_three_tier_conditional_match_hierarchy_non_oscillat
     });
     try std.testing.expectEqual(@as(u32, 0), rep2.applied_fix_count);
     try std.testing.expectEqualStrings(fixed_src, try db.getSourceText(fid));
+}
+
+test "test_phase111c_check_fix_resolves_cross_module_deps_and_preserves_pkg_id" {
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var vfs = VfsSourceMap.init(std.testing.allocator, &interner);
+    defer vfs.deinit(std.testing.io);
+    var db = try CompilerDb.init(std.testing.allocator);
+    defer db.deinit();
+    try db.setInternalCore(true);
+
+    const dep_src =
+        \\pub struct CoreTag {
+        \\    pub code: i32,
+        \\}
+    ++ "\n";
+    const dep_fid = try vfs.setOverlay("core/root.cx", dep_src, .std_core);
+    _ = try db.setInput(dep_fid, dep_src, .low);
+    try db.setFilePath(dep_fid, "core/root.cx");
+    try db.setFilePackageId(dep_fid, .std_core);
+    try db.registerRootModule("core", dep_fid);
+
+    const child_count: usize = 9;
+    var child_fids: [child_count]FileId = undefined;
+    var root_src_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer root_src_buf.deinit(std.testing.allocator);
+
+    for (0..child_count) |i| {
+        var mod_name_buf: [16]u8 = undefined;
+        const mod_name = try std.fmt.bufPrint(&mod_name_buf, "sub{d}", .{i});
+        var path_buf: [32]u8 = undefined;
+        const mod_path = try std.fmt.bufPrint(&path_buf, "stdlib/cx/{s}.cx", .{mod_name});
+        var child_src_buf: [320]u8 = undefined;
+        const child_src = if (i == 0)
+            try std.fmt.bufPrint(
+                &child_src_buf,
+                "use core.CoreTag;\n\n" ++
+                    "impl str {{\n    pub fn tag_zero(&self) -> i32 {{\n        return 0_i32;\n    }}\n}}\n\n" ++
+                    "pub fn passthrough_{d}(item: own CoreTag) -> CoreTag {{\n    return own item;\n}}\n",
+                .{i},
+            )
+        else
+            try std.fmt.bufPrint(
+                &child_src_buf,
+                "use core.CoreTag;\nuse cx.sub0.passthrough_0;\n\n" ++
+                    "pub fn passthrough_{d}(item: own CoreTag) -> CoreTag {{\n" ++
+                    "    return passthrough_0(own item);\n}}\n",
+                .{i},
+            );
+        const child_fid = try vfs.setOverlay(mod_path, child_src, .std_core);
+        _ = try db.setInput(child_fid, child_src, .low);
+        try db.setFilePath(child_fid, mod_path);
+        try db.setFilePackageId(child_fid, .std_core);
+        child_fids[i] = child_fid;
+
+        var export_buf: [96]u8 = undefined;
+        const export_line = try std.fmt.bufPrint(
+            &export_buf,
+            "pub mod {s};\npub use {s}.passthrough_{d};\n",
+            .{ mod_name, mod_name, i },
+        );
+        try root_src_buf.appendSlice(std.testing.allocator, export_line);
+    }
+
+    const root_fid = try vfs.setOverlay("stdlib/cx/mod.cx", root_src_buf.items, .std_core);
+    _ = try db.setInput(root_fid, root_src_buf.items, .low);
+    try db.setFilePath(root_fid, "stdlib/cx/mod.cx");
+    try db.setFilePackageId(root_fid, .std_core);
+    for (0..child_count) |i| {
+        var mod_name_buf: [16]u8 = undefined;
+        const mod_name = try std.fmt.bufPrint(&mod_name_buf, "sub{d}", .{i});
+        try db.bindExternalModule(root_fid, mod_name, child_fids[i]);
+    }
+    try db.registerRootModule("cx", root_fid);
+
+    var explicit_files: std.ArrayListUnmanaged(FileId) = .empty;
+    defer explicit_files.deinit(std.testing.allocator);
+    try db.collectExplicitModSubtreeFiles(&.{root_fid}, &explicit_files);
+    try db.setExplicitLintTargetFiles(explicit_files.items);
+
+    const report = try applyCheckFixesOnDb(std.testing.allocator, &db, .{
+        .vfs = &vfs,
+        .is_writing_to_disk = false,
+        .candidate_files = explicit_files.items,
+    });
+    try std.testing.expect(!report.is_rolled_back);
+    try std.testing.expectEqual(@as(u32, child_count + 1), report.applied_fix_count);
+    try std.testing.expectEqual(@as(u32, child_count), report.modified_file_count);
+    try std.testing.expectEqual(PackageId.std_core, vfs.getFileEntry(child_fids[0]).?.package_id);
+    try std.testing.expect(std.mem.indexOf(u8, try db.getSourceText(child_fids[0]), "    own item\n") != null);
+}
+
+test "test_phase111c_w0408_skips_comptime_if_and_w0201_allows_single_cap_const" {
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var vfs = VfsSourceMap.init(std.testing.allocator, &interner);
+    defer vfs.deinit(std.testing.io);
+    var db = try CompilerDb.init(std.testing.allocator);
+    defer db.deinit();
+
+    const raw_src =
+        \\pub const E: f64 = 2.718281828459045_f64;
+        \\pub const C0: i32 = 1_i32;
+        \\
+        \\pub fn classify_val(lhs: i32, rhs: i32) -> i32 {
+        \\    comptime if true {
+        \\        if lhs < 0_i32 {
+        \\            return -1_i32;
+        \\        }
+        \\    }
+        \\    comptime if false {
+        \\        return 0_i32;
+        \\    } else {
+        \\        if rhs < 0_i32 {
+        \\            return -2_i32;
+        \\        }
+        \\    }
+        \\    if lhs > 0_i32 {
+        \\        if rhs > 0_i32 {
+        \\            return C0;
+        \\        }
+        \\    }
+        \\    0_i32
+        \\}
+    ++ "\n";
+
+    const fid = try vfs.setOverlay("src/comptime_and_const.cx", raw_src, .root);
+    _ = try db.setInput(fid, raw_src, .low);
+    try db.setFilePath(fid, "src/comptime_and_const.cx");
+
+    const pre_sink = try db.projectFileDiagnostics(fid);
+    try std.testing.expectEqual(@as(u32, 0), pre_sink.error_count);
+    for (pre_sink.asSlice()) |diag| {
+        try std.testing.expect(diag.code != .w0201_non_canonical_identifier_case);
+    }
+    try std.testing.expectEqual(@as(u32, 1), pre_sink.warning_count);
+    try std.testing.expect(pre_sink.asSlice()[0].code == .w0408_collapsible_if);
+
+    const fix_rep = try applyCheckFixesOnDb(std.testing.allocator, &db, .{
+        .vfs = &vfs,
+        .is_writing_to_disk = false,
+        .candidate_files = &.{fid},
+    });
+    try std.testing.expect(!fix_rep.is_rolled_back);
+    try std.testing.expectEqual(@as(u32, 1), fix_rep.applied_fix_count);
+
+    const post_sink = try db.projectFileDiagnostics(fid);
+    try std.testing.expectEqual(@as(u32, 0), post_sink.error_count);
+    try std.testing.expectEqual(@as(u32, 0), post_sink.warning_count);
+    const patched_src = try db.getSourceText(fid);
+    try std.testing.expect(std.mem.indexOf(u8, patched_src, "if lhs > 0_i32 and rhs > 0_i32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, patched_src, "comptime if true {") != null);
+}
+
+test "test_phase111c_w0404_marks_imported_overload_siblings_as_used" {
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var vfs = VfsSourceMap.init(std.testing.allocator, &interner);
+    defer vfs.deinit(std.testing.io);
+    var db = try CompilerDb.init(std.testing.allocator);
+    defer db.deinit();
+
+    const mem_src =
+        \\@overload
+        \\pub fn with_arena[R](hint: usize, body: |usize| -> R) -> R {
+        \\    body(hint)
+        \\}
+        \\
+        \\@overload
+        \\pub fn with_arena[R](body: |usize| -> R) -> R {
+        \\    body(64_usize)
+        \\}
+        \\
+        \\pub fn unused_helper() -> usize {
+        \\    0_usize
+        \\}
+    ++ "\n";
+    const col_src =
+        \\use pkg.mem.{unused_helper, with_arena};
+        \\
+        \\pub fn run_merge() -> usize {
+        \\    with_arena[usize](|cap: usize| cap)
+        \\}
+    ++ "\n";
+    const root_src = "pub mod mem;\npub mod col;\n";
+
+    const mem_fid = try vfs.setOverlay("src/mem.cx", mem_src, .root);
+    _ = try db.setInput(mem_fid, mem_src, .low);
+    try db.setFilePath(mem_fid, "src/mem.cx");
+
+    const col_fid = try vfs.setOverlay("src/col.cx", col_src, .root);
+    _ = try db.setInput(col_fid, col_src, .low);
+    try db.setFilePath(col_fid, "src/col.cx");
+
+    const root_fid = try vfs.setOverlay("src/lib.cx", root_src, .root);
+    _ = try db.setInput(root_fid, root_src, .low);
+    try db.setFilePath(root_fid, "src/lib.cx");
+    try db.bindExternalModule(root_fid, "mem", mem_fid);
+    try db.bindExternalModule(root_fid, "col", col_fid);
+    try db.registerPackageRootFile(.root, root_fid);
+
+    const all_files = [_]FileId{ root_fid, mem_fid, col_fid };
+    try db.setExplicitLintTargetFiles(&all_files);
+
+    const col_sink = try db.projectFileDiagnostics(col_fid);
+    try std.testing.expectEqual(@as(u32, 0), col_sink.error_count);
+    try std.testing.expectEqual(@as(u32, 1), col_sink.warning_count);
+    try std.testing.expect(col_sink.asSlice()[0].code == .w0404_unused_import);
+    try std.testing.expect(std.mem.indexOf(u8, col_sink.asSlice()[0].message, "unused_helper") != null);
+
+    const fix_rep = try applyCheckFixesOnDb(std.testing.allocator, &db, .{
+        .vfs = &vfs,
+        .is_writing_to_disk = false,
+        .candidate_files = &all_files,
+    });
+    try std.testing.expect(!fix_rep.is_rolled_back);
+    try std.testing.expectEqual(@as(u32, 1), fix_rep.applied_fix_count);
+    try std.testing.expect(std.mem.indexOf(u8, try db.getSourceText(col_fid), "use pkg.mem.with_arena;") != null);
+}
+
+test "test_phase111c_w0333_removes_private_impl_method_contracts_without_polluting_caller" {
+    var interner = try StringInterner.init(std.testing.allocator);
+    defer interner.deinit();
+    var vfs = VfsSourceMap.init(std.testing.allocator, &interner);
+    defer vfs.deinit(std.testing.io);
+    var db = try CompilerDb.init(std.testing.allocator);
+    defer db.deinit();
+
+    const raw_src =
+        \\@no_alloc @no_panic
+        \\fn zero_seed[T]() -> u32 {
+        \\    0_u32
+        \\}
+        \\
+        \\struct RawTable {
+        \\    items: u32,
+        \\}
+        \\
+        \\impl RawTable {
+        \\    @no_alloc @no_panic
+        \\    fn empty() -> Self {
+        \\        Self { items: zero_seed[u32]() }
+        \\    }
+        \\
+        \\    fn checked_step(&mut self, divisor: u32) -> u32 {
+        \\        self.items / divisor
+        \\    }
+        \\}
+        \\
+        \\pub struct FastMap {
+        \\    raw: RawTable,
+        \\}
+        \\
+        \\impl FastMap {
+        \\    @no_alloc @no_panic
+        \\    pub fn new() -> Self {
+        \\        Self { raw: RawTable.empty() }
+        \\    }
+        \\
+        \\    pub fn probe(&mut self, divisor: u32) -> u32 {
+        \\        self.raw.checked_step(divisor)
+        \\    }
+        \\}
+    ++ "\n";
+
+    const fid = try vfs.setOverlay("src/raw_table.cx", raw_src, .root);
+    _ = try db.setInput(fid, raw_src, .low);
+    try db.setFilePath(fid, "src/raw_table.cx");
+    try db.setExplicitLintTargetFiles(&.{fid});
+
+    const fix_rep = try applyCheckFixesOnDb(std.testing.allocator, &db, .{
+        .vfs = &vfs,
+        .is_writing_to_disk = false,
+        .candidate_files = &.{fid},
+    });
+    try std.testing.expect(!fix_rep.is_rolled_back);
+    try std.testing.expectEqual(@as(u32, 4), fix_rep.applied_fix_count);
+
+    const post_sink = try db.projectFileDiagnostics(fid);
+    try std.testing.expectEqual(@as(u32, 0), post_sink.error_count);
+    try std.testing.expectEqual(@as(u32, 0), post_sink.warning_count);
 }

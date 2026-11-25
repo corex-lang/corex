@@ -422,7 +422,7 @@ test "test_step2_stdlib_cx_four_tier_differential_parity" {
         "    if nums.len() != 3 or nums[0] != 40_u32 or nums[2] != 25_u32 { return 1; }\n" ++
         "\n" ++
         "    var small = SmallVec[u32, 4].new();\n" ++
-        "    var idx: u32 = 0_u32;\n" ++
+        "    var idx = 0_u32;\n" ++
         "    while idx < 6_u32 {\n" ++
         "        small.push(idx * 10_u32);\n" ++
         "        idx += 1_u32;\n" ++
@@ -466,7 +466,7 @@ test "test_step2_stdlib_cx_four_tier_differential_parity" {
         "    if duped != \"arena-backed\" { own arena.release(); return 9; }\n" ++
         "    own arena.release();\n" ++
         "    let scratch_len: usize = with_scratch(|scratch: &mut Arena| -> usize {\n" ++
-        "        return scratch.dupe_str(\"ping-pong\").len();\n" ++
+        "        scratch.dupe_str(\"ping-pong\").len()\n" ++
         "    });\n" ++
         "    if scratch_len != 9 { return 10; }\n" ++
         "\n" ++
@@ -483,7 +483,7 @@ test "test_step2_stdlib_cx_four_tier_differential_parity" {
         "    if e0 != 0.0_f64 or not math.approx_eq_ulp(pyth, 5.0_f64, max_ulps: 2_u64) or\n" ++
         "        not math.approx_eq_ulp(trig, 1.0_f64, max_ulps: 4_u64) { return 16; }\n" ++
         "    if math.div_ceil(10_u32, 3_u32) != 4_u32 or math.ilog2(64_u32) != 6_u32 { return 17; }\n" ++
-        "    return 0;\n" ++
+        "    0\n" ++
         "}\n";
 
     const app_fid = FileId.fromInt(0);
@@ -581,7 +581,7 @@ test "test_regression_critical03_soa_vec_as_soa_slice_immutable_and_subslice_str
         "    let nested: &#soa [Particle] = sub[1..3];\n" ++
         "    if nested.len() != 2_usize or nested[0].x != 3 or nested[0].y != 30 or nested[1].y != 40 { return 7; }\n" ++
         "    if nested.* != (full[2..4]).* { return 8; }\n" ++
-        "    return 0;\n" ++
+        "    0\n" ++
         "}\n";
 
     const app_fid = FileId.fromInt(0);
@@ -673,7 +673,7 @@ test "test_regression_critical04_sast_arena_drop_elision_nontrivial_string_and_p
         "@inline(never)\n" ++
         "pub fn run_arena_nontrivial_vec() -> usize {\n" ++
         "    var arena = Arena.new();\n" ++
-        "    var count: usize = 0_usize;\n" ++
+        "    var count = 0_usize;\n" ++
         "    {\n" ++
         "        var items = Vec[TrackedElem].in_arena(&mut arena);\n" ++
         "        items.push(TrackedElem { tag: 101 });\n" ++
@@ -681,7 +681,7 @@ test "test_regression_critical04_sast_arena_drop_elision_nontrivial_string_and_p
         "        count = items.len();\n" ++
         "    }\n" ++
         "    own arena.release();\n" ++
-        "    return count;\n" ++
+        "    count\n" ++
         "}\n" ++
         "\n" ++
         "@inline(never)\n" ++
@@ -691,7 +691,7 @@ test "test_regression_critical04_sast_arena_drop_elision_nontrivial_string_and_p
         "        var text = String.new();\n" ++
         "        text.push_str(\"0123456789abcdef0123456789abcdef0123456789abcdef\");\n" ++
         "        var small = SmallVec[u32, 4].new();\n" ++
-        "        var idx: u32 = 0_u32;\n" ++
+        "        var idx = 0_u32;\n" ++
         "        while idx < 8_u32 {\n" ++
         "            small.push(idx);\n" ++
         "            idx += 1_u32;\n" ++
@@ -699,13 +699,13 @@ test "test_regression_critical04_sast_arena_drop_elision_nontrivial_string_and_p
         "        text.len() + small.len()\n" ++
         "    };\n" ++
         "    own arena.release();\n" ++
-        "    return total;\n" ++
+        "    total\n" ++
         "}\n" ++
         "\n" ++
         "pub fn main() -> i32 {\n" ++
         "    if run_arena_nontrivial_vec() != 2_usize { return 1; }\n" ++
         "    if run_with_ctx_inline_containers() != 56_usize { return 2; }\n" ++
-        "    return 0;\n" ++
+        "    0\n" ++
         "}\n";
 
     const app_fid = FileId.fromInt(0);
@@ -767,7 +767,7 @@ test "test_regression_critical05_soa_vec_in_arena_routing_and_try_push_oom_elem_
         "}\n" ++
         "\n" ++
         "pub fn is_signed_type[T: Integer]() -> bool {\n" ++
-        "    return @implements[T, Signed]();\n" ++
+        "    @implements[T, Signed]()\n" ++
         "}\n" ++
         "\n" ++
         "pub fn main() -> i32 {\n" ++
@@ -804,7 +804,7 @@ test "test_regression_critical05_soa_vec_in_arena_routing_and_try_push_oom_elem_
         "\n" ++
         "    // [3] `@implements[T, Signed]()` monomorphization parity across all 4 tiers:\n" ++
         "    if not is_signed_type[i32]() or is_signed_type[u32]() { return 4; }\n" ++
-        "    return 0;\n" ++
+        "    0\n" ++
         "}\n";
 
     const app_fid = FileId.fromInt(0);

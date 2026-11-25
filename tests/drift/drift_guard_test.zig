@@ -441,9 +441,9 @@ test "test_drift_guard_phase2_cst_node_kind_ast_tag_and_parser_diagnostics" {
 }
 
 test "test_drift_guard_phase3_query_db_fmt_engine_and_cli_flags" {
-    // [1] Verify `QueryStage` 14-stage enum contiguity (`0..13`) and `query_db` layout parity:
+    // [1] Verify `QueryStage` 18-stage enum contiguity (`0..17`) and `query_db` layout parity:
     const stage_values = std.enums.values(corex.QueryStage);
-    try std.testing.expectEqual(@as(usize, 14), stage_values.len);
+    try std.testing.expectEqual(@as(usize, 18), stage_values.len);
     inline for (stage_values, 0..) |stage_val, i| {
         try std.testing.expectEqual(@as(u8, @intCast(i)), @backingInt(stage_val));
     }
@@ -1068,7 +1068,7 @@ test "test_drift_guard_phase7_5_dr21_surface_syntax_and_diagnostics" {
     }
 
     // [4] Verify all 8 `DR-21` `DiagnosticCode` tags (`146` total catalog entries) and test coverage:
-    try std.testing.expectEqual(@as(usize, 146), diagnostic.DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 182), diagnostic.DIAGNOSTIC_CATALOG.len);
     const dr21_specs = [_]struct {
         /// Canonical Phase 7.5 `DR-21` `DiagnosticCode` tag.
         code: DiagnosticCode,
@@ -1572,7 +1572,7 @@ test "test_drift_guard_phase9_pkg_seams_diagnostics_and_cli" {
 
     // [5] Verify all 7 new Phase 9 `DiagnosticCode` tags (`E0010`–`E0016`) + reused `DR-17` codes (`E0324`–`E0327`,
     //     `E0435`, `W0330`) in `DIAGNOSTIC_CATALOG`, `stage0/src/`, and `tests/unit/`:
-    try std.testing.expectEqual(@as(usize, 146), diagnostic.DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 182), diagnostic.DIAGNOSTIC_CATALOG.len);
     try std.testing.expectEqual(
         DiagnosticCode.e0435_invalid_cfg_predicate,
         DiagnosticCode.e0435_unknown_cfg_feature,
@@ -1646,8 +1646,8 @@ test "test_drift_guard_phase9_pkg_seams_diagnostics_and_cli" {
 test "test_drift_guard_phase10_tooling_lsp_check_and_upgrade" {
     // [1] Verify `DIAGNOSTIC_CATALOG` (`146` contiguous entries) and `W0202` / `W0403` coverage:
     try expectContiguousEnum(DiagnosticCode);
-    try std.testing.expectEqual(@as(usize, 146), diagnostic.DIAGNOSTIC_CATALOG.len);
-    try std.testing.expectEqual(@as(usize, 146), std.enums.values(DiagnosticCode).len);
+    try std.testing.expectEqual(@as(usize, 182), diagnostic.DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 182), std.enums.values(DiagnosticCode).len);
 
     const phase10_diag_specs = [_]struct {
         /// Canonical Phase 10 `DiagnosticCode` tag exercised by `check` and `upgrade`.
@@ -1698,15 +1698,19 @@ test "test_drift_guard_phase10_tooling_lsp_check_and_upgrade" {
     try expectContiguousEnum(router.CompileFlagId);
     try std.testing.expectEqual(@as(usize, 25), router.COMPILE_FLAGS.len);
 
-    // [3] Verify `CHECK_FLAGS` (`4` sorted entries), `UPGRADE_FLAGS` (`6`), and `LSP_FLAGS` (`2`) + `--help` parity:
+    // [3] Verify `CHECK_FLAGS` (`8` sorted entries), `UPGRADE_FLAGS` (`6`), and `LSP_FLAGS` (`2`) + `--help` parity:
     try expectContiguousEnum(router.CheckFlagId);
     const expected_check_flags = [_][]const u8{
         "--caps",
         "--deny-warnings",
+        "--disable",
         "--explain-caps",
         "--fix",
+        "--fix-unsafe",
+        "--only",
+        "--unsafe-fixes",
     };
-    try std.testing.expectEqual(@as(usize, 4), router.CHECK_FLAGS.len);
+    try std.testing.expectEqual(@as(usize, 8), router.CHECK_FLAGS.len);
     var sub_help_buf: [8192]u8 = undefined;
     var check_help_writer = std.Io.Writer.fixed(&sub_help_buf);
     try router.renderSubcommandHelp(&check_help_writer, StyleConfig.MONOCHROME, .check);
@@ -1839,7 +1843,7 @@ test "test_drift_guard_phase106_dr23_diagnostics_tokens_and_upgrade_rules" {
 
     // [2] Verify all 10 `DR-23` `DiagnosticCode` tags (`146` total catalog entries) and `.err` severity:
     try expectContiguousEnum(DiagnosticCode);
-    try std.testing.expectEqual(@as(usize, 146), diagnostic.DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 182), diagnostic.DIAGNOSTIC_CATALOG.len);
     const dr23_diag_specs = [_]struct {
         /// Canonical Phase 10.6 `DR-23` `DiagnosticCode` tag.
         code: DiagnosticCode,
@@ -1973,7 +1977,7 @@ test "test_drift_guard_phase111b_dr24_diagnostics_tokens_and_upgrade_rules" {
 
     // [2] Verify all 8 new `DR-24` `DiagnosticCode` tags (`146` total catalog entries) and `stage0/src` + `tests/unit` coverage:
     try expectContiguousEnum(DiagnosticCode);
-    try std.testing.expectEqual(@as(usize, 146), diagnostic.DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 182), diagnostic.DIAGNOSTIC_CATALOG.len);
     const dr24_diag_specs = [_]struct {
         /// Canonical Phase 11.1b `DR-24` `DiagnosticCode` tag.
         code: DiagnosticCode,
@@ -2057,4 +2061,260 @@ test "test_drift_guard_phase111b_dr24_diagnostics_tokens_and_upgrade_rules" {
         try std.testing.expectEqual(desc.id, corex.lookupUpgradeRule(expected_code).?);
         try std.testing.expect(desc.summary.len > 0);
     }
+}
+
+test "test_drift_guard_phase111c_dr25_lint_catalog_manifest_firewall_and_grammar" {
+    // [1] Verify 44-rule `DIAGNOSTIC_LINT_CATALOG` contiguity, category/applicability counts, and selector bijection:
+    const RuleId = diagnostic.RuleId;
+    try expectContiguousEnum(RuleId);
+    try std.testing.expectEqual(@as(usize, 44), std.enums.values(RuleId).len);
+    try std.testing.expectEqual(@as(usize, 44), diagnostic.DIAGNOSTIC_LINT_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 1), @sizeOf(RuleId));
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(corex.lint_filter.RuleMask64));
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(corex.lint_filter.EffectiveFileRules));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(corex.lint_filter.RawLintCandidate));
+
+    var cat_correctness: usize = 0;
+    var cat_suspicious: usize = 0;
+    var cat_clarity: usize = 0;
+    var cat_style: usize = 0;
+    var cat_perf: usize = 0;
+    var fix_machine: usize = 0;
+    var fix_unsafe: usize = 0;
+    var fix_diag_only: usize = 0;
+
+    for (diagnostic.DIAGNOSTIC_LINT_CATALOG, 0..) |meta, idx| {
+        try std.testing.expectEqual(idx, @as(usize, meta.rule_id.asInt()));
+        try std.testing.expect(meta.slug.len > 0);
+        try std.testing.expectEqual(meta.rule_id, meta.diag_code.asLintRuleId().?);
+        switch (diagnostic.lookupLintRuleBySelector(meta.slug)) {
+            .rule => |by_slug| try std.testing.expectEqual(meta.rule_id, by_slug),
+            else => return error.TestUnexpectedResult,
+        }
+        switch (diagnostic.lookupLintRuleBySelector(meta.diag_code.asCodeStr())) {
+            .rule => |by_code| try std.testing.expectEqual(meta.rule_id, by_code),
+            else => return error.TestUnexpectedResult,
+        }
+        switch (meta.category) {
+            .correctness => cat_correctness += 1,
+            .suspicious => cat_suspicious += 1,
+            .clarity => cat_clarity += 1,
+            .style => cat_style += 1,
+            .perf => cat_perf += 1,
+        }
+        switch (meta.default_applicability) {
+            .machine_applicable => fix_machine += 1,
+            .maybe_incorrect => fix_unsafe += 1,
+            .unspecified, .has_placeholders => fix_diag_only += 1,
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), cat_correctness);
+    try std.testing.expectEqual(@as(usize, 11), cat_suspicious);
+    try std.testing.expectEqual(@as(usize, 14), cat_clarity);
+    try std.testing.expectEqual(@as(usize, 10), cat_style);
+    try std.testing.expectEqual(@as(usize, 5), cat_perf);
+    try std.testing.expectEqual(@as(usize, 26), fix_machine);
+    try std.testing.expectEqual(@as(usize, 7), fix_unsafe);
+    try std.testing.expectEqual(@as(usize, 11), fix_diag_only);
+
+    // [2] Verify `FORBIDDEN_STRAY_TOOL_DOTFILES` (`10` sorted CoreX dotfiles; never `.rustfmt.toml`, Ruling 2.3):
+    const stray_list = corex.pkg_manifest.FORBIDDEN_STRAY_TOOL_DOTFILES;
+    try std.testing.expectEqual(@as(usize, 10), stray_list.len);
+    for (stray_list, 0..) |dotfile_name, idx| {
+        try std.testing.expect(!std.mem.eql(u8, dotfile_name, ".rustfmt.toml"));
+        if (idx > 0) {
+            try std.testing.expectEqual(
+                std.math.Order.lt,
+                std.mem.order(u8, stray_list[idx - 1], dotfile_name),
+            );
+        }
+    }
+
+    // [3] Verify `E0017`–`E0020`, `E0240`, and `W0001`–`W0004` catalog codes:
+    try std.testing.expectEqualStrings("E0017", DiagnosticCode.e0017_stray_tool_config_dotfile.asCodeStr());
+    try std.testing.expectEqualStrings("E0018", DiagnosticCode.e0018_forbidden_tool_config_key.asCodeStr());
+    try std.testing.expectEqualStrings("E0019", DiagnosticCode.e0019_invalid_lint_rule_or_glob.asCodeStr());
+    try std.testing.expectEqualStrings("E0020", DiagnosticCode.e0020_tool_setting_out_of_range.asCodeStr());
+    try std.testing.expectEqualStrings("E0240", DiagnosticCode.e0240_invalid_suppression_selector.asCodeStr());
+    try std.testing.expectEqualStrings("W0001", DiagnosticCode.w0001_deprecated_cli_option.asCodeStr());
+    try std.testing.expectEqualStrings("W0002", DiagnosticCode.w0002_unused_suppression.asCodeStr());
+    try std.testing.expectEqualStrings("W0003", DiagnosticCode.w0003_missing_suppression_reason.asCodeStr());
+    try std.testing.expectEqualStrings("W0004", DiagnosticCode.w0004_prefer_expect_over_allow.asCodeStr());
+
+    // [4] Read-only parity check against sibling `../vscode-ext-corex/syntaxes/corex.tmLanguage.json` when present:
+    if (std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "../vscode-ext-corex/syntaxes/corex.tmLanguage.json",
+        std.testing.allocator,
+        .limited(4 * 1024 * 1024),
+    )) |tml_bytes| {
+        defer std.testing.allocator.free(tml_bytes);
+        try std.testing.expect(std.mem.indexOf(u8, tml_bytes, "file-expect") != null);
+        try std.testing.expect(std.mem.indexOf(u8, tml_bytes, "file-allow") != null);
+        try std.testing.expect(std.mem.indexOf(u8, tml_bytes, "(expect|allow)") != null);
+    } else |_| {}
+}
+
+test "test_drift_guard_phase111c_core_stdlib_and_comparisons_zero_warnings" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const FileId = corex.FileId;
+    const CompilerDb = corex.CompilerDb;
+
+    const core_paths = [_][]const u8{
+        "core/root.cx",
+        "core/primitives.cx",
+        "core/mem.cx",
+        "core/atomic.cx",
+        "core/simd.cx",
+        "core/panic.cx",
+        "core/runtime.cx",
+        "core/sys/mod.cx",
+        "core/sys/linux.cx",
+        "core/sys/macos.cx",
+        "core/sys/windows.cx",
+        "core/sys/wasi.cx",
+        "core/ffi.cx",
+        "core/async.cx",
+    };
+    const stdlib_paths = [_][]const u8{
+        "stdlib/cx/mod.cx",
+        "stdlib/cx/mem.cx",
+        "stdlib/cx/math.cx",
+        "stdlib/cx/col.cx",
+        "stdlib/cx/str.cx",
+    };
+
+    // [1] Verify `core/**/*.cx` and `stdlib/cx/*.cx` emit 0 errors and 0 warnings under `--sast-strict`:
+    {
+        var db = try CompilerDb.init(allocator);
+        defer db.deinit();
+        try db.setInternalCore(true);
+        db.setSastStrict(true);
+
+        var all_fids: [core_paths.len + stdlib_paths.len]FileId = undefined;
+        for (core_paths, 0..) |mod_path, i| {
+            const raw_bytes = try std.Io.Dir.cwd().readFileAlloc(io, mod_path, allocator, .limited(4 * 1024 * 1024));
+            defer allocator.free(raw_bytes);
+            const fid = FileId.fromInt(@intCast(100 + i));
+            all_fids[i] = fid;
+            try db.setFilePackageId(fid, .std_core);
+            try db.setFilePath(fid, mod_path);
+            _ = try db.setInput(fid, raw_bytes, .low);
+        }
+
+        const core_root_fid = all_fids[0];
+        try db.registerRootModule("core", core_root_fid);
+        try db.bindExternalModule(core_root_fid, "primitives", all_fids[1]);
+        try db.bindExternalModule(core_root_fid, "mem", all_fids[2]);
+        try db.bindExternalModule(core_root_fid, "atomic", all_fids[3]);
+        try db.bindExternalModule(core_root_fid, "simd", all_fids[4]);
+        try db.bindExternalModule(core_root_fid, "panic", all_fids[5]);
+        try db.bindExternalModule(core_root_fid, "runtime", all_fids[6]);
+        try db.bindExternalModule(core_root_fid, "sys", all_fids[7]);
+        try db.bindExternalModule(core_root_fid, "ffi", all_fids[12]);
+        try db.bindExternalModule(core_root_fid, "async", all_fids[13]);
+
+        const sys_mod_fid = all_fids[7];
+        try db.bindExternalModule(sys_mod_fid, "linux", all_fids[8]);
+        try db.bindExternalModule(sys_mod_fid, "macos", all_fids[9]);
+        try db.bindExternalModule(sys_mod_fid, "windows", all_fids[10]);
+        try db.bindExternalModule(sys_mod_fid, "wasi", all_fids[11]);
+        try db.markCoreKernelSubtree(core_root_fid);
+
+        for (stdlib_paths, 0..) |cx_path, i| {
+            const raw_bytes = try std.Io.Dir.cwd().readFileAlloc(io, cx_path, allocator, .limited(4 * 1024 * 1024));
+            defer allocator.free(raw_bytes);
+            const slot_idx = core_paths.len + i;
+            const fid = FileId.fromInt(@intCast(100 + slot_idx));
+            all_fids[slot_idx] = fid;
+            try db.setFilePackageId(fid, .std_core);
+            try db.setFilePath(fid, cx_path);
+            _ = try db.setInput(fid, raw_bytes, .low);
+        }
+
+        const cx_mod_fid = all_fids[core_paths.len];
+        try db.registerRootModule("cx", cx_mod_fid);
+        try db.registerCxStdlibPreludeRoot(cx_mod_fid);
+        try db.bindExternalModule(cx_mod_fid, "mem", all_fids[core_paths.len + 1]);
+        try db.bindExternalModule(cx_mod_fid, "math", all_fids[core_paths.len + 2]);
+        try db.bindExternalModule(cx_mod_fid, "col", all_fids[core_paths.len + 3]);
+        try db.bindExternalModule(cx_mod_fid, "str", all_fids[core_paths.len + 4]);
+
+        try db.setExplicitLintTargetFiles(&all_fids);
+
+        for (all_fids) |fid| {
+            _ = try db.parseCst(fid);
+        }
+        for (all_fids) |fid| {
+            _ = try db.resolveSignatures(fid);
+        }
+        for (all_fids, 0..) |fid, idx| {
+            const path_label = if (idx < core_paths.len) core_paths[idx] else stdlib_paths[idx - core_paths.len];
+            const proj_sink = try db.projectFileDiagnostics(fid);
+            if (proj_sink.diagnostics.items.len > 0) {
+                for (proj_sink.diagnostics.items) |diag_item| {
+                    std.debug.print(
+                        "Phase 11.1c zero-warning drift in `{s}` [{s}]: {s}\n",
+                        .{ path_label, diag_item.code.asCodeStr(), diag_item.message },
+                    );
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 0), proj_sink.diagnostics.items.len);
+        }
+    }
+
+    // [2] Verify every ```cx showcase in `docs/COMPARISONS.md` parses cleanly and formats idempotently:
+    const raw_comparisons_md = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        "docs/COMPARISONS.md",
+        allocator,
+        .limited(2 * 1024 * 1024),
+    );
+    defer allocator.free(raw_comparisons_md);
+    var lf_buf = try std.ArrayList(u8).initCapacity(allocator, raw_comparisons_md.len);
+    defer lf_buf.deinit(allocator);
+    for (raw_comparisons_md) |ch| {
+        if (ch != '\r') lf_buf.appendAssumeCapacity(ch);
+    }
+    const comparisons_md = lf_buf.items;
+    try std.testing.expect(std.mem.indexOf(u8, comparisons_md, "Compiler-Integrated Linter & Hygiene") != null);
+
+    var showcase_count: usize = 0;
+    var scan_pos: usize = 0;
+    while (std.mem.indexOfPos(u8, comparisons_md, scan_pos, "```cx\n")) |fence_open| {
+        const block_start = fence_open + "```cx\n".len;
+        const fence_close = std.mem.indexOfPos(u8, comparisons_md, block_start, "\n```") orelse
+            return error.UnclosedCxCodeFenceInComparisons;
+        scan_pos = fence_close + "\n```".len;
+        showcase_count += 1;
+
+        const raw_snippet = comparisons_md[block_start .. fence_close + 1];
+        const snippet_fid = FileId.fromInt(@intCast(500 + showcase_count));
+
+        var fm_arena = corex.BumpArena.init(allocator);
+        defer fm_arena.deinit();
+        const extracted_opt = try corex.pkg_manifest.extractScriptFrontmatter(
+            &fm_arena,
+            snippet_fid,
+            raw_snippet,
+            null,
+        );
+        const body_slice = if (extracted_opt) |ext|
+            raw_snippet[ext.prefix_end_byte..]
+        else
+            raw_snippet;
+
+        var fmt_res = try corex.fmt_engine.formatSource(allocator, body_slice, snippet_fid);
+        defer fmt_res.deinit(allocator);
+        if (fmt_res.has_syntax_errors or fmt_res.is_changed) {
+            std.debug.print(
+                "Showcase #{d} in `docs/COMPARISONS.md` failed check (err={}, changed={}):\n{s}\n",
+                .{ showcase_count, fmt_res.has_syntax_errors, fmt_res.is_changed, fmt_res.formatted_text },
+            );
+        }
+        try std.testing.expect(!fmt_res.has_syntax_errors);
+        try std.testing.expect(!fmt_res.is_changed);
+    }
+    try std.testing.expect(showcase_count >= 12);
 }

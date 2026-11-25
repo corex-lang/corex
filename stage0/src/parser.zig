@@ -15,6 +15,7 @@ const mem_foundation = @import("mem_foundation.zig");
 const syntax_arenas = @import("syntax_arenas.zig");
 const lexer = @import("lexer.zig");
 const diagnostic = @import("diag/diagnostic.zig");
+const lint_filter = @import("lint_filter.zig");
 
 const FileId = mem_foundation.FileId;
 const Span = mem_foundation.Span;
@@ -50,6 +51,8 @@ const DiagnosticSink = diagnostic.DiagnosticSink;
 const LabeledSpan = diagnostic.LabeledSpan;
 const SuggestedFix = diagnostic.SuggestedFix;
 const TextEdit = diagnostic.TextEdit;
+const LintSettings = lint_filter.LintSettings;
+const RawLintCandidate = lint_filter.RawLintCandidate;
 
 // ---------------------------------------- TYPES ----------------------------------------
 
@@ -135,6 +138,12 @@ pub const ParserOptions = struct {
     is_casing_warning_enabled: bool = true,
     /// When `true`, includes top-level `test` and `bench` declarations in `root`'s AST item slice.
     is_including_tests: bool = true,
+    /// Effective `[lint.settings]` configuration for `W0203` (`allowed-ident-names`).
+    lint_settings: LintSettings = .{},
+    /// Optional collector receiving 24-byte `RawLintCandidate`s (`CompilerDb` mode) instead of direct `DiagnosticSink` warnings.
+    raw_lint_candidates_out: ?*std.ArrayListUnmanaged(RawLintCandidate) = null,
+    /// `true` when parsing a synthetic `@c_import` header buffer where C identifiers and signatures are lint-exempt.
+    is_c_import_virtual: bool = false,
 };
 
 /// Pratt infix binding power pair `(left_bp, right_bp)` and non-associativity flag (`DR-03` Section 5.3).
@@ -519,6 +528,7 @@ pub const MATCH_ARM_CONSUME_SET: TokenSet128 = TokenSet128.initMany(&.{.comma});
 /// Stop-before anchor set for `match` arm loops.
 pub const MATCH_ARM_STOP_SET: TokenSet128 = TokenSet128.initMany(&.{
     .rbrace,
+    .at,
     .fat_arrow,
     .underscore,
     .dot,
@@ -1150,6 +1160,34 @@ fn spliceCstArenaWindow(
     }
 }
 
+/// Returns `true` if `kind` can participate as a word segment in a `kebab-case` lint rule selector (`DR-25`).
+inline fn isLintSelectorWordKind(kind: TokenKind) bool {
+    return isIdentifierKind(kind) or isKeywordKind(kind) or kind == .prim_type;
+}
+
+/// Returns `true` if `@<name>` is a built-in statement/block/suppression attribute (never an `@intrinsic` call).
+fn isKnownStmtOrBlockAttrName(name: []const u8) bool {
+    const ATTR_NAMES = std.StaticStringMap(void).initComptime(.{
+        .{ "allow", {} },
+        .{ "cfg", {} },
+        .{ "cold", {} },
+        .{ "deprecated", {} },
+        .{ "expect", {} },
+        .{ "hot", {} },
+        .{ "likely", {} },
+        .{ "must_vectorize", {} },
+        .{ "no_alloc", {} },
+        .{ "no_block", {} },
+        .{ "no_panic", {} },
+        .{ "state", {} },
+        .{ "unlikely", {} },
+        .{ "unroll", {} },
+        .{ "unused", {} },
+        .{ "vectorize_width", {} },
+    });
+    return ATTR_NAMES.has(name);
+}
+
 // ------------------------------------- PUBLIC API --------------------------------------
 
 // ------------------- Parser Implementation --------------------
@@ -1186,6 +1224,10 @@ pub const Parser = struct {
     is_in_cond_header: bool = false,
     /// `true` while parsing inside a declaration or member annotated with `@allow(non_canonical_case)`.
     is_allowing_non_canonical_case: bool = false,
+    /// `true` while parsing an `extern` block, `extern static`, or `extern fn` declaration (`W0201`/`W0203` exempt).
+    is_in_extern_context: bool = false,
+    /// `true` while parsing an item carrying `@link(name: …)` or `@link_name(…)` (`W0201` exempt).
+    has_link_name_exemption: bool = false,
     /// `true` while executing `Parser.parse()`, gating scratch casing-exemption sets freed on exit.
     is_in_full_parse: bool = false,
     /// Nominal type identifiers declared under `@allow(non_canonical_case)` in the active `parse()` pass.
@@ -2387,13 +2429,120 @@ pub const Parser = struct {
         }, cst_start);
     }
 
+    /// Appends `lint_cand` to `raw_lint_candidates_out` (`CompilerDb`) or materializes into `diagnostic_sink`.
+    fn recordOrEmitParserLintCandidate(self: *Parser, lint_cand: RawLintCandidate) !void {
+        if (self.options.is_c_import_virtual) return;
+        if (self.options.raw_lint_candidates_out) |raw_out| {
+            try raw_out.append(self.token_buffer.allocator, lint_cand);
+            return;
+        }
+        if (lint_cand.rule_id != .non_canonical_case) return;
+        if (self.diagnostic_sink) |sink| {
+            try lint_filter.materializeLexCstLintCandidate(
+                self.source,
+                self.file_id,
+                self.interner,
+                lint_cand,
+                sink,
+            );
+        }
+    }
+
+    /// Checks a value-binding identifier token for `W0203` (`single-char-ident`, `DR-25` §2.2).
+    fn checkSingleCharBinding(self: *Parser, token_id: TokenIndex, binding_role: u16) !void {
+        if (self.options.is_c_import_virtual or self.is_in_extern_context or token_id.isNone()) return;
+        const ident_str = self.getTokenLexeme(token_id);
+        if (ident_str.len == 0 or (ident_str.len == 1 and ident_str[0] == '_')) return;
+        const ALLOWED_SINGLE_CHAR_MASK: u32 =
+            (@as(u32, 1) << ('i' - 'a')) |
+            (@as(u32, 1) << ('j' - 'a')) |
+            (@as(u32, 1) << ('k' - 'a')) |
+            (@as(u32, 1) << ('n' - 'a')) |
+            (@as(u32, 1) << ('x' - 'a')) |
+            (@as(u32, 1) << ('y' - 'a')) |
+            (@as(u32, 1) << ('z' - 'a')) |
+            (@as(u32, 1) << ('w' - 'a'));
+        if (ident_str.len == 1 and ident_str[0] >= 'a' and ident_str[0] <= 'z') {
+            if ((ALLOWED_SINGLE_CHAR_MASK & (@as(u32, 1) << @intCast(ident_str[0] - 'a'))) != 0) return;
+        } else if (ident_str.len > 1) {
+            const cp_len = std.unicode.utf8CountCodepoints(ident_str) catch 2;
+            if (cp_len != 1) return;
+        }
+        if (self.interner) |str_interner| {
+            if (self.options.lint_settings.isAllowedIdentName(str_interner, ident_str)) return;
+        }
+        const tok_span = self.getTokenSpan(token_id);
+        try self.recordOrEmitParserLintCandidate(.{
+            .rule_id = .single_char_ident,
+            .fix_kind = 0,
+            .aux_u16 = binding_role,
+            .start_byte = tok_span.start_byte,
+            .end_byte = tok_span.end_byte,
+            .node_or_tok = token_id.asInt(),
+            .aux_payload = 0,
+        });
+    }
+
+    /// Emits `W0202` (`fix_kind = 10`) when a function or closure specifies an explicit `-> unit` / `-> ()` return type.
+    fn maybeEmitRedundantUnitReturn(
+        self: *Parser,
+        prev_end_byte: u32,
+        arrow_tok: TokenIndex,
+        ret_type_node: NodeIndex,
+    ) !void {
+        if (self.options.is_c_import_virtual or ret_type_node.isNone() or
+            ret_type_node.asInt() >= self.ast.countNodes() or self.cursor == 0)
+        {
+            return;
+        }
+        const ret_node = self.ast.getNode(ret_type_node);
+        const last_tok_span = self.getTokenSpan(TokenIndex.fromInt(self.cursor - 1));
+        const is_bare_unit = switch (ret_node.tag) {
+            .prim_type => !ret_node.main_token.isNone() and
+                std.mem.eql(u8, self.getTokenLexeme(ret_node.main_token), "unit") and
+                self.getTokenSpan(ret_node.main_token).end_byte == last_tok_span.end_byte,
+            .tuple_type => ret_node.lhs.tag == .none and ret_node.rhs.tag == .none,
+            else => false,
+        };
+        if (!is_bare_unit) return;
+
+        const arrow_span = self.getTokenSpan(arrow_tok);
+        const ret_end_byte = last_tok_span.end_byte;
+        const has_cmt = hasCommentMarkerInSlice(self.source, prev_end_byte, ret_end_byte);
+        try self.recordOrEmitParserLintCandidate(.{
+            .rule_id = .non_idiomatic_syntax,
+            .fix_kind = 10,
+            .start_byte = arrow_span.start_byte,
+            .end_byte = ret_end_byte,
+            .node_or_tok = ret_type_node.asInt(),
+            .aux_payload = if (has_cmt) std.math.maxInt(u64) else prev_end_byte,
+        });
+    }
+
     /// Emits or updates in-place `W0201` (`w0201_non_canonical_identifier_case`) for `token_id`.
     fn emitOrUpdateCasingWarning(
         self: *Parser,
         token_id: TokenIndex,
         expected_case: IdentifierCase,
     ) !void {
-        if (!self.options.is_casing_warning_enabled) return;
+        if (!self.options.is_casing_warning_enabled or self.options.is_c_import_virtual) return;
+        if (self.options.raw_lint_candidates_out) |raw_out| {
+            const ident_span = self.getTokenSpan(token_id);
+            const case_fix_kind: u8 = switch (expected_case) {
+                .snake_case => 1,
+                .pascal_case => 2,
+                .screaming_snake_case => 3,
+                .reserved_or_wildcard => 0,
+            };
+            try raw_out.append(self.token_buffer.allocator, .{
+                .rule_id = .non_canonical_case,
+                .fix_kind = case_fix_kind,
+                .start_byte = ident_span.start_byte,
+                .end_byte = ident_span.end_byte,
+                .node_or_tok = token_id.asInt(),
+            });
+            return;
+        }
         const sink = self.diagnostic_sink orelse return;
         const ident_span = self.getTokenSpan(token_id);
         const lexeme = self.getTokenLexeme(token_id);
@@ -2719,7 +2868,16 @@ pub const Parser = struct {
         return cond_expr;
     }
 
-    /// Consumes an identifier, recovering cross-namespace and hybrid casing violations via `W0201`.
+    /// Returns `true` if `lexeme` is an ASCII `[A-Z][0-9]*` identifier (valid as both `PascalCase` and `SCREAMING_SNAKE_CASE`).
+    fn isCanonicalSingleCapConstIdent(lexeme: []const u8) bool {
+        if (lexeme.len == 0 or !std.ascii.isUpper(lexeme[0])) return false;
+        for (lexeme[1..]) |ch| {
+            if (!std.ascii.isDigit(ch)) return false;
+        }
+        return true;
+    }
+
+    /// Consumes a declaration identifier, recovering cross-namespace and hybrid casing violations via `W0201`.
     fn expectIdentifierWithCasing(
         self: *Parser,
         expected_kind: TokenKind,
@@ -2727,18 +2885,63 @@ pub const Parser = struct {
         has_error: *bool,
         missing_msg: []const u8,
     ) !TokenIndex {
+        return self.expectIdentifierSlotWithCasing(expected_kind, expected_case, true, has_error, missing_msg);
+    }
+
+    /// Consumes a reference-site identifier, suppressing duplicate `W0201` candidates in `CompilerDb` mode.
+    fn expectIdentifierRefWithCasing(
+        self: *Parser,
+        expected_kind: TokenKind,
+        expected_case: IdentifierCase,
+        has_error: *bool,
+        missing_msg: []const u8,
+    ) !TokenIndex {
+        return self.expectIdentifierSlotWithCasing(expected_kind, expected_case, false, has_error, missing_msg);
+    }
+
+    /// Shared implementation for `expectIdentifierWithCasing` (`is_decl_site == true`) and reference sites.
+    fn expectIdentifierSlotWithCasing(
+        self: *Parser,
+        expected_kind: TokenKind,
+        expected_case: IdentifierCase,
+        is_decl_site: bool,
+        has_error: *bool,
+        missing_msg: []const u8,
+    ) !TokenIndex {
         const cur_rec = self.peekNth(0);
         if (isIdentifierKind(cur_rec.kind)) {
             const preview_lexeme = self.peekLexemeNth(0);
+            const is_c_alias = expected_case == .pascal_case and CANONICAL_C_TYPE_ALIASES.has(preview_lexeme);
+            const is_single_cap_const = expected_case == .screaming_snake_case and
+                cur_rec.kind == .type_ident and isCanonicalSingleCapConstIdent(preview_lexeme);
+            const is_intrinsic_exempt = self.is_in_extern_context or self.has_link_name_exemption or is_c_alias;
+            if (self.options.raw_lint_candidates_out != null) {
+                const tok_id = try self.consumeLeaf(.token_leaf, .{});
+                if (is_decl_site and !is_intrinsic_exempt and !is_single_cap_const) {
+                    const cls = lexer.classifyIdentifierOrKeyword(preview_lexeme);
+                    const is_delta_snake = preview_lexeme.len >= 3 and
+                        (std.mem.startsWith(u8, preview_lexeme, "\xCE\x94") or
+                            std.mem.startsWith(u8, preview_lexeme, "_\xCE\x94")) and
+                        expected_case == .snake_case and !cls.has_case_violation;
+                    if (!is_delta_snake and (cur_rec.kind != expected_kind or cls.has_case_violation)) {
+                        try self.emitOrUpdateCasingWarning(tok_id, expected_case);
+                    }
+                }
+                return tok_id;
+            }
+            if (is_single_cap_const) {
+                return self.consumeLeaf(.token_leaf, .{});
+            }
             const is_exempt_type = expected_case == .pascal_case and
-                (CANONICAL_C_TYPE_ALIASES.has(preview_lexeme) or
-                    self.allowed_non_canonical_types.contains(preview_lexeme));
+                (is_c_alias or self.allowed_non_canonical_types.contains(preview_lexeme));
             const is_exempt_member = expected_case == .snake_case and
                 self.allowed_non_canonical_members.contains(preview_lexeme);
-            if (self.is_allowing_non_canonical_case or is_exempt_type or is_exempt_member) {
+            if (is_intrinsic_exempt or self.is_allowing_non_canonical_case or is_exempt_type or is_exempt_member) {
                 const tok_id = try self.consumeLeaf(.token_leaf, .{});
                 self.suppressCasingWarningAtToken(tok_id);
-                if (self.is_allowing_non_canonical_case and self.is_in_full_parse and preview_lexeme.len > 0) {
+                if ((self.is_allowing_non_canonical_case or is_intrinsic_exempt) and
+                    self.is_in_full_parse and preview_lexeme.len > 0)
+                {
                     if (expected_case == .pascal_case) {
                         try self.allowed_non_canonical_types.put(self.ast.allocator, preview_lexeme, {});
                     } else {
@@ -3058,7 +3261,8 @@ pub const Parser = struct {
 
             if (isIdentifierKind(self.peekKind()) or isKeywordKind(self.peekKind())) {
                 const name_tok = try self.consumeLeaf(.token_leaf, .{});
-                if (std.mem.eql(u8, self.getTokenLexeme(name_tok), "noalloc")) {
+                const attr_name_lex = self.getTokenLexeme(name_tok);
+                if (std.mem.eql(u8, attr_name_lex, "noalloc")) {
                     has_attr_err = true;
                     has_error.* = true;
                     const name_span = self.getTokenSpan(name_tok);
@@ -3072,6 +3276,23 @@ pub const Parser = struct {
                         "@no_alloc",
                         "replace `@noalloc` with `@no_alloc`",
                     );
+                } else if (std.mem.eql(u8, attr_name_lex, "allow") or std.mem.eql(u8, attr_name_lex, "expect")) {
+                    if (self.peekKind() == .lparen) {
+                        try self.parseLintSelectorList(at_span.start_byte, &has_attr_err);
+                        if (has_attr_err) has_error.* = true;
+                    } else {
+                        has_attr_err = true;
+                        has_error.* = true;
+                        const name_span = self.getTokenSpan(name_tok);
+                        try self.emitLintSelectorDiagnostic(
+                            Span.init(self.file_id, at_span.start_byte, name_span.end_byte),
+                            "`@allow` and `@expect` require a non-empty `(rule, …)` selector list",
+                            "missing `(rule, …)` selector list",
+                            null,
+                        );
+                    }
+                    self.cst.finishNode(attr_cst, .{ .has_error = has_attr_err });
+                    continue;
                 }
             } else {
                 has_attr_err = true;
@@ -3090,6 +3311,248 @@ pub const Parser = struct {
             self.cst.finishNode(attr_cst, .{ .has_error = has_attr_err });
         }
         return result;
+    }
+
+    /// Emits `E0240` (`e0240_invalid_suppression_selector`) with an optional footer `help:` note.
+    fn emitLintSelectorDiagnostic(
+        self: *Parser,
+        span: Span,
+        message: []const u8,
+        label_text: []const u8,
+        opt_note: ?[]const u8,
+    ) anyerror!void {
+        if (self.diagnostic_sink == null) return;
+        const sink = self.diagnostic_sink.?;
+        const notes_slice: []const []const u8 = if (opt_note) |note_str| &.{note_str} else &.{};
+        try sink.emit(.{
+            .code = .e0240_invalid_suppression_selector,
+            .severity = .err,
+            .message = message,
+            .labels = &.{.{
+                .span = span,
+                .label = label_text,
+                .style = .primary,
+            }},
+            .notes = notes_slice,
+        });
+    }
+
+    /// Parses `( Selector { "," Selector } [ "," "reason" ":" STRING_LIT ] [","] )` on `@allow` / `@expect` (`DR-25`).
+    fn parseLintSelectorList(self: *Parser, attr_start_byte: u32, has_attr_err: *bool) anyerror!void {
+        const open_paren = try self.consumeLeaf(.token_leaf, .{});
+        var rule_count: u32 = 0;
+        var has_seen_reason = false;
+
+        while (self.peekKind() != .rparen and
+            self.peekKind() != .rbrace and
+            self.peekKind() != .eof)
+        {
+            const loop_start = self.cursor;
+            const cur_kind = self.peekKind();
+
+            if (isIdentifierKind(cur_kind) and
+                (self.peekKindNth(1) == .colon or self.peekKindNth(1) == .eq))
+            {
+                const key_tok = try self.consumeLeaf(.token_leaf, .{});
+                const sep_tok = try self.consumeLeaf(.token_leaf, .{});
+                if (self.token_buffer.getToken(sep_tok).kind == .eq) {
+                    has_attr_err.* = true;
+                    const eq_span = self.getTokenSpan(sep_tok);
+                    try self.emitDiagnosticWithFix(
+                        .e0223_retired_attribute_eq,
+                        eq_span,
+                        "`=` key-value separator inside `@attr(…)` has been retired; use `:` instead",
+                        "retired `=` in attribute argument; write `:`",
+                        eq_span,
+                        ":",
+                        "replace `=` with `:`",
+                    );
+                }
+                const key_lex = self.getTokenLexeme(key_tok);
+                if (!std.mem.eql(u8, key_lex, "reason")) {
+                    has_attr_err.* = true;
+                    try self.emitLintSelectorDiagnostic(
+                        self.getTokenSpan(key_tok),
+                        "unknown keyword argument in lint suppression; only `reason: \"…\"` is permitted",
+                        "expected `reason: \"…\"`",
+                        null,
+                    );
+                    _ = try self.parseExpr(true);
+                } else {
+                    if (has_seen_reason) {
+                        has_attr_err.* = true;
+                        try self.emitLintSelectorDiagnostic(
+                            self.getTokenSpan(key_tok),
+                            "duplicate `reason:` argument in lint suppression",
+                            "duplicate `reason:`",
+                            null,
+                        );
+                    }
+                    has_seen_reason = true;
+                    if (self.peekKind() == .string_lit) {
+                        _ = try self.consumeLeaf(.literal_expr, .{});
+                    } else {
+                        has_attr_err.* = true;
+                        try self.emitLintSelectorDiagnostic(
+                            self.getTokenSpan(self.peekTokenIndexNth(0)),
+                            "`reason:` requires a plain string literal (`reason: \"…\"`)",
+                            "expected plain string literal",
+                            null,
+                        );
+                        _ = try self.parseExpr(true);
+                    }
+                }
+            } else if (cur_kind == .star) {
+                has_attr_err.* = true;
+                rule_count += 1;
+                const star_tok = try self.consumeLeaf(.token_leaf, .{ .has_error = true });
+                try self.emitLintSelectorDiagnostic(
+                    self.getTokenSpan(star_tok),
+                    "wildcard `*` lint suppression is forbidden; list explicit `kebab-case` slugs or `W0xxx` codes",
+                    "blanket `*` suppression is forbidden",
+                    null,
+                );
+            } else if (isLintSelectorWordKind(cur_kind)) {
+                const first_tok = try self.consumeLeaf(.token_leaf, .{});
+                const sel_start_byte = self.getTokenSpan(first_tok).start_byte;
+                var sel_end_byte = self.getTokenSpan(first_tok).end_byte;
+                var has_spaced_hyphen = false;
+
+                if (has_seen_reason) {
+                    has_attr_err.* = true;
+                    try self.emitLintSelectorDiagnostic(
+                        self.getTokenSpan(first_tok),
+                        "lint rule selectors must precede `reason: \"…\"`",
+                        "place rule selector before `reason:`",
+                        null,
+                    );
+                }
+
+                while (self.peekKind() == .minus) {
+                    const minus_peek = self.peekTokenIndexNth(0);
+                    const minus_span = self.getTokenSpan(minus_peek);
+                    if (minus_span.start_byte != sel_end_byte) has_spaced_hyphen = true;
+                    _ = try self.consumeLeaf(.token_leaf, .{});
+                    sel_end_byte = minus_span.end_byte;
+
+                    const seg_kind = self.peekKind();
+                    if (isLintSelectorWordKind(seg_kind) or seg_kind == .int_lit) {
+                        const seg_peek = self.peekTokenIndexNth(0);
+                        const seg_span = self.getTokenSpan(seg_peek);
+                        if (seg_span.start_byte != minus_span.end_byte) has_spaced_hyphen = true;
+                        _ = try self.consumeLeaf(.token_leaf, .{});
+                        sel_end_byte = seg_span.end_byte;
+                    } else {
+                        has_spaced_hyphen = true;
+                        break;
+                    }
+                }
+
+                rule_count += 1;
+                const sel_span = Span.init(self.file_id, sel_start_byte, sel_end_byte);
+                if (has_spaced_hyphen) {
+                    has_attr_err.* = true;
+                    try self.emitLintSelectorDiagnostic(
+                        sel_span,
+                        "hyphenated lint rule slug must not contain spaces around `-`",
+                        "remove spaces around `-` in lint slug",
+                        null,
+                    );
+                } else {
+                    const raw_selector = self.source[@intCast(sel_start_byte)..@intCast(sel_end_byte)];
+                    switch (diagnostic.lookupLintRuleBySelector(raw_selector)) {
+                        .rule => {},
+                        .forbidden_category_or_wildcard => {
+                            has_attr_err.* = true;
+                            try self.emitLintSelectorDiagnostic(
+                                sel_span,
+                                "category-wide or blanket lint suppression is forbidden; list explicit rule slugs or `W0xxx` codes",
+                                "category/wildcard selector is not allowed",
+                                null,
+                            );
+                        },
+                        .non_suppressible_error_code => {
+                            has_attr_err.* = true;
+                            try self.emitLintSelectorDiagnostic(
+                                sel_span,
+                                "hard compiler error codes (`E0xxx`) cannot be suppressed with `@allow` or `@expect`",
+                                "compiler error cannot be suppressed",
+                                null,
+                            );
+                        },
+                        .non_suppressible_subsystem_warning => {
+                            has_attr_err.* = true;
+                            try self.emitLintSelectorDiagnostic(
+                                sel_span,
+                                "non-lint subsystem warning cannot be suppressed with `@allow` or `@expect`",
+                                "not a suppressible lint rule",
+                                null,
+                            );
+                        },
+                        .unknown => {
+                            has_attr_err.* = true;
+                            if (self.diagnostic_sink) |sink| {
+                                const arena_alloc = sink.arena.asAllocator();
+                                const msg_text = try std.fmt.allocPrint(
+                                    arena_alloc,
+                                    "unknown lint rule `{s}`",
+                                    .{raw_selector},
+                                );
+                                const opt_help: ?[]const u8 = if (diagnostic.suggestClosestLintRule(raw_selector)) |closest|
+                                    try std.fmt.allocPrint(arena_alloc, "help: did you mean `{s}`?", .{closest})
+                                else
+                                    null;
+                                try self.emitLintSelectorDiagnostic(
+                                    sel_span,
+                                    msg_text,
+                                    "unrecognized lint rule selector",
+                                    opt_help,
+                                );
+                            }
+                        },
+                    }
+                }
+            } else {
+                has_attr_err.* = true;
+                const bad_tok = try self.consumeLeaf(.invalid_parse_leaf, .{ .has_error = true });
+                try self.emitLintSelectorDiagnostic(
+                    self.getTokenSpan(bad_tok),
+                    "expected `kebab-case` lint rule slug, `W0xxx` code, or `reason: \"…\"`",
+                    "invalid lint selector token",
+                    null,
+                );
+            }
+
+            if (self.peekKind() == .comma) {
+                _ = try self.consumeLeaf(.token_leaf, .{});
+            } else {
+                break;
+            }
+            if (self.cursor == loop_start) break;
+        }
+
+        const close_tok = self.peekTokenIndexNth(0);
+        const has_close_paren = self.peekKind() == .rparen;
+        try self.expectClosingDelimiter(
+            .rparen,
+            open_paren,
+            has_attr_err,
+            "expected `)` to close lint selector list",
+        );
+
+        if (rule_count == 0 and !has_attr_err.*) {
+            has_attr_err.* = true;
+            const end_byte = if (has_close_paren)
+                self.getTokenSpan(close_tok).end_byte
+            else
+                self.getTokenSpan(open_paren).end_byte;
+            try self.emitLintSelectorDiagnostic(
+                Span.init(self.file_id, attr_start_byte, end_byte),
+                "`@allow` and `@expect` require at least one lint rule selector",
+                "empty lint selector list",
+                null,
+            );
+        }
     }
 
     /// Parses optional `Vis = "pub" [ "(" ( "pkg" | "super" ) ")" ]` into `.visibility_modifier` CST (`ADR-22E`).
@@ -3178,10 +3641,17 @@ pub const Parser = struct {
         var has_error = false;
         const outer_attrs = try self.parseAttributesWithSlice(&has_error);
         const saved_allow_case = self.is_allowing_non_canonical_case;
+        const saved_link_exempt = self.has_link_name_exemption;
         if (self.hasAllowNonCanonicalCaseAttr(item_cst)) {
             self.is_allowing_non_canonical_case = true;
         }
-        defer self.is_allowing_non_canonical_case = saved_allow_case;
+        if (self.hasLinkNameAttr(item_cst)) {
+            self.has_link_name_exemption = true;
+        }
+        defer {
+            self.is_allowing_non_canonical_case = saved_allow_case;
+            self.has_link_name_exemption = saved_link_exempt;
+        }
         const vis_start_tok = self.peekTokenIndexNth(0);
         const vis_cst_idx = self.cst.countNodes();
         const outer_vis = try self.parseVisibilityWithLevel(&has_error);
@@ -3632,7 +4102,13 @@ pub const Parser = struct {
         if (self.peekKind() == .kw_as) {
             _ = try self.consumeLeaf(.token_leaf, .{});
             if (isIdentifierKind(self.peekKind()) or self.peekKind() == .underscore) {
-                _ = try self.consumeLeaf(.token_leaf, .{});
+                const alias_tok = try self.consumeLeaf(.token_leaf, .{});
+                if (self.options.raw_lint_candidates_out != null and
+                    self.token_buffer.getToken(alias_tok).kind != .underscore and
+                    lexer.classifyIdentifierOrKeyword(self.getTokenLexeme(alias_tok)).has_case_violation)
+                {
+                    try self.emitOrUpdateCasingWarning(alias_tok, .snake_case);
+                }
             } else {
                 has_error.* = true;
                 try self.emitUnexpectedToken(
@@ -3645,6 +4121,13 @@ pub const Parser = struct {
         self.cst.finishNode(tree_cst, .{ .has_error = has_error.* });
     }
 
+    /// Returns `true` if `const <ident> = @c_import(…)` starts at the identifier cursor (`W0201` `snake_case` module binding).
+    fn isConstCImportBindingAtIdent(self: *const Parser) bool {
+        return self.peekKindNth(1) == .eq and
+            self.peekKindNth(2) == .at and
+            std.mem.eql(u8, self.peekLexemeNth(3), "c_import");
+    }
+
     /// Parses `ConstItem = "const" CONST_IDENT [ ":" Type ] [ "=" Expr ] ";" ;`.
     fn parseConstItem(
         self: *Parser,
@@ -3653,9 +4136,10 @@ pub const Parser = struct {
     ) anyerror!NodeIndex {
         self.cst.nodes.items(.kind)[item_cst.asInt()] = .const_item;
         const const_tok = try self.consumeLeaf(.const_introducer, .{});
+        const is_c_import_alias = self.isConstCImportBindingAtIdent();
         const name_tok = try self.expectIdentifierWithCasing(
-            .const_ident,
-            .screaming_snake_case,
+            if (is_c_import_alias) .ident else .const_ident,
+            if (is_c_import_alias) .snake_case else .screaming_snake_case,
             has_error,
             "expected constant identifier after `const`",
         );
@@ -4429,10 +4913,17 @@ pub const Parser = struct {
 
                 try self.parseAttributes(&has_mem_err);
                 const saved_allow_mem = self.is_allowing_non_canonical_case;
+                const saved_link_mem = self.has_link_name_exemption;
                 if (self.hasAllowNonCanonicalCaseAttr(mem_cst)) {
                     self.is_allowing_non_canonical_case = true;
                 }
-                defer self.is_allowing_non_canonical_case = saved_allow_mem;
+                if (self.hasLinkNameAttr(mem_cst)) {
+                    self.has_link_name_exemption = true;
+                }
+                defer {
+                    self.is_allowing_non_canonical_case = saved_allow_mem;
+                    self.has_link_name_exemption = saved_link_mem;
+                }
                 try self.parseVisibility(&has_mem_err);
 
                 const member_node = switch (self.peekKind()) {
@@ -4529,10 +5020,17 @@ pub const Parser = struct {
 
                 try self.parseAttributes(&has_mem_err);
                 const saved_allow_mem = self.is_allowing_non_canonical_case;
+                const saved_link_mem = self.has_link_name_exemption;
                 if (self.hasAllowNonCanonicalCaseAttr(mem_cst)) {
                     self.is_allowing_non_canonical_case = true;
                 }
-                defer self.is_allowing_non_canonical_case = saved_allow_mem;
+                if (self.hasLinkNameAttr(mem_cst)) {
+                    self.has_link_name_exemption = true;
+                }
+                defer {
+                    self.is_allowing_non_canonical_case = saved_allow_mem;
+                    self.has_link_name_exemption = saved_link_mem;
+                }
                 try self.parseVisibility(&has_mem_err);
 
                 const member_node = switch (self.peekKind()) {
@@ -4604,6 +5102,9 @@ pub const Parser = struct {
         has_error: *bool,
     ) anyerror!NodeIndex {
         self.cst.nodes.items(.kind)[item_cst.asInt()] = .extern_block_item;
+        const saved_extern_ctx = self.is_in_extern_context;
+        self.is_in_extern_context = true;
+        defer self.is_in_extern_context = saved_extern_ctx;
         const extern_tok = try self.consumeLeaf(.token_leaf, .{});
         const block_abi_tok: TokenIndex = if (self.peekKind() == .string_lit)
             try self.consumeLeaf(.token_leaf, .{})
@@ -4780,6 +5281,9 @@ pub const Parser = struct {
         has_error: *bool,
     ) anyerror!NodeIndex {
         self.cst.nodes.items(.kind)[item_cst.asInt()] = .extern_static_item;
+        const saved_extern_ctx = self.is_in_extern_context;
+        self.is_in_extern_context = true;
+        defer self.is_in_extern_context = saved_extern_ctx;
         var effective_abi_tok = inherited_abi_tok;
         if (self.peekKind() == .kw_extern) {
             _ = try self.consumeLeaf(.token_leaf, .{});
@@ -4914,6 +5418,10 @@ pub const Parser = struct {
             );
 
         const is_extern_fn = has_explicit_extern or is_in_extern_block;
+        const saved_extern_ctx = self.is_in_extern_context;
+        if (is_extern_fn) self.is_in_extern_context = true;
+        defer self.is_in_extern_context = saved_extern_ctx;
+
         const sig_cst = try self.startCstNode(.fn_sig);
         if (is_extern_fn) {
             _ = try self.expectExternSymbolIdentifier(
@@ -4948,10 +5456,18 @@ pub const Parser = struct {
 
         var ret_type_op: PackedOperand = .NONE;
         if (self.peekKind() == .arrow) {
+            const prev_end_byte: u32 = if (self.cursor > 0)
+                self.getTokenSpan(TokenIndex.fromInt(self.cursor - 1)).end_byte
+            else
+                self.getTokenSpan(fn_tok).end_byte;
             const ret_cst = try self.startCstNode(.return_type);
-            _ = try self.consumeLeaf(.token_leaf, .{});
-            ret_type_op = PackedOperand.initNode(try self.parseTypeWithMode(.is_only));
+            const arrow_tok = try self.consumeLeaf(.token_leaf, .{});
+            const ret_type_node = try self.parseTypeWithMode(.is_only);
+            ret_type_op = PackedOperand.initNode(ret_type_node);
             self.cst.finishNode(ret_cst, .{ .has_error = has_error.* });
+            if (!has_error.*) {
+                try self.maybeEmitRedundantUnitReturn(prev_end_byte, arrow_tok, ret_type_node);
+            }
         }
 
         if (self.peekKind() == .kw_where) {
@@ -5284,7 +5800,27 @@ pub const Parser = struct {
         self.allowed_non_canonical_members = .empty;
     }
 
-    /// Pre-scans `@allow(… non_canonical_case …)` declarations in `token_buffer` for forward-ref and incremental parity.
+    /// Returns `true` if `tok` begins a `W0201`, `non-canonical-case`, or legacy `non_canonical_case` selector.
+    fn isNonCanonicalCaseSelectorAt(self: *const Parser, tok: TokenIndex) bool {
+        const lex = self.getTokenLexeme(tok);
+        if (std.mem.eql(u8, lex, "W0201") or std.mem.eql(u8, lex, "non_canonical_case")) {
+            return true;
+        }
+        if (std.mem.eql(u8, lex, "non")) {
+            const start_off: usize = self.token_buffer.getToken(tok).byte_offset;
+            const slug_text = "non-canonical-case";
+            if (start_off + slug_text.len <= self.source.len and
+                std.mem.eql(u8, self.source[start_off .. start_off + slug_text.len], slug_text))
+            {
+                if (start_off + slug_text.len == self.source.len) return true;
+                const trailing_ch = self.source[start_off + slug_text.len];
+                return !std.ascii.isAlphanumeric(trailing_ch) and trailing_ch != '_' and trailing_ch != '-';
+            }
+        }
+        return false;
+    }
+
+    /// Pre-scans `@allow` / `@expect` `non-canonical-case` (`W0201`) declarations for forward-ref and incremental parity.
     fn precollectAllowedNonCanonicalNames(self: *Parser) !void {
         const kind_slice = self.token_buffer.tokens.items(.kind);
         const total = kind_slice.len;
@@ -5294,7 +5830,7 @@ pub const Parser = struct {
             const name_idx = self.skipCarrierRawIndex(at_idx + 1);
             if (name_idx >= total) break;
             const name_lex = self.getTokenLexeme(TokenIndex.fromInt(@intCast(name_idx)));
-            if (!std.mem.eql(u8, name_lex, "allow")) continue;
+            if (!std.mem.eql(u8, name_lex, "allow") and !std.mem.eql(u8, name_lex, "expect")) continue;
 
             var cur_idx = self.skipCarrierRawIndex(name_idx + 1);
             if (cur_idx >= total or kind_slice[cur_idx] != .lparen) continue;
@@ -5309,13 +5845,10 @@ pub const Parser = struct {
                     paren_depth += 1;
                 } else if (cur_kind == .rparen) {
                     paren_depth -= 1;
-                } else if (isIdentifierKind(cur_kind)) {
-                    const arg_lex = self.getTokenLexeme(TokenIndex.fromInt(@intCast(cur_idx)));
-                    if (std.mem.eql(u8, arg_lex, "non_canonical_case") or
-                        std.mem.eql(u8, arg_lex, "W0201"))
-                    {
-                        has_non_canonical = true;
-                    }
+                } else if (isIdentifierKind(cur_kind) and
+                    self.isNonCanonicalCaseSelectorAt(TokenIndex.fromInt(@intCast(cur_idx))))
+                {
+                    has_non_canonical = true;
                 }
                 cur_idx = self.skipCarrierRawIndex(cur_idx + 1);
             }
@@ -5466,12 +5999,53 @@ pub const Parser = struct {
                         const lex = self.getTokenLexeme(leaf.token);
                         if (!has_seen_attr_name) {
                             has_seen_attr_name = true;
-                            if (!std.mem.eql(u8, lex, "allow")) break;
+                            if (!std.mem.eql(u8, lex, "allow") and !std.mem.eql(u8, lex, "expect")) break;
                             is_allow_attr = true;
                         } else if (is_allow_attr and isIdentifierKind(tok_rec.kind) and
-                            (std.mem.eql(u8, lex, "non_canonical_case") or
-                                std.mem.eql(u8, lex, "W0201")))
+                            self.isNonCanonicalCaseSelectorAt(leaf.token))
                         {
+                            return true;
+                        }
+                    }
+                }
+                cursor = attr_end;
+                continue;
+            }
+            cursor += @max(@as(usize, child.subtree_size), 1);
+        }
+        return false;
+    }
+
+    /// Returns `true` if `item_cst` carries a leading `@link_name(…)` or `@link(… name: …)` attribute (`W0201` exempt).
+    fn hasLinkNameAttr(self: *const Parser, item_cst: CstNodeIndex) bool {
+        if (item_cst.isNone()) return false;
+        const total = self.cst.countNodes();
+        var cursor: usize = item_cst.asInt() + 1;
+        while (cursor < total) {
+            const child = self.cst.getNode(CstNodeIndex.fromInt(@intCast(cursor)));
+            if (child.kind == .attribute) {
+                const attr_end = @min(cursor + @max(@as(usize, child.subtree_size), 1), total);
+                var has_seen_attr_name = false;
+                var is_link_attr = false;
+                var tok_cur = cursor + 1;
+                while (tok_cur < attr_end) : (tok_cur += 1) {
+                    const leaf = self.cst.getNode(CstNodeIndex.fromInt(@intCast(tok_cur)));
+                    if (leaf.subtree_size <= 1 and !leaf.token.isNone() and
+                        leaf.token.asInt() < self.token_buffer.countTokens())
+                    {
+                        const tok_rec = self.token_buffer.getToken(leaf.token);
+                        if (tok_rec.kind == .at) continue;
+                        const lex = self.getTokenLexeme(leaf.token);
+                        if (!has_seen_attr_name) {
+                            has_seen_attr_name = true;
+                            if (std.mem.eql(u8, lex, "link_name")) return true;
+                            if (std.mem.eql(u8, lex, "link")) {
+                                is_link_attr = true;
+                                continue;
+                            }
+                            break;
+                        }
+                        if (is_link_attr and isIdentifierKind(tok_rec.kind) and std.mem.eql(u8, lex, "name")) {
                             return true;
                         }
                     }
@@ -5926,7 +6500,8 @@ pub const Parser = struct {
                 }
 
                 if (isIdentifierKind(self.peekKind()) or self.peekKind() == .underscore) {
-                    const name_tok = if (self.peekKind() == .underscore)
+                    const is_wildcard_param = (self.peekKind() == .underscore);
+                    const name_tok = if (is_wildcard_param)
                         try self.consumeLeaf(.token_leaf, .{})
                     else
                         try self.expectIdentifierWithCasing(
@@ -5935,6 +6510,9 @@ pub const Parser = struct {
                             &has_param_err,
                             "expected `snake_case` parameter name",
                         );
+                    if (!is_wildcard_param and !has_param_err) {
+                        try self.checkSingleCharBinding(name_tok, 1);
+                    }
                     if (self.peekKind() == .colon) {
                         _ = try self.consumeLeaf(.token_leaf, .{});
                     } else if (self.isUnambiguousMissingColonTypeStart(false)) {
@@ -7104,7 +7682,7 @@ pub const Parser = struct {
             }
 
             // Consume the type identifier segment (requiring `.type_ident` `PascalCase`):
-            first_tok = try self.expectIdentifierWithCasing(
+            first_tok = try self.expectIdentifierRefWithCasing(
                 .type_ident,
                 .pascal_case,
                 &has_err,
@@ -7125,7 +7703,7 @@ pub const Parser = struct {
                 self.peekKindNth(2) != .lparen)
             {
                 _ = try self.consumeLeaf(.token_leaf, .{});
-                _ = try self.expectIdentifierWithCasing(
+                _ = try self.expectIdentifierRefWithCasing(
                     .type_ident,
                     .pascal_case,
                     &has_err,
@@ -7217,6 +7795,12 @@ pub const Parser = struct {
 
     /// Parses `Block = "{" { Stmt } [ TailExpr ] "}" ;` (`DR-03` Section 5.4 Part 6).
     pub fn parseBlock(self: *Parser) anyerror!NodeIndex {
+        const block_cst = try self.startCstNode(.block);
+        return self.parseBlockWithCst(block_cst, false);
+    }
+
+    /// Parses a `Block` body into an already-opened `block_cst` CST node (supporting leading `{ Attribute }`).
+    fn parseBlockWithCst(self: *Parser, block_cst: CstNodeIndex, has_initial_err: bool) anyerror!NodeIndex {
         const saved_cond_header = self.is_in_cond_header;
         const saved_lhs_place = self.is_in_lhs_place;
         self.is_in_cond_header = false;
@@ -7226,7 +7810,6 @@ pub const Parser = struct {
             self.is_in_lhs_place = saved_lhs_place;
         }
 
-        const block_cst = try self.startCstNode(.block);
         self.pushState(.block_stmt_loop, block_cst) catch |err| switch (err) {
             error.ParseDepthExceeded => {
                 return self.recoverDepthOverflow(block_cst, BLOCK_STMT_STOP_SET, .expr_hole);
@@ -7235,7 +7818,7 @@ pub const Parser = struct {
         };
         defer self.popStates(1);
 
-        var has_error = false;
+        var has_error = has_initial_err;
         const open_brace = if (self.peekKind() == .lbrace)
             try self.consumeLeaf(.token_leaf, .{})
         else
@@ -7255,8 +7838,16 @@ pub const Parser = struct {
             self.is_recovering_depth_overflow = false;
             if (self.peekKind() == .semi) {
                 const empty_cst = try self.startCstNode(.empty_stmt);
-                _ = try self.consumeLeaf(.token_leaf, .{});
+                const semi_tok = try self.consumeLeaf(.token_leaf, .{});
                 self.cst.finishNode(empty_cst, .{});
+                const semi_span = self.getTokenSpan(semi_tok);
+                try self.recordOrEmitParserLintCandidate(.{
+                    .rule_id = .non_idiomatic_syntax,
+                    .fix_kind = 11,
+                    .start_byte = semi_span.start_byte,
+                    .end_byte = semi_span.end_byte,
+                    .node_or_tok = empty_cst.asInt(),
+                });
                 continue;
             }
 
@@ -7355,14 +7946,28 @@ pub const Parser = struct {
         return true;
     }
 
-    /// Returns `true` if `@` at `peek(0)` starts an `@attribute` prefix on a local declaration/statement.
+    /// Returns `true` if `@` at `peek(0)` starts an `@attribute` prefix on a local declaration/statement (`DR-25`).
     fn isLeadingStmtAttribute(self: *const Parser) bool {
+        const first_head_kind = self.peekKindNth(1);
+        const is_known_stmt_attr = (isIdentifierKind(first_head_kind) or isKeywordKind(first_head_kind)) and
+            isKnownStmtOrBlockAttrName(self.getTokenLexeme(self.peekTokenIndexNth(1)));
+
         var lookahead: usize = 0;
         var steps: usize = 0;
         while (steps < 256 and self.peekKindNth(lookahead) == .at) : (steps += 1) {
             if (!self.skipOneAttributeLookahead(&lookahead, &steps)) return false;
         }
-        return switch (self.peekKindNth(lookahead)) {
+        if (lookahead == 0) return false;
+
+        const landing_kind = self.peekKindNth(lookahead);
+        if (is_known_stmt_attr) {
+            return switch (landing_kind) {
+                .semi, .rbrace, .rparen, .rbracket, .comma, .eof => false,
+                else => true,
+            };
+        }
+
+        return switch (landing_kind) {
             .kw_let,
             .kw_var,
             .kw_const,
@@ -7376,13 +7981,20 @@ pub const Parser = struct {
             .kw_use,
             .kw_defer,
             .kw_errdefer,
+            .kw_return,
+            .kw_break,
+            .kw_continue,
             .kw_yield,
             .kw_for,
             .kw_while,
             .kw_loop,
+            .kw_if,
             .kw_match,
             .kw_with,
             .kw_comptime,
+            .kw_unsafe,
+            .kw_async,
+            .lbrace,
             => true,
             .ident => self.peekKindNth(lookahead + 1) == .colon,
             else => false,
@@ -7780,6 +8392,7 @@ pub const Parser = struct {
                 &has_error,
                 "expected `snake_case` error capture identifier inside `|…|`",
             );
+            if (!has_error) try self.checkSingleCharBinding(cap_tok, 3);
             capture_op = PackedOperand.initToken(cap_tok);
             _ = try self.expectToken(
                 .pipe,
@@ -7870,7 +8483,7 @@ pub const Parser = struct {
         if (self.peekKind() == .colon) {
             const label_cst = try self.startCstNode(.loop_label);
             _ = try self.consumeLeaf(.token_leaf, .{});
-            const label_tok = try self.expectIdentifierWithCasing(
+            const label_tok = try self.expectIdentifierRefWithCasing(
                 .ident,
                 .snake_case,
                 &has_error,
@@ -7910,7 +8523,7 @@ pub const Parser = struct {
         if (self.peekKind() == .colon) {
             const label_cst = try self.startCstNode(.loop_label);
             _ = try self.consumeLeaf(.token_leaf, .{});
-            const label_tok = try self.expectIdentifierWithCasing(
+            const label_tok = try self.expectIdentifierRefWithCasing(
                 .ident,
                 .snake_case,
                 &has_error,
@@ -7973,7 +8586,7 @@ pub const Parser = struct {
                 if (self.peekKind() == .colon) {
                     const label_cst = try self.startCstNode(.loop_label);
                     _ = try self.consumeLeaf(.token_leaf, .{});
-                    const label_tok = try self.expectIdentifierWithCasing(
+                    const label_tok = try self.expectIdentifierRefWithCasing(
                         .ident,
                         .snake_case,
                         &has_error,
@@ -8000,7 +8613,7 @@ pub const Parser = struct {
                 if (self.peekKind() == .colon) {
                     const label_cst = try self.startCstNode(.loop_label);
                     _ = try self.consumeLeaf(.token_leaf, .{});
-                    const label_tok = try self.expectIdentifierWithCasing(
+                    const label_tok = try self.expectIdentifierRefWithCasing(
                         .ident,
                         .snake_case,
                         &has_error,
@@ -8117,6 +8730,7 @@ pub const Parser = struct {
                     &has_error,
                     "expected `snake_case` loop index identifier after `,`",
                 );
+                if (!has_error) try self.checkSingleCharBinding(index_tok, 4);
             }
         }
 
@@ -8562,6 +9176,7 @@ pub const Parser = struct {
                                 &has_rest_err,
                                 "expected `snake_case` rest binding identifier after `..`",
                             );
+                            if (!has_rest_err) try self.checkSingleCharBinding(ident_tok, 5);
                             if (has_rest_err) has_err = true;
                             self.cst.finishNode(rest_cst, .{ .has_error = has_rest_err });
                             const rest_node = try self.ast.appendNodeWithCst(.{
@@ -8617,7 +9232,7 @@ pub const Parser = struct {
                 const var_cst = try self.startCstNode(.variant_pat);
                 var has_err = false;
                 const dot_tok = try self.consumeLeaf(.token_leaf, .{});
-                _ = try self.expectIdentifierWithCasing(
+                _ = try self.expectIdentifierRefWithCasing(
                     .type_ident,
                     .pascal_case,
                     &has_err,
@@ -8657,6 +9272,7 @@ pub const Parser = struct {
                     &has_err,
                     "expected `snake_case` binding identifier",
                 );
+                if (!has_err) try self.checkSingleCharBinding(ident_tok, 5);
                 if (self.peekKind() == .at) {
                     self.cst.nodes.items(.kind)[bind_cst.asInt()] = .at_pat;
                     self.pushState(.pattern_parse, bind_cst) catch |err| switch (err) {
@@ -8767,6 +9383,7 @@ pub const Parser = struct {
                         &has_err,
                         "expected `snake_case` binding identifier",
                     );
+                    if (!has_err) try self.checkSingleCharBinding(ident_tok, 5);
                     if (self.peekKind() == .at) {
                         self.cst.nodes.items(.kind)[bind_cst.asInt()] = .at_pat;
                         self.pushState(.pattern_parse, bind_cst) catch |err| switch (err) {
@@ -8813,6 +9430,7 @@ pub const Parser = struct {
                         &has_err,
                         "expected `snake_case` pattern binding identifier before `@`",
                     );
+                    if (!has_err) try self.checkSingleCharBinding(ident_tok, 5);
                     _ = try self.consumeLeaf(.token_leaf, .{});
                     const subpat_node = try self.parseSinglePattern(
                         is_binding_slot,
@@ -8908,6 +9526,7 @@ pub const Parser = struct {
                     &has_err,
                     "expected `snake_case` pattern binding identifier",
                 );
+                if (!has_err) try self.checkSingleCharBinding(ident_tok, 5);
                 self.cst.finishNode(bind_cst, .{ .has_error = has_err });
                 return self.ast.appendNodeWithCst(.{
                     .tag = .bind_pat,
@@ -9008,7 +9627,7 @@ pub const Parser = struct {
                     has_shorthand_mod = true;
                     _ = try self.consumePatternBindingModifier(&has_field_err);
                 }
-                const field_tok = try self.expectIdentifierWithCasing(
+                const field_tok = try self.expectIdentifierRefWithCasing(
                     .ident,
                     .snake_case,
                     &has_field_err,
@@ -9024,10 +9643,35 @@ pub const Parser = struct {
                             "move `var` or `&` into the renamed sub-pattern",
                         );
                     }
-                    try payload_pats.append(
-                        self.ast.allocator,
-                        (try self.parsePattern(is_binding_slot)).asInt(),
-                    );
+                    const pat_cst_before = self.cst.countNodes();
+                    const sub_pat = try self.parsePattern(is_binding_slot);
+                    try payload_pats.append(self.ast.allocator, sub_pat.asInt());
+                    if (!has_field_err and self.cst.countNodes() == pat_cst_before + 2 and !sub_pat.isNone()) {
+                        const sub_node = self.ast.getNode(sub_pat);
+                        if (sub_node.tag == .bind_pat and !sub_node.main_token.isNone() and
+                            self.token_buffer.getToken(sub_node.main_token).kind == .ident)
+                        {
+                            const field_lex = self.getTokenLexeme(field_tok);
+                            const bind_lex = self.getTokenLexeme(sub_node.main_token);
+                            if (field_lex.len > 0 and std.mem.eql(u8, field_lex, bind_lex)) {
+                                const field_span = self.getTokenSpan(field_tok);
+                                const bind_span = self.getTokenSpan(sub_node.main_token);
+                                const has_cmt = hasCommentMarkerInSlice(
+                                    self.source,
+                                    field_span.end_byte,
+                                    bind_span.end_byte,
+                                );
+                                try self.recordOrEmitParserLintCandidate(.{
+                                    .rule_id = .non_idiomatic_syntax,
+                                    .fix_kind = 12,
+                                    .start_byte = field_span.start_byte,
+                                    .end_byte = bind_span.end_byte,
+                                    .node_or_tok = field_cst.asInt(),
+                                    .aux_payload = if (has_cmt) std.math.maxInt(u64) else field_span.end_byte,
+                                });
+                            }
+                        }
+                    }
                 } else {
                     const bind_node = try self.ast.appendNodeWithCst(.{
                         .tag = .bind_pat,
@@ -10142,12 +10786,13 @@ pub const Parser = struct {
 
                     if (self.peekKind() == .pipe) {
                         _ = try self.consumeLeaf(.token_leaf, .{});
-                        _ = try self.expectIdentifierWithCasing(
+                        const cap_tok = try self.expectIdentifierWithCasing(
                             .ident,
                             .snake_case,
                             &has_catch_err,
                             "expected `snake_case` error capture identifier after `catch |`",
                         );
+                        if (!has_catch_err) try self.checkSingleCharBinding(cap_tok, 6);
                         _ = try self.expectToken(
                             .pipe,
                             &has_catch_err,
@@ -10351,7 +10996,7 @@ pub const Parser = struct {
                 self.isStrModuleAt(0))
                 try self.consumeLeaf(.token_leaf, .{})
             else
-                try self.expectIdentifierWithCasing(
+                try self.expectIdentifierRefWithCasing(
                     .ident,
                     .snake_case,
                     &has_err,
@@ -10609,7 +11254,7 @@ pub const Parser = struct {
 
             var opt_label_tok: TokenIndex = .none;
             if (isIdentifierKind(self.peekKind()) and self.peekKindNth(1) == .colon) {
-                opt_label_tok = try self.expectIdentifierWithCasing(
+                opt_label_tok = try self.expectIdentifierRefWithCasing(
                     .ident,
                     .snake_case,
                     &has_arg_err,
@@ -11030,6 +11675,67 @@ pub const Parser = struct {
         return open_kind == .pipe or open_kind == .pipepipe;
     }
 
+    /// Returns `true` if `@` at `peek(0)` begins an attributed block expression (`{ Attribute } [unsafe|async|comptime] { … }`).
+    fn isAttributedBlockExpr(self: *const Parser) bool {
+        const first_head_kind = self.peekKindNth(1);
+        const has_no_call_parens = self.peekKindNth(2) != .lparen and self.peekKindNth(2) != .lbracket;
+        const is_block_attr = has_no_call_parens or
+            ((isIdentifierKind(first_head_kind) or isKeywordKind(first_head_kind)) and
+                isKnownStmtOrBlockAttrName(self.getTokenLexeme(self.peekTokenIndexNth(1))));
+        if (!is_block_attr) return false;
+
+        var lookahead: usize = 0;
+        var steps: usize = 0;
+        while (steps < 256 and self.peekKindNth(lookahead) == .at) : (steps += 1) {
+            if (!self.skipOneAttributeLookahead(&lookahead, &steps)) return false;
+        }
+        if (lookahead == 0) return false;
+        const next_kind = self.peekKindNth(lookahead);
+        if (next_kind == .lbrace) return true;
+        if ((next_kind == .kw_unsafe or next_kind == .kw_async or next_kind == .kw_comptime) and
+            self.peekKindNth(lookahead + 1) == .lbrace)
+        {
+            return true;
+        }
+        return false;
+    }
+
+    /// Parses an attributed block expression (`{ Attribute } [unsafe | async | comptime] { … }`) (`DR-25`).
+    fn parseAttributedBlockExpr(self: *Parser) anyerror!NodeIndex {
+        const blk_cst = try self.startCstNode(.block);
+        var has_attr_err = false;
+        try self.parseAttributes(&has_attr_err);
+
+        const saved_allow_blk = self.is_allowing_non_canonical_case;
+        if (self.hasAllowNonCanonicalCaseAttr(blk_cst)) {
+            self.is_allowing_non_canonical_case = true;
+        }
+        defer self.is_allowing_non_canonical_case = saved_allow_blk;
+
+        if (self.peekKind() == .kw_unsafe or self.peekKind() == .kw_async) {
+            _ = try self.consumeLeaf(.token_leaf, .{});
+            const inner_blk = try self.parseBlock();
+            self.cst.finishNode(blk_cst, .{ .has_error = has_attr_err });
+            if (!inner_blk.isNone() and inner_blk.asInt() < self.ast.ast_to_cst.items.len) {
+                self.ast.ast_to_cst.items[inner_blk.asInt()] = blk_cst;
+            }
+            self.has_last_expr_block_body = true;
+            return inner_blk;
+        }
+        if (self.peekKind() == .kw_comptime) {
+            const comp_tok = try self.consumeLeaf(.token_leaf, .{});
+            const inner_blk = try self.parseBlock();
+            self.cst.finishNode(blk_cst, .{ .has_error = has_attr_err });
+            self.has_last_expr_block_body = true;
+            return self.ast.appendNodeWithCst(.{
+                .tag = .unary_expr,
+                .main_token = comp_tok,
+                .lhs = PackedOperand.initNode(inner_blk),
+            }, blk_cst);
+        }
+        return self.parseBlockWithCst(blk_cst, has_attr_err);
+    }
+
     /// Parses a `PrimaryExpr` (`DR-03` Section 5.4 Part 8, `DR-22` Section 3.3 & `DR-24` Section 2.2).
     fn parsePrimaryExpr(self: *Parser, is_struct_lit_allowed: bool) anyerror!NodeIndex {
         const saved_stmt_lhs = self.is_in_stmt_lhs;
@@ -11131,7 +11837,7 @@ pub const Parser = struct {
                 const var_cst = try self.startCstNode(.contextual_variant_expr);
                 var has_err = false;
                 const dot_tok = try self.consumeLeaf(.token_leaf, .{});
-                const var_tok = try self.expectIdentifierWithCasing(
+                const var_tok = try self.expectIdentifierRefWithCasing(
                     .type_ident,
                     .pascal_case,
                     &has_err,
@@ -11303,10 +12009,13 @@ pub const Parser = struct {
                 if (self.isAttributedClosureExpr()) {
                     return self.parseClosureExpr(is_struct_lit_allowed);
                 }
+                if (self.isAttributedBlockExpr()) {
+                    return self.parseAttributedBlockExpr();
+                }
                 const intr_cst = try self.startCstNode(.path_pat);
                 var has_intr_err = false;
                 const at_tok = try self.consumeLeaf(.token_leaf, .{});
-                const ident_tok = try self.expectIdentifierWithCasing(
+                const ident_tok = try self.expectIdentifierRefWithCasing(
                     .ident,
                     .snake_case,
                     &has_intr_err,
@@ -11454,6 +12163,7 @@ pub const Parser = struct {
             &has_err,
             "expected `snake_case` binding identifier in `(… := …)`",
         );
+        if (!has_err) try self.checkSingleCharBinding(ident_tok, 7);
 
         var type_node: NodeIndex = .none;
         if (self.peekKind() == .colon) {
@@ -11579,7 +12289,7 @@ pub const Parser = struct {
                 "expected `.` after `context` in `with` binding",
                 "expected `.` here",
             );
-            const slot_tok = try self.expectIdentifierWithCasing(
+            const slot_tok = try self.expectIdentifierRefWithCasing(
                 .ident,
                 .snake_case,
                 &has_bind_err,
@@ -11732,7 +12442,7 @@ pub const Parser = struct {
             }
 
             if (isIdentifierKind(self.peekKind())) {
-                const field_tok = try self.expectIdentifierWithCasing(
+                const field_tok = try self.expectIdentifierRefWithCasing(
                     .ident,
                     .snake_case,
                     &has_field_err,
@@ -11740,7 +12450,35 @@ pub const Parser = struct {
                 );
                 if (self.peekKind() == .colon) {
                     _ = try self.consumeLeaf(.token_leaf, .{});
-                    try field_nodes.append(self.ast.allocator, (try self.parseExpr(true)).asInt());
+                    const expr_cst_before = self.cst.countNodes();
+                    const val_expr = try self.parseExpr(true);
+                    try field_nodes.append(self.ast.allocator, val_expr.asInt());
+                    if (!has_field_err and self.cst.countNodes() == expr_cst_before + 1 and !val_expr.isNone()) {
+                        const val_node = self.ast.getNode(val_expr);
+                        if (val_node.tag == .ident_expr and !val_node.main_token.isNone() and
+                            self.token_buffer.getToken(val_node.main_token).kind != .at)
+                        {
+                            const field_lex = self.getTokenLexeme(field_tok);
+                            const val_lex = self.getTokenLexeme(val_node.main_token);
+                            if (field_lex.len > 0 and std.mem.eql(u8, field_lex, val_lex)) {
+                                const field_span = self.getTokenSpan(field_tok);
+                                const val_span = self.getTokenSpan(val_node.main_token);
+                                const has_cmt = hasCommentMarkerInSlice(
+                                    self.source,
+                                    field_span.end_byte,
+                                    val_span.end_byte,
+                                );
+                                try self.recordOrEmitParserLintCandidate(.{
+                                    .rule_id = .non_idiomatic_syntax,
+                                    .fix_kind = 12,
+                                    .start_byte = field_span.start_byte,
+                                    .end_byte = val_span.end_byte,
+                                    .node_or_tok = field_cst.asInt(),
+                                    .aux_payload = if (has_cmt) std.math.maxInt(u64) else field_span.end_byte,
+                                });
+                            }
+                        }
+                    }
                 } else {
                     const shorthand_node = try self.ast.appendNodeWithCst(.{
                         .tag = .ident_expr,
@@ -11869,16 +12607,30 @@ pub const Parser = struct {
         }
 
         if (self.peekKind() == .arrow) {
+            const prev_end_byte: u32 = if (self.cursor > 0)
+                self.getTokenSpan(TokenIndex.fromInt(self.cursor - 1)).end_byte
+            else
+                self.getTokenSpan(open_tok).end_byte;
             const ret_cst = try self.startCstNode(.return_type);
-            _ = try self.consumeLeaf(.token_leaf, .{});
-            _ = try self.parseType();
+            const arrow_tok = try self.consumeLeaf(.token_leaf, .{});
+            const ret_type_node = try self.parseType();
             self.cst.finishNode(ret_cst, .{ .has_error = has_error });
+            if (!has_error) {
+                try self.maybeEmitRedundantUnitReturn(prev_end_byte, arrow_tok, ret_type_node);
+            }
         }
 
-        const body_node = if (self.peekKind() == .lbrace)
+        const is_block_closure = (self.peekKind() == .lbrace);
+        const body_node = if (is_block_closure)
             try self.parseBlock()
         else
             try self.parseExpr(is_struct_lit_allowed);
+
+        if (is_block_closure and !has_error) {
+            for (param_tokens.items) |raw_param_tok| {
+                try self.checkSingleCharBinding(TokenIndex.fromInt(raw_param_tok), 2);
+            }
+        }
 
         self.cst.finishNode(clos_cst, .{ .has_error = has_error });
         var lhs_op: PackedOperand = .NONE;
@@ -12480,6 +13232,14 @@ pub const Parser = struct {
                 const loop_start = self.cursor;
                 const arm_cst = try self.startCstNode(.match_arm);
                 var has_arm_err = false;
+                if (self.peekKind() == .at) {
+                    try self.parseAttributes(&has_arm_err);
+                }
+                const saved_allow_arm = self.is_allowing_non_canonical_case;
+                if (self.hasAllowNonCanonicalCaseAttr(arm_cst)) {
+                    self.is_allowing_non_canonical_case = true;
+                }
+                defer self.is_allowing_non_canonical_case = saved_allow_arm;
 
                 const pat_node = try self.parsePattern(false);
                 if (self.peekKind() == .kw_if) {
@@ -12568,7 +13328,7 @@ pub fn parseTokens(
     diagnostic_sink: ?*DiagnosticSink,
     interner: ?*StringInterner,
 ) !NodeIndex {
-    var parser_instance = Parser.init(
+    return parseTokensWithOptions(
         source,
         file_id,
         token_buffer,
@@ -12576,6 +13336,30 @@ pub fn parseTokens(
         ast_arena,
         diagnostic_sink,
         interner,
+        .{},
+    );
+}
+
+/// Parses an already-tokenized `token_buffer` with explicit `ParserOptions`.
+pub fn parseTokensWithOptions(
+    source: []const u8,
+    file_id: FileId,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *LosslessCstArena,
+    ast_arena: *AstArena,
+    diagnostic_sink: ?*DiagnosticSink,
+    interner: ?*StringInterner,
+    options: ParserOptions,
+) !NodeIndex {
+    var parser_instance = Parser.initWithOptions(
+        source,
+        file_id,
+        token_buffer,
+        cst_arena,
+        ast_arena,
+        diagnostic_sink,
+        interner,
+        options,
     );
     return parser_instance.parse();
 }
@@ -12590,6 +13374,29 @@ pub fn parseSource(
     diagnostic_sink: ?*DiagnosticSink,
     interner: ?*StringInterner,
 ) !NodeIndex {
+    return parseSourceWithOptions(
+        source,
+        file_id,
+        token_buffer,
+        cst_arena,
+        ast_arena,
+        diagnostic_sink,
+        interner,
+        .{},
+    );
+}
+
+/// Tokenizes and parses `source` with explicit `ParserOptions` (`CompilerDb` `RawLintCandidate` routing).
+pub fn parseSourceWithOptions(
+    source: []const u8,
+    file_id: FileId,
+    token_buffer: *TokenBuffer,
+    cst_arena: *LosslessCstArena,
+    ast_arena: *AstArena,
+    diagnostic_sink: ?*DiagnosticSink,
+    interner: ?*StringInterner,
+    options: ParserOptions,
+) !NodeIndex {
     token_buffer.tokens.shrinkRetainingCapacity(0);
     token_buffer.trivia.clearRetainingCapacity();
     cst_arena.nodes.shrinkRetainingCapacity(0);
@@ -12599,8 +13406,33 @@ pub fn parseSource(
     ast_arena.extra_data.clearRetainingCapacity();
     ast_arena.ast_to_cst.clearRetainingCapacity();
 
-    try lexer.tokenize(source, file_id, token_buffer, diagnostic_sink, interner);
-    return parseTokens(
+    if (!options.is_c_import_virtual) {
+        try lexer.tokenizeWithOptions(
+            source,
+            file_id,
+            token_buffer,
+            diagnostic_sink,
+            interner,
+            .{
+                .is_casing_warning_enabled = options.is_casing_warning_enabled,
+                .lint_settings = options.lint_settings,
+                .raw_lint_candidates_out = options.raw_lint_candidates_out,
+            },
+        );
+    } else {
+        try lexer.tokenizeWithOptions(
+            source,
+            file_id,
+            token_buffer,
+            diagnostic_sink,
+            interner,
+            .{
+                .is_casing_warning_enabled = false,
+                .is_escape_warning_enabled = false,
+            },
+        );
+    }
+    return parseTokensWithOptions(
         source,
         file_id,
         token_buffer,
@@ -12608,6 +13440,7 @@ pub fn parseSource(
         ast_arena,
         diagnostic_sink,
         interner,
+        options,
     );
 }
 
@@ -12643,6 +13476,60 @@ fn hasUnescapedInterpBrace(lit_slice: []const u8) bool {
     return false;
 }
 
+/// Splices `replacement` into `candidates` over `[old_start_byte, old_end_byte)`, shifting trailing byte spans.
+fn spliceRawLintCandidatesInPlace(
+    alloc: std.mem.Allocator,
+    candidates: *std.ArrayListUnmanaged(RawLintCandidate),
+    old_start_byte: u32,
+    old_end_byte: u32,
+    byte_delta: i64,
+    replacement: []const RawLintCandidate,
+) !void {
+    var updated: std.ArrayListUnmanaged(RawLintCandidate) = .empty;
+    errdefer updated.deinit(alloc);
+    try updated.ensureTotalCapacity(alloc, candidates.items.len + replacement.len);
+
+    var has_inserted_replacement = false;
+    for (candidates.items) |cand_item| {
+        if (cand_item.end_byte <= old_start_byte) {
+            updated.appendAssumeCapacity(cand_item);
+            continue;
+        }
+        if (!has_inserted_replacement) {
+            updated.appendSliceAssumeCapacity(replacement);
+            has_inserted_replacement = true;
+        }
+        if (cand_item.start_byte >= old_end_byte) {
+            var shifted = cand_item;
+            shifted.start_byte = @intCast(@max(0, @as(i64, cand_item.start_byte) + byte_delta));
+            shifted.end_byte = @intCast(@max(0, @as(i64, cand_item.end_byte) + byte_delta));
+            if (cand_item.rule_id == .ungrouped_numeric_literal) {
+                const old_int_start: u32 = @intCast(cand_item.aux_payload >> 32);
+                const old_int_end: u32 = @intCast(cand_item.aux_payload & 0xFFFF_FFFF);
+                const new_int_start: u32 = @intCast(@max(0, @as(i64, old_int_start) + byte_delta));
+                const new_int_end: u32 = @intCast(@max(0, @as(i64, old_int_end) + byte_delta));
+                shifted.aux_payload = (@as(u64, new_int_start) << 32) | new_int_end;
+            } else if (cand_item.rule_id == .non_upper_hex_literal) {
+                const old_m_end: u32 = @intCast(cand_item.aux_payload >> 32);
+                const new_m_end: u32 = @intCast(@max(0, @as(i64, old_m_end) + byte_delta));
+                shifted.aux_payload = (@as(u64, new_m_end) << 32);
+            } else if (cand_item.rule_id == .unicode_trojan_control and cand_item.fix_kind == 3) {
+                shifted.node_or_tok = @intCast(@max(0, @as(i64, cand_item.node_or_tok) + byte_delta));
+                const old_lit_end: u32 = @intCast(cand_item.aux_payload >> 32);
+                const codepoint_lo: u32 = @intCast(cand_item.aux_payload & 0xFFFF_FFFF);
+                const new_lit_end: u32 = @intCast(@max(0, @as(i64, old_lit_end) + byte_delta));
+                shifted.aux_payload = (@as(u64, new_lit_end) << 32) | codepoint_lo;
+            }
+            updated.appendAssumeCapacity(shifted);
+        }
+    }
+    if (!has_inserted_replacement) {
+        updated.appendSliceAssumeCapacity(replacement);
+    }
+    candidates.deinit(alloc);
+    candidates.* = updated;
+}
+
 /// Incrementally re-lexes and re-parses `new_source` across `edit` in $O(K + \text{window})$ time.
 pub fn reparseIncremental(
     new_source: []const u8,
@@ -12653,6 +13540,31 @@ pub fn reparseIncremental(
     ast_arena: *AstArena,
     diagnostic_sink: ?*DiagnosticSink,
     interner: ?*StringInterner,
+) !IncrementalReparseStats {
+    return reparseIncrementalWithOptions(
+        new_source,
+        file_id,
+        edit,
+        token_buffer,
+        cst_arena,
+        ast_arena,
+        diagnostic_sink,
+        interner,
+        .{},
+    );
+}
+
+/// Incrementally re-lexes and re-parses `new_source` across `edit` with explicit `ParserOptions`.
+pub fn reparseIncrementalWithOptions(
+    new_source: []const u8,
+    file_id: FileId,
+    edit: EditRange,
+    token_buffer: *TokenBuffer,
+    cst_arena: *LosslessCstArena,
+    ast_arena: *AstArena,
+    diagnostic_sink: ?*DiagnosticSink,
+    interner: ?*StringInterner,
+    options: ParserOptions,
 ) !IncrementalReparseStats {
     // [1] Verify that the prior token buffer and CST are error-free and structurally eligible:
     if (edit.start_byte <= edit.old_end_byte and
@@ -12686,7 +13598,9 @@ pub fn reparseIncremental(
             {}
 
             var has_potential_lexer_warn_in_reused = false;
-            if (diagnostic_sink != null and (prefix_count > 0 or suffix_start < total_items)) {
+            if (options.raw_lint_candidates_out == null and diagnostic_sink != null and
+                (prefix_count > 0 or suffix_start < total_items))
+            {
                 const prefix_tok_limit: usize = if (prefix_count < total_items)
                     windows[prefix_count].first_token
                 else
@@ -12709,26 +13623,29 @@ pub fn reparseIncremental(
                         tok_kind == .byte_lit or tok_kind == .byte_string_lit or
                         tok_kind == .fmt_string_lit)
                     {
-                        const new_off_i64: i64 = if (tok_idx < prefix_tok_limit)
-                            @as(i64, tok_offsets[tok_idx])
-                        else
-                            @as(i64, tok_offsets[tok_idx]) + byte_delta;
-                        if (new_off_i64 >= 0) {
-                            const new_off: usize = @intCast(new_off_i64);
-                            const lit_slice = new_source[new_off..@min(new_off + tok_lens[tok_idx], new_source.len)];
-                            if (tok_kind == .fmt_string_lit and
-                                (!hasUnescapedInterpBrace(lit_slice) or
-                                    (lit_slice.len > 2 and
-                                        (std.mem.indexOf(u8, lit_slice[2..], "f\"") != null or
-                                            std.mem.indexOf(u8, lit_slice[2..], "f#") != null))))
-                            {
-                                has_potential_lexer_warn_in_reused = true;
+                        const t_start: usize = @min(@as(usize, tok_offsets[tok_idx]), new_source.len);
+                        const t_end: usize = @min(t_start + @as(usize, tok_lens[tok_idx]), new_source.len);
+                        const t_slice = if (tok_idx < prefix_tok_limit)
+                            new_source[t_start..t_end]
+                        else blk_suf: {
+                            const s_start: usize = @intCast(@max(0, @as(i64, tok_offsets[tok_idx]) + byte_delta));
+                            const s_clamped = @min(s_start, new_source.len);
+                            const s_end = @min(s_clamped + @as(usize, tok_lens[tok_idx]), new_source.len);
+                            break :blk_suf new_source[s_clamped..s_end];
+                        };
+                        var has_high_byte = false;
+                        for (t_slice) |ch| {
+                            if (ch >= 0x80) {
+                                has_high_byte = true;
                                 break;
                             }
-                            if (std.mem.indexOfScalar(u8, lit_slice, '\\') != null) {
-                                has_potential_lexer_warn_in_reused = true;
-                                break;
-                            }
+                        }
+                        if (has_high_byte or
+                            tok_kind == .fmt_string_lit or
+                            std.mem.indexOfScalar(u8, t_slice, '\\') != null)
+                        {
+                            has_potential_lexer_warn_in_reused = true;
+                            break;
                         }
                     }
                 }
@@ -12754,13 +13671,23 @@ pub fn reparseIncremental(
                 defer window_tokens.deinit();
                 var window_sink = DiagnosticSink.init(token_buffer.allocator);
                 defer window_sink.deinit();
+                var win_lex_lints: std.ArrayListUnmanaged(RawLintCandidate) = .empty;
+                defer win_lex_lints.deinit(token_buffer.allocator);
 
-                var win_lexer = lexer.Lexer.init(
+                var win_lexer = lexer.Lexer.initWithOptions(
                     new_source[0..reparse_new_end_byte],
                     file_id,
                     &window_tokens,
                     &window_sink,
                     interner,
+                    .{
+                        .is_casing_warning_enabled = options.is_casing_warning_enabled,
+                        .lint_settings = options.lint_settings,
+                        .raw_lint_candidates_out = if (options.raw_lint_candidates_out != null)
+                            &win_lex_lints
+                        else
+                            null,
+                    },
                 );
                 win_lexer.cursor = reparse_start_byte;
                 try win_lexer.tokenize();
@@ -12854,7 +13781,7 @@ pub fn reparseIncremental(
                     var dummy_ast = AstArena.init(ast_arena.allocator);
                     defer dummy_ast.deinit();
 
-                    var win_parser = Parser.init(
+                    var win_parser = Parser.initWithOptions(
                         new_source,
                         file_id,
                         token_buffer,
@@ -12862,6 +13789,12 @@ pub fn reparseIncremental(
                         &dummy_ast,
                         &window_sink,
                         interner,
+                        .{
+                            .max_depth = options.max_depth,
+                            .is_casing_warning_enabled = false,
+                            .is_including_tests = options.is_including_tests,
+                            .is_c_import_virtual = true,
+                        },
                     );
                     defer win_parser.clearAllowedNonCanonicalNames();
                     try win_parser.precollectAllowedNonCanonicalNames();
@@ -12914,17 +13847,39 @@ pub fn reparseIncremental(
                         ast_arena.extra_data.clearRetainingCapacity();
                         ast_arena.ast_to_cst.clearRetainingCapacity();
 
-                        try replayLexerCasingWarnings(
-                            new_source,
-                            file_id,
-                            token_buffer,
-                            diagnostic_sink,
-                            interner,
-                        );
+                        if (options.raw_lint_candidates_out) |raw_out| {
+                            var keep_len: usize = 0;
+                            for (raw_out.items) |cand_item| {
+                                const is_parser_rule = cand_item.rule_id == .non_canonical_case or
+                                    cand_item.rule_id == .non_idiomatic_syntax or
+                                    cand_item.rule_id == .single_char_ident;
+                                if (!is_parser_rule) {
+                                    raw_out.items[keep_len] = cand_item;
+                                    keep_len += 1;
+                                }
+                            }
+                            raw_out.items.len = keep_len;
+                            try spliceRawLintCandidatesInPlace(
+                                token_buffer.allocator,
+                                raw_out,
+                                reparse_start_byte,
+                                reparse_old_end_byte,
+                                byte_delta,
+                                win_lex_lints.items,
+                            );
+                        } else if (options.is_casing_warning_enabled) {
+                            try replayLexerCasingWarnings(
+                                new_source,
+                                file_id,
+                                token_buffer,
+                                diagnostic_sink,
+                                interner,
+                            );
+                        }
 
                         var verify_cst = LosslessCstArena.init(cst_arena.allocator);
                         defer verify_cst.deinit();
-                        _ = try parseTokens(
+                        _ = try parseTokensWithOptions(
                             new_source,
                             file_id,
                             token_buffer,
@@ -12932,7 +13887,18 @@ pub fn reparseIncremental(
                             ast_arena,
                             diagnostic_sink,
                             interner,
+                            options,
                         );
+                        if (options.raw_lint_candidates_out) |raw_out| {
+                            std.mem.sort(RawLintCandidate, raw_out.items, {}, struct {
+                                /// Orders `RawLintCandidate`s deterministically by `(start_byte, end_byte, rule_id)`.
+                                fn lessThan(_: void, lhs: RawLintCandidate, rhs: RawLintCandidate) bool {
+                                    if (lhs.start_byte != rhs.start_byte) return lhs.start_byte < rhs.start_byte;
+                                    if (lhs.end_byte != rhs.end_byte) return lhs.end_byte < rhs.end_byte;
+                                    return @intFromEnum(lhs.rule_id) < @intFromEnum(rhs.rule_id);
+                                }
+                            }.lessThan);
+                        }
 
                         return .{
                             .reused_prefix_items = prefix_count,
@@ -12953,7 +13919,10 @@ pub fn reparseIncremental(
     }
 
     // Fallback to full scratch tokenize and parse:
-    const root_id = try parseSource(
+    if (options.raw_lint_candidates_out) |raw_out| {
+        raw_out.clearRetainingCapacity();
+    }
+    const root_id = try parseSourceWithOptions(
         new_source,
         file_id,
         token_buffer,
@@ -12961,6 +13930,7 @@ pub fn reparseIncremental(
         ast_arena,
         diagnostic_sink,
         interner,
+        options,
     );
     const root_node = ast_arena.getNode(root_id);
     const total_reparsed: u32 = if (root_node.rhs.tag == .extra) root_node.rhs.payload else 0;
@@ -14744,17 +15714,17 @@ test "test_parser_allow_non_canonical_case_and_c_scalar_aliases_suppress_w0201" 
         "pub type c_char = i8;\n" ++
         "pub type c_ulonglong = u64;\n" ++
         "pub type c_void = opaque;\n\n" ++
-        "@allow(non_canonical_case)\n" ++
+        "@allow(non-canonical-case, reason: \"C FFI binding\")\n" ++
         "@repr(C)\n" ++
         "pub struct sqlite3_stmt {\n" ++
         "    pub pVm: i32,\n" ++
         "}\n\n" ++
         "pub struct SqliteRow {\n" ++
-        "    @allow(non_canonical_case)\n" ++
+        "    @allow(non-canonical-case, reason: \"C FFI binding\")\n" ++
         "    pub nCol: c_char,\n" ++
         "}\n\n" ++
         "impl sqlite3_stmt {\n" ++
-        "    @allow(non_canonical_case)\n" ++
+        "    @allow(non-canonical-case, reason: \"C FFI binding\")\n" ++
         "    pub fn isReady(&self) -> bool {\n" ++
         "        return self.pVm == 1;\n" ++
         "    }\n" ++
@@ -14770,17 +15740,17 @@ test "test_parser_allow_non_canonical_case_and_c_scalar_aliases_suppress_w0201" 
         "pub type c_char = i8;\n" ++
         "pub type c_ulonglong = u64;\n" ++
         "pub type c_void = opaque;\n\n" ++
-        "@allow(non_canonical_case)\n" ++
+        "@allow(non-canonical-case, reason: \"C FFI binding\")\n" ++
         "@repr(C)\n" ++
         "pub struct sqlite3_stmt {\n" ++
         "    pub pVm: i32,\n" ++
         "}\n\n" ++
         "pub struct SqliteRow {\n" ++
-        "    @allow(non_canonical_case)\n" ++
+        "    @allow(non-canonical-case, reason: \"C FFI binding\")\n" ++
         "    pub nCol: c_char,\n" ++
         "}\n\n" ++
         "impl sqlite3_stmt {\n" ++
-        "    @allow(non_canonical_case)\n" ++
+        "    @allow(non-canonical-case, reason: \"C FFI binding\")\n" ++
         "    pub fn isReady(&self) -> bool {\n" ++
         "        return self.pVm == 1;\n" ++
         "    }\n" ++
@@ -15251,4 +16221,73 @@ test "test_dr24_inline_if_fmt_strings_bracket_attrs_docstrings_and_reparse" {
     );
     try std.testing.expectEqual(@as(u32, 1), rep_sink.warning_count);
     try std.testing.expectEqual(DiagnosticCode.w0119_useless_format_string, rep_sink.asSlice()[0].code);
+}
+
+test "test_dr25_attributed_stmt_block_match_arm_and_lint_selector_e0240" {
+    const allocator = std.testing.allocator;
+    var interner = try StringInterner.init(allocator);
+    defer interner.deinit();
+
+    // [1] Valid `{ Attribute }` on `Stmt` (`return`, assignment, call), expression `Block`, and `MatchArm`:
+    const valid_src =
+        \\@expect(single-char-ident, W0408, reason: "matrix loop")
+        \\pub fn eval_step(flag: bool, code: i32) -> i32 {
+        \\    var acc: i32 = @expect(non-idiomatic-syntax, reason: "block expr") {
+        \\        let inner = 10;
+        \\        inner + 5
+        \\    };
+        \\    @expect(manual-assign-or-swap, reason: "stmt assign")
+        \\    acc = acc + 1;
+        \\    let matched = match code {
+        \\        @expect(unreachable-pattern, reason: "match arm")
+        \\        0 => 100,
+        \\        _ => @expect(non-idiomatic-syntax, reason: "arm block") unsafe { acc },
+        \\    };
+        \\    if @default_init[bool]() {
+        \\        @expect(needless-trailing-return, reason: "early return")
+        \\        return matched;
+        \\    }
+        \\    matched
+        \\}
+    ;
+    var tok_buf = TokenBuffer.init(allocator);
+    defer tok_buf.deinit();
+    var cst = LosslessCstArena.init(allocator);
+    defer cst.deinit();
+    var ast = AstArena.init(allocator);
+    defer ast.deinit();
+    var sink = DiagnosticSink.init(allocator);
+    defer sink.deinit();
+
+    _ = try parseSource(valid_src, FileId.fromInt(110), &tok_buf, &cst, &ast, &sink, &interner);
+    try std.testing.expectEqual(@as(u32, 0), sink.error_count);
+    try std.testing.expectEqual(@as(u32, 0), sink.warning_count);
+    try verifyCstAndAstInvariants(allocator, valid_src, &tok_buf, &cst, &ast);
+
+    // [2] Negative `E0240` cases: bare `@allow`, empty `()`, `*`, category `style`, `E0302`, `W0314`, spaced `-`, typo:
+    const bad_src =
+        \\@allow
+        \\pub fn bad_a() -> i32 { 0 }
+        \\
+        \\@expect()
+        \\pub fn bad_b() -> i32 { 0 }
+        \\
+        \\@allow(*, style, E0302, W0314, single - char - ident, colapsible-if)
+        \\pub fn bad_c() -> i32 { 0 }
+    ;
+    sink.resetRetainingCapacity();
+    _ = try parseSource(bad_src, FileId.fromInt(111), &tok_buf, &cst, &ast, &sink, &interner);
+    try verifyCstAndAstInvariants(allocator, bad_src, &tok_buf, &cst, &ast);
+    try std.testing.expectEqual(@as(u32, 8), sink.error_count);
+
+    var saw_typo_suggestion = false;
+    for (sink.asSlice()) |diag_item| {
+        try std.testing.expectEqual(DiagnosticCode.e0240_invalid_suppression_selector, diag_item.code);
+        for (diag_item.notes) |note_str| {
+            if (std.mem.indexOf(u8, note_str, "did you mean `collapsible-if`?") != null) {
+                saw_typo_suggestion = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_typo_suggestion);
 }

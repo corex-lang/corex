@@ -20,6 +20,7 @@ const symbol_resolver = @import("symbol_resolver.zig");
 const type_system = @import("type_system.zig");
 const mir_sast = @import("mir_sast.zig");
 const fmt_engine = @import("fmt_engine.zig");
+const lint_filter = @import("lint_filter.zig");
 const query_db = @import("query_db.zig");
 const codegen_abi = @import("codegen_abi.zig");
 const pkg_manifest = @import("pkg_manifest.zig");
@@ -167,6 +168,8 @@ const LspMethod = enum(u8) {
     inlay_hint,
     /// `textDocument/codeAction` `SuggestedFix` quickfix code actions request.
     code_action,
+    /// `textDocument/codeLens` runnable `test` / `bench` CodeLens request.
+    code_lens,
     /// `textDocument/formatting` lossless CST whole-document formatting request.
     formatting,
     /// `textDocument/rangeFormatting` lossless CST range formatting request.
@@ -805,6 +808,16 @@ pub const LspSession = struct {
     workspace_root_dir: ?[]u8 = null,
     /// Owned normalized `corex.toml` path if discovered during `initialize`.
     manifest_path: ?[]u8 = null,
+    /// Effective `[lsp]` configuration resolved from `corex.toml` (`DR-25` §3.1 & Ruling 2.2).
+    lsp_config: pkg_manifest.LspConfig = .{},
+    /// Last valid normalized dependency/build BLAKE3 digest of `corex.toml` for zero-teardown reload.
+    last_manifest_blake3: [32]u8 = @splat(0),
+    /// `true` once `last_manifest_blake3` has been recorded from a workspace manifest mount.
+    has_manifest_blake3: bool = false,
+    /// Cached workspace manifest directory path last probed by `checkStrayToolConfigDotfiles`.
+    cached_stray_dotfile_dir: ?[]u8 = null,
+    /// Cached result of `checkStrayToolConfigDotfiles` (`false` avoids 16 NTFS stats on live reload).
+    cached_has_stray_dotfiles: bool = false,
     /// Ordered list of workspace/dependency `FileId`s mounted into `db`.
     mounted_files: std.ArrayListUnmanaged(FileId) = .empty,
     /// $O(1)$ membership set of `FileId.asInt()` values already present in `mounted_files`.
@@ -877,6 +890,7 @@ pub const LspSession = struct {
         self.mounted_files.deinit(self.allocator);
         if (self.workspace_root_dir) |ws_dir| self.allocator.free(ws_dir);
         if (self.manifest_path) |m_path| self.allocator.free(m_path);
+        if (self.cached_stray_dotfile_dir) |dot_dir| self.allocator.free(dot_dir);
         self.semantic_tokens_cache.deinit();
         self.outbound_buf.deinit();
         self.turn_arena.deinit();
@@ -1174,6 +1188,7 @@ const LSP_METHOD_MAP = std.StaticStringMap(LspMethod).initComptime(.{
     .{ "initialized", .initialized },
     .{ "shutdown", .shutdown },
     .{ "textDocument/codeAction", .code_action },
+    .{ "textDocument/codeLens", .code_lens },
     .{ "textDocument/completion", .completion },
     .{ "textDocument/definition", .definition },
     .{ "textDocument/diagnostic", .document_diagnostic },
@@ -1244,7 +1259,7 @@ const RETIRED_BUILTIN_ATTR_SET = std.StaticStringMap(void).initComptime(.{
     .{ "zero_pad", {} },
 });
 
-/// $O(1)$ hover documentation catalog for all 60 built-in `@attribute` keys in `type_system.BUILTIN_ATTRIBUTE_MAP`.
+/// $O(1)$ hover documentation catalog for built-in `@attribute` keys in `type_system.BUILTIN_ATTRIBUTE_MAP`.
 const BUILTIN_ATTR_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
     .{
         "align",
@@ -1256,8 +1271,8 @@ const BUILTIN_ATTR_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
     .{
         "allow",
         HoverDocSpec{
-            .signature = "@allow(code)",
-            .summary = "Scoped suppression for a specific compiler warning or lint diagnostic code (e.g., `@allow(W0402)`).",
+            .signature = "@allow(rule, …, reason: \"…\")",
+            .summary = "Unverified lint suppression; prefer `@expect(rule, …, reason: \"…\")` so resolved lints trigger `W0002`.",
         },
     },
     .{
@@ -1356,6 +1371,13 @@ const BUILTIN_ATTR_HOVER_MAP = std.StaticStringMap(HoverDocSpec).initComptime(.{
         HoverDocSpec{
             .signature = "@escapes",
             .summary = "FFI parameter contract declaring that the callee stores the pointer beyond the call's return (`E0306` provenance check).",
+        },
+    },
+    .{
+        "expect",
+        HoverDocSpec{
+            .signature = "@expect(rule, …, reason: \"…\")",
+            .summary = "Verified scoped lint suppression (`DR-25`): silences listed rules and emits `W0002` once resolved.",
         },
     },
     .{
@@ -3628,6 +3650,17 @@ fn mountWorkspaceGraphLazy(session: *LspSession) !void {
                 var manifest_bundle = loaded_bundle_val;
                 defer manifest_bundle.deinit();
 
+                session.lsp_config = manifest_bundle.root_manifest.lsp;
+                session.last_manifest_blake3 = manifest_bundle.root_manifest_blake3;
+                session.has_manifest_blake3 = true;
+                try session.db.setPackageLintSemanticSettings(.root, manifest_bundle.root_manifest.lint.settings, null);
+                try session.db.setPackageLintFilterConfig(
+                    .root,
+                    manifest_bundle.workspace_root_dir,
+                    manifest_bundle.root_manifest.lint,
+                    null,
+                );
+
                 const toml_dir = std.fs.path.dirname(toml_path) orelse ws_root;
                 const lock_path = try std.fmt.allocPrint(
                     session.allocator,
@@ -3824,6 +3857,54 @@ fn mountWorkspaceGraphLazy(session: *LspSession) !void {
                                 node_root_fid,
                             );
                             try session.db.symbol_table.markPackageDepsConfigured(pkg_node.pkg_id);
+                            if (pkg_node.pkg_id == .root) {
+                                var active_root_m: *const pkg_manifest.Manifest = &manifest_bundle.root_manifest;
+                                if (active_root_m.package == null) {
+                                    for (manifest_bundle.members) |*ws_mem| {
+                                        if (ws_mem.manifest.package) |mem_pkg| {
+                                            if (std.mem.eql(
+                                                u8,
+                                                session.db.interner.get(mem_pkg.name_kebab),
+                                                pkg_node.canonical_name,
+                                            )) {
+                                                active_root_m = &ws_mem.manifest;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                session.lsp_config = active_root_m.lsp;
+                                try session.db.setPackageLintSemanticSettings(.root, active_root_m.lint.settings, null);
+                                try session.db.setPackageLintFilterConfig(
+                                    .root,
+                                    pkg_node.package_root_path,
+                                    active_root_m.lint,
+                                    null,
+                                );
+                            } else if (pkg_node.source_kind == .workspace_member) {
+                                for (manifest_bundle.members) |*ws_mem| {
+                                    if (ws_mem.manifest.package) |mem_pkg| {
+                                        if (std.mem.eql(
+                                            u8,
+                                            session.db.interner.get(mem_pkg.name_kebab),
+                                            pkg_node.canonical_name,
+                                        )) {
+                                            try session.db.setPackageLintSemanticSettings(
+                                                pkg_node.pkg_id,
+                                                ws_mem.manifest.lint.settings,
+                                                null,
+                                            );
+                                            try session.db.setPackageLintFilterConfig(
+                                                pkg_node.pkg_id,
+                                                ws_mem.abs_dir,
+                                                ws_mem.manifest.lint,
+                                                null,
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -3940,6 +4021,7 @@ fn handleInitializeRequest(
     try body_writer.writeAll(",\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\",\"[\"],\"retriggerCharacters\":[\",\"]}");
     try body_writer.writeAll(",\"inlayHintProvider\":true");
     try body_writer.writeAll(",\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]}");
+    try body_writer.writeAll(",\"codeLensProvider\":{\"resolveProvider\":false}");
     try body_writer.writeAll(",\"documentFormattingProvider\":true,\"documentRangeFormattingProvider\":true");
     try body_writer.writeAll(",\"renameProvider\":{\"prepareProvider\":true}}");
     try body_writer.writeAll(",\"serverInfo\":{\"name\":\"corex-lsp\",\"version\":\"0.1.0\"}}}");
@@ -3957,6 +4039,93 @@ fn lookupMountedFileId(session: *LspSession, norm_path: []const u8) ?FileId {
     return session.vfs.path_to_file_id.get(resolved_id);
 }
 
+/// Returns `true` when `norm_path` refers to a `corex.toml` manifest file.
+fn isCorexTomlPath(norm_path: []const u8) bool {
+    return std.mem.eql(u8, std.fs.path.basename(norm_path), "corex.toml");
+}
+
+/// Reloads `[lint]` / `[fmt]` / `[lsp]` from `toml_path` without tearing down `CompilerDb` when `BLAKE3` is unchanged.
+fn reloadManifestToolingLive(
+    session: *LspSession,
+    toml_fid: FileId,
+    toml_path: []const u8,
+    live_text_opt: ?[]const u8,
+) !void {
+    if (session.manifest_path == null) {
+        session.manifest_path = try session.allocator.dupe(u8, toml_path);
+    }
+    const toml_dir = std.fs.path.dirname(toml_path) orelse (session.workspace_root_dir orelse ".");
+    const cfg_env = symbol_resolver.CfgEnv.fromTargetSpec(codegen_abi.TargetSpec.host(), true);
+
+    var toml_sink = DiagnosticSink.init(session.allocator);
+    defer toml_sink.deinit();
+
+    if (live_text_opt) |live_toml| {
+        var toml_arena = BumpArena.init(session.allocator);
+        defer toml_arena.deinit();
+        if (pkg_manifest.parseManifest(
+            session.allocator,
+            &toml_arena,
+            &session.db.interner,
+            toml_fid,
+            live_toml,
+            &cfg_env,
+            &toml_sink,
+        )) |parsed_res| {
+            var parsed_m = parsed_res;
+            defer parsed_m.doc.deinit(session.allocator);
+            probeWorkspaceStrayDotfilesCached(session, toml_dir, toml_fid, &toml_sink);
+            if (!toml_sink.hasErrors()) {
+                session.lsp_config = parsed_m.manifest.lsp;
+                try session.db.setPackageLintSemanticSettings(.root, parsed_m.manifest.lint.settings, null);
+                try session.db.setPackageLintFilterConfig(.root, toml_dir, parsed_m.manifest.lint, null);
+                session.last_manifest_blake3 = parsed_m.manifest.root_manifest_blake3;
+                session.has_manifest_blake3 = true;
+            }
+        } else |_| {}
+    } else {
+        if (pkg_manifest.loadWorkspaceManifestBundle(
+            session.io,
+            session.allocator,
+            &session.db.interner,
+            toml_path,
+            toml_fid,
+            &cfg_env,
+            &toml_sink,
+        )) |loaded_b| {
+            var bundle = loaded_b;
+            defer bundle.deinit();
+            if (!toml_sink.hasErrors()) {
+                if (session.has_manifest_blake3 and
+                    std.mem.eql(u8, &bundle.root_manifest_blake3, &session.last_manifest_blake3))
+                {
+                    session.lsp_config = bundle.root_manifest.lsp;
+                    try session.db.setPackageLintSemanticSettings(.root, bundle.root_manifest.lint.settings, null);
+                    try session.db.setPackageLintFilterConfig(
+                        .root,
+                        bundle.workspace_root_dir,
+                        bundle.root_manifest.lint,
+                        null,
+                    );
+                } else {
+                    try mountWorkspaceGraphLazy(session);
+                }
+            }
+        } else |_| {}
+    }
+
+    if (!toml_fid.isNone() and session.isFileOpen(toml_fid)) {
+        try queuePushDiagnostics(session, toml_fid);
+    }
+    var open_it = session.open_doc_versions.keyIterator();
+    while (open_it.next()) |open_raw_ptr| {
+        const open_fid = FileId.fromInt(open_raw_ptr.*);
+        if (open_fid != toml_fid) {
+            try queuePushDiagnostics(session, open_fid);
+        }
+    }
+}
+
 /// Resolves or mounts a document URI into `FileId`, returning `.none` if not found on disk or in VFS.
 fn resolveDocumentFileId(
     session: *LspSession,
@@ -3969,9 +4138,12 @@ fn resolveDocumentFileId(
         return existing_fid;
     }
     if (session.vfs.resolveOrCreatePath(session.io, norm_path, .root)) |disk_fid| {
-        var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
-        defer visited.deinit(session.allocator);
-        try mountExternalSubmodulesShallow(session, disk_fid, norm_path, .medium, .root, &visited, 0);
+        _ = session.vfs.getLineIndex(disk_fid) catch {};
+        if (std.mem.endsWith(u8, norm_path, ".cx")) {
+            var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+            defer visited.deinit(session.allocator);
+            try mountExternalSubmodulesShallow(session, disk_fid, norm_path, .medium, .root, &visited, 0);
+        }
         return disk_fid;
     } else |_| {}
     return .none;
@@ -4007,9 +4179,16 @@ fn handleDidOpenNotification(
     }
 
     const fid = session.vfs.setEditorOverlay(session.io, overlay_path, doc_text, pkg_id, true) catch return;
-    try session.recordMountedFile(fid);
+    _ = session.vfs.getLineIndex(fid) catch {};
     try session.recordClientUri(fid, raw_uri);
     try session.open_doc_versions.put(session.allocator, fid.asInt(), doc_version);
+
+    if (isCorexTomlPath(norm_path)) {
+        try reloadManifestToolingLive(session, fid, norm_path, doc_text);
+        return;
+    }
+
+    try session.recordMountedFile(fid);
 
     const effective_vpath = session.vfs.getFilePath(fid);
     const canonical_vpath = if (effective_vpath.len > 0) effective_vpath else overlay_path;
@@ -4053,6 +4232,7 @@ fn handleDidChangeNotificationBatch(
     if (total_change_items == 0) return;
 
     const initial_src = getLiveDocumentSource(session, fid) orelse "";
+    const is_toml_doc = isCorexTomlPath(norm_path);
 
     // Fast path; single ranged edit uses the already-cached `vfs.getLineIndex(fid)` directly:
     if (change_params_batch.len == 1 and total_change_items == 1) {
@@ -4095,6 +4275,11 @@ fn handleDidChangeNotificationBatch(
                     .new_end_byte = @intCast(start_off + repl_text.len),
                 };
                 _ = session.vfs.setEditorOverlay(session.io, overlay_path, spliced, pkg_id, true) catch return;
+                _ = session.vfs.getLineIndex(fid) catch {};
+                if (is_toml_doc) {
+                    try reloadManifestToolingLive(session, fid, norm_path, spliced);
+                    return;
+                }
                 _ = try session.db.setInputWithEdit(fid, spliced, .low, edit_range);
                 try queuePushDiagnostics(session, fid);
                 return;
@@ -4103,6 +4288,11 @@ fn handleDidChangeNotificationBatch(
         // Single full-document sync (`range == null`):
         if (repl_text.len > vfs_sourcemap.MAX_OPEN_OVERLAY_BYTES) return;
         _ = session.vfs.setEditorOverlay(session.io, overlay_path, repl_text, pkg_id, true) catch return;
+        _ = session.vfs.getLineIndex(fid) catch {};
+        if (is_toml_doc) {
+            try reloadManifestToolingLive(session, fid, norm_path, repl_text);
+            return;
+        }
         _ = try session.db.setInput(fid, repl_text, .low);
         try queuePushDiagnostics(session, fid);
         return;
@@ -4181,6 +4371,11 @@ fn handleDidChangeNotificationBatch(
     }
 
     _ = session.vfs.setEditorOverlay(session.io, overlay_path, working_src, pkg_id, true) catch return;
+    _ = session.vfs.getLineIndex(fid) catch {};
+    if (is_toml_doc) {
+        try reloadManifestToolingLive(session, fid, norm_path, working_src);
+        return;
+    }
     if (!has_full_sync and folded_edit != null) {
         _ = try session.db.setInputWithEdit(fid, working_src, .low, folded_edit.?);
     } else {
@@ -4201,6 +4396,19 @@ fn handleDidSaveNotification(
     const existing_vpath = session.vfs.getFilePath(fid);
     const overlay_path = if (existing_vpath.len > 0) existing_vpath else norm_path;
     const pkg_id = session.db.symbol_table.getFilePackageId(fid);
+
+    if (isCorexTomlPath(norm_path)) {
+        if (params.getStringField("text")) |saved_toml| {
+            if (saved_toml.len <= vfs_sourcemap.MAX_OPEN_OVERLAY_BYTES) {
+                _ = session.vfs.setEditorOverlay(session.io, overlay_path, saved_toml, pkg_id, true) catch return;
+                _ = session.vfs.getLineIndex(fid) catch {};
+                try reloadManifestToolingLive(session, fid, norm_path, saved_toml);
+                return;
+            }
+        }
+        try reloadManifestToolingLive(session, fid, norm_path, null);
+        return;
+    }
 
     if (params.getStringField("text")) |saved_text| {
         const cur_src = getLiveDocumentSource(session, fid) orelse "";
@@ -4261,6 +4469,28 @@ fn handleDidCloseNotification(
     session.removeClientUri(fid);
 }
 
+/// Probes `toml_dir` for forbidden stray tool dotfiles, caching clean negative results across live edits.
+fn probeWorkspaceStrayDotfilesCached(
+    session: *LspSession,
+    toml_dir: []const u8,
+    file_id: FileId,
+    sink: *DiagnosticSink,
+) void {
+    if (session.cached_stray_dotfile_dir) |cached_dir| {
+        if (std.mem.eql(u8, cached_dir, toml_dir)) {
+            if (session.cached_has_stray_dotfiles) {
+                _ = pkg_manifest.checkStrayToolConfigDotfiles(session.io, toml_dir, file_id, sink) catch false;
+            }
+            return;
+        }
+        session.allocator.free(cached_dir);
+        session.cached_stray_dotfile_dir = null;
+    }
+    const found = pkg_manifest.checkStrayToolConfigDotfiles(session.io, toml_dir, file_id, sink) catch false;
+    session.cached_stray_dotfile_dir = session.allocator.dupe(u8, toml_dir) catch null;
+    session.cached_has_stray_dotfiles = found;
+}
+
 /// Handles `workspace/didChangeWatchedFiles`: reloads `corex.toml`/`corex.lock` and unopened disk `.cx` files.
 fn handleDidChangeWatchedFilesNotification(
     session: *LspSession,
@@ -4271,6 +4501,11 @@ fn handleDidChangeWatchedFilesNotification(
     if (changes_val != .array_val) return;
 
     var has_manifest_change = false;
+    if (session.cached_stray_dotfile_dir) |dot_dir| {
+        session.allocator.free(dot_dir);
+        session.cached_stray_dotfile_dir = null;
+    }
+    session.cached_has_stray_dotfiles = false;
     for (changes_val.array_val) |ev_obj| {
         const raw_uri = ev_obj.getStringField("uri") orelse continue;
         if (raw_uri.len == 0 or raw_uri.len > MAX_LSP_URI_BYTES) continue;
@@ -4322,7 +4557,33 @@ fn handleDidChangeWatchedFilesNotification(
     }
 
     if (has_manifest_change) {
+        if (session.manifest_path) |m_path| {
+            const m_fid = session.vfs.resolveOrCreatePath(session.io, m_path, .root) catch .none;
+            if (!m_fid.isNone()) {
+                if (std.Io.Dir.cwd().readFileAlloc(
+                    session.io,
+                    m_path,
+                    arena_alloc,
+                    .limited(pkg_manifest.MAX_TOML_BYTES),
+                )) |disk_toml| {
+                    _ = session.vfs.setEditorOverlay(
+                        session.io,
+                        m_path,
+                        disk_toml,
+                        .root,
+                        session.isFileOpen(m_fid),
+                    ) catch {};
+                    _ = session.vfs.getLineIndex(m_fid) catch {};
+                } else |_| {}
+                try reloadManifestToolingLive(session, m_fid, m_path, null);
+                return;
+            }
+        }
         try mountWorkspaceGraphLazy(session);
+        var open_it = session.open_doc_versions.keyIterator();
+        while (open_it.next()) |open_raw_ptr| {
+            try queuePushDiagnostics(session, FileId.fromInt(open_raw_ptr.*));
+        }
     }
 }
 
@@ -4359,7 +4620,7 @@ fn appendFileDiagnosticsDedup(
     }
 }
 
-/// Collects all syntax, signature, body typecheck, SAST/MIR, and `comptime` diagnostics for `file_id`.
+/// Collects all syntax, signature, body typecheck, SAST/MIR, `comptime`, and projected lint diagnostics for `file_id`.
 fn collectFileDiagnostics(
     session: *LspSession,
     arena_alloc: std.mem.Allocator,
@@ -4368,37 +4629,67 @@ fn collectFileDiagnostics(
     var collected: std.ArrayListUnmanaged(CollectedDiagnostic) = .empty;
     var seen_keys: std.StringHashMapUnmanaged(void) = .empty;
 
-    _ = try session.db.parseCst(file_id);
-    _ = try session.db.resolveSignatures(file_id);
+    const vfs_path = session.vfs.getFilePath(file_id);
+    if (isCorexTomlPath(vfs_path)) {
+        const toml_src = getLiveDocumentSource(session, file_id) orelse "";
+        const toml_dir = std.fs.path.dirname(vfs_path) orelse (session.workspace_root_dir orelse ".");
+        const cfg_env = symbol_resolver.CfgEnv.fromTargetSpec(codegen_abi.TargetSpec.host(), true);
+        var toml_arena = BumpArena.init(arena_alloc);
+        var toml_sink = DiagnosticSink.init(arena_alloc);
+        if (pkg_manifest.parseManifest(
+            arena_alloc,
+            &toml_arena,
+            &session.db.interner,
+            file_id,
+            toml_src,
+            &cfg_env,
+            &toml_sink,
+        )) |parsed_toml| {
+            var tmp_doc = parsed_toml.doc;
+            tmp_doc.deinit(arena_alloc);
+        } else |_| {}
+        probeWorkspaceStrayDotfilesCached(session, toml_dir, file_id, &toml_sink);
+        for (toml_sink.diagnostics.items) |diag_item| {
+            const cloned_msg = try arena_alloc.dupe(u8, diag_item.message);
+            var cloned_diag = diag_item;
+            cloned_diag.message = cloned_msg;
+            if (cloned_diag.primary_span.file_id.isNone()) {
+                cloned_diag.primary_span.file_id = file_id;
+            }
+            try collected.append(arena_alloc, .{ .diag = cloned_diag });
+        }
+        return collected.items;
+    }
+
+    // [1] Run leaf `projectFileDiagnostics` (`parseCst`, `resolveSignatures`, `typecheckBody`, `verifySastMir`, & lint filter):
+    _ = try session.db.projectFileDiagnostics(file_id);
     const entries = try arena_alloc.dupe(
         query_db.ItemTreeEntry,
         (try session.db.extractItemTree(file_id)).entries,
     );
 
-    // [1] Run all per-`DefId` signature/body/SAST/`comptime` queries first without retaining HashMap pointers:
-    for (entries) |entry| {
-        try session.db.unwindIfCanceled();
-        _ = try session.db.getDefSignature(entry.def_id);
-        switch (entry.kind) {
-            .mod_decl, .use_decl, .ffi_extern_block => {},
-            else => {
-                _ = try session.db.typecheckBody(entry.def_id);
-                _ = try session.db.verifySastMir(entry.def_id);
-                if (entry.kind == .const_decl or entry.kind == .extern_block) {
-                    _ = session.db.evalComptimeDef(entry.def_id) catch |ct_err| switch (ct_err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        error.Canceled => return error.Canceled,
-                        else => {},
-                    };
-                }
-            },
+    // Run `evalComptimeDef` on `.const_decl` / `.extern_block` items when free of upstream errors:
+    const has_proj_errors = if (session.db.projected_file_diagnostics.getPtr(file_id.asInt())) |proj_ptr|
+        proj_ptr.hasErrors()
+    else
+        false;
+    if (!has_proj_errors) {
+        for (entries) |entry| {
+            try session.db.unwindIfCanceled();
+            if (entry.kind == .const_decl or entry.kind == .extern_block) {
+                _ = session.db.evalComptimeDef(entry.def_id) catch |ct_err| switch (ct_err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Canceled => return error.Canceled,
+                    else => {},
+                };
+            }
         }
     }
 
-    // Pre-resolve any `E0220` retired-bang fixes before reading `*const DiagnosticSink` pointers:
+    // Pre-resolve any `E0220` retired-bang fixes before borrowing `*const DiagnosticSink` pointers:
     var pending_bang_spans: std.ArrayListUnmanaged(Span) = .empty;
-    if (session.db.parsed_artifacts.getPtr(file_id.asInt())) |parsed_ptr| {
-        for (parsed_ptr.diagnostics.diagnostics.items) |diag_item| {
+    if (session.db.projected_file_diagnostics.getPtr(file_id.asInt())) |proj_ptr| {
+        for (proj_ptr.diagnostics.items) |diag_item| {
             if (diag_item.code == .e0220_retired_bang_prefix and diag_item.suggestions.len == 0) {
                 try pending_bang_spans.append(arena_alloc, diag_item.primary_span);
             }
@@ -4408,29 +4699,15 @@ fn collectFileDiagnostics(
         _ = try session.db.resolveBangFixSuggestion(file_id, bang_span);
     }
 
-    // [2] Read each `*const DiagnosticSink` fresh from quiescent `CompilerDb` maps with zero interleaved mutations:
-    if (session.db.parsed_artifacts.getPtr(file_id.asInt())) |parsed_ptr| {
-        try appendFileDiagnosticsDedup(arena_alloc, file_id, &parsed_ptr.diagnostics, &seen_keys, &collected);
-    }
-    if (session.db.getSignatureDiagnostics(file_id)) |sig_sink| {
-        try appendFileDiagnosticsDedup(arena_alloc, file_id, sig_sink, &seen_keys, &collected);
+    // [2] Read projected file sink + `comptime` sinks fresh from quiescent `CompilerDb` maps:
+    if (session.db.projected_file_diagnostics.getPtr(file_id.asInt())) |proj_ptr| {
+        try appendFileDiagnosticsDedup(arena_alloc, file_id, proj_ptr, &seen_keys, &collected);
     }
     for (entries) |entry| {
-        switch (entry.kind) {
-            .mod_decl, .use_decl, .ffi_extern_block => {},
-            else => {
-                if (session.db.getBodyDiagnostics(entry.def_id)) |body_sink| {
-                    try appendFileDiagnosticsDedup(arena_alloc, file_id, body_sink, &seen_keys, &collected);
-                }
-                if (session.db.getSastDiagnostics(entry.def_id)) |sast_sink| {
-                    try appendFileDiagnosticsDedup(arena_alloc, file_id, sast_sink, &seen_keys, &collected);
-                }
-                if (entry.kind == .const_decl or entry.kind == .extern_block) {
-                    if (session.db.getComptimeDiagnostics(entry.def_id)) |ct_sink| {
-                        try appendFileDiagnosticsDedup(arena_alloc, file_id, ct_sink, &seen_keys, &collected);
-                    }
-                }
-            },
+        if (entry.kind == .const_decl or entry.kind == .extern_block) {
+            if (session.db.getComptimeDiagnostics(entry.def_id)) |ct_sink| {
+                try appendFileDiagnosticsDedup(arena_alloc, file_id, ct_sink, &seen_keys, &collected);
+            }
         }
     }
 
@@ -4446,8 +4723,13 @@ fn collectFileDiagnostics(
     return collected.items;
 }
 
-/// Maps `DiagnosticCode` to optional LSP 3.17 `DiagnosticTag` (`1 = Unnecessary`, `2 = Deprecated`).
+/// Maps `DiagnosticCode` to optional LSP 3.17 `DiagnosticTag` (`1 = Unnecessary`, `2 = Deprecated`, `DR-25` §3.4).
 fn classifyLspDiagnosticTag(code: DiagnosticCode) ?u8 {
+    if (code.asLintRuleId()) |rule_id| {
+        if (code == .w0403_deprecated_symbol) return 2;
+        if (rule_id.asMeta().is_unnecessary_tag) return 1;
+        return null;
+    }
     return switch (code) {
         .w0401_unreachable_pattern_arm,
         .w0402_unused_binding,
@@ -4460,7 +4742,7 @@ fn classifyLspDiagnosticTag(code: DiagnosticCode) ?u8 {
     };
 }
 
-/// Writes a single LSP 3.17 `Diagnostic` JSON object (including `tags` and `relatedInformation`) to `writer`.
+/// Writes a single LSP 3.17 `Diagnostic` JSON object (including `"W0xxx/slug"`, `tags`, and `relatedInformation`).
 fn writeSingleLspDiagnosticJson(
     session: *LspSession,
     arena_alloc: std.mem.Allocator,
@@ -4469,17 +4751,27 @@ fn writeSingleLspDiagnosticJson(
     writer: *std.Io.Writer,
 ) !void {
     const primary_range = spanToLspRange(session, file_id, diag_item.primary_span);
-    const lsp_severity: u8 = switch (diag_item.severity) {
+    const maybe_lint_rule = diag_item.code.asLintRuleId();
+    const lsp_severity: u8 = if (maybe_lint_rule != null)
+        2
+    else switch (diag_item.severity) {
         .err => 1,
         .warning => 2,
         .note => 3,
         .help => 4,
     };
 
+    var code_buf: [80]u8 = undefined;
+    const lsp_code_str: []const u8 = if (maybe_lint_rule) |rule_id|
+        (std.fmt.bufPrint(&code_buf, "{s}/{s}", .{ diag_item.code.asCodeStr(), rule_id.asSlug() }) catch
+            diag_item.code.asCodeStr())
+    else
+        diag_item.code.asCodeStr();
+
     try writer.writeAll("{\"range\":");
     try writeLspRangeJson(writer, primary_range);
     try writer.print(",\"severity\":{d},\"code\":", .{lsp_severity});
-    try writeJsonString(writer, diag_item.code.asCodeStr());
+    try writeJsonString(writer, lsp_code_str);
     try writer.writeAll(",\"source\":\"corex\",\"message\":");
 
     if (diag_item.notes.len == 0) {
@@ -7179,7 +7471,9 @@ fn handleHoverRequest(
                 const at_rec = parsed_cst.token_buffer.getToken(at_tok);
                 const name_rec = parsed_cst.token_buffer.getToken(name_tok);
                 const name_lex = symbol_resolver.extractTokenSlice(live_src, &parsed_cst.token_buffer, name_tok);
-                if (INTRINSIC_HOVER_MAP.get(name_lex) orelse BUILTIN_ATTR_HOVER_MAP.get(name_lex)) |doc_spec| {
+                const maybe_at_spec: ?HoverDocSpec = INTRINSIC_HOVER_MAP.get(name_lex) orelse
+                    BUILTIN_ATTR_HOVER_MAP.get(name_lex);
+                if (maybe_at_spec) |doc_spec| {
                     const doc_md = try std.fmt.allocPrint(
                         arena_alloc,
                         "```corex\n{s}\n```\n\n{s}",
@@ -7191,6 +7485,24 @@ fn handleHoverRequest(
                 if (cur_rec.kind == .at) {
                     pos = byteOffsetToLspPosition(session, fid, name_rec.byte_offset);
                 }
+            }
+
+            if (try tryBuildLintSelectorHover(
+                arena_alloc,
+                fid,
+                live_src,
+                &parsed_cst.token_buffer,
+                &parsed_cst.cst_arena,
+                cursor_byte,
+            )) |lint_hover| {
+                return writeMarkdownHoverFrame(
+                    session,
+                    fid,
+                    lint_hover.span,
+                    lint_hover.markdown,
+                    out_writer,
+                    rpc_id,
+                );
             }
         }
     }
@@ -7589,6 +7901,102 @@ fn handleHoverRequest(
     }
 
     return writeMarkdownHoverFrame(session, fid, target.token_span, md_alloc.written(), out_writer, rpc_id);
+}
+
+/// Builds hover documentation when `cursor_byte` rests on a lint rule selector inside `@expect(…)` / `@allow(…)`.
+fn tryBuildLintSelectorHover(
+    arena_alloc: std.mem.Allocator,
+    fid: FileId,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    cursor_byte: u32,
+) !?struct { span: Span, markdown: []const u8 } {
+    if (cursor_byte >= source.len) return null;
+    const total_nodes = cst_arena.countNodes();
+    var idx: usize = 0;
+    while (idx < total_nodes) {
+        const node_id = CstNodeIndex.fromInt(@intCast(idx));
+        const node_rec = cst_arena.getNode(node_id);
+        if (node_rec.kind != .attribute) {
+            idx += 1;
+            continue;
+        }
+        const attr_span = computeCstSubtreeByteSpan(fid, token_buffer, cst_arena, node_id) orelse {
+            idx += @max(@as(usize, 1), node_rec.subtree_size);
+            continue;
+        };
+        if (cursor_byte < attr_span.start_byte or cursor_byte > attr_span.end_byte) {
+            idx += @max(@as(usize, 1), node_rec.subtree_size);
+            continue;
+        }
+
+        const end_idx = @min(total_nodes, idx + @max(@as(usize, 1), node_rec.subtree_size));
+        var attr_name: []const u8 = "";
+        var lparen_byte: ?u32 = null;
+        var cur = idx + 1;
+        while (cur < end_idx) : (cur += 1) {
+            const leaf = cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+            if (leaf.subtree_size > 1 or leaf.token.isNone() or leaf.token.asInt() >= token_buffer.countTokens()) {
+                continue;
+            }
+            const t_rec = token_buffer.getToken(leaf.token);
+            if (t_rec.kind == .at) continue;
+            if (attr_name.len == 0 and isIdentifierOrKeywordToken(t_rec.kind)) {
+                attr_name = symbol_resolver.extractTokenSlice(source, token_buffer, leaf.token);
+                continue;
+            }
+            if (t_rec.kind == .lparen) {
+                lparen_byte = t_rec.byte_offset;
+                break;
+            }
+        }
+        if ((!std.mem.eql(u8, attr_name, "expect") and !std.mem.eql(u8, attr_name, "allow")) or
+            lparen_byte == null or cursor_byte <= lparen_byte.?)
+        {
+            return null;
+        }
+
+        var sel_lo: usize = @min(@as(usize, cursor_byte), source.len);
+        while (sel_lo > 0 and (std.ascii.isAlphanumeric(source[sel_lo - 1]) or
+            source[sel_lo - 1] == '-' or source[sel_lo - 1] == '_')) : (sel_lo -= 1)
+        {}
+        var sel_hi: usize = @min(@as(usize, cursor_byte), source.len);
+        while (sel_hi < source.len and (std.ascii.isAlphanumeric(source[sel_hi]) or
+            source[sel_hi] == '-' or source[sel_hi] == '_')) : (sel_hi += 1)
+        {}
+        if (sel_lo >= sel_hi) return null;
+        const sel_slice = source[sel_lo..sel_hi];
+        switch (diagnostic.lookupLintRuleBySelector(sel_slice)) {
+            .rule => |rule_id| {
+                const meta = rule_id.asMeta();
+                const cat_entry = diagnostic.DIAGNOSTIC_CATALOG[@backingInt(meta.diag_code)];
+                const fix_label: []const u8 = switch (meta.default_applicability) {
+                    .machine_applicable => "safe autofix (`--fix`)",
+                    .maybe_incorrect => "unsafe autofix (`--fix-unsafe`)",
+                    else => "diagnostic only",
+                };
+                const md_text = try std.fmt.allocPrint(
+                    arena_alloc,
+                    "```corex\n{s}/{s} // [{s}] ({s})\n```\n\n**{s}**\n\n{s}",
+                    .{
+                        meta.diag_code.asCodeStr(),
+                        meta.slug,
+                        meta.category.asStr(),
+                        fix_label,
+                        cat_entry.title,
+                        cat_entry.explanation,
+                    },
+                );
+                return .{
+                    .span = Span.init(fid, @intCast(sel_lo), @intCast(sel_hi)),
+                    .markdown = md_text,
+                };
+            },
+            else => return null,
+        }
+    }
+    return null;
 }
 
 /// Writes `{"jsonrpc":"2.0","id":…,"result":null}` and flushes `out_writer`.
@@ -9813,6 +10221,40 @@ fn isCursorInsideFmtStringHoleDepth(fmt_lexeme: []const u8, rel_cursor: usize, d
     return brace_depth > 0;
 }
 
+/// Returns `true` when `cursor_byte` sits inside the `(…)` selector list of `@expect(…)` or `@allow(…)`.
+fn isCursorInsideLintAttrArgs(
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cursor_byte: u32,
+) bool {
+    var paren_stack: [32]TokenIndex = undefined;
+    var stack_len: usize = 0;
+    const tok_count = token_buffer.countTokens();
+    var i: usize = 0;
+    while (i < tok_count) : (i += 1) {
+        const tok_id = TokenIndex.fromInt(@intCast(i));
+        const tok_rec = token_buffer.getToken(tok_id);
+        if (tok_rec.flags.is_synthesized or tok_rec.kind == .eof) continue;
+        if (tok_rec.byte_offset >= cursor_byte) break;
+        if (tok_rec.kind == .lparen) {
+            if (stack_len < paren_stack.len) {
+                paren_stack[stack_len] = tok_id;
+                stack_len += 1;
+            }
+        } else if (tok_rec.kind == .rparen) {
+            if (stack_len > 0) stack_len -= 1;
+        }
+    }
+    if (stack_len == 0) return false;
+    const open_paren = paren_stack[stack_len - 1];
+    if (open_paren.asInt() < 2) return false;
+    const name_tok = TokenIndex.fromInt(open_paren.asInt() - 1);
+    const at_tok = TokenIndex.fromInt(open_paren.asInt() - 2);
+    if (token_buffer.getToken(at_tok).kind != .at) return false;
+    const attr_name = symbol_resolver.extractTokenSlice(source, token_buffer, name_tok);
+    return std.mem.eql(u8, attr_name, "expect") or std.mem.eql(u8, attr_name, "allow");
+}
+
 /// Handles `textDocument/completion`: dot-completion (`IncompleteDotTarget`), `@` attributes, and lexical scope (`<= 256`).
 fn handleCompletionRequest(
     session: *LspSession,
@@ -9893,8 +10335,42 @@ fn handleCompletionRequest(
         }
     }
 
-    if (is_after_at) {
+    const is_inside_lint_attr = !is_inside_fmt_hole and
+        isCursorInsideLintAttrArgs(src, &parsed_art.token_buffer, cursor_byte);
+
+    if (is_inside_lint_attr) {
+        var lint_start: usize = cursor_byte;
+        while (lint_start > 0) {
+            const prev_ch = src[lint_start - 1];
+            if (std.ascii.isAlphanumeric(prev_ch) or prev_ch == '-' or prev_ch == '_') {
+                lint_start -= 1;
+            } else {
+                break;
+            }
+        }
+        const lint_prefix = src[lint_start..cursor_byte];
+        for (diagnostic.DIAGNOSTIC_LINT_CATALOG) |lint_meta| {
+            try appendUniqueCompletion(arena_alloc, &seen_labels, &items, lint_prefix, .{
+                .label = lint_meta.slug,
+                .kind = 20,
+                .detail = lint_meta.diag_code.asCodeStr(),
+                .sort_tier = 0,
+            });
+        }
+        try appendUniqueCompletion(arena_alloc, &seen_labels, &items, lint_prefix, .{
+            .label = "reason",
+            .kind = 10,
+            .detail = "reason: \"…\" rationale",
+            .sort_tier = 1,
+        });
+    } else if (is_after_at) {
         if (!is_inside_fmt_hole) {
+            try appendUniqueCompletion(arena_alloc, &seen_labels, &items, prefix, .{
+                .label = "expect",
+                .kind = 24,
+                .detail = "@attribute",
+                .sort_tier = 0,
+            });
             for (type_system.BUILTIN_ATTRIBUTE_MAP.keys()) |attr_name| {
                 if (RETIRED_BUILTIN_ATTR_SET.has(attr_name)) continue;
                 try appendUniqueCompletion(arena_alloc, &seen_labels, &items, prefix, .{
@@ -10278,8 +10754,12 @@ fn handleCompletionRequest(
     }
 
     std.mem.sort(CompletionCandidate, items.items, {}, isCompletionCandidateBefore);
-    const out_count = @min(items.items.len, MAX_COMPLETION_ITEMS);
-    const is_incomplete = items.items.len >= MAX_COMPLETION_ITEMS;
+    const configured_max: usize = @min(
+        @max(@as(usize, session.lsp_config.max_completion_items), 16),
+        MAX_COMPLETION_ITEMS,
+    );
+    const out_count = @min(items.items.len, configured_max);
+    const is_incomplete = items.items.len > out_count or items.items.len >= MAX_COMPLETION_ITEMS;
 
     session.outbound_buf.clearRetainingCapacity();
     const body_writer = &session.outbound_buf.writer;
@@ -10695,6 +11175,33 @@ fn handleInlayHintRequest(
 
         const side_tables = (try session.db.getDefSideTables(entry.def_id)) orelse continue;
         parsed_art = session.db.parsed_artifacts.getPtr(fid.asInt()) orelse break;
+
+        // [0] Optional inferred effect summary hint on `fn` headers when `inlay-hints-effects = "all"`:
+        if (session.lsp_config.inlay_hints_effects == .all and entry.kind == .fn_decl and
+            emitted_hints < MAX_INLAY_HINTS and entry_span.start_byte >= start_byte)
+        {
+            if (session.db.getSastSummaryProj(entry.def_id) catch null) |fn_sum| {
+                const eff = fn_sum.inferredEffects();
+                const eff_lbl: []const u8 = if (!eff.alloc and !eff.may_panic)
+                    " /* pure */"
+                else if (eff.alloc and eff.may_panic)
+                    " /* alloc, panic */"
+                else if (eff.alloc)
+                    " /* alloc */"
+                else
+                    " /* panic */";
+                const hdr_pos = byteOffsetToLspPosition(session, fid, entry_span.end_byte);
+                if (emitted_hints > 0) try body_writer.writeByte(',');
+                try body_writer.print(
+                    "{{\"position\":{{\"line\":{d},\"character\":{d}}},\"label\":",
+                    .{ hdr_pos.line, hdr_pos.character },
+                );
+                try writeJsonString(body_writer, eff_lbl);
+                try body_writer.writeAll(",\"paddingLeft\":true}");
+                emitted_hints += 1;
+            }
+        }
+
         var ast_raw = side_tables.ast_start;
         const ast_limit = @min(side_tables.ast_end, @as(u32, @intCast(parsed_art.ast_arena.countNodes())));
 
@@ -10703,7 +11210,7 @@ fn handleInlayHintRequest(
             const ast_node = parsed_art.ast_arena.getNode(ast_id);
 
             // [1] Inferred `: <Type>` on unannotated single-binding `let` / `var` declarations (with `textEdits`!):
-            if (ast_node.tag == .local_var_decl) {
+            if (session.lsp_config.inlay_hints_types and ast_node.tag == .local_var_decl) {
                 const cst_orig = parsed_art.ast_arena.getCstOrigin(ast_id);
                 if (!cst_orig.isNone()) {
                     var has_explicit_colon = false;
@@ -10767,8 +11274,57 @@ fn handleInlayHintRequest(
                 }
             }
 
+            // [2] Implicit MVS autoref hints (`(&mut)` / `(own)`) on method receivers when `inlay-hints-mvs-modes = true`:
+            if (session.lsp_config.inlay_hints_mvs_modes and ast_node.tag == .method_call and
+                emitted_hints < MAX_INLAY_HINTS and ast_node.lhs.tag == .node)
+            {
+                const m_callee = session.db.symbol_table.unwrapAliasSymbolIdx(side_tables.getNodeSymbol(ast_id));
+                if (!m_callee.isNone() and m_callee.asInt() < session.db.symbol_table.countSymbols()) {
+                    const m_sym = session.db.symbol_table.getSymbol(m_callee).*;
+                    if (session.db.type_pool.getFnSignatureView(m_sym.type_id)) |m_sv| {
+                        if (m_sv.paramCount() > 0) {
+                            const recv_mode = m_sv.getParamMode(0);
+                            const recv_ty = m_sv.getParamType(0);
+                            const is_mut_recv = recv_mode == .inout_mode or
+                                (!recv_ty.isPrimitiveOrSentinel() and
+                                    session.db.type_pool.getTag(recv_ty) == .mut_ref_ty);
+                            const mvs_badge: ?[]const u8 = if (recv_mode == .sink_mode)
+                                "(own) "
+                            else if (is_mut_recv)
+                                "(&mut) "
+                            else
+                                null;
+                            if (mvs_badge) |badge_str| {
+                                const recv_ast = NodeIndex.fromInt(ast_node.lhs.payload);
+                                const recv_cst = parsed_art.ast_arena.getCstOrigin(recv_ast);
+                                if (computeCstSubtreeByteSpan(
+                                    fid,
+                                    &parsed_art.token_buffer,
+                                    &parsed_art.cst_arena,
+                                    recv_cst,
+                                )) |recv_sp| {
+                                    if (recv_sp.start_byte >= start_byte and recv_sp.start_byte <= end_byte) {
+                                        const recv_pos = byteOffsetToLspPosition(session, fid, recv_sp.start_byte);
+                                        if (emitted_hints > 0) try body_writer.writeByte(',');
+                                        try body_writer.print(
+                                            "{{\"position\":{{\"line\":{d},\"character\":{d}}},\"label\":",
+                                            .{ recv_pos.line, recv_pos.character },
+                                        );
+                                        try writeJsonString(body_writer, badge_str);
+                                        try body_writer.writeByte('}');
+                                        emitted_hints += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // [3] Positional argument `<param>:` hints on `.call_expr`, `.generic_call`, `.method_call`:
-            if (ast_node.tag == .call_expr or ast_node.tag == .generic_call or ast_node.tag == .method_call) {
+            if (session.lsp_config.inlay_hints_parameter_names != .none and
+                (ast_node.tag == .call_expr or ast_node.tag == .generic_call or ast_node.tag == .method_call))
+            {
                 var callee_idx = side_tables.getNodeSymbol(ast_id);
                 if (callee_idx.isNone() and ast_node.lhs.tag == .node) {
                     callee_idx = side_tables.getNodeSymbol(NodeIndex.fromInt(ast_node.lhs.payload));
@@ -10811,8 +11367,10 @@ fn handleInlayHintRequest(
                         const p_name = param_specs[spec_idx].name_text;
                         if (p_name.len == 0 or std.mem.startsWith(u8, p_name, "_")) continue;
 
-                        // Suppress redundant `foo(count: count)` when argument is an identical identifier:
-                        if (arg_rec.tag == .ident_expr) {
+                        // Suppress redundant `foo(count: count)` under `"non-matching"` when argument matches `p_name`:
+                        if (session.lsp_config.inlay_hints_parameter_names == .non_matching and
+                            arg_rec.tag == .ident_expr)
+                        {
                             const arg_lex = symbol_resolver.extractTokenSlice(
                                 src,
                                 &parsed_art.token_buffer,
@@ -10922,6 +11480,7 @@ fn handleCodeActionRequest(
         for (all_fixes.items) |fix| {
             if (action_count >= MAX_CODE_ACTIONS) break;
             if (fix.edits.len == 0) continue;
+            if (fix.applicability != .machine_applicable and fix.applicability != .maybe_incorrect) continue;
 
             var uri_groups: std.ArrayListUnmanaged(CodeActionUriGroup) = .empty;
             var uri_to_group_idx: std.StringHashMapUnmanaged(usize) = .empty;
@@ -10959,12 +11518,16 @@ fn handleCodeActionRequest(
             }
             if (!is_fix_valid or uri_groups.items.len == 0) continue;
 
+            const base_title = if (fix.message.len > 0) fix.message else "Apply CoreX quick fix";
+            const action_title = if (fix.applicability == .maybe_incorrect and
+                std.mem.indexOf(u8, base_title, "unsafe") == null)
+                try std.fmt.allocPrint(arena_alloc, "{s} (unsafe fix)", .{base_title})
+            else
+                base_title;
+
             if (action_count > 0) try body_writer.writeByte(',');
             try body_writer.writeAll("{\"title\":");
-            try writeJsonString(
-                body_writer,
-                if (fix.message.len > 0) fix.message else "Apply CoreX quick fix",
-            );
+            try writeJsonString(body_writer, action_title);
             try body_writer.print(
                 ",\"kind\":\"quickfix\",\"isPreferred\":{s},\"diagnostics\":[",
                 .{if (fix.applicability == .machine_applicable) "true" else "false"},
@@ -10994,6 +11557,191 @@ fn handleCodeActionRequest(
             try body_writer.writeAll("}}}");
             action_count += 1;
         }
+
+        // Secondary Quick Fix (`isPreferred: false`): suppress lint rule with line-scoped `// corex check: expect(…)`:
+        if (action_count < MAX_CODE_ACTIONS) {
+            if (entry.diag.code.asLintRuleId()) |rule_id| {
+                if (rule_id != .unused_suppression and rule_id != .prefer_expect_over_allow) {
+                    if (getLiveDocumentSource(session, fid)) |live_src| {
+                        const target_uri = resolveOutboundUri(session, arena_alloc, fid) catch "";
+                        if (target_uri.len > 0) {
+                            const diag_start = @min(@as(usize, d_span.start_byte), live_src.len);
+                            var multiline_tok_start: ?usize = null;
+                            if (session.db.parsed_artifacts.getPtr(fid.asInt())) |parsed_ptr| {
+                                const tok_total = parsed_ptr.token_buffer.countTokens();
+                                var t_lo: usize = 0;
+                                var t_hi: usize = tok_total;
+                                while (t_lo < t_hi) {
+                                    const t_mid = t_lo + (t_hi - t_lo) / 2;
+                                    const tr = parsed_ptr.token_buffer.getToken(TokenIndex.fromInt(@intCast(t_mid)));
+                                    if (@as(usize, tr.byte_offset) + tr.byte_len <= diag_start) {
+                                        t_lo = t_mid + 1;
+                                    } else {
+                                        t_hi = t_mid;
+                                    }
+                                }
+                                if (t_lo < tok_total) {
+                                    const tr = parsed_ptr.token_buffer.getToken(TokenIndex.fromInt(@intCast(t_lo)));
+                                    const t_s: usize = @min(@as(usize, tr.byte_offset), live_src.len);
+                                    const t_e: usize = @min(t_s + tr.byte_len, live_src.len);
+                                    const is_str_like = tr.kind == .string_lit or
+                                        tr.kind == .fmt_string_lit or
+                                        tr.kind == .byte_string_lit;
+                                    if (is_str_like and diag_start >= t_s and diag_start < t_e and
+                                        std.mem.indexOfScalar(u8, live_src[t_s..t_e], '\n') != null)
+                                    {
+                                        var anchor_start = t_s;
+                                        const cst_total = parsed_ptr.cst_arena.countNodes();
+                                        var best_cst_start: ?usize = null;
+                                        var c_i: usize = 1;
+                                        while (c_i < cst_total) : (c_i += 1) {
+                                            const cid = CstNodeIndex.fromInt(@intCast(c_i));
+                                            const ck = parsed_ptr.cst_arena.getNode(cid).kind;
+                                            const is_stmt_or_item = switch (ck) {
+                                                .local_decl_stmt,
+                                                .assign_stmt,
+                                                .return_stmt,
+                                                .expr_stmt,
+                                                .const_item,
+                                                .fn_item,
+                                                .test_item,
+                                                .bench_item,
+                                                => true,
+                                                else => false,
+                                            };
+                                            if (!is_stmt_or_item) continue;
+                                            if (symbol_resolver.computeCstSubtreeSpan(
+                                                fid,
+                                                &parsed_ptr.token_buffer,
+                                                &parsed_ptr.cst_arena,
+                                                cid,
+                                            )) |csp| {
+                                                if (t_s >= csp.start_byte and t_e <= csp.end_byte) {
+                                                    best_cst_start = @min(@as(usize, csp.start_byte), live_src.len);
+                                                }
+                                            }
+                                        }
+                                        if (best_cst_start) |bcs| anchor_start = bcs;
+                                        multiline_tok_start = anchor_start;
+                                    }
+                                }
+                            }
+
+                            const sup_title = try std.fmt.allocPrint(
+                                arena_alloc,
+                                "Suppress `{s}` with `@expect`",
+                                .{rule_id.asSlug()},
+                            );
+                            var ins_pos: LspPosition = undefined;
+                            var sup_text: []const u8 = "";
+                            if (multiline_tok_start) |anchor_byte| {
+                                var line_start = anchor_byte;
+                                while (line_start > 0 and live_src[line_start - 1] != '\n') : (line_start -= 1) {}
+                                var indent_end = line_start;
+                                while (indent_end < live_src.len and
+                                    (live_src[indent_end] == ' ' or live_src[indent_end] == '\t')) : (indent_end += 1)
+                                {}
+                                const indent_slice = live_src[line_start..indent_end];
+                                ins_pos = byteOffsetToLspPosition(session, fid, @intCast(line_start));
+                                sup_text = try std.fmt.allocPrint(
+                                    arena_alloc,
+                                    "{s}@expect({s}, reason: \"explain suppression\")\n",
+                                    .{ indent_slice, rule_id.asSlug() },
+                                );
+                            } else {
+                                var line_end = diag_start;
+                                while (line_end < live_src.len and
+                                    live_src[line_end] != '\n' and live_src[line_end] != '\r') : (line_end += 1)
+                                {}
+                                ins_pos = byteOffsetToLspPosition(session, fid, @intCast(line_end));
+                                sup_text = try std.fmt.allocPrint(
+                                    arena_alloc,
+                                    " // corex check: expect({s}) -- explain suppression",
+                                    .{rule_id.asSlug()},
+                                );
+                            }
+
+                            if (action_count > 0) try body_writer.writeByte(',');
+                            try body_writer.writeAll("{\"title\":");
+                            try writeJsonString(body_writer, sup_title);
+                            try body_writer.writeAll(",\"kind\":\"quickfix\",\"isPreferred\":false,\"diagnostics\":[");
+                            try writeSingleLspDiagnosticJson(session, arena_alloc, fid, entry.diag, body_writer);
+                            try body_writer.writeAll("],\"edit\":{\"changes\":{");
+                            try writeJsonString(body_writer, target_uri);
+                            try body_writer.writeAll(":[{\"range\":");
+                            try writeLspRangeJson(body_writer, .{ .start = ins_pos, .end = ins_pos });
+                            try body_writer.writeAll(",\"newText\":");
+                            try writeJsonString(body_writer, sup_text);
+                            try body_writer.writeAll("}]}}}");
+                            action_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    try body_writer.writeAll("]}");
+    try flushOutboundJsonFrame(out_writer, session.outbound_buf.written());
+}
+
+/// Handles `textDocument/codeLens`: emits runnable `▸ Run test` / `▸ Run bench` CodeLenses when enabled (`[lsp]`).
+fn handleCodeLensRequest(
+    session: *LspSession,
+    arena_alloc: std.mem.Allocator,
+    params: JsonValue,
+    out_writer: *std.Io.Writer,
+    rpc_id: JsonRpcId,
+) !void {
+    const raw_uri = (try extractValidatedRequestUri(session, params, out_writer, rpc_id)) orelse return;
+    if (!session.lsp_config.code_lens_test_bench) {
+        return writeEmptyArrayResultFrame(session, out_writer, rpc_id);
+    }
+
+    const fid = try resolveDocumentFileId(session, arena_alloc, raw_uri);
+    if (fid.isNone() or isCorexTomlPath(session.vfs.getFilePath(fid))) {
+        return writeEmptyArrayResultFrame(session, out_writer, rpc_id);
+    }
+
+    _ = try session.db.parseCst(fid);
+    const entries = try arena_alloc.dupe(
+        query_db.ItemTreeEntry,
+        (try session.db.extractItemTree(fid)).entries,
+    );
+    const parsed_art = session.db.parsed_artifacts.getPtr(fid.asInt()) orelse
+        return writeEmptyArrayResultFrame(session, out_writer, rpc_id);
+    const target_uri = try resolveOutboundUri(session, arena_alloc, fid);
+
+    session.outbound_buf.clearRetainingCapacity();
+    const body_writer = &session.outbound_buf.writer;
+    try body_writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+    try writeJsonRpcId(body_writer, rpc_id);
+    try body_writer.writeAll(",\"result\":[");
+
+    var lens_count: usize = 0;
+    for (entries) |entry| {
+        if (entry.kind != .test_decl and entry.kind != .bench_decl) continue;
+        const entry_span = computeCstSubtreeByteSpan(
+            fid,
+            &parsed_art.token_buffer,
+            &parsed_art.cst_arena,
+            entry.cst_node,
+        ) orelse continue;
+        const lens_range = spanToLspRange(session, fid, entry_span);
+        const is_bench = (entry.kind == .bench_decl);
+        if (lens_count > 0) try body_writer.writeByte(',');
+        try body_writer.writeAll("{\"range\":");
+        try writeLspRangeJson(body_writer, lens_range);
+        try body_writer.writeAll(",\"command\":{\"title\":");
+        try writeJsonString(body_writer, if (is_bench) "▸ Run bench" else "▸ Run test");
+        try body_writer.writeAll(",\"command\":");
+        try writeJsonString(body_writer, if (is_bench) "corex.runBench" else "corex.runTest");
+        try body_writer.writeAll(",\"arguments\":[");
+        try writeJsonString(body_writer, target_uri);
+        try body_writer.writeByte(',');
+        try writeJsonString(body_writer, entry.name_text);
+        try body_writer.writeAll("]}}");
+        lens_count += 1;
     }
 
     try body_writer.writeAll("]}");
@@ -12126,6 +12874,7 @@ fn dispatchSingleJsonMessage(
             try flushPendingPushDiagnostics(session, arena_alloc, out_writer);
             break :blk_ca handleCodeActionRequest(session, arena_alloc, params, out_writer, rpc_id);
         },
+        .code_lens => handleCodeLensRequest(session, arena_alloc, params, out_writer, rpc_id),
         .formatting => handleFormattingRequest(session, arena_alloc, params, false, out_writer, rpc_id),
         .range_formatting => handleFormattingRequest(session, arena_alloc, params, true, out_writer, rpc_id),
         .prepare_rename => handlePrepareRenameRequest(session, arena_alloc, params, out_writer, rpc_id),
@@ -12663,7 +13412,7 @@ test "test_lsp_utf8_vs_utf16_did_change_and_multi_change_coalescing" {
             &inbound,
             "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{" ++
                 "\"uri\":\"file:///D%3A/virt/enc.cx\",\"languageId\":\"corex\",\"version\":1," ++
-                "\"text\":\"pub fn check() -> i32 {\\n    let _label = \\\"𐍈\\\"; let val = 10;\\n    return val;\\n}\\n\"}}}",
+                "\"text\":\"pub fn check() -> i32 {\\n    let _label = \\\"𐍈\\\"; let val = 10;\\n    1000 + val * 2\\n}\\n\"}}}",
         );
 
         // Replace `10` with `42` on line 1 (`"    let _label = \"𐍈\"; let val = "` = 35 UTF-8 cols vs 33 UTF-16 cols):
@@ -13088,7 +13837,7 @@ test "test_lsp_redteam_257_overlay_lru_eviction_formatting_and_did_change" {
         &inbound,
         "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{" ++
             "\"uri\":\"file:///virt/evict_1.cx\",\"languageId\":\"corex\",\"version\":1," ++
-            "\"text\":\"pub fn second_fn() -> i32 {\\n    return 7;\\n}\\n\"}}}",
+            "\"text\":\"pub fn second_fn(seed: i32) -> i32 {\\n    seed + 7\\n}\\n\"}}}",
     );
 
     var file_idx: usize = 2;
@@ -13362,9 +14111,12 @@ test "test_lsp_redteam_readonly_pkg_guards_and_non_empty_code_action_edits" {
     const frames = try extractTestOutboundPayloads(allocator, out_alloc.written());
     defer allocator.free(frames);
     try std.testing.expectEqual(@as(usize, 5), frames.len);
-    for (frames) |resp_json| {
+    for (frames[0..4]) |resp_json| {
         try std.testing.expect(std.mem.indexOf(u8, resp_json, "\"result\":[]") != null);
     }
+    try std.testing.expect(std.mem.indexOf(u8, frames[4], "foreign edit only") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[4], "/cx/dep") == null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[4], "Suppress `unused-binding` with `@expect`") != null);
 }
 
 test "test_lsp_redteam_dr22_slice_ptr_methods_and_soa_private_field_visibility" {

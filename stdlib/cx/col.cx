@@ -60,9 +60,9 @@ pub struct SmallVec[T, const N: usize = 8] {
 @derive(Copy, Equatable)
 bit_field DequeHeadExp: u32 {
     /| Ring start index in `0 .. (1 << 27) - 1`.
-    pub head: u32 | 27,
+    head: u32 | 27,
     /| `0` when unallocated (`cap == 0`); `1..=28` encodes `cap = 1 << (exp_plus_1 - 1)`.
-    pub exp_plus_1: u8 | 5,
+    exp_plus_1: u8 | 5,
 }
 
 /| Exact 24-byte power-of-two double-ended ring buffer (`16 B` on `wasm32`).
@@ -180,7 +180,7 @@ type ProbeGroup = SwarProbeGroup;
 
 /| 24-byte (`16 B` on `wasm32`) type-erased SwissTable engine (`growth_left` stored at `ctrl.sub(8)` when allocated).
 @repr(C)
-pub(pkg) struct RawTableInner {
+struct RawTableInner {
     /| Points to `EMPTY_CTRL_GROUP` when `bucket_mask == 0`, else `alloc_base.add(8)`.
     pub ctrl: *mut u8,
     /| `buckets - 1` (`0` when unallocated).
@@ -306,10 +306,10 @@ const WY_P2: u64 = 0x8EBC_6AF0_9C88_C6E3_u64;
 const WY_P3: u64 = 0x5899_65CC_7537_4CC3_u64;
 
 /| SwissTable control byte marking an unoccupied slot (`0b1111_1111`).
-pub(pkg) const CTRL_EMPTY: u8 = 0xFF_u8;
+const CTRL_EMPTY: u8 = 0xFF_u8;
 
 /| SwissTable control byte marking a tombstone slot (`0b1000_0000`).
-pub(pkg) const CTRL_DELETED: u8 = 0x80_u8;
+const CTRL_DELETED: u8 = 0x80_u8;
 
 /| SwissTable SIMD probe group width (`16` bytes) on `x86_64` and `aarch64`.
 @cfg(target.arch == "x86_64" or target.arch == "aarch64")
@@ -343,9 +343,8 @@ const COL_STATIC_RODATA: AllocatorHandle = AllocatorHandle { raw_tagged_ptr: 2_u
 // -------------------------------------- INTERNALS --------------------------------------
 // -------------- Pointer, Alignment & Growth Math --------------
 /| Returns a well-aligned non-null sentinel pointer `@align_of[T]()` for empty or ZST containers.
-@no_alloc @no_panic
 fn dangling_ptr[T]() -> *mut T {
-    return @align_of[T]() as *mut T;
+    @align_of[T]() as *mut T
 }
 
 /| Rounds `offset` upward to power-of-two `alignment` using trap-free wrapping arithmetic (`@no_panic`).
@@ -354,7 +353,7 @@ fn align_up_wrapping(offset: usize, alignment: usize, /) -> usize {
         return offset;
     }
     let mask: usize = alignment -% 1;
-    return (offset +% mask) & ~mask;
+    (offset +% mask) & ~mask
 }
 
 /| Rounds `offset` upward to power-of-two `alignment`, returning `.None` on `usize` overflow.
@@ -366,17 +365,17 @@ fn checked_align_up(offset: usize, alignment: usize, /) -> usize? {
     if offset > usize.MAX -% mask {
         return .None;
     }
-    return .Some((offset +% mask) & ~mask);
+    .Some((offset +% mask) & ~mask)
 }
 
 /| Returns the smaller of `lhs` and `rhs` (`usize`).
 fn min_usize_local(lhs: usize, rhs: usize, /) -> usize {
-    return if lhs < rhs => lhs else rhs;
+    if lhs < rhs => lhs else rhs
 }
 
 /| Returns the larger of `lhs` and `rhs` (`usize`).
 fn max_usize_local(lhs: usize, rhs: usize, /) -> usize {
-    return if lhs > rhs => lhs else rhs;
+    if lhs > rhs => lhs else rhs
 }
 
 /| Computes the next amortized capacity (`2x` up to `64`, `1.5x` above `64`, bounded by `u32.MAX` & `isize.MAX`).
@@ -394,14 +393,14 @@ fn next_amortized_cap[T](cur_cap: usize, required_cap: usize, /) -> usize!AllocE
     let grown: usize = if cur_cap == 0 => min_init
         else if cur_cap < 64 => cur_cap << 1_usize
         else cur_cap +% (cur_cap >> 1_usize);
-    return .Ok(min_usize_local(max_usize_local(grown, required_cap), max_cap));
+    .Ok(min_usize_local(max_usize_local(grown, required_cap), max_cap))
 }
 
 // ------------------ 64-Bit Wyhash Primitives ------------------
 /| Folded 128-bit multiply-XOR mixer (`low ^ high`) at the core of `Wyhash`.
 fn wy_mix(lhs: u64, rhs: u64, /) -> u64 {
     let (lo, hi) = widening_mul_u64(lhs, rhs);
-    return lo ^ hi;
+    lo ^ hi
 }
 
 /| Reads an unaligned little-endian `u64` from `ptr` safely across all architectures.
@@ -411,7 +410,7 @@ fn wy_read_u64_le(ptr: *u8, /) -> u64 {
     unsafe {
         @memcpy(&raw mut raw[0] as *mut opaque, ptr as *opaque, 8);
     }
-    return @from_le_bytes[u64](raw);
+    @from_le_bytes[u64](raw)
 }
 
 /| Reads an unaligned little-endian `u32` (zero-extended to `u64`) from `ptr`.
@@ -421,7 +420,7 @@ fn wy_read_u32_le(ptr: *u8, /) -> u64 {
     unsafe {
         @memcpy(&raw mut raw[0] as *mut opaque, ptr as *opaque, 4);
     }
-    return @from_le_bytes[u32](raw) as u64;
+    @from_le_bytes[u32](raw) as u64
 }
 
 // ---------------- SlotMap Layout & Key Helpers ----------------
@@ -429,9 +428,9 @@ fn wy_read_u32_le(ptr: *u8, /) -> u64 {
 @std_cap_boundary(clears: [unsafe_op, may_panic]) @inline @no_alloc @no_panic
 fn unpack_slot_key[K](key: &K, /) -> RawSlotKey {
     @compile_assert(@size_of[K]() == 8, "SlotMap key K must be an 8-byte SlotKey handle");
-    return unsafe {
+    unsafe {
         @ptr_read(&raw key.* as *RawSlotKey)
-    };
+    }
 }
 
 /| Reconstructs generic 8-byte `SlotKey`-shaped handle `K` from `(index, odd_generation)`.
@@ -439,12 +438,12 @@ fn unpack_slot_key[K](key: &K, /) -> RawSlotKey {
 fn pack_slot_key[K](index: u32, generation: u32, /) -> K {
     @compile_assert(@size_of[K]() == 8, "SlotMap key K must be an 8-byte SlotKey handle");
     let raw_key = RawSlotKey {
-        index: index,
-        generation: generation,
+        index,
+        generation,
     };
-    return unsafe {
+    unsafe {
         @ptr_read(&raw raw_key as *K)
-    };
+    }
 }
 
 /| Computes `(slots_byte_offset, total_Layout)` for a `SlotMap` slab of `cap` entries.
@@ -461,7 +460,7 @@ fn slot_map_slab_layout[V](cap: usize, /) -> (usize, Layout)!AllocError {
         return .Err(.OutOfMemory);
     }
     let total_bytes: usize = slots_off +% (cap *% slot_stride);
-    return .Ok((slots_off, Layout { size: total_bytes, alignment: slab_align }));
+    .Ok((slots_off, Layout { size: total_bytes, alignment: slab_align }))
 }
 
 // -------------- SwissTable Group & RawTableInner --------------
@@ -469,17 +468,17 @@ fn slot_map_slab_layout[V](cap: usize, /) -> (usize, Layout)!AllocError {
 impl SimdGroupBitMask {
     /| Returns `true` if at least one lane matched.
     fn has_any(self) -> bool {
-        return self.bits != 0_u16;
+        self.bits != 0_u16
     }
 
     /| Returns the index (`0..=16`) of the lowest set match bit.
     fn trailing_zeros(self) -> usize {
-        return self.bits.trailing_zeros() as usize;
+        self.bits.trailing_zeros() as usize
     }
 
     /| Returns the count (`0..=16`) of leading clear lanes from the top of the 16-byte group.
     fn leading_zeros(self) -> usize {
-        return self.bits.leading_zeros() as usize;
+        self.bits.leading_zeros() as usize
     }
 
     /| Clears and returns the lowest matching lane index (`0..15`), or `.None` when empty.
@@ -489,7 +488,7 @@ impl SimdGroupBitMask {
             return .None;
         }
         self.bits = old_bits & (old_bits -% 1_u16);
-        return .Some(old_bits.trailing_zeros() as usize);
+        .Some(old_bits.trailing_zeros() as usize)
     }
 }
 
@@ -497,17 +496,17 @@ impl SimdGroupBitMask {
 impl SwarGroupBitMask {
     /| Returns `true` if at least one byte lane matched.
     fn has_any(self) -> bool {
-        return self.bits != 0_u64;
+        self.bits != 0_u64
     }
 
     /| Returns the byte lane index (`0..=8`) of the lowest set MSB.
     fn trailing_zeros(self) -> usize {
-        return (self.bits.trailing_zeros() >> 3_u32) as usize;
+        (self.bits.trailing_zeros() >> 3_u32) as usize
     }
 
     /| Returns the byte lane count (`0..=8`) of leading clear MSBs from byte 7 downward.
     fn leading_zeros(self) -> usize {
-        return (self.bits.leading_zeros() >> 3_u32) as usize;
+        (self.bits.leading_zeros() >> 3_u32) as usize
     }
 
     /| Clears and returns the lowest matching byte lane (`0..7`), or `.None` when empty.
@@ -517,7 +516,7 @@ impl SwarGroupBitMask {
             return .None;
         }
         self.bits = old_bits & (old_bits -% 1_u64);
-        return .Some((old_bits.trailing_zeros() >> 3_u32) as usize);
+        .Some((old_bits.trailing_zeros() >> 3_u32) as usize)
     }
 }
 
@@ -526,32 +525,32 @@ impl SimdProbeGroup {
     /| Loads 16 control bytes starting at `ptr` (unaligned).
     @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     fn load(ptr: *u8, /) -> Self {
-        return Self {
+        Self {
             lanes: unsafe {
                 @simd_load_unaligned[[u8; 16]](ptr)
             },
-        };
+        }
     }
 
     /| Matches 7-bit fingerprint `h2` (`0..127`) across all 16 control lanes in parallel.
     fn match_h2(self, h2: u8, /) -> GroupBitMask {
-        return GroupBitMask {
+        GroupBitMask {
             bits: @simd_bitmask(@simd_eq(self.lanes, @simd_splat[[u8; 16]](h2))),
-        };
+        }
     }
 
     /| Matches `CTRL_EMPTY` (`0xFF`) across all 16 control lanes.
     fn match_empty(self) -> GroupBitMask {
-        return GroupBitMask {
+        GroupBitMask {
             bits: @simd_bitmask(@simd_eq(self.lanes, @simd_splat[[u8; 16]](CTRL_EMPTY))),
-        };
+        }
     }
 
     /| Matches `CTRL_EMPTY` (`0xFF`) or `CTRL_DELETED` (`0x80`) via lane sign bits.
     fn match_empty_or_deleted(self) -> GroupBitMask {
-        return GroupBitMask {
+        GroupBitMask {
             bits: @simd_bitmask(self.lanes),
-        };
+        }
     }
 }
 
@@ -559,44 +558,44 @@ impl SimdProbeGroup {
 impl SwarProbeGroup {
     /| Loads 8 control bytes starting at `ptr` in little-endian lane order.
     fn load(ptr: *u8, /) -> Self {
-        return Self {
+        Self {
             word: wy_read_u64_le(ptr),
-        };
+        }
     }
 
     /| Exact branchless 8-byte SWAR `h2` match (`0` false positives, `5` scalar ALU ops).
     fn match_h2(self, h2: u8, /) -> GroupBitMask {
         let diff: u64 = self.word ^ ((h2 as u64) *% SWAR_REP_01);
         let non_zero: u64 = (diff & SWAR_REP_7F) +% SWAR_REP_7F;
-        return GroupBitMask {
+        GroupBitMask {
             bits: ~(non_zero | diff) & SWAR_REP_80,
-        };
+        }
     }
 
     /| Exact branchless `CTRL_EMPTY` (`0xFF`, bits 7 & 6 both `1`) match in 3 ALU ops.
     fn match_empty(self) -> GroupBitMask {
-        return GroupBitMask {
+        GroupBitMask {
             bits: (self.word & (self.word << 1_u64)) & SWAR_REP_80,
-        };
+        }
     }
 
     /| Matches `CTRL_EMPTY` (`0xFF`) or `CTRL_DELETED` (`0x80`) via bit 7.
     fn match_empty_or_deleted(self) -> GroupBitMask {
-        return GroupBitMask {
+        GroupBitMask {
             bits: self.word & SWAR_REP_80,
-        };
+        }
     }
 }
 
 /| Maps logical `Deque` index `idx` onto physical slot `0..cap` using power-of-two mask wrap.
 fn deque_phys_slot(head_exp: DequeHeadExp, cap: usize, idx: usize, /) -> usize {
     let mask: usize = cap -% 1_usize;
-    return ((head_exp.head as usize) +% idx) & mask;
+    ((head_exp.head as usize) +% idx) & mask
 }
 
 /| Computes `87.5%` (`7 / 8`) usable SwissTable capacity for power-of-two `buckets`.
 fn bucket_usable_capacity(buckets: usize, /) -> usize {
-    return buckets -% (buckets >> 3_usize);
+    buckets -% (buckets >> 3_usize)
 }
 
 /| Computes `(entries_off_from_alloc_base, Layout)` for `buckets` SwissTable slots.
@@ -609,7 +608,7 @@ fn raw_table_slab_layout(buckets: usize, elem_size: usize, elem_align: usize, /)
         return .Err(.OutOfMemory);
     }
     let total_bytes: usize = entries_off +% (buckets *% elem_size);
-    return .Ok((entries_off, Layout { size: total_bytes, alignment: slab_align }));
+    .Ok((entries_off, Layout { size: total_bytes, alignment: slab_align }))
 }
 
 /| Swaps `elem_size` bytes between non-overlapping `slot_a` and `slot_b` in 64-byte stack chunks.
@@ -632,37 +631,36 @@ fn swap_raw_bytes(slot_a: *mut u8, slot_b: *mut u8, elem_size: usize, /) {
 
 impl RawTableInner {
     /| Constructs an unallocated `RawTableInner` pointing at static `.rodata` `EMPTY_CTRL_GROUP`.
-    @no_alloc @no_panic
-    pub(pkg) fn empty(alloc: AllocatorHandle, /) -> Self {
-        return Self {
+    fn empty(alloc: AllocatorHandle, /) -> Self {
+        Self {
             ctrl: EMPTY_CTRL_GROUP.as_ptr() as *mut u8,
             bucket_mask: 0,
             items: 0,
-            alloc: alloc,
-        };
+            alloc,
+        }
     }
 
     /| Computes bucket `idx` address relative to `alloc_base = self.ctrl.sub(8)` so `>= 16B` alignments never misalign.
     @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
-    pub(pkg) fn bucket_ptr(&self, idx: usize, elem_size: usize, elem_align: usize, /) -> *mut u8 {
+    fn bucket_ptr(&self, idx: usize, elem_size: usize, elem_align: usize, /) -> *mut u8 {
         if elem_size == 0 or self.bucket_mask == 0 {
             return elem_align as *mut u8;
         }
         let buckets: usize = (self.bucket_mask as usize) +% 1;
         let entries_off: usize = align_up_wrapping(8_usize +% buckets +% GROUP_WIDTH, elem_align);
-        return unsafe {
+        unsafe {
             self.ctrl.sub(8_usize).add(entries_off +% (idx *% elem_size))
-        };
+        }
     }
 
     /| Returns a mutable reference to `growth_left: u32` stored at `alloc_base` (`self.ctrl.sub(8)`).
     @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     fn growth_left_mut(&mut self) -> &mut u32 {
-        return (SliceOps[u32] {}).ptr_mut(
+        (SliceOps[u32] {}).ptr_mut(
             unsafe {
                 self.ctrl.sub(8_usize) as *mut u32
             },
-        );
+        )
     }
 
     /| Reads `growth_left: u32` at `alloc_base` (`0` when unallocated).
@@ -671,15 +669,15 @@ impl RawTableInner {
         if self.bucket_mask == 0 {
             return 0;
         }
-        return unsafe {
+        unsafe {
             (self.ctrl.sub(8_usize) as *u32).read()
-        };
+        }
     }
 
     /| Updates `ctrl[idx]` and mirrors indices `0..GROUP_WIDTH` at `ctrl[buckets + idx]` branchlessly.
     @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
-    pub(pkg) fn set_ctrl(&mut self, idx: usize, ctrl_byte: u8, /) {
-        let mask: usize = self.bucket_mask as usize;
+    fn set_ctrl(&mut self, idx: usize, ctrl_byte: u8, /) {
+        let mask = self.bucket_mask as usize;
         let mirror_idx: usize = ((idx -% GROUP_WIDTH) & mask) +% GROUP_WIDTH;
         unsafe {
             self.ctrl.add(idx).write(ctrl_byte);
@@ -689,7 +687,7 @@ impl RawTableInner {
 
     /| Type-erased `@noinline` SwissTable lookup shared across `Map`/`Set` instantiations via linker ICF.
     @std_cap_boundary(clears: [unsafe_op, alloc, may_panic]) @noinline @no_alloc @no_panic
-    pub(pkg) fn find_raw(
+    fn find_raw(
         &self,
         hash_val: u64,
         elem_size: usize,
@@ -700,13 +698,13 @@ impl RawTableInner {
         if self.items == 0 {
             return .None;
         }
-        let h2: u8 = (hash_val & 0x7F_u64) as u8;
-        let mask: usize = self.bucket_mask as usize;
+        let h2 = (hash_val & 0x7F_u64) as u8;
+        let mask = self.bucket_mask as usize;
         var pos: usize = ((hash_val >> 7_u64) as usize) & mask;
         var stride: usize = 0;
 
         while true {
-            let grp: ProbeGroup = ProbeGroup.load(
+            let grp = ProbeGroup.load(
                 unsafe {
                     self.ctrl.add(pos)
                 } as *u8,
@@ -724,13 +722,13 @@ impl RawTableInner {
             stride = stride +% GROUP_WIDTH;
             pos = (pos +% stride) & mask;
         }
-        return .None;
+        .None
     }
 
     /| Finds the first `EMPTY` or `DELETED` slot for `hash_val` when key absence is already known.
     @std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
     fn find_first_avail_slot(&self, hash_val: u64, /) -> usize {
-        let mask: usize = self.bucket_mask as usize;
+        let mask = self.bucket_mask as usize;
         var pos: usize = ((hash_val >> 7_u64) as usize) & mask;
         var stride: usize = 0;
         while true {
@@ -747,12 +745,12 @@ impl RawTableInner {
             stride = stride +% GROUP_WIDTH;
             pos = (pos +% stride) & mask;
         }
-        return 0;
+        0
     }
 
     /| Type-erased `@noinline` SwissTable find-or-insert slot preparation returning `(slot_idx, found_existing)`.
     @std_cap_boundary(clears: [unsafe_op]) @noinline
-    pub(pkg) fn find_or_prepare_insert_raw(
+    fn find_or_prepare_insert_raw(
         &mut self,
         hash_val: u64,
         seed: u64,
@@ -763,14 +761,14 @@ impl RawTableInner {
         /,
     ) -> (usize, bool)!AllocError {
         if self.bucket_mask != 0 {
-            let h2: u8 = (hash_val & 0x7F_u64) as u8;
-            let mask: usize = self.bucket_mask as usize;
+            let h2 = (hash_val & 0x7F_u64) as u8;
+            let mask = self.bucket_mask as usize;
             var pos: usize = ((hash_val >> 7_u64) as usize) & mask;
             var stride: usize = 0;
             var first_avail: usize? = .None;
 
             while true {
-                let grp: ProbeGroup = ProbeGroup.load(
+                let grp = ProbeGroup.load(
                     unsafe {
                         self.ctrl.add(pos)
                     } as *u8,
@@ -818,13 +816,13 @@ impl RawTableInner {
         }
         self.set_ctrl(slot, (hash_val & 0x7F_u64) as u8);
         self.items += 1;
-        return .Ok((slot, false));
+        .Ok((slot, false))
     }
 
     /| Adaptive tombstone erasure marking `idx` `CTRL_EMPTY` whenever surrounding window has `< GROUP_WIDTH` full/tombstone bytes.
     @std_cap_boundary(clears: [unsafe_op]) @noinline @no_alloc @no_panic
-    pub(pkg) fn erase_slot_ctrl(&mut self, idx: usize, /) {
-        let mask: usize = self.bucket_mask as usize;
+    fn erase_slot_ctrl(&mut self, idx: usize, /) {
+        let mask = self.bucket_mask as usize;
         let idx_before: usize = (idx -% GROUP_WIDTH) & mask;
         let empty_before: GroupBitMask = ProbeGroup
             .load(
@@ -860,7 +858,7 @@ impl RawTableInner {
         hash_bucket: |u64, *u8| -> u64,
         /,
     ) {
-        let mask: usize = self.bucket_mask as usize;
+        let mask = self.bucket_mask as usize;
         let buckets: usize = mask +% 1;
         var i: usize = 0;
         while i < buckets {
@@ -880,7 +878,7 @@ impl RawTableInner {
             } == CTRL_DELETED {
                 let cur_ptr: *mut u8 = self.bucket_ptr(idx, elem_size, elem_align);
                 let hash_val: u64 = hash_bucket(seed, cur_ptr as *u8);
-                let h2: u8 = (hash_val & 0x7F_u64) as u8;
+                let h2 = (hash_val & 0x7F_u64) as u8;
                 let h1_pos: usize = ((hash_val >> 7_u64) as usize) & mask;
                 let target_idx: usize = self.find_first_avail_slot(hash_val);
 
@@ -972,12 +970,12 @@ impl RawTableInner {
 
         self.dealloc_slab_raw(elem_size, elem_align);
         self.* = next_table;
-        return .Ok(());
+        .Ok(())
     }
 
     /| Compacts tombstones in place when occupancy `<= 50%`, else doubles bucket count (`@noinline` ICF boundary).
     @noinline
-    pub(pkg) fn rehash_or_grow_raw(
+    fn rehash_or_grow_raw(
         &mut self,
         seed: u64,
         elem_size: usize,
@@ -996,17 +994,17 @@ impl RawTableInner {
         if cur_buckets > (usize.MAX >> 1_usize) {
             return .Err(.OutOfMemory);
         }
-        return self.grow_to_buckets_raw(
+        self.grow_to_buckets_raw(
             cur_buckets << 1_usize,
             seed,
             elem_size,
             elem_align,
             hash_bucket,
-        );
+        )
     }
 
     /| Ensures capacity for `additional` new items without reallocating during subsequent insertions.
-    pub(pkg) fn reserve_raw(
+    fn reserve_raw(
         &mut self,
         additional: usize,
         seed: u64,
@@ -1034,14 +1032,14 @@ impl RawTableInner {
             if target_buckets > ((u32.MAX as usize) >> 1_usize) {
                 return .Err(.OutOfMemory);
             }
-            target_buckets = target_buckets << 1_usize;
+            target_buckets <<= 1_usize;
         }
-        return self.grow_to_buckets_raw(target_buckets, seed, elem_size, elem_align, hash_bucket);
+        self.grow_to_buckets_raw(target_buckets, seed, elem_size, elem_align, hash_bucket)
     }
 
     /| Resets all allocated control bytes to `CTRL_EMPTY` and restores full `growth_left`.
     @std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
-    pub(pkg) fn reset_ctrl_empty(&mut self) {
+    fn reset_ctrl_empty(&mut self) {
         if self.bucket_mask != 0 {
             let buckets: usize = (self.bucket_mask as usize) +% 1;
             unsafe {
@@ -1054,7 +1052,7 @@ impl RawTableInner {
 
     /| Frees the backing SwissTable slab (when heap-owned and allocated) and resets `self` to `empty`.
     @std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
-    pub(pkg) fn dealloc_slab_raw(&mut self, elem_size: usize, elem_align: usize, /) {
+    fn dealloc_slab_raw(&mut self, elem_size: usize, elem_align: usize, /) {
         if self.bucket_mask != 0 and not self.alloc.is_arena_or_static() {
             let buckets: usize = (self.bucket_mask as usize) +% 1;
             let slab_align: usize = max_usize_local(8, max_usize_local(GROUP_WIDTH, elem_align));
@@ -1078,7 +1076,7 @@ fn hash_key_seeded[K: Hash, H: Hasher](seed: u64, key: &K, /) -> u64 {
     var hasher: H = @default_init[H]();
     hasher.write_u64(seed);
     key.hash(&mut hasher);
-    return hasher.finish();
+    hasher.finish()
 }
 
 /| Computes `floor(log2(n))` for non-zero `n >= 1`.
@@ -1091,15 +1089,15 @@ fn ilog2_usize_local(n: usize, /) -> u32 {
 
 /| Munro & Wild (2018) `u128`-widened `Powersort` node power (`0` overflow traps across 32-bit and 64-bit).
 @std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
-pub(pkg) fn powersort_node_power(n: usize, start_a: usize, end_a: usize, end_b: usize, /) -> u8 {
+fn powersort_node_power(n: usize, start_a: usize, end_a: usize, end_b: usize, /) -> u8 {
     if n == 0 {
         return 0_u8;
     }
-    let denom: u128 = n as u128;
+    let denom = n as u128;
     let quot_a: u128 = (((start_a as u128) +% (end_a as u128)) << 61_u128) / denom;
     let quot_b: u128 = (((end_a as u128) +% (end_b as u128)) << 61_u128) / denom;
-    let diff_64: u64 = (quot_a ^ quot_b) as u64;
-    return ((diff_64.leading_zeros() -| 1_u32) & 0xFF_u32) as u8;
+    let diff_64 = (quot_a ^ quot_b) as u64;
+    ((diff_64.leading_zeros() -| 1_u32) & 0xFF_u32) as u8
 }
 
 impl[T] SliceOps[T] {
@@ -1111,7 +1109,7 @@ impl[T] SliceOps[T] {
                 &ptr.*
             };
         }
-        return self.ptr_ref(dangling_ptr[T]() as *T);
+        self.ptr_ref(dangling_ptr[T]() as *T)
     }
 
     /| Projects non-null `ptr` as `&mut T` with dominating non-null proof (`0` bounds traps).
@@ -1122,7 +1120,7 @@ impl[T] SliceOps[T] {
                 &mut ptr.*
             };
         }
-        return self.ptr_mut(dangling_ptr[T]());
+        self.ptr_mut(dangling_ptr[T]())
     }
 
     /| Swaps `base[idx_a]` and `base[idx_b]` in place via `swap_raw_bytes` (`AutoDrop`/ZST-safe).
@@ -1161,11 +1159,11 @@ impl[T] SliceOps[T] {
         }
         var i: usize = 1;
         while i < n {
-            var hole_val: T = unsafe {
+            let hole_val: T = unsafe {
                 @ptr_read(base.add(i) as *T)
             };
             var hole_idx: usize = i;
-            var committed: bool = false;
+            var committed = false;
             defer {
                 if not committed {
                     unsafe {
@@ -1274,12 +1272,12 @@ impl[T] SliceOps[T] {
         if n == 0 or @size_of[T]() == 0 {
             return 0;
         }
-        var gap_val: T = unsafe {
+        let gap_val: T = unsafe {
             @ptr_read(base as *T)
         };
         var gap_pos: usize = 0;
         var num_lt: usize = 0;
-        var committed: bool = false;
+        var committed = false;
         defer {
             if not committed {
                 unsafe {
@@ -1290,7 +1288,7 @@ impl[T] SliceOps[T] {
 
         var right: usize = 1;
         while right < n {
-            let is_lt: usize = less(
+            let is_lt = less(
                 self.ptr_ref(
                     unsafe {
                         base.add(right) as *T
@@ -1307,13 +1305,13 @@ impl[T] SliceOps[T] {
             right = right +% 1;
         }
 
-        let gap_is_lt: usize = less(&gap_val, pivot) as usize;
+        let gap_is_lt = less(&gap_val, pivot) as usize;
         unsafe {
             @ptr_copy(base.add(num_lt) as *T, base.add(gap_pos), 1);
             committed = true;
             @ptr_write(base.add(num_lt), own gap_val);
         }
-        return num_lt +% gap_is_lt;
+        num_lt +% gap_is_lt
     }
 
     /| Returns the median index of `(idx_a, idx_b, idx_c)` under `less`.
@@ -1369,7 +1367,7 @@ impl[T] SliceOps[T] {
                 (idx_a, idx_b) = (idx_b, idx_a);
             }
         }
-        return idx_b;
+        idx_b
     }
 
     /| Selects pivot index via Tukey's ninther (`N >= 50`) or median-of-three (`N < 50`).
@@ -1389,7 +1387,7 @@ impl[T] SliceOps[T] {
             );
             return self.median3_index(base, med_lo, med_mid, med_hi, less);
         }
-        return self.median3_index(base, 0, mid, n -% 1, less);
+        self.median3_index(base, 0, mid, n -% 1, less)
     }
 
     /| Outlined `ipnsort` quicksort loop (`@noinline` to keep `<= 24` fast path tiny in caller I-cache).
@@ -1527,7 +1525,7 @@ impl[T] SliceOps[T] {
             );
             return target_end;
         }
-        return end_idx;
+        end_idx
     }
 
     /| Merges adjacent sorted runs `base[start..mid]` and `base[mid..end_idx]` stably using `scratch`.
@@ -1655,7 +1653,7 @@ impl[T] SliceOps[T] {
     @std_cap_boundary(clears: [unsafe_op]) @noinline
     fn powersort_driver(&self, base: *mut T, n: usize, less: |&T, &T| -> bool, /) {
         let half_cap: usize = (n +% 1) / 2;
-        let scratch_layout: Layout = Layout {
+        let scratch_layout = Layout {
             size: half_cap *% @size_of[T](),
             alignment: @align_of[T](),
         };
@@ -1695,7 +1693,7 @@ impl[T] SliceOps[T] {
                         stack[top] = PowersortRun {
                             start: run_start,
                             end: run_end,
-                            power: power,
+                            power,
                         };
                         top = top +% 1;
                     }
@@ -1783,8 +1781,8 @@ impl[T] SliceOps[T] {
             }
             return;
         }
-        var is_asc: bool = true;
-        var is_desc: bool = true;
+        var is_asc = true;
+        var is_desc = true;
         var i: usize = 1;
         while i < n and (is_asc or is_desc) {
             let cur_lt_prev: bool = less(
@@ -1856,19 +1854,19 @@ impl[T] Vec[T] {
     /| Constructs an empty `Vec[T]` without allocating (`cap = u32.MAX` when `@size_of[T]() == 0`).
     @std_cap_boundary(clears: [alloc]) @inline @no_alloc @no_panic
     pub fn new() -> Self {
-        return Self {
+        Self {
             ptr: dangling_ptr[T](),
             elem_len: 0,
             cap: if @size_of[T]() == 0 => u32.MAX else 0,
             alloc: context.allocator,
-        };
+        }
     }
 
     /| Pre-allocates capacity for at least `cap` elements using `context.allocator`, panicking on `AllocError`.
     pub fn with_capacity(cap: usize, /) -> Self {
-        return Self.try_with_capacity(cap) catch {
+        Self.try_with_capacity(cap) catch {
             panic(f"Vec.with_capacity({cap=}) out of memory");
-        };
+        }
     }
 
     /| Fallibly pre-allocates capacity for at least `cap` elements using `context.allocator`.
@@ -1877,7 +1875,7 @@ impl[T] Vec[T] {
         if cap > 0 {
             out.try_reserve(cap)?;
         }
-        return .Ok(own out);
+        .Ok(own out)
     }
 
     /| Constructs a `Vec[T]` backed directly by `arena` (`0`-instruction drop when `T: TrivialDrop`).
@@ -1891,7 +1889,7 @@ impl[T] Vec[T] {
         if cap > 0 {
             out.reserve(cap);
         }
-        return out;
+        out
     }
 
     /| Allocates a new `Vec[T]` populated by copying `src`.
@@ -1905,53 +1903,53 @@ impl[T] Vec[T] {
             }
         }
         out.elem_len = count as u32;
-        return out;
+        out
     }
 
     /| Returns the number of live elements in `self`.
     @no_alloc @no_panic
     pub fn len(&self) -> usize {
-        return self.elem_len as usize;
+        self.elem_len as usize
     }
 
     /| Returns the number of elements `self` can hold without reallocating.
     @no_alloc @no_panic
     pub fn capacity(&self) -> usize {
-        return self.cap as usize;
+        self.cap as usize
     }
 
     /| Returns `true` if `self` contains zero elements.
     @no_alloc @no_panic
     pub fn is_empty(&self) -> bool {
-        return self.elem_len == 0;
+        self.elem_len == 0
     }
 
     /| Borrows `self` as an immutable slice `&[T]`.
     @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn as_slice(&self) -> &[T] {
-        return unsafe {
+        unsafe {
             @slice_from_raw_parts(self.ptr as *T, self.elem_len as usize)
-        };
+        }
     }
 
     /| Borrows `self` as a mutable slice `&mut [T]`.
     @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn as_mut_slice(&mut self) -> &mut [T] {
-        return unsafe {
+        unsafe {
             @slice_from_raw_parts_mut(self.ptr, self.elem_len as usize)
-        };
+        }
     }
 
     /| Returns a raw immutable pointer to the vector's buffer.
     @no_alloc @no_panic
     pub fn as_ptr(&self) -> *T {
-        return self.ptr as *T;
+        self.ptr as *T
     }
 
     /| Returns a raw mutable pointer to the vector's buffer.
     @no_alloc @no_panic
     pub fn as_mut_ptr(&mut self) -> *mut T {
-        return self.ptr;
+        self.ptr
     }
 
     /| Bounds-checked element projection supporting both shared (`let`) and mutable (`inout`) access.
@@ -1986,7 +1984,7 @@ impl[T] Vec[T] {
         if self.elem_len == self.cap {
             self.try_reserve(1)?;
         }
-        let write_idx: usize = self.elem_len as usize;
+        let write_idx = self.elem_len as usize;
         if @size_of[T]() != 0 {
             unsafe {
                 @ptr_write(self.ptr.add(write_idx), own item);
@@ -1995,7 +1993,7 @@ impl[T] Vec[T] {
             @forget(own item);
         }
         self.elem_len += 1;
-        return .Ok(());
+        .Ok(())
     }
 
     /| Removes and returns the last element of `self`, or `.None` when empty.
@@ -2005,7 +2003,7 @@ impl[T] Vec[T] {
             return .None;
         }
         self.elem_len = self.elem_len -% 1_u32;
-        let last_idx: usize = self.elem_len as usize;
+        let last_idx = self.elem_len as usize;
         if @size_of[T]() == 0 {
             return .Some(
                 unsafe {
@@ -2013,11 +2011,11 @@ impl[T] Vec[T] {
                 },
             );
         }
-        return .Some(
+        .Some(
             unsafe {
                 @ptr_read(self.ptr.add(last_idx) as *T)
             },
-        );
+        )
     }
 
     /| Reserves capacity for at least `additional` more elements, panicking on `AllocError`.
@@ -2030,7 +2028,7 @@ impl[T] Vec[T] {
     /| Fallibly reserves capacity for at least `additional` more elements.
     @std_cap_boundary(clears: [unsafe_op])
     pub fn try_reserve(&mut self, additional: usize, /) -> unit!AllocError {
-        let cur_len: usize = self.elem_len as usize;
+        let cur_len = self.elem_len as usize;
         if additional > (u32.MAX as usize) -% cur_len {
             return .Err(.OutOfMemory);
         }
@@ -2038,7 +2036,7 @@ impl[T] Vec[T] {
             return .Ok(());
         }
         let req_cap: usize = cur_len +% additional;
-        let cur_cap: usize = self.cap as usize;
+        let cur_cap = self.cap as usize;
         if req_cap <= cur_cap {
             return .Ok(());
         }
@@ -2059,7 +2057,7 @@ impl[T] Vec[T] {
         };
         self.ptr = raw_ptr as *mut T;
         self.cap = next_cap as u32;
-        return .Ok(());
+        .Ok(())
     }
 
     /| Appends a bitwise copy of all elements in `src`.
@@ -2071,7 +2069,7 @@ impl[T] Vec[T] {
         }
         self.reserve(count);
         if @size_of[T]() != 0 {
-            let cur_len: usize = self.elem_len as usize;
+            let cur_len = self.elem_len as usize;
             unsafe {
                 @ptr_copy_nonoverlapping(src.as_ptr(), self.ptr.add(cur_len), count);
             }
@@ -2082,7 +2080,7 @@ impl[T] Vec[T] {
     /| Inserts `item` at `idx` (`idx <= len`), shifting subsequent elements right by one slot.
     @std_cap_boundary(clears: [unsafe_op])
     pub fn insert(&mut self, idx: usize, item: own T, /) {
-        let cur_len: usize = self.elem_len as usize;
+        let cur_len = self.elem_len as usize;
         assert(idx <= cur_len, f"Vec.insert index {idx=} out of bounds (len={self.elem_len})");
         self.reserve(1);
         if @size_of[T]() != 0 {
@@ -2101,7 +2099,7 @@ impl[T] Vec[T] {
     /| Removes and returns the element at `idx`, shifting subsequent elements left to preserve order.
     @std_cap_boundary(clears: [unsafe_op, alloc]) @no_alloc
     pub fn remove(&mut self, idx: usize, /) -> T {
-        let cur_len: usize = self.elem_len as usize;
+        let cur_len = self.elem_len as usize;
         assert(idx < cur_len, "Vec.remove index out of bounds");
         self.elem_len = self.elem_len -% 1_u32;
         if @size_of[T]() == 0 {
@@ -2118,13 +2116,13 @@ impl[T] Vec[T] {
                 @ptr_copy(self.ptr.add(idx +% 1) as *T, self.ptr.add(idx), tail_len);
             }
         }
-        return removed;
+        removed
     }
 
     /| Removes and returns the element at `idx` in $O(1)$ by moving the last element into `idx`.
     @std_cap_boundary(clears: [unsafe_op, alloc]) @no_alloc
     pub fn swap_remove(&mut self, idx: usize, /) -> T {
-        let cur_len: usize = self.elem_len as usize;
+        let cur_len = self.elem_len as usize;
         assert(idx < cur_len, "Vec.swap_remove index out of bounds");
         let last_idx: usize = cur_len -% 1;
         self.elem_len = self.elem_len -% 1_u32;
@@ -2141,13 +2139,13 @@ impl[T] Vec[T] {
                 @ptr_copy_nonoverlapping(self.ptr.add(last_idx) as *T, self.ptr.add(idx), 1);
             }
         }
-        return removed;
+        removed
     }
 
     /| Shortens `self` to `new_len`, dropping excess tail elements in order.
     @std_cap_boundary(clears: [unsafe_op]) @no_alloc
     pub fn truncate(&mut self, new_len: usize, /) {
-        let old_len: usize = self.elem_len as usize;
+        let old_len = self.elem_len as usize;
         if new_len >= old_len {
             return;
         }
@@ -2178,7 +2176,7 @@ impl[T] Vec[T] {
     /| Retains only elements satisfying `keep(&elem)` in original order (`100%` unwind-safe via swap compaction).
     @std_cap_boundary(clears: [unsafe_op])
     pub fn retain(&mut self, keep: |&T| -> bool, /) {
-        let total: usize = self.elem_len as usize;
+        let total = self.elem_len as usize;
         var write_idx: usize = 0;
         var read_idx: usize = 0;
         while read_idx < total {
@@ -2202,8 +2200,8 @@ impl[T] Vec[T] {
     @no_alloc @no_panic
     pub fn into_raw_parts(own self) -> (*mut T, usize, usize, AllocatorHandle) {
         let out_ptr: *mut T = self.ptr;
-        let out_len: usize = self.elem_len as usize;
-        let out_cap: usize = self.cap as usize;
+        let out_len = self.elem_len as usize;
+        let out_cap = self.cap as usize;
         let out_alloc: AllocatorHandle = self.alloc;
         @forget(own self);
         return (out_ptr, out_len, out_cap, out_alloc);
@@ -2218,12 +2216,12 @@ impl[T] Vec[T] {
         alloc: AllocatorHandle,
         /,
     ) -> Self {
-        return Self {
-            ptr: ptr,
+        Self {
+            ptr,
             elem_len: len as u32,
             cap: cap as u32,
-            alloc: alloc,
-        };
+            alloc,
+        }
     }
 }
 
@@ -2232,7 +2230,7 @@ impl[T] AutoDrop for Vec[T] {
     @std_cap_boundary(clears: [unsafe_op])
     pub fn drop(&mut self) {
         self.truncate(0);
-        let cur_cap: usize = self.cap as usize;
+        let cur_cap = self.cap as usize;
         if cur_cap != 0 and @size_of[T]() != 0 and not self.alloc.is_arena_or_static() {
             self.alloc.dealloc(
                 self.ptr as *mut u8,
@@ -2250,7 +2248,7 @@ impl[T] Default for Vec[T] {
     /| Returns an empty `Vec[T]`.
     @no_alloc @no_panic
     pub fn default() -> Self {
-        return Self.new();
+        Self.new()
     }
 }
 
@@ -2258,7 +2256,7 @@ impl[T: Clone] Clone for Vec[T] {
     /| Deep-clones every element into a fresh `Vec[T]` allocated from `context.allocator` (unwind-safe).
     @std_cap_boundary(clears: [unsafe_op])
     pub fn clone(&self) -> Self {
-        let count: usize = self.elem_len as usize;
+        let count = self.elem_len as usize;
         var out: Self = Self.with_capacity(count);
         var i: usize = 0;
         while i < count {
@@ -2282,7 +2280,7 @@ impl[T: Clone] Clone for Vec[T] {
             out.elem_len += 1;
             i = i +% 1;
         }
-        return out;
+        out
     }
 }
 
@@ -2294,7 +2292,7 @@ impl[T: Equatable] Equatable for Vec[T] {
             return false;
         }
         if @size_of[T]() == 0 {
-            let count_zst: usize = self.elem_len as usize;
+            let count_zst = self.elem_len as usize;
             var z_idx: usize = 0;
             while z_idx < count_zst {
                 if (SliceOps[T] {}).ptr_ref(self.ptr as *T).* != (SliceOps[T] {}).ptr_ref(
@@ -2306,7 +2304,7 @@ impl[T: Equatable] Equatable for Vec[T] {
             }
             return true;
         }
-        let count: usize = self.elem_len as usize;
+        let count = self.elem_len as usize;
         var i: usize = 0;
         while i < count {
             if (SliceOps[T] {}).ptr_ref(
@@ -2322,7 +2320,7 @@ impl[T: Equatable] Equatable for Vec[T] {
             }
             i = i +% 1;
         }
-        return true;
+        true
     }
 }
 
@@ -2330,9 +2328,8 @@ impl[T: Debug] Debug for Vec[T] {
     /| Formats `self` as `[elem0, elem1, …]` into `out` without heap allocation.
     @std_cap_boundary(clears: [unsafe_op, alloc]) @no_alloc
     pub fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
-        spec;
         out.write_str("[")?;
-        let count: usize = self.elem_len as usize;
+        let count = self.elem_len as usize;
         var i: usize = 0;
         while i < count {
             if i > 0 {
@@ -2350,7 +2347,7 @@ impl[T: Debug] Debug for Vec[T] {
             @fmt_write(out, f"{elem_ref:?}")?;
             i = i +% 1;
         }
-        return out.write_str("]");
+        out.write_str("]")
     }
 }
 
@@ -2359,7 +2356,7 @@ impl[T, const N: usize] SmallVec[T, N] {
     /| Constructs an empty inline `SmallVec[T, N]` without heap allocation.
     @no_alloc @no_panic
     pub fn new() -> Self {
-        return Self {
+        Self {
             len_and_flag: 0_u32,
             heap_cap: if @size_of[T]() == 0 => u32.MAX else 0_u32,
             storage: SmallVecStorage {
@@ -2368,7 +2365,7 @@ impl[T, const N: usize] SmallVec[T, N] {
                     alloc: COL_STATIC_RODATA,
                 },
             },
-        };
+        }
     }
 
     /| Constructs a `SmallVec[T, N]` in spilled mode backed by `arena` so `push` never overwrites `alloc`.
@@ -2386,7 +2383,7 @@ impl[T, const N: usize] SmallVec[T, N] {
         if cap > 0 {
             out.reserve(cap);
         }
-        return out;
+        out
     }
 
     /| Pre-allocates capacity for `cap` elements (remaining inline when `cap <= N`).
@@ -2395,19 +2392,19 @@ impl[T, const N: usize] SmallVec[T, N] {
         if cap > N {
             out.reserve(cap);
         }
-        return out;
+        out
     }
 
     /| Returns `true` if elements currently reside in a spilled heap/arena buffer rather than inline storage.
     @no_alloc @no_panic
     pub fn is_spilled(&self) -> bool {
-        return (self.len_and_flag & SMALLVEC_SPILL_FLAG) != 0_u32;
+        (self.len_and_flag & SMALLVEC_SPILL_FLAG) != 0_u32
     }
 
     /| Returns the number of live elements in `self`.
     @no_alloc @no_panic
     pub fn len(&self) -> usize {
-        return (self.len_and_flag & SMALLVEC_LEN_MASK) as usize;
+        (self.len_and_flag & SMALLVEC_LEN_MASK) as usize
     }
 
     /| Returns the current capacity (`N` when inline, `heap_cap` when spilled, `SMALLVEC_LEN_MASK` for ZST).
@@ -2416,13 +2413,13 @@ impl[T, const N: usize] SmallVec[T, N] {
         if @size_of[T]() == 0 {
             return SMALLVEC_LEN_MASK as usize;
         }
-        return if self.is_spilled() => self.heap_cap as usize else N;
+        if self.is_spilled() => self.heap_cap as usize else N
     }
 
     /| Returns `true` if `self` contains zero elements.
     @no_alloc @no_panic
     pub fn is_empty(&self) -> bool {
-        return self.len() == 0;
+        self.len() == 0
     }
 
     /| Returns a raw immutable pointer to the active inline or spilled element buffer.
@@ -2460,17 +2457,17 @@ impl[T, const N: usize] SmallVec[T, N] {
     /| Borrows `self` as an immutable slice `&[T]`.
     @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn as_slice(&self) -> &[T] {
-        return unsafe {
+        unsafe {
             @slice_from_raw_parts(self.as_ptr(), self.len())
-        };
+        }
     }
 
     /| Borrows `self` as a mutable slice `&mut [T]`.
     @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn as_mut_slice(&mut self) -> &mut [T] {
-        return unsafe {
+        unsafe {
             @slice_from_raw_parts_mut(self.as_mut_ptr(), self.len())
-        };
+        }
     }
 
     /| Bounds-checked element projection supporting shared and mutable indexing.
@@ -2529,7 +2526,7 @@ impl[T, const N: usize] SmallVec[T, N] {
             let heap_cur: SmallVecHeap[T] = unsafe {
                 self.storage.heap
             };
-            let old_cap: usize = self.heap_cap as usize;
+            let old_cap = self.heap_cap as usize;
             let new_raw: *mut u8 = if old_cap == 0 {
                 heap_cur.alloc.alloc(Layout { size: new_bytes, alignment: elem_align })?
             } else {
@@ -2567,7 +2564,7 @@ impl[T, const N: usize] SmallVec[T, N] {
         };
         self.heap_cap = next_cap as u32;
         self.len_and_flag = (cur_len as u32) | SMALLVEC_SPILL_FLAG;
-        return .Ok(());
+        .Ok(())
     }
 
     /| Appends `item`, spilling inline storage to `context.allocator` if `len == N`.
@@ -2593,7 +2590,7 @@ impl[T, const N: usize] SmallVec[T, N] {
         }
         let flag_bits: u32 = self.len_and_flag & SMALLVEC_SPILL_FLAG;
         self.len_and_flag = flag_bits | ((cur_len +% 1) as u32);
-        return .Ok(());
+        .Ok(())
     }
 
     /| Removes and returns the last element, or `.None` if empty.
@@ -2613,11 +2610,11 @@ impl[T, const N: usize] SmallVec[T, N] {
                 },
             );
         }
-        return .Some(
+        .Some(
             unsafe {
                 @ptr_read(self.as_ptr().add(next_len))
             },
-        );
+        )
     }
 
     /| Shortens `self` to `new_len`, dropping excess tail elements while preserving spill state.
@@ -2663,7 +2660,7 @@ impl[T, const N: usize] AutoDrop for SmallVec[T, N] {
             let heap_cur: SmallVecHeap[T] = unsafe {
                 self.storage.heap
             };
-            let cap_val: usize = self.heap_cap as usize;
+            let cap_val = self.heap_cap as usize;
             if cap_val != 0 and @size_of[T]() != 0 and not heap_cur.alloc.is_arena_or_static() {
                 heap_cur.alloc.dealloc(
                     heap_cur.ptr as *mut u8,
@@ -2683,7 +2680,7 @@ impl[T, const N: usize] Default for SmallVec[T, N] {
     /| Returns an empty inline `SmallVec[T, N]`.
     @no_alloc @no_panic
     pub fn default() -> Self {
-        return Self.new();
+        Self.new()
     }
 }
 
@@ -2698,7 +2695,7 @@ impl[T: Clone, const N: usize] Clone for SmallVec[T, N] {
             out.push(src[i].clone());
             i = i +% 1;
         }
-        return out;
+        out
     }
 }
 
@@ -2737,7 +2734,7 @@ impl[T: Equatable, const N: usize] Equatable for SmallVec[T, N] {
             }
             i = i +% 1;
         }
-        return true;
+        true
     }
 }
 
@@ -2766,7 +2763,7 @@ impl[T: Debug, const N: usize] Debug for SmallVec[T, N] {
             @fmt_write(out, f"{elem_ref:?}")?;
             i = i +% 1;
         }
-        return out.write_str("]");
+        out.write_str("]")
     }
 }
 
@@ -2775,7 +2772,7 @@ impl[T] Deque[T] {
     /| Constructs an empty `Deque[T]` without heap allocation (`24 B` on 64-bit, `16 B` on `wasm32`).
     @std_cap_boundary(clears: [alloc]) @inline @no_alloc @no_panic
     pub fn new() -> Self {
-        return Self {
+        Self {
             ptr: dangling_ptr[T](),
             head_exp: DequeHeadExp {
                 head: 0_u32,
@@ -2783,14 +2780,14 @@ impl[T] Deque[T] {
             },
             elem_len: 0_u32,
             alloc: context.allocator,
-        };
+        }
     }
 
     /| Pre-allocates ring capacity for at least `cap` elements, panicking on `AllocError`.
     pub fn with_capacity(cap: usize, /) -> Self {
-        return Self.try_with_capacity(cap) catch {
+        Self.try_with_capacity(cap) catch {
             panic(f"Deque.with_capacity({cap=}) out of memory");
-        };
+        }
     }
 
     /| Fallibly pre-allocates ring capacity for at least `cap` elements.
@@ -2799,7 +2796,7 @@ impl[T] Deque[T] {
         if cap > 0 {
             out.try_reserve(cap)?;
         }
-        return .Ok(own out);
+        .Ok(own out)
     }
 
     /| Constructs a `Deque[T]` backed by `arena` (`0`-instruction drop when `T: TrivialDrop`).
@@ -2816,13 +2813,13 @@ impl[T] Deque[T] {
         if cap > 0 {
             out.reserve(cap);
         }
-        return out;
+        out
     }
 
     /| Returns the number of live elements in `self`.
     @no_alloc @no_panic
     pub fn len(&self) -> usize {
-        return self.elem_len as usize;
+        self.elem_len as usize
     }
 
     /| Returns the allocated power-of-two ring capacity (`0` when unallocated, `1 << 27` max).
@@ -2832,19 +2829,19 @@ impl[T] Deque[T] {
         if exp_p1 == 0_u8 {
             return 0;
         }
-        return 1_usize << (((exp_p1 -% 1_u8) & 31_u8) as usize);
+        1_usize << (((exp_p1 -% 1_u8) & 31_u8) as usize)
     }
 
     /| Returns `true` if `self` contains zero elements.
     @no_alloc @no_panic
     pub fn is_empty(&self) -> bool {
-        return self.elem_len == 0_u32;
+        self.elem_len == 0_u32
     }
 
     /| Projects the ring buffer as two contiguous ordered slices `(front_slice, back_slice)`.
     @std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
     pub fn as_slices(&self) -> (&[T], &[T]) {
-        let cur_len: usize = self.elem_len as usize;
+        let cur_len = self.elem_len as usize;
         if cur_len == 0 or @size_of[T]() == 0 {
             let first: &[T] = unsafe {
                 @slice_from_raw_parts(self.ptr as *T, cur_len)
@@ -2855,7 +2852,7 @@ impl[T] Deque[T] {
             return (first, empty_sl);
         }
         let cap_val: usize = self.capacity();
-        let head_idx: usize = self.head_exp.head as usize;
+        let head_idx = self.head_exp.head as usize;
         let tail_room: usize = cap_val -% head_idx;
         if cur_len <= tail_room {
             let front: &[T] = unsafe {
@@ -2872,7 +2869,7 @@ impl[T] Deque[T] {
         let back_part: &[T] = unsafe {
             @slice_from_raw_parts(self.as_ptr() as *T, cur_len -% tail_room)
         };
-        return (front_part, back_part);
+        (front_part, back_part)
     }
 
     /| Bounds-checked logical ring indexing `0..len` using branchless power-of-two mask wrap.
@@ -2919,7 +2916,7 @@ impl[T] Deque[T] {
     @std_cap_boundary(clears: [unsafe_op])
     pub fn try_reserve(&mut self, additional: usize, /) -> unit!AllocError {
         let max_ring_cap: usize = 1_usize << 27_usize;
-        let cur_len: usize = self.elem_len as usize;
+        let cur_len = self.elem_len as usize;
         if additional > max_ring_cap -% cur_len {
             return .Err(.OutOfMemory);
         }
@@ -2931,7 +2928,7 @@ impl[T] Deque[T] {
         if needed <= old_cap {
             return .Ok(());
         }
-        var exp: u8 = 2_u8;
+        var exp = 2_u8;
         var next_cap: usize = 4;
         while next_cap < needed {
             exp = exp +% 1_u8;
@@ -2950,7 +2947,7 @@ impl[T] Deque[T] {
         let new_ptr: *mut T = new_raw as *mut T;
 
         if cur_len > 0 {
-            let head_idx: usize = self.head_exp.head as usize;
+            let head_idx = self.head_exp.head as usize;
             let first_len: usize = min_usize_local(cur_len, old_cap -% head_idx);
             unsafe {
                 @ptr_copy_nonoverlapping(self.ptr.add(head_idx) as *T, new_ptr, first_len);
@@ -2974,7 +2971,7 @@ impl[T] Deque[T] {
             head: 0_u32,
             exp_plus_1: exp +% 1_u8,
         };
-        return .Ok(());
+        .Ok(())
     }
 
     /| Appends `item` to the back of the ring buffer.
@@ -3000,7 +2997,7 @@ impl[T] Deque[T] {
             @forget(own item);
         }
         self.elem_len += 1_u32;
-        return .Ok(());
+        .Ok(())
     }
 
     /| Prepends `item` to the front of the ring buffer.
@@ -3027,7 +3024,7 @@ impl[T] Deque[T] {
             @forget(own item);
         }
         self.elem_len += 1_u32;
-        return .Ok(());
+        .Ok(())
     }
 
     /| Removes and returns the front element in $O(1)$, or `.None` when empty.
@@ -3044,14 +3041,14 @@ impl[T] Deque[T] {
                 },
             );
         }
-        let old_head: usize = self.head_exp.head as usize;
+        let old_head = self.head_exp.head as usize;
         let mask: usize = self.capacity() -% 1;
         self.head_exp.head = ((old_head +% 1) & mask) as u32;
-        return .Some(
+        .Some(
             unsafe {
                 @ptr_read(self.ptr.add(old_head) as *T)
             },
-        );
+        )
     }
 
     /| Removes and returns the back element in $O(1)$, or `.None` when empty.
@@ -3070,18 +3067,18 @@ impl[T] Deque[T] {
         }
         let mask: usize = self.capacity() -% 1;
         let tail_slot: usize = ((self.head_exp.head as usize) +% (self.elem_len as usize)) & mask;
-        return .Some(
+        .Some(
             unsafe {
                 @ptr_read(self.ptr.add(tail_slot) as *T)
             },
-        );
+        )
     }
 
     /| Drops all live elements and resets `head = 0` while preserving ring capacity.
     @std_cap_boundary(clears: [unsafe_op]) @no_alloc
     pub fn clear(&mut self) {
-        let old_len: usize = self.elem_len as usize;
-        let old_head: usize = self.head_exp.head as usize;
+        let old_len = self.elem_len as usize;
+        let old_head = self.head_exp.head as usize;
         self.elem_len = 0_u32;
         self.head_exp.head = 0_u32;
         comptime if not @implements[T, TrivialDrop]() {
@@ -3127,7 +3124,7 @@ impl[T] Default for Deque[T] {
     /| Returns an empty `Deque[T]`.
     @no_alloc @no_panic
     pub fn default() -> Self {
-        return Self.new();
+        Self.new()
     }
 }
 
@@ -3146,7 +3143,7 @@ impl[T: Clone] Clone for Deque[T] {
             out.push_back(back_part[j].clone());
             j = j +% 1;
         }
-        return out;
+        out
     }
 }
 
@@ -3157,14 +3154,14 @@ impl[T: Equatable] Equatable for Deque[T] {
         if self.elem_len != other.elem_len {
             return false;
         }
-        let count: usize = self.elem_len as usize;
+        let count = self.elem_len as usize;
         if @size_of[T]() == 0 {
             return true;
         }
         let lhs_mask: usize = self.capacity() -% 1;
         let rhs_mask: usize = other.capacity() -% 1;
-        let lhs_head: usize = self.head_exp.head as usize;
-        let rhs_head: usize = other.head_exp.head as usize;
+        let lhs_head = self.head_exp.head as usize;
+        let rhs_head = other.head_exp.head as usize;
         var i: usize = 0;
         while i < count {
             let lhs_elem: &T = (SliceOps[T] {}).ptr_ref(
@@ -3182,7 +3179,7 @@ impl[T: Equatable] Equatable for Deque[T] {
             }
             i = i +% 1;
         }
-        return true;
+        true
     }
 }
 
@@ -3211,7 +3208,7 @@ impl[T: Debug] Debug for Deque[T] {
             @fmt_write(out, f"{elem_ref:?}")?;
             j = j +% 1;
         }
-        return out.write_str("]");
+        out.write_str("]")
     }
 }
 
@@ -3229,14 +3226,14 @@ impl[K, V] SlotMap[K, V] {
     /| Constructs an empty `SlotMap[K, V]` without allocating.
     @std_cap_boundary(clears: [alloc]) @inline @no_alloc @no_panic
     pub fn new() -> Self {
-        return Self {
+        Self {
             base_ptr: dangling_ptr[u32]() as *mut u8,
             live_len: 0_u32,
             cap: 0_u32,
             free_head: SLOT_FREE_NONE,
             alloc: context.allocator,
             ..
-        };
+        }
     }
 
     /| Pre-allocates at least `cap` generational slots, panicking on `AllocError`.
@@ -3247,7 +3244,7 @@ impl[K, V] SlotMap[K, V] {
                 panic(f"SlotMap.with_capacity({cap=}) out of memory");
             };
         }
-        return out;
+        out
     }
 
     /| Constructs a `SlotMap[K, V]` backed by `arena` (`0`-instruction drop when `V: TrivialDrop`).
@@ -3265,30 +3262,30 @@ impl[K, V] SlotMap[K, V] {
                 panic(f"SlotMap.in_arena({cap=}) out of memory");
             };
         }
-        return out;
+        out
     }
 
     /| Returns the number of live values stored in `self`.
     @no_alloc @no_panic
     pub fn len(&self) -> usize {
-        return self.live_len as usize;
+        self.live_len as usize
     }
 
     /| Returns the total allocated slot capacity.
     @no_alloc @no_panic
     pub fn capacity(&self) -> usize {
-        return self.cap as usize;
+        self.cap as usize
     }
 
     /| Returns `true` if `self` contains zero live values.
     @no_alloc @no_panic
     pub fn is_empty(&self) -> bool {
-        return self.live_len == 0_u32;
+        self.live_len == 0_u32
     }
 
     /| Returns raw pointer to `generations: [u32; cap]` at offset `0` of `base_ptr`.
     fn gens_ptr(&self) -> *mut u32 {
-        return self.base_ptr as *mut u32;
+        self.base_ptr as *mut u32
     }
 
     /| Returns raw pointer to `slots: [SlotUnion[V]; cap]` inside `base_ptr`.
@@ -3296,9 +3293,9 @@ impl[K, V] SlotMap[K, V] {
     fn slots_ptr(&self) -> *mut SlotUnion[V] {
         let gens_bytes: usize = (self.cap as usize) *% 4;
         let slots_off: usize = align_up_wrapping(gens_bytes, @align_of[SlotUnion[V]]());
-        return unsafe {
+        unsafe {
             self.base_ptr.add(slots_off) as *mut SlotUnion[V]
-        };
+        }
     }
 
     /| Verifies `index < cap`, odd live generation bit `(gen_val & 1) != 0`, and exact generation match.
@@ -3310,18 +3307,18 @@ impl[K, V] SlotMap[K, V] {
         let stored_gen: u32 = unsafe {
             self.gens_ptr().add(raw_key.index as usize).read()
         };
-        return stored_gen == raw_key.generation;
+        stored_gen == raw_key.generation
     }
 
     /| Fallibly grows the combined `[generations | slots]` slab to hold `additional` more items.
     @std_cap_boundary(clears: [unsafe_op])
     pub fn try_reserve(&mut self, additional: usize, /) -> unit!AllocError {
-        let cur_len: usize = self.live_len as usize;
+        let cur_len = self.live_len as usize;
         if additional > ((SLOT_FREE_NONE -% 1_u32) as usize) -% cur_len {
             return .Err(.OutOfMemory);
         }
         let req_cap: usize = cur_len +% additional;
-        let old_cap: usize = self.cap as usize;
+        let old_cap = self.cap as usize;
         if req_cap <= old_cap and (additional == 0 or self.free_head != SLOT_FREE_NONE) {
             return .Ok(());
         }
@@ -3336,7 +3333,7 @@ impl[K, V] SlotMap[K, V] {
 
         let (new_slots_off, new_layout) = slot_map_slab_layout[V](next_cap)?;
         let new_base: *mut u8 = self.alloc.alloc(new_layout)?;
-        let new_gens: *mut u32 = new_base as *mut u32;
+        let new_gens = new_base as *mut u32;
         let new_slots: *mut SlotUnion[V] = unsafe {
             new_base.add(new_slots_off) as *mut SlotUnion[V]
         };
@@ -3367,14 +3364,14 @@ impl[K, V] SlotMap[K, V] {
         self.base_ptr = new_base;
         self.cap = next_cap as u32;
         self.free_head = old_cap as u32;
-        return .Ok(());
+        .Ok(())
     }
 
     /| Inserts `val` in $O(1)$ amortized time and returns its unique odd-generation `K` handle.
     pub fn insert(&mut self, val: own V, /) -> K {
-        return self.try_insert(own val) catch {
+        self.try_insert(own val) catch {
             panic("SlotMap.insert out of memory");
-        };
+        }
     }
 
     /| Fallibly inserts `val` and returns its unique odd-generation `K` handle.
@@ -3384,7 +3381,7 @@ impl[K, V] SlotMap[K, V] {
             self.try_reserve(1)?;
         }
         let slot_idx: u32 = self.free_head;
-        let idx_usz: usize = slot_idx as usize;
+        let idx_usz = slot_idx as usize;
         let gens: *mut u32 = self.gens_ptr();
         let slots: *mut SlotUnion[V] = self.slots_ptr();
 
@@ -3407,13 +3404,13 @@ impl[K, V] SlotMap[K, V] {
         }
         self.free_head = next_free;
         self.live_len += 1_u32;
-        return .Ok(pack_slot_key[K](slot_idx, next_gen));
+        .Ok(pack_slot_key[K](slot_idx, next_gen))
     }
 
     /| Returns `true` if `key` still addresses a live unremoved value in `self`.
     @no_alloc @no_panic
     pub fn contains(&self, key: K, /) -> bool {
-        return self.is_live_slot(unpack_slot_key(&key));
+        self.is_live_slot(unpack_slot_key(&key))
     }
 
     /| Borrows the value associated with `key`, or returns `.None` if `key` is stale or out of bounds.
@@ -3428,11 +3425,11 @@ impl[K, V] SlotMap[K, V] {
                 self.slots_ptr().add(raw_key.index as usize) as *SlotUnion[V]
             },
         );
-        return .Some(
+        .Some(
             unsafe {
                 &slot_ref.value
             },
-        );
+        )
     }
 
     /| Mutably borrows the value associated with `key`, or returns `.None` if `key` is stale.
@@ -3447,11 +3444,11 @@ impl[K, V] SlotMap[K, V] {
                 self.slots_ptr().add(raw_key.index as usize)
             },
         );
-        return .Some(
+        .Some(
             unsafe {
                 &mut slot_ref.value
             },
-        );
+        )
     }
 
     /| Mutably borrows two distinct live slots `(key_a, key_b)` simultaneously, returning `.None` if aliased or stale.
@@ -3473,7 +3470,7 @@ impl[K, V] SlotMap[K, V] {
                 slots.add(raw_b.index as usize)
             },
         );
-        return .Some(
+        .Some(
             (
                 unsafe {
                     &mut slot_a.value
@@ -3482,7 +3479,7 @@ impl[K, V] SlotMap[K, V] {
                     &mut slot_b.value
                 },
             ),
-        );
+        )
     }
 
     /| Removes and returns the value at `key`, advancing its generation to an even free value (retiring on `u32.MAX`).
@@ -3492,7 +3489,7 @@ impl[K, V] SlotMap[K, V] {
         if not self.is_live_slot(raw_key) {
             return .None;
         }
-        let idx_usz: usize = raw_key.index as usize;
+        let idx_usz = raw_key.index as usize;
         let gens: *mut u32 = self.gens_ptr();
         let slots: *mut SlotUnion[V] = self.slots_ptr();
         let slot_ref: &SlotUnion[V] = (SliceOps[SlotUnion[V]] {}).ptr_ref(
@@ -3516,7 +3513,7 @@ impl[K, V] SlotMap[K, V] {
             self.free_head = raw_key.index;
         }
         self.live_len = self.live_len -% 1_u32;
-        return .Some(own taken);
+        .Some(own taken)
     }
 
     /| Drops all live values while advancing their generations so existing `SlotKey`s become stale.
@@ -3525,7 +3522,7 @@ impl[K, V] SlotMap[K, V] {
         if self.live_len == 0_u32 {
             return;
         }
-        let total_cap: usize = self.cap as usize;
+        let total_cap = self.cap as usize;
         let gens: *mut u32 = self.gens_ptr();
         let slots: *mut SlotUnion[V] = self.slots_ptr();
         var i: usize = 0;
@@ -3571,7 +3568,7 @@ impl[K, V] AutoDrop for SlotMap[K, V] {
     @std_cap_boundary(clears: [unsafe_op])
     pub fn drop(&mut self) {
         self.clear();
-        let cur_cap: usize = self.cap as usize;
+        let cur_cap = self.cap as usize;
         if cur_cap != 0 and not self.alloc.is_arena_or_static() {
             if slot_map_slab_layout[V](cur_cap) is .Ok((_, slab_layout)) {
                 self.alloc.dealloc(self.base_ptr, slab_layout);
@@ -3586,7 +3583,7 @@ impl[K, V] Default for SlotMap[K, V] {
     /| Returns an empty `SlotMap[K, V]`.
     @no_alloc @no_panic
     pub fn default() -> Self {
-        return Self.new();
+        Self.new()
     }
 }
 
@@ -3597,8 +3594,8 @@ pub fn wyhash_bytes(bytes: &[u8], seed: u64, /) -> u64 {
     let total_len: usize = bytes.len();
     let base: *u8 = bytes.as_ptr();
     var cur_seed: u64 = seed ^ wy_mix(seed ^ WY_P0, WY_P1);
-    var a_word: u64 = 0_u64;
-    var b_word: u64 = 0_u64;
+    var a_word = 0_u64;
+    var b_word = 0_u64;
 
     if total_len <= 16 {
         if total_len >= 4 {
@@ -3621,9 +3618,9 @@ pub fn wyhash_bytes(bytes: &[u8], seed: u64, /) -> u64 {
                 },
             );
         } else if total_len > 0 {
-            let byte0: u64 = bytes[0] as u64;
-            let byte_mid: u64 = bytes[total_len >> 1_usize] as u64;
-            let byte_end: u64 = bytes[total_len -% 1] as u64;
+            let byte0 = bytes[0] as u64;
+            let byte_mid = bytes[total_len >> 1_usize] as u64;
+            let byte_end = bytes[total_len -% 1] as u64;
             a_word = (byte0 << 16_u64) | (byte_mid << 8_u64) | byte_end;
         }
     } else {
@@ -3698,29 +3695,29 @@ pub fn wyhash_bytes(bytes: &[u8], seed: u64, /) -> u64 {
         );
     }
 
-    a_word = a_word ^ WY_P1;
-    b_word = b_word ^ cur_seed;
+    a_word ^= WY_P1;
+    b_word ^= cur_seed;
     let (mul_lo, mul_hi) = widening_mul_u64(a_word, b_word);
-    return wy_mix(mul_lo ^ WY_P0 ^ (total_len as u64), mul_hi ^ WY_P1);
+    wy_mix(mul_lo ^ WY_P0 ^ (total_len as u64), mul_hi ^ WY_P1)
 }
 
 impl WyHasher {
     /| Constructs a `WyHasher` with canonical default secret state.
     @inline @no_alloc @no_panic
     pub fn new() -> Self {
-        return Self {
+        Self {
             state: WY_P0,
             seed: WY_P1,
-        };
+        }
     }
 
     /| Constructs a `WyHasher` initialized from explicit 64-bit `seed`.
     @inline @no_alloc @no_panic
     pub fn with_seed(seed: u64, /) -> Self {
-        return Self {
+        Self {
             state: wy_mix(seed ^ WY_P0, WY_P1),
             seed: seed ^ WY_P2,
-        };
+        }
     }
 }
 
@@ -3728,7 +3725,7 @@ impl Default for WyHasher {
     /| Returns `WyHasher.new()`.
     @inline @no_alloc @no_panic
     pub fn default() -> Self {
-        return Self.new();
+        Self.new()
     }
 }
 
@@ -3750,7 +3747,7 @@ impl Hasher for WyHasher {
     /| Finalizes and returns the 64-bit `Wyhash` digest without mutating `self`.
     @inline @no_alloc @no_panic
     pub fn finish(&self) -> u64 {
-        return wy_mix(self.state ^ WY_P0, self.seed ^ WY_P3);
+        wy_mix(self.state ^ WY_P0, self.seed ^ WY_P3)
     }
 }
 
@@ -3759,10 +3756,10 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
     /| Constructs an empty `Map` seeded deterministically from `@ctx_next_rng_seed()` (`0` heap allocs).
     @std_cap_boundary(clears: [alloc]) @no_alloc @no_panic
     pub fn new() -> Self {
-        return Self {
+        Self {
             raw: RawTableInner.empty(context.allocator),
             seed: @ctx_next_rng_seed(),
-        };
+        }
     }
 
     /| Pre-allocates SwissTable buckets for at least `cap` entries, panicking on `AllocError`.
@@ -3771,7 +3768,7 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
         if cap > 0 {
             out.reserve(cap);
         }
-        return out;
+        out
     }
 
     /| Fallibly pre-allocates SwissTable buckets for at least `cap` entries.
@@ -3780,7 +3777,7 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
         if cap > 0 {
             out.try_reserve(cap)?;
         }
-        return .Ok(own out);
+        .Ok(own out)
     }
 
     /| Constructs a `Map` backed by `arena` (`0`-instruction drop when `K: TrivialDrop` and `V: TrivialDrop`).
@@ -3792,25 +3789,25 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
         if cap > 0 {
             out.reserve(cap);
         }
-        return out;
+        out
     }
 
     /| Returns the number of live `(K, V)` entries in `self`.
     @no_alloc @no_panic
     pub fn len(&self) -> usize {
-        return self.raw.items as usize;
+        self.raw.items as usize
     }
 
     /| Returns the number of entries `self` can hold before rehashing or growing.
     @no_alloc @no_panic
     pub fn capacity(&self) -> usize {
-        return (self.raw.items as usize) +% (self.raw.growth_left() as usize);
+        (self.raw.items as usize) +% (self.raw.growth_left() as usize)
     }
 
     /| Returns `true` if `self` contains zero live entries.
     @no_alloc @no_panic
     pub fn is_empty(&self) -> bool {
-        return self.raw.items == 0_u32;
+        self.raw.items == 0_u32
     }
 
     /| Internal helper locating bucket index matching `key`, or `.None`.
@@ -3820,7 +3817,7 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
         }
         let hash_val: u64 = hash_key_seeded[K, H](self.seed, key);
         let target_ptr: *K = &raw key.*;
-        return self.raw.find_raw(
+        self.raw.find_raw(
             hash_val,
             @size_of[MapBucket[K, V]](),
             @align_of[MapBucket[K, V]](),
@@ -3829,15 +3826,15 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
                 let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(
                     bucket_raw as *MapBucket[K, V],
                 );
-                return target_ref.* == bucket_ref.key;
+                target_ref.* == bucket_ref.key
             },
-        );
+        )
     }
 
     /| Returns `true` if `self` contains an entry matching `key`.
     @no_alloc @no_panic
     pub fn contains_key(&self, key: &K, /) -> bool {
-        return self.find_bucket_idx(key) is .Some(_);
+        self.find_bucket_idx(key) is .Some(_)
     }
 
     /| Borrows the value associated with `key`, or `.None` if absent.
@@ -3852,7 +3849,7 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
             let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(bucket_ptr);
             return .Some(&bucket_ref.val);
         }
-        return .None;
+        .None
     }
 
     /| Mutably borrows the value associated with `key`, or `.None` if absent.
@@ -3867,7 +3864,7 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
             let bucket_ref: &mut MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_mut(bucket_ptr);
             return .Some(&mut bucket_ref.val);
         }
-        return .None;
+        .None
     }
 
     /| Borrows both the stored `(&K, &V)` entry matching `key`, or `.None` if absent.
@@ -3882,14 +3879,14 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
             let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(bucket_ptr);
             return .Some((&bucket_ref.key, &bucket_ref.val));
         }
-        return .None;
+        .None
     }
 
     /| Inserts `(key, val)`, returning the displaced `V` if `key` was already present.
     pub fn insert(&mut self, key: own K, val: own V, /) -> V? {
-        return self.try_insert(own key, own val) catch {
+        self.try_insert(own key, own val) catch {
             panic("Map.insert out of memory");
-        };
+        }
     }
 
     /| Fallibly inserts `(key, val)`, returning `.Ok(.Some(old_val))` on overwrite or `.Ok(.None)` on new key.
@@ -3909,13 +3906,13 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
                     let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(
                         bucket_raw as *MapBucket[K, V],
                     );
-                    return target_ref.* == bucket_ref.key;
+                    target_ref.* == bucket_ref.key
                 },
                 |cur_seed: u64, bucket_raw: *u8| -> u64 {
                     let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(
                         bucket_raw as *MapBucket[K, V],
                     );
-                    return hash_key_seeded[K, H](cur_seed, &bucket_ref.key);
+                    hash_key_seeded[K, H](cur_seed, &bucket_ref.key)
                 },
             )?;
         let bucket_ptr: *mut MapBucket[K, V] = self.raw.bucket_ptr(
@@ -3937,7 +3934,7 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
         unsafe {
             @ptr_write(bucket_ptr, MapBucket[K, V] { key: own key, val: own val });
         }
-        return .Ok(.None);
+        .Ok(.None)
     }
 
     /| Returns a mutable reference to `key`'s value, lazily evaluating `default_fn()` only when absent.
@@ -3945,8 +3942,8 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
     pub fn get_or_insert_with(&mut self, key: own K, default_fn: || -> V, /) -> &mut V {
         let hash_val: u64 = hash_key_seeded[K, H](self.seed, &key);
         let target_ptr: *K = &raw key;
-        if self.raw.items != 0_u32 {
-            if self.raw.find_raw(
+        if self.raw.items != 0_u32 and (
+            self.raw.find_raw(
                 hash_val,
                 @size_of[MapBucket[K, V]](),
                 @align_of[MapBucket[K, V]](),
@@ -3955,19 +3952,19 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
                     let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(
                         bucket_raw as *MapBucket[K, V],
                     );
-                    return target_ref.* == bucket_ref.key;
+                    target_ref.* == bucket_ref.key
                 },
-            ) is .Some(existing_idx) {
-                let existing_ptr: *mut MapBucket[K, V] = self.raw.bucket_ptr(
-                    existing_idx,
-                    @size_of[MapBucket[K, V]](),
-                    @align_of[MapBucket[K, V]](),
-                ) as *mut MapBucket[K, V];
-                let existing_ref: &mut MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_mut(
-                    existing_ptr,
-                );
-                return &mut existing_ref.val;
-            }
+            ) is .Some(existing_idx)
+        ) {
+            let existing_ptr: *mut MapBucket[K, V] = self.raw.bucket_ptr(
+                existing_idx,
+                @size_of[MapBucket[K, V]](),
+                @align_of[MapBucket[K, V]](),
+            ) as *mut MapBucket[K, V];
+            let existing_ref: &mut MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_mut(
+                existing_ptr,
+            );
+            return &mut existing_ref.val;
         }
         self.reserve(1);
         let init_val: V = default_fn();
@@ -3981,13 +3978,13 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
                 let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(
                     bucket_raw as *MapBucket[K, V],
                 );
-                return target_ref.* == bucket_ref.key;
+                target_ref.* == bucket_ref.key
             },
             |cur_seed: u64, bucket_raw: *u8| -> u64 {
                 let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(
                     bucket_raw as *MapBucket[K, V],
                 );
-                return hash_key_seeded[K, H](cur_seed, &bucket_ref.key);
+                hash_key_seeded[K, H](cur_seed, &bucket_ref.key)
             },
         ) catch {
             panic("Map.get_or_insert_with out of memory");
@@ -4029,7 +4026,7 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
             self.raw.erase_slot_ctrl(idx);
             return .Some((own entry.key, own entry.val));
         }
-        return .None;
+        .None
     }
 
     /| Removes `key` from `self` and returns its `V`, dropping the stored `K` (`@no_alloc @no_panic` when `K: TrivialDrop`).
@@ -4053,7 +4050,7 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
             self.raw.erase_slot_ctrl(idx);
             return .Some(own out_val);
         }
-        return .None;
+        .None
     }
 
     /| Reserves space for at least `additional` new entries without reallocating, panicking on `AllocError`.
@@ -4065,7 +4062,7 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
 
     /| Fallibly reserves space for at least `additional` new entries.
     pub fn try_reserve(&mut self, additional: usize, /) -> unit!AllocError {
-        return self.raw.reserve_raw(
+        self.raw.reserve_raw(
             additional,
             self.seed,
             @size_of[MapBucket[K, V]](),
@@ -4074,9 +4071,9 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
                 let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(
                     bucket_raw as *MapBucket[K, V],
                 );
-                return hash_key_seeded[K, H](cur_seed, &bucket_ref.key);
+                hash_key_seeded[K, H](cur_seed, &bucket_ref.key)
             },
-        );
+        )
     }
 
     /| Drops all live `(K, V)` entries while retaining the allocated bucket slab.
@@ -4148,7 +4145,7 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
     /| Returns a zero-allocation iterator yielding `(&K, &V)` over all live entries.
     @no_alloc @no_panic
     pub fn iter(&self) -> MapIter[K, V] {
-        return MapIter[K, V] {
+        MapIter[K, V] {
             ctrl: self.raw.ctrl as *u8,
             buckets_base: self.raw.bucket_ptr(
                 0,
@@ -4157,19 +4154,19 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
             ) as *u8,
             index: 0,
             remaining: self.raw.items as usize,
-        };
+        }
     }
 
     /| Returns a zero-allocation iterator yielding `&K` over all live keys.
     @no_alloc @no_panic
     pub fn keys(&self) -> MapKeysIter[K, V] {
-        return MapKeysIter[K, V] { inner: self.iter() };
+        MapKeysIter[K, V] { inner: self.iter() }
     }
 
     /| Returns a zero-allocation iterator yielding `&V` over all live values.
     @no_alloc @no_panic
     pub fn values(&self) -> MapValuesIter[K, V] {
-        return MapValuesIter[K, V] { inner: self.iter() };
+        MapValuesIter[K, V] { inner: self.iter() }
     }
 }
 
@@ -4201,7 +4198,7 @@ impl[K, V] MapIter[K, V] {
                 return .Some((&bucket_ref.key, &bucket_ref.val));
             }
         }
-        return .None;
+        .None
     }
 }
 
@@ -4212,7 +4209,7 @@ impl[K, V] MapKeysIter[K, V] {
         if self.inner.next() is .Some((key_ref, _)) {
             return .Some(key_ref);
         }
-        return .None;
+        .None
     }
 }
 
@@ -4223,7 +4220,7 @@ impl[K, V] MapValuesIter[K, V] {
         if self.inner.next() is .Some((_, val_ref)) {
             return .Some(val_ref);
         }
-        return .None;
+        .None
     }
 }
 
@@ -4239,7 +4236,7 @@ impl[K: Equatable + Hash, V, H: Hasher] Default for Map[K, V, H] {
     /| Returns an empty `Map[K, V, H]`.
     @no_alloc @no_panic
     pub fn default() -> Self {
-        return Self.new();
+        Self.new()
     }
 }
 
@@ -4251,7 +4248,7 @@ impl[K: Equatable + Hash + Clone, V: Clone, H: Hasher] Clone for Map[K, V, H] {
         while it.next() is .Some((key_ref, val_ref)) {
             _ = out.insert(key_ref.clone(), val_ref.clone());
         }
-        return out;
+        out
     }
 }
 
@@ -4272,7 +4269,7 @@ impl[K: Equatable + Hash, V: Equatable, H: Hasher] Equatable for Map[K, V, H] {
                 return false;
             }
         }
-        return true;
+        true
     }
 }
 
@@ -4283,7 +4280,7 @@ impl[K: Equatable + Hash + Debug, V: Debug, H: Hasher] Debug for Map[K, V, H] {
         _ = spec;
         out.write_str("{")?;
         var it: MapIter[K, V] = self.iter();
-        var first: bool = true;
+        var first = true;
         while it.next() is .Some((key_ref, val_ref)) {
             if not first {
                 out.write_str(", ")?;
@@ -4291,7 +4288,7 @@ impl[K: Equatable + Hash + Debug, V: Debug, H: Hasher] Debug for Map[K, V, H] {
             first = false;
             @fmt_write(out, f"{key_ref:?}: {val_ref:?}")?;
         }
-        return out.write_str("}");
+        out.write_str("}")
     }
 }
 
@@ -4300,12 +4297,12 @@ impl[T: Equatable + Hash, H: Hasher] Set[T, H] {
     /| Constructs an empty `Set[T, H]` seeded deterministically from `@ctx_next_rng_seed()`.
     @std_cap_boundary(clears: [alloc]) @inline @no_alloc @no_panic
     pub fn new() -> Self {
-        return Self {
+        Self {
             inner: Map {
                 raw: RawTableInner.empty(context.allocator),
                 seed: @ctx_next_rng_seed(),
             },
-        };
+        }
     }
 
     /| Pre-allocates SwissTable buckets for at least `cap` elements, panicking on `AllocError`.
@@ -4314,7 +4311,7 @@ impl[T: Equatable + Hash, H: Hasher] Set[T, H] {
         if cap > 0 {
             out.inner.reserve(cap);
         }
-        return out;
+        out
     }
 
     /| Fallibly pre-allocates SwissTable buckets for at least `cap` elements.
@@ -4323,7 +4320,7 @@ impl[T: Equatable + Hash, H: Hasher] Set[T, H] {
         if cap > 0 {
             out.inner.try_reserve(cap)?;
         }
-        return .Ok(own out);
+        .Ok(own out)
     }
 
     /| Constructs a `Set[T, H]` backed directly by `arena`.
@@ -4337,47 +4334,47 @@ impl[T: Equatable + Hash, H: Hasher] Set[T, H] {
         if cap > 0 {
             out.inner.reserve(cap);
         }
-        return out;
+        out
     }
 
     /| Returns the number of distinct elements in `self`.
     @no_alloc @no_panic
     pub fn len(&self) -> usize {
-        return self.inner.len();
+        self.inner.len()
     }
 
     /| Returns the number of elements `self` can hold without rehashing or growing.
     @no_alloc @no_panic
     pub fn capacity(&self) -> usize {
-        return self.inner.capacity();
+        self.inner.capacity()
     }
 
     /| Returns `true` if `self` contains zero elements.
     @no_alloc @no_panic
     pub fn is_empty(&self) -> bool {
-        return self.inner.is_empty();
+        self.inner.is_empty()
     }
 
     /| Returns `true` if `self` contains `value`.
     @no_alloc @no_panic
     pub fn contains(&self, value: &T, /) -> bool {
-        return self.inner.contains_key(value);
+        self.inner.contains_key(value)
     }
 
     /| Inserts `value`, returning `true` if newly inserted or `false` if already present.
     pub fn insert(&mut self, value: own T, /) -> bool {
-        return self.inner.insert(own value, ()) is .None;
+        self.inner.insert(own value, ()) is .None
     }
 
     /| Fallibly inserts `value`, returning `.Ok(true)` if newly inserted.
     pub fn try_insert(&mut self, value: own T, /) -> bool!AllocError {
-        return .Ok((self.inner.try_insert(own value, ())?) is .None);
+        .Ok((self.inner.try_insert(own value, ())?) is .None)
     }
 
     /| Removes `value` from `self`, returning `true` if it was present.
     @no_alloc @no_panic
     pub fn remove(&mut self, value: &T, /) -> bool {
-        return self.inner.remove(value) is .Some(_);
+        self.inner.remove(value) is .Some(_)
     }
 
     /| Reserves capacity for at least `additional` new elements.
@@ -4387,7 +4384,7 @@ impl[T: Equatable + Hash, H: Hasher] Set[T, H] {
 
     /| Fallibly reserves capacity for at least `additional` new elements.
     pub fn try_reserve(&mut self, additional: usize, /) -> unit!AllocError {
-        return self.inner.try_reserve(additional);
+        self.inner.try_reserve(additional)
     }
 
     /| Drops all elements while retaining allocated bucket capacity.
@@ -4404,7 +4401,7 @@ impl[T: Equatable + Hash, H: Hasher] Set[T, H] {
     /| Returns a zero-allocation iterator yielding `&T` over all live elements.
     @no_alloc @no_panic
     pub fn iter(&self) -> SetIter[T] {
-        return SetIter[T] { inner: self.inner.iter() };
+        SetIter[T] { inner: self.inner.iter() }
     }
 }
 
@@ -4415,7 +4412,7 @@ impl[T] SetIter[T] {
         if self.inner.next() is .Some((elem_ref, _)) {
             return .Some(elem_ref);
         }
-        return .None;
+        .None
     }
 }
 
@@ -4434,16 +4431,16 @@ impl[T: Equatable + Hash, H: Hasher] Default for Set[T, H] {
     /| Returns an empty `Set[T, H]`.
     @no_alloc @no_panic
     pub fn default() -> Self {
-        return Self.new();
+        Self.new()
     }
 }
 
 impl[T: Equatable + Hash + Clone, H: Hasher] Clone for Set[T, H] {
     /| Deep-clones `self` into a new `Set[T, H]`.
     pub fn clone(&self) -> Self {
-        return Self {
+        Self {
             inner: self.inner.clone(),
-        };
+        }
     }
 }
 
@@ -4451,7 +4448,7 @@ impl[T: Equatable + Hash, H: Hasher] Equatable for Set[T, H] {
     /| Returns `true` iff both sets contain the exact same elements.
     @no_alloc @no_panic
     pub fn eq(&self, other: &Self, /) -> bool {
-        return self.inner == other.inner;
+        self.inner == other.inner
     }
 }
 
@@ -4462,7 +4459,7 @@ impl[T: Equatable + Hash + Debug, H: Hasher] Debug for Set[T, H] {
         _ = spec;
         out.write_str("{")?;
         var it: SetIter[T] = self.iter();
-        var first: bool = true;
+        var first = true;
         while it.next() is .Some(elem_ref) {
             if not first {
                 out.write_str(", ")?;
@@ -4470,7 +4467,7 @@ impl[T: Equatable + Hash + Debug, H: Hasher] Debug for Set[T, H] {
             first = false;
             @fmt_write(out, f"{elem_ref:?}")?;
         }
-        return out.write_str("}");
+        out.write_str("}")
     }
 }
 
@@ -4558,7 +4555,7 @@ pub fn binary_search[T: Comparable](slice: &[T], target: &T, /) -> usize!usize {
     if final_ref.* == target.* {
         return .Ok(base);
     }
-    return .Err(base +% ((final_ref.* < target.*) as usize));
+    .Err(base +% ((final_ref.* < target.*) as usize))
 }
 
 /| Searches sorted `slice` via `cmp_fn(&elem)` (`elem.cmp(target)` convention), returning `.Ok(idx)` or `.Err(ins_idx)`.
@@ -4603,7 +4600,7 @@ pub fn binary_search_by[T](slice: &[T], cmp_fn: |&T| -> Ordering, /) -> usize!us
     if final_ord == .Equal {
         return .Ok(base);
     }
-    return .Err(base +% ((final_ord == .Less) as usize));
+    .Err(base +% ((final_ord == .Less) as usize))
 }
 
 /| Returns the first index where partitioned `pred(&elem)` becomes `false` (`0` Pentagon bounds traps).
@@ -4629,7 +4626,7 @@ pub fn partition_point[T](slice: &[T], pred: |&T| -> bool, /) -> usize {
         base = if go_right => mid +% 1 else base;
         size = size -% (half +% ((go_right as usize) *% (1_usize -% (size & 1_usize))));
     }
-    return base;
+    base
 }
 
 /| Compacts consecutive equal elements to the prefix of `slice`, returning the unique prefix length.
@@ -4657,7 +4654,7 @@ pub fn dedup_slice[T: Equatable](slice: &mut [T], /) -> usize {
         }
         read_idx = read_idx +% 1;
     }
-    return write_idx;
+    write_idx
 }
 
 /| Partitions `slice` in place so elements satisfying `pred` precede those that do not, returning the split index.
@@ -4712,7 +4709,7 @@ pub fn partition_in_place[T](slice: &mut [T], pred: |&T| -> bool, /) -> usize {
             left = left +% 1;
         }
     }
-    return left;
+    left
 }
 
 /| Rotates `slice` left by `mid % max(slice.len(), 1)` positions in place using three reversals (`@no_panic`).
@@ -4747,19 +4744,19 @@ pub fn rotate_left[T](slice: &mut [T], mid: usize, /) {
 /| Returns a sliding-window iterator yielding contiguous sub-slices of statically non-zero `width`.
 @no_alloc @no_panic
 pub fn windows[T](slice: &[T], width: usize is 1..=usize.MAX, /) -> WindowsIter[T] {
-    return WindowsIter[T] {
-        slice: slice,
-        width: width,
-    };
+    WindowsIter[T] {
+        slice,
+        width,
+    }
 }
 
 /| Returns a chunk iterator yielding non-overlapping sub-slices of up to non-zero `chunk_size` elements.
 @no_alloc @no_panic
 pub fn chunks[T](slice: &[T], chunk_size: usize is 1..=usize.MAX, /) -> ChunksIter[T] {
-    return ChunksIter[T] {
-        slice: slice,
-        chunk_size: chunk_size,
-    };
+    ChunksIter[T] {
+        slice,
+        chunk_size,
+    }
 }
 
 impl[T] WindowsIter[T] {
@@ -4784,7 +4781,7 @@ impl[T] WindowsIter[T] {
         self.slice = unsafe {
             @slice_from_raw_parts(next_ptr, rem -% 1)
         };
-        return .Some(win);
+        .Some(win)
     }
 }
 
@@ -4811,6 +4808,6 @@ impl[T] ChunksIter[T] {
         self.slice = unsafe {
             @slice_from_raw_parts(next_ptr, rem -% take_len)
         };
-        return .Some(chunk_sl);
+        .Some(chunk_sl)
     }
 }

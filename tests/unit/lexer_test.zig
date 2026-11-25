@@ -630,7 +630,7 @@ test "test_lexer_raw_strings_char_literals_and_directives" {
         try expectLosslessRoundTrip(bad_char, &char_buf);
     }
 
-    const unexpected_tokens = "#unknown #soa_extra # ` λ \xFF\xFE";
+    const unexpected_tokens = "#unknown #soa_extra # ` § \xFF\xFE";
     var unexp_buf = TokenBuffer.init(std.testing.allocator);
     defer unexp_buf.deinit();
     var unexp_sink = DiagnosticSink.init(std.testing.allocator);

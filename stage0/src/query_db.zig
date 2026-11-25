@@ -27,6 +27,8 @@ const codegen_abi = @import("codegen_abi.zig");
 const codegen_dev_seam = @import("codegen_dev_seam.zig");
 const pkg_cxi_seam = @import("pkg_cxi_seam.zig");
 const check_audit = @import("check_audit.zig");
+const lint_filter = @import("lint_filter.zig");
+const pkg_manifest = @import("pkg_manifest.zig");
 pub const c_frontend = @import("c_frontend.zig");
 pub const c_translate = @import("c_translate.zig");
 
@@ -311,7 +313,7 @@ pub const GotSlotId = enum(u32) {
     }
 };
 
-/// Canonical 14-stage demand-driven query pipeline (`PLAN.md` Phase 3 & Phase 5, `DR-12` Section 3.1).
+/// Canonical 18-stage demand-driven query pipeline (`PLAN.md` Phase 3 & Phase 5, `DR-12` §3.1, `DR-25` §3.2).
 pub const QueryStage = enum(u8) {
     /// Stage 0: External source text input (`FileId -> SourceInput`).
     source_text = 0,
@@ -341,6 +343,14 @@ pub const QueryStage = enum(u8) {
     eval_comptime_def = 12,
     /// Stage 13: Dual-mode `--dev` / `--release` module `MIR` optimization (`(FileId, is_release) -> MirOptModuleResult`).
     optimize_mir_module = 13,
+    /// Stage 14: Per-package `[lint.settings]` semantic thresholds (`PackageId -> LintSettings`, `DR-25` §3.2).
+    lint_semantic_settings = 14,
+    /// Stage 15: Per-file Four-Scope `SuppressionTable` (`FileId -> SuppressionTable`, `DR-25` §3.2).
+    suppression_table = 15,
+    /// Stage 16: Per-package `[lint]` `disable` / `exclude` / `overrides` + CLI matrix (`PackageId -> u64`, `DR-25` §3.2).
+    lint_disabled_matrix = 16,
+    /// Stage 17: Leaf filtered `DiagnosticSink` + `W0002`–`W0004` stale-expect projection (`FileId -> DiagnosticSink`).
+    project_file_diagnostics = 17,
 };
 
 /// Universal 8-byte key uniquely identifying a node in the `CompilerDb` dependency DAG.
@@ -381,6 +391,16 @@ pub const QueryKey = extern struct {
             .flags = 0,
             .reserved = 0,
             .entity_index = def_id.asInt(),
+        };
+    }
+
+    /// Constructs a `QueryKey` targeting `pkg_id` at `stage` (`lint_semantic_settings` or `lint_disabled_matrix`).
+    pub inline fn forPackage(stage: QueryStage, pkg_id: PackageId) QueryKey {
+        return .{
+            .stage = stage,
+            .flags = 0,
+            .reserved = 0,
+            .entity_index = pkg_id.asInt(),
         };
     }
 
@@ -517,6 +537,8 @@ pub const ParsedCstArtifact = struct {
     node_extra_end: []u32 = &.{},
     /// Cached whole-file `@allow(…)` suppression span list computed once per parse.
     allowed_spans: []symbol_resolver.AllowedSpanEntry = &.{},
+    /// Configuration-oblivious syntax/lexer `RawLintCandidate` facts cached during Stage 1 (`DR-25` §3.2).
+    raw_lint_candidates: std.ArrayListUnmanaged(lint_filter.RawLintCandidate) = .empty,
 
     /// Initializes an empty `ParsedCstArtifact` bound to `allocator`.
     pub fn init(allocator: std.mem.Allocator) ParsedCstArtifact {
@@ -539,6 +561,43 @@ pub const ParsedCstArtifact = struct {
         self.allowed_spans = &.{};
     }
 
+    /// Splices `replacement` into `raw_lint_candidates` over `[old_start_byte, old_end_byte)`, shifting trailing spans.
+    pub fn spliceRawLintCandidatesWindow(
+        self: *ParsedCstArtifact,
+        old_start_byte: u32,
+        old_end_byte: u32,
+        byte_delta: i64,
+        replacement: []const lint_filter.RawLintCandidate,
+    ) !void {
+        const alloc = self.token_buffer.allocator;
+        var updated: std.ArrayListUnmanaged(lint_filter.RawLintCandidate) = .empty;
+        errdefer updated.deinit(alloc);
+        try updated.ensureTotalCapacity(alloc, self.raw_lint_candidates.items.len + replacement.len);
+
+        var inserted_replacement = false;
+        for (self.raw_lint_candidates.items) |cand| {
+            if (cand.end_byte <= old_start_byte) {
+                updated.appendAssumeCapacity(cand);
+                continue;
+            }
+            if (!inserted_replacement) {
+                updated.appendSliceAssumeCapacity(replacement);
+                inserted_replacement = true;
+            }
+            if (cand.start_byte >= old_end_byte) {
+                var shifted = cand;
+                shifted.start_byte = @intCast(@max(0, @as(i64, cand.start_byte) + byte_delta));
+                shifted.end_byte = @intCast(@max(0, @as(i64, cand.end_byte) + byte_delta));
+                updated.appendAssumeCapacity(shifted);
+            }
+        }
+        if (!inserted_replacement) {
+            updated.appendSliceAssumeCapacity(replacement);
+        }
+        self.raw_lint_candidates.deinit(alloc);
+        self.raw_lint_candidates = updated;
+    }
+
     /// Clears `diagnostics` while retaining token, CST, and AST buffers for `reparseIncremental`.
     pub fn clearDiagnosticsOnly(self: *ParsedCstArtifact) void {
         self.diagnostics.resetRetainingCapacity();
@@ -547,6 +606,7 @@ pub const ParsedCstArtifact = struct {
     /// Clears syntax tables while retaining allocated capacity for fast incremental re-parsing.
     pub fn resetForReparse(self: *ParsedCstArtifact) void {
         self.freeCachedSyntaxMaps();
+        self.raw_lint_candidates.clearRetainingCapacity();
         self.token_buffer.tokens.shrinkRetainingCapacity(0);
         self.token_buffer.trivia.clearRetainingCapacity();
         self.cst_arena.nodes.shrinkRetainingCapacity(0);
@@ -563,6 +623,7 @@ pub const ParsedCstArtifact = struct {
     /// Releases all owned syntax arenas and diagnostic buffers.
     pub fn deinit(self: *ParsedCstArtifact) void {
         self.freeCachedSyntaxMaps();
+        self.raw_lint_candidates.deinit(self.token_buffer.allocator);
         self.token_buffer.deinit();
         self.cst_arena.deinit();
         self.ast_arena.deinit();
@@ -796,6 +857,12 @@ pub const ExternalFileSyntaxView = struct {
     file_side_tables: ?*const BodySemanticSideTables,
 };
 
+/// Saved signature-level `(SymbolIndex, TypeId)` pair anchored to a non-body AST node ordinal.
+const SavedSigAstEntry = struct {
+    sym_idx: SymbolIndex = .none,
+    type_id: TypeId = .err_ty,
+};
+
 /// Symbol-table watermark and AST fingerprint state for `resolveSignatures` Early Cutoff rebasing (`SE-07`).
 const FileSigSyncState = struct {
     /// Inclusive `SymbolIndex` watermark recorded before `collectFileModuleItems`.
@@ -804,6 +871,14 @@ const FileSigSyncState = struct {
     sym_end: u32 = 0,
     /// `ParsedCstArtifact.ast_fingerprint` matching `fn_param_specs` and `file_side_tables`.
     ast_fingerprint: Fingerprint128 = .ZERO,
+    /// Ordered signature AST side-table entries outside `.block`/`.fn_expr_body` subtrees.
+    sig_ast_entries: []SavedSigAstEntry = &.{},
+
+    /// Releases `sig_ast_entries` back to `allocator`.
+    pub fn deinit(self: *FileSigSyncState, allocator: std.mem.Allocator) void {
+        if (self.sig_ast_entries.len > 0) allocator.free(self.sig_ast_entries);
+        self.* = undefined;
+    }
 };
 
 /// Stage 8 per-definition bidirectional body type-checking artifact.
@@ -818,6 +893,10 @@ pub const TypedBodyArtifact = struct {
     error_count: u32 = 0,
     /// Number of warnings (e.g., `W0401`, `W0402`) emitted inside `def_id`'s body.
     warning_count: u32 = 0,
+    /// Start byte of `def_id`'s owning top-level CST item when diagnostics were recorded (`Ruling 3.4`).
+    origin_item_start_byte: u32 = 0,
+    /// 64-bit `Wyhash` of `source[item_start .. item_end]` when diagnostics were recorded (`Ruling 3.4`).
+    origin_item_byte_hash: u64 = 0,
     /// 128-bit signature fingerprint consumed during body checking.
     signature_fingerprint: Fingerprint128,
     /// 128-bit position-independent body AST fingerprint consumed during body checking.
@@ -838,6 +917,10 @@ pub const SastVerificationArtifact = struct {
     error_count: u32 = 0,
     /// Number of SAST warnings (`W0308`, `W0314`, `W0329`, `W0330`) emitted inside `def_id`.
     warning_count: u32 = 0,
+    /// Start byte of `def_id`'s owning top-level CST item when SAST diagnostics were recorded (`Ruling 3.4`).
+    origin_item_start_byte: u32 = 0,
+    /// 64-bit `Wyhash` of `source[item_start .. item_end]` when SAST diagnostics were recorded (`Ruling 3.4`).
+    origin_item_byte_hash: u64 = 0,
     /// Count of `bounds_check` / `slice_range_check` intrinsics statically proven & eliminated.
     eliminated_bounds_checks: u32 = 0,
     /// Count of `.narrow()` (`narrow_check`) intrinsics statically proven & eliminated.
@@ -962,6 +1045,44 @@ pub const PackageCxiArtifact = struct {
     }
 };
 
+/// Owned per-`PackageId` `[lint.settings]` semantic configuration (`QueryStage.lint_semantic_settings`).
+pub const PackageLintSemanticEntry = struct {
+    /// Owned sorted `StringId` slice backing `settings.allowed_ident_names`.
+    owned_idents: []mem_foundation.StringId = &.{},
+    /// Owned sorted `u21` slice backing `settings.allowed_confusables`.
+    owned_confusables: []u21 = &.{},
+    /// Active semantic lint parameters (`DR-25` §3.1).
+    settings: lint_filter.LintSettings = .{},
+    /// Precomputed 128-bit semantic settings digest.
+    semantic_fingerprint: Fingerprint128 = .ZERO,
+
+    /// Releases owned `allowed_ident_names` and `allowed_confusables` slices.
+    pub fn deinit(self: *PackageLintSemanticEntry, allocator: std.mem.Allocator) void {
+        if (self.owned_idents.len > 0) allocator.free(self.owned_idents);
+        if (self.owned_confusables.len > 0) allocator.free(self.owned_confusables);
+        self.* = undefined;
+    }
+};
+
+/// Owned per-`PackageId` `[lint]` filter configuration (`QueryStage.lint_disabled_matrix`).
+pub const PackageLintFilterEntry = struct {
+    /// Package root directory prefix for computing package-relative POSIX file paths (`""` when unset).
+    pkg_root_dir: []u8 = &.{},
+    /// Arena owning deep-cloned `CompiledGlob64` NFAs and `LintOverride` slices.
+    arena: mem_foundation.BumpArena,
+    /// Validated `[lint]` filter configuration (`disable_mask`, `exclude`, `overrides`).
+    config: pkg_manifest.LintConfig = .{},
+    /// Precomputed 64-bit matrix fingerprint over `(config, pkg_root_dir)`.
+    matrix_fingerprint: u64 = 0,
+
+    /// Releases owned `pkg_root_dir` and `arena` storage.
+    pub fn deinit(self: *PackageLintFilterEntry, allocator: std.mem.Allocator) void {
+        if (self.pkg_root_dir.len > 0) allocator.free(self.pkg_root_dir);
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 /// Directed intra-package `mod <name>;` parent-to-child file edge maintained for $O(V + E)$ subtree traversal.
 pub const ModLink = struct {
     /// Parent module `FileId` containing `mod <name>;`.
@@ -1054,7 +1175,7 @@ pub const ModuleCompileOptions = struct {
 
 /// Telemetry counters tracking per-stage query executions, Early Cutoffs, and fast-path hits.
 pub const QueryTelemetry = struct {
-    /// Number of times each `QueryStage` (`0..13`) executed its compute function.
+    /// Number of times each `QueryStage` (`0..17`) executed its compute function.
     stage_executions: [STAGE_COUNT]u64 = @splat(0),
     /// Number of times `maybeChangedAfter` verified a memo on the Green Path without re-execution.
     green_hits: u64 = 0,
@@ -1495,7 +1616,7 @@ pub const CImportCache = struct {
 
 // --------------------------------------- CONSTS ----------------------------------------
 
-/// Total number of `QueryStage` variants in the canonical pipeline (`14`).
+/// Total number of `QueryStage` variants in the canonical pipeline (`18`).
 pub const STAGE_COUNT: usize = @typeInfo(QueryStage).@"enum".field_names.len;
 /// Total number of `Durability` tiers (`3`: `.low`, `.medium`, `.high`).
 pub const DURABILITY_COUNT: usize = @typeInfo(Durability).@"enum".field_names.len;
@@ -1556,6 +1677,13 @@ inline fn getTokenLexeme(
 /// Returns `true` if `kind` is an identifier token (`.ident`, `.type_ident`, or `.const_ident`).
 inline fn isIdentifierTokenKind(kind: TokenKind) bool {
     return kind == .ident or kind == .type_ident or kind == .const_ident;
+}
+
+/// Packs `(owner_def_id, member_ordinal, name)` into a revision-invariant 64-bit `impl`-method SAST summary key.
+inline fn packOwnerMethodSummaryKey(owner_def_id: DefId, sym_rec: symbol_resolver.SymbolRecord) u64 {
+    const low_bits: u64 = @as(u64, sym_rec.name.asInt() & 0x00FF_FFFF) |
+        (@as(u64, sym_rec.member_ordinal & 0xFF) << 24);
+    return (@as(u64, owner_def_id.asInt()) << 32) | low_bits;
 }
 
 // ---------- Position-Independent Structural Hashers -----------
@@ -4406,6 +4534,8 @@ pub const CompilerDb = struct {
     sast_summaries: std.AutoHashMapUnmanaged(u32, mir_sast.FnRegionSummary) = .empty,
     /// Stage 9 per-symbol `FnRegionSummary` records (including `impl` methods) keyed by `SymbolIndex.asInt()`.
     sast_sym_summaries: std.AutoHashMapUnmanaged(u32, mir_sast.FnRegionSummary) = .empty,
+    /// Stage 9 revision-invariant `impl` method summaries keyed by `packOwnerMethodSummaryKey(owner_def_id, sym)`.
+    sast_owner_method_summaries: std.AutoHashMapUnmanaged(u64, mir_sast.FnRegionSummary) = .empty,
     /// Canonical deduplicated `InternPool` (`TypeArena`) shared across queries.
     type_pool: InternPool,
     /// Unified lexical and module `SymbolTable` shared across queries.
@@ -4526,6 +4656,20 @@ pub const CompilerDb = struct {
     type_canon_hashes: std.ArrayListUnmanaged(Fingerprint128) = .empty,
     /// Cross-`DefId` cache of store-independent scalar `const` evaluations keyed by `SymbolIndex.asInt()`.
     cached_scalar_consts: std.AutoHashMapUnmanaged(u32, hir.ComptimeValue) = .empty,
+    /// Stage 14 per-`PackageId` `[lint.settings]` semantic parameters (`DR-25` §3.2).
+    package_lint_semantics: std.AutoHashMapUnmanaged(PackageId, PackageLintSemanticEntry) = .empty,
+    /// Stage 16 per-`PackageId` `[lint]` `disable`/`exclude`/`overrides` filters (`DR-25` §3.2).
+    package_lint_filters: std.AutoHashMapUnmanaged(PackageId, PackageLintFilterEntry) = .empty,
+    /// Active CLI `--only` and `--disable` selector filter (`DR-25` §3.3).
+    cli_lint_filter: lint_filter.CliLintFilter = .{},
+    /// Explicit CLI target `FileId`s enabling lint emission on targeted `PackageId.std_core` files.
+    explicit_lint_target_files: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Monotonic epoch incremented when `explicit_lint_target_files` mutates.
+    explicit_lint_targets_epoch: u64 = 0,
+    /// Stage 15 memoized Four-Scope `SuppressionTable`s keyed by `FileId.asInt()`.
+    suppression_tables: std.AutoHashMapUnmanaged(u32, lint_filter.SuppressionTable) = .empty,
+    /// Stage 17 leaf projected `DiagnosticSink`s keyed by `FileId.asInt()`.
+    projected_file_diagnostics: std.AutoHashMapUnmanaged(u32, DiagnosticSink) = .empty,
 
     /// Initializes a new `CompilerDb` instance bound to `allocator`.
     pub fn init(allocator: std.mem.Allocator) !CompilerDb {
@@ -4577,6 +4721,10 @@ pub const CompilerDb = struct {
             st_ptr.deinit();
         }
         self.file_side_tables.deinit(self.allocator);
+        var sync_iter = self.file_sig_sync_states.valueIterator();
+        while (sync_iter.next()) |sync_ptr| {
+            sync_ptr.deinit(self.allocator);
+        }
         self.file_sig_sync_states.deinit(self.allocator);
 
         var def_st_iter = self.def_side_tables.valueIterator();
@@ -4659,6 +4807,31 @@ pub const CompilerDb = struct {
         }
         self.opt_diagnostics.deinit(self.allocator);
 
+        var sup_iter = self.suppression_tables.valueIterator();
+        while (sup_iter.next()) |sup_ptr| {
+            sup_ptr.deinit(self.allocator);
+        }
+        self.suppression_tables.deinit(self.allocator);
+
+        var proj_diag_iter = self.projected_file_diagnostics.valueIterator();
+        while (proj_diag_iter.next()) |sink_ptr| {
+            sink_ptr.deinit();
+        }
+        self.projected_file_diagnostics.deinit(self.allocator);
+
+        var lint_sem_iter = self.package_lint_semantics.valueIterator();
+        while (lint_sem_iter.next()) |sem_ptr| {
+            sem_ptr.deinit(self.allocator);
+        }
+        self.package_lint_semantics.deinit(self.allocator);
+
+        var lint_flt_iter = self.package_lint_filters.valueIterator();
+        while (lint_flt_iter.next()) |flt_ptr| {
+            flt_ptr.deinit(self.allocator);
+        }
+        self.package_lint_filters.deinit(self.allocator);
+        self.explicit_lint_target_files.deinit(self.allocator);
+
         self.c_import_cache.deinit(self.allocator);
         for (self.c_import_defines.items) |owned_def| self.allocator.free(owned_def);
         self.c_import_defines.deinit(self.allocator);
@@ -4692,6 +4865,7 @@ pub const CompilerDb = struct {
         self.sast_results.deinit(self.allocator);
         self.sast_summaries.deinit(self.allocator);
         self.sast_sym_summaries.deinit(self.allocator);
+        self.sast_owner_method_summaries.deinit(self.allocator);
         var child_mods_it = self.parent_to_child_mods.valueIterator();
         while (child_mods_it.next()) |link_list_ptr| {
             link_list_ptr.deinit(self.allocator);
@@ -5272,9 +5446,17 @@ pub const CompilerDb = struct {
                 }
                 return FileId.fromInt(key.entity_index);
             },
-            .parse_cst, .lower_ast, .item_tree, .resolve_signatures, .optimize_mir_module => {
+            .parse_cst,
+            .lower_ast,
+            .item_tree,
+            .resolve_signatures,
+            .optimize_mir_module,
+            .suppression_table,
+            .project_file_diagnostics,
+            => {
                 return FileId.fromInt(key.entity_index);
             },
+            .lint_semantic_settings, .lint_disabled_matrix => null,
             .item_tree_sig_proj,
             .body_ast_proj,
             .def_signature,
@@ -5363,10 +5545,21 @@ pub const CompilerDb = struct {
             var side_val = removed_kv.value;
             side_val.deinit();
         }
-        _ = self.file_sig_sync_states.remove(fid_raw);
+        if (self.file_sig_sync_states.fetchRemove(fid_raw)) |removed_kv| {
+            var sync_val = removed_kv.value;
+            sync_val.deinit(self.allocator);
+        }
         if (self.sig_diagnostics.fetchRemove(fid_raw)) |removed_kv| {
             var sink_val = removed_kv.value;
             sink_val.deinit();
+        }
+        if (self.suppression_tables.fetchRemove(fid_raw)) |removed_kv| {
+            var sup_val = removed_kv.value;
+            sup_val.deinit(self.allocator);
+        }
+        if (self.projected_file_diagnostics.fetchRemove(fid_raw)) |removed_kv| {
+            var proj_val = removed_kv.value;
+            proj_val.deinit();
         }
         _ = self.symbol_table.file_module_scopes.remove(fid_raw);
 
@@ -7591,6 +7784,284 @@ pub const CompilerDb = struct {
         return self.optimized_mir_modules.getPtr(key.asU64()) orelse error.MissingSourceInput;
     }
 
+    // ---------- Stage 14-17 Lint Policy & Projection API ----------
+
+    /// Bumps `current_revision` across all durability tiers after a lint policy mutation.
+    fn bumpLintPolicyRevision(self: *CompilerDb) void {
+        self.current_revision = self.current_revision.next();
+        var tier_idx: usize = 0;
+        while (tier_idx < DURABILITY_COUNT) : (tier_idx += 1) {
+            self.last_changed_by_durability[tier_idx] = self.current_revision;
+        }
+    }
+
+    /// Deep-clones `glob` into `arena` and re-interns `pattern_id` into `self.interner`.
+    fn cloneCompiledGlobIntoArena(
+        self: *CompilerDb,
+        arena: *mem_foundation.BumpArena,
+        glob: pkg_manifest.CompiledGlob64,
+        src_interner: *const StringInterner,
+    ) !pkg_manifest.CompiledGlob64 {
+        const pat_id = try self.interner.intern(src_interner.get(glob.pattern_id));
+        const cloned_subs = try arena.allocSlice(pkg_manifest.SubNfa64, glob.sub_nfas.len);
+        for (glob.sub_nfas, 0..) |sub, i| {
+            cloned_subs[i] = .{
+                .num_states = sub.num_states,
+                .valid_state_mask = sub.valid_state_mask,
+                .initial_mask = sub.initial_mask,
+                .accept_bit = sub.accept_bit,
+                .self_loop_mask = sub.self_loop_mask,
+                .advance_mask = sub.advance_mask,
+                .char_classes = try arena.dupe([4]u64, sub.char_classes),
+                .eps_closure = try arena.dupe(u64, sub.eps_closure),
+            };
+        }
+        return .{
+            .pattern_id = pat_id,
+            .sub_nfas = cloned_subs,
+        };
+    }
+
+    /// Installs `[lint.settings]` for `pkg_id` with 128-bit Early-Cutoff comparison (`DR-25` §3.2).
+    pub fn setPackageLintSemanticSettings(
+        self: *CompilerDb,
+        pkg_id: PackageId,
+        settings: lint_filter.LintSettings,
+        src_interner: ?*const StringInterner,
+    ) !void {
+        const ext_interner = src_interner orelse &self.interner;
+        const owned_idents = try self.allocator.alloc(mem_foundation.StringId, settings.allowed_ident_names.len);
+        errdefer if (owned_idents.len > 0) self.allocator.free(owned_idents);
+        for (settings.allowed_ident_names, 0..) |raw_id, i| {
+            owned_idents[i] = try self.interner.intern(ext_interner.get(raw_id));
+        }
+        const owned_confusables = try self.allocator.dupe(u21, settings.allowed_confusables);
+        errdefer if (owned_confusables.len > 0) self.allocator.free(owned_confusables);
+
+        var normalized = settings;
+        normalized.allowed_ident_names = owned_idents;
+        normalized.allowed_confusables = owned_confusables;
+        const raw_digest = normalized.computeSemanticFingerprint(&self.interner);
+        const new_fp: Fingerprint128 = .{ .low = raw_digest.low, .high = raw_digest.high };
+
+        const prev_fp: Fingerprint128 = if (self.package_lint_semantics.get(pkg_id)) |existing|
+            existing.semantic_fingerprint
+        else blk_def: {
+            const def_digest = (lint_filter.LintSettings{}).computeSemanticFingerprint(&self.interner);
+            break :blk_def .{ .low = def_digest.low, .high = def_digest.high };
+        };
+
+        if (try self.package_lint_semantics.fetchPut(self.allocator, pkg_id, .{
+            .owned_idents = owned_idents,
+            .owned_confusables = owned_confusables,
+            .settings = normalized,
+            .semantic_fingerprint = new_fp,
+        })) |prev_kv| {
+            var old_entry = prev_kv.value;
+            old_entry.deinit(self.allocator);
+        }
+
+        if (!Fingerprint128.eql(prev_fp, new_fp)) {
+            self.bumpLintPolicyRevision();
+            const sem_key = QueryKey.forPackage(.lint_semantic_settings, pkg_id);
+            if (self.memos.getPtr(sem_key.asU64())) |memo_ptr| {
+                memo_ptr.output_fingerprint = new_fp;
+                memo_ptr.changed_at = self.current_revision;
+                memo_ptr.verified_at = self.current_revision;
+            }
+            self.invalidateTransientCaches();
+        }
+    }
+
+    /// Installs `[lint]` `disable` / `exclude` / `[[lint.overrides]]` for `pkg_id` without invalidating Stage 1–9 memos.
+    pub fn setPackageLintFilterConfig(
+        self: *CompilerDb,
+        pkg_id: PackageId,
+        pkg_root_dir: []const u8,
+        config: pkg_manifest.LintConfig,
+        src_interner: ?*const StringInterner,
+    ) !void {
+        const ext_interner = src_interner orelse &self.interner;
+        var clone_arena = mem_foundation.BumpArena.init(self.allocator);
+        errdefer clone_arena.deinit();
+
+        const cloned_exclude = try clone_arena.allocSlice(pkg_manifest.CompiledGlob64, config.exclude.len);
+        for (config.exclude, 0..) |glob_item, i| {
+            cloned_exclude[i] = try self.cloneCompiledGlobIntoArena(&clone_arena, glob_item, ext_interner);
+        }
+        const cloned_overrides = try clone_arena.allocSlice(pkg_manifest.LintOverride, config.overrides.len);
+        for (config.overrides, 0..) |ov_item, ov_i| {
+            const ov_files = try clone_arena.allocSlice(pkg_manifest.CompiledGlob64, ov_item.files.len);
+            for (ov_item.files, 0..) |inc_glob, j| {
+                ov_files[j] = try self.cloneCompiledGlobIntoArena(&clone_arena, inc_glob, ext_interner);
+            }
+            const ov_excl = try clone_arena.allocSlice(pkg_manifest.CompiledGlob64, ov_item.exclude_files.len);
+            for (ov_item.exclude_files, 0..) |exc_glob, j| {
+                ov_excl[j] = try self.cloneCompiledGlobIntoArena(&clone_arena, exc_glob, ext_interner);
+            }
+            cloned_overrides[ov_i] = .{
+                .files = ov_files,
+                .exclude_files = ov_excl,
+                .disable_mask = ov_item.disable_mask,
+            };
+        }
+
+        const cloned_cfg: pkg_manifest.LintConfig = .{
+            .inherit = config.inherit,
+            .has_explicit_inherit = config.has_explicit_inherit,
+            .disable_mask = config.disable_mask,
+            .exclude = cloned_exclude,
+            .overrides = cloned_overrides,
+        };
+        const owned_root = try self.allocator.dupe(u8, pkg_root_dir);
+        errdefer if (owned_root.len > 0) self.allocator.free(owned_root);
+
+        var mat_hasher = std.hash.Wyhash.init(0xD250_0016_CAFE_BEEF);
+        const cfg_fp = cloned_cfg.computeDisabledMatrixFingerprint(&self.interner);
+        mat_hasher.update(std.mem.asBytes(&cfg_fp));
+        mat_hasher.update(owned_root);
+        const new_mat_fp = mat_hasher.final();
+
+        const prev_mat_fp: ?u64 = if (self.package_lint_filters.get(pkg_id)) |existing|
+            existing.matrix_fingerprint
+        else
+            null;
+
+        if (try self.package_lint_filters.fetchPut(self.allocator, pkg_id, .{
+            .pkg_root_dir = owned_root,
+            .arena = clone_arena,
+            .config = cloned_cfg,
+            .matrix_fingerprint = new_mat_fp,
+        })) |prev_kv| {
+            var old_entry = prev_kv.value;
+            old_entry.deinit(self.allocator);
+        }
+
+        if (prev_mat_fp == null or prev_mat_fp.? != new_mat_fp) {
+            self.bumpLintPolicyRevision();
+            const mat_key = QueryKey.forPackage(.lint_disabled_matrix, pkg_id);
+            if (self.memos.getPtr(mat_key.asU64())) |memo_ptr| {
+                memo_ptr.output_fingerprint = self.computeLintDisabledMatrixFingerprint(pkg_id);
+                memo_ptr.changed_at = self.current_revision;
+                memo_ptr.verified_at = self.current_revision;
+            }
+        }
+    }
+
+    /// Updates the CLI `--only` / `--disable` filter and invalidates leaf `.lint_disabled_matrix` memos on change.
+    pub fn setCliLintFilter(self: *CompilerDb, filter: lint_filter.CliLintFilter) void {
+        if (self.cli_lint_filter.has_only == filter.has_only and
+            self.cli_lint_filter.only_mask == filter.only_mask and
+            self.cli_lint_filter.disable_mask == filter.disable_mask)
+        {
+            return;
+        }
+        self.cli_lint_filter = filter;
+        self.bumpLintPolicyRevision();
+        var memo_iter = self.memos.iterator();
+        while (memo_iter.next()) |kv| {
+            const unpacked = unpackQueryKeyU64(kv.key_ptr.*);
+            if (unpacked.stage == .lint_disabled_matrix) {
+                const pkg_id = PackageId.fromInt(@intCast(unpacked.entity_index));
+                kv.value_ptr.output_fingerprint = self.computeLintDisabledMatrixFingerprint(pkg_id);
+                kv.value_ptr.changed_at = self.current_revision;
+                kv.value_ptr.verified_at = self.current_revision;
+            }
+        }
+    }
+
+    /// Registers explicit CLI target `FileId`s so targeted `core/` or `stdlib/` files emit lint diagnostics.
+    pub fn setExplicitLintTargetFiles(self: *CompilerDb, target_files: []const FileId) !void {
+        self.explicit_lint_target_files.clearRetainingCapacity();
+        for (target_files) |fid| {
+            if (!fid.isNone()) {
+                try self.explicit_lint_target_files.put(self.allocator, fid.asInt(), {});
+            }
+        }
+        self.explicit_lint_targets_epoch +%= 1;
+        self.bumpLintPolicyRevision();
+        self.bumpConfigInput(CONFIG_KEY_INTERNAL_CORE);
+        var memo_iter = self.memos.iterator();
+        while (memo_iter.next()) |kv| {
+            const unpacked = unpackQueryKeyU64(kv.key_ptr.*);
+            if (unpacked.stage == .lint_disabled_matrix) {
+                const pkg_id = PackageId.fromInt(@intCast(unpacked.entity_index));
+                kv.value_ptr.output_fingerprint = self.computeLintDisabledMatrixFingerprint(pkg_id);
+                kv.value_ptr.changed_at = self.current_revision;
+                kv.value_ptr.verified_at = self.current_revision;
+            }
+        }
+    }
+
+    /// Returns `true` if `file_id` should emit lint warnings (`W0xxx` with `RuleId`) during projection.
+    pub fn isLintTargetFile(self: *const CompilerDb, file_id: FileId) bool {
+        if (file_id.isNone()) return false;
+        if (self.explicit_lint_target_files.contains(file_id.asInt())) return true;
+        const pkg_id = self.symbol_table.getFilePackageId(file_id);
+        if (pkg_id == .root) return true;
+        if (pkg_id == .std_core) {
+            if (!self.is_internal_core) return false;
+            if (self.source_inputs.get(file_id.asInt())) |inp| {
+                return inp.durability != .high;
+            }
+            return false;
+        }
+        if (self.package_lint_filters.contains(pkg_id)) return true;
+        if (self.source_inputs.get(file_id.asInt())) |inp| {
+            return inp.durability != .high;
+        }
+        return false;
+    }
+
+    /// Stage 14: Fetches `[lint.settings]` for `pkg_id`, recording a dependency edge on `.lint_semantic_settings`.
+    pub fn getLintSemanticSettings(
+        self: *CompilerDb,
+        pkg_id: PackageId,
+    ) QueryError!lint_filter.LintSettings {
+        _ = try self.fetchQuery(QueryKey.forPackage(.lint_semantic_settings, pkg_id));
+        if (self.package_lint_semantics.get(pkg_id)) |entry| {
+            return entry.settings;
+        }
+        return .{};
+    }
+
+    /// Stage 15: Fetches or builds the Four-Scope `SuppressionTable` for `file_id` (`DR-25` §4.2).
+    pub fn suppressionTable(
+        self: *CompilerDb,
+        file_id: FileId,
+    ) QueryError!*const lint_filter.SuppressionTable {
+        _ = try self.fetchQuery(QueryKey.forFile(.suppression_table, file_id));
+        return self.suppression_tables.getPtr(file_id.asInt()) orelse error.MissingSourceInput;
+    }
+
+    /// Stage 16 projection: resolves the 8-byte `EffectiveFileRules` for `file_id`, recording `.lint_disabled_matrix`.
+    pub fn effectiveFileRules(
+        self: *CompilerDb,
+        file_id: FileId,
+    ) QueryError!lint_filter.EffectiveFileRules {
+        const pkg_id = self.symbol_table.getFilePackageId(file_id);
+        _ = try self.fetchQuery(QueryKey.forPackage(.lint_disabled_matrix, pkg_id));
+        if (self.package_lint_filters.get(pkg_id)) |flt_entry| {
+            var norm_buf: [1024]u8 = undefined;
+            const rel_path = self.resolvePackageRelativeLintPath(file_id, flt_entry.pkg_root_dir, &norm_buf);
+            return .{
+                .disabled_mask = flt_entry.config.resolveFileDisabledMask(rel_path, self.cli_lint_filter),
+            };
+        }
+        return .{
+            .disabled_mask = self.cli_lint_filter.applyToDisabledMask(0),
+        };
+    }
+
+    /// Stage 17: Projects the filtered, deduplicated, and span-rebased `DiagnosticSink` for `file_id`.
+    pub fn projectFileDiagnostics(
+        self: *CompilerDb,
+        file_id: FileId,
+    ) QueryError!*const DiagnosticSink {
+        _ = try self.fetchQuery(QueryKey.forFile(.project_file_diagnostics, file_id));
+        return self.projected_file_diagnostics.getPtr(file_id.asInt()) orelse error.MissingSourceInput;
+    }
+
     /// Appends `file_id` and its transitive `external_mod_files` children into `out_files` in dependency-first order.
     fn appendModuleSubtreePostOrder(
         self: *CompilerDb,
@@ -8466,8 +8937,12 @@ pub const CompilerDb = struct {
     ) QueryError!bool {
         try self.unwindIfCanceled();
 
-        if (self.in_flight_keys.contains(key.asU64())) {
-            // An ancestor frame is actively recomputing `key`, so prior memos depending on `key` must take the Red Path:
+        if (self.in_flight_keys.contains(key.asU64()) or
+            (key.stage == .verify_sast_mir and (key.flags & SAST_SUMMARY_PROJ_FLAG) != 0 and
+                self.in_flight_keys.contains(QueryKey.forDef(.verify_sast_mir, DefId.fromInt(key.entity_index)).asU64())))
+        {
+            // An ancestor frame is actively recomputing `key` (or its backing `.verify_sast_mir` def),
+            // so prior memos depending on `key` must take the Red Path:
             return true;
         }
 
@@ -8484,9 +8959,9 @@ pub const CompilerDb = struct {
             return true;
         };
 
-        // [1] Input queries (`.source_text`, synthetic config keys, and `@embed_bytes` file keys):
-        if (key.stage == .source_text) {
-            if ((key.flags & EMBED_FILE_KEY_FLAG) != 0) {
+        // [1] Input queries (`.source_text`, `.lint_semantic_settings`, `.lint_disabled_matrix`, and `@embed_bytes`):
+        if (key.stage == .source_text or key.stage == .lint_semantic_settings or key.stage == .lint_disabled_matrix) {
+            if (key.stage == .source_text and (key.flags & EMBED_FILE_KEY_FLAG) != 0) {
                 if (memo_snapshot.verified_at != self.current_revision) {
                     const live_fp = self.probeEmbeddedFileFingerprint(SymbolId.fromInt(key.entity_index));
                     var effective_changed_at = memo_snapshot.changed_at;
@@ -8565,6 +9040,11 @@ pub const CompilerDb = struct {
 
         // [5] Red Path: a dependency changed after `last_verified`, so re-execute and check Early Cutoff:
         if (has_changed_dep) {
+            if (self.memos.get(key.asU64())) |fresh_memo| {
+                if (fresh_memo.verified_at == self.current_revision) {
+                    return fresh_memo.changed_at.isAfter(after_revision);
+                }
+            }
             const updated_memo = try self.executeAndBackdate(key);
             return updated_memo.changed_at.isAfter(after_revision);
         }
@@ -8784,12 +9264,21 @@ pub const CompilerDb = struct {
                 FileId.fromInt(key.entity_index),
                 (key.flags & 1) != 0,
             ),
+            .lint_semantic_settings => self.computeLintSemanticSettings(
+                PackageId.fromInt(@intCast(key.entity_index)),
+            ),
+            .suppression_table => self.computeSuppressionTable(FileId.fromInt(key.entity_index)),
+            .lint_disabled_matrix => self.computeLintDisabledMatrix(
+                PackageId.fromInt(@intCast(key.entity_index)),
+            ),
+            .project_file_diagnostics => self.computeProjectFileDiagnostics(FileId.fromInt(key.entity_index)),
         };
     }
 
     /// Stage 1 implementation: tokenizes and parses `file_id` into `parsed_artifacts`.
     fn computeParseCst(self: *CompilerDb, file_id: FileId) QueryError!Fingerprint128 {
         const source = try self.getSourceText(file_id);
+        const settings = try self.getLintSemanticSettings(self.symbol_table.getFilePackageId(file_id));
         try self.unwindIfCanceled();
 
         const src_fp = if (self.source_inputs.get(file_id.asInt())) |inp|
@@ -8808,6 +9297,11 @@ pub const CompilerDb = struct {
         };
 
         const parsed_ptr = gop.value_ptr;
+        const parse_opts = parser.ParserOptions{
+            .lint_settings = settings,
+            .raw_lint_candidates_out = &parsed_ptr.raw_lint_candidates,
+            .is_c_import_virtual = file_id.asInt() >= VIRTUAL_C_IMPORT_FILE_ID_BASE,
+        };
         const is_incremental_reparse_eligible = gop.found_existing and
             !parsed_ptr.has_parse_errors and
             pending_opt != null and
@@ -8818,7 +9312,7 @@ pub const CompilerDb = struct {
         if (is_incremental_reparse_eligible) {
             parsed_ptr.clearDiagnosticsOnly();
             errdefer parsed_ptr.resetForReparse();
-            const inc_stats = parser.reparseIncremental(
+            const inc_stats = parser.reparseIncrementalWithOptions(
                 source,
                 file_id,
                 pending_opt.?.value.range,
@@ -8827,6 +9321,7 @@ pub const CompilerDb = struct {
                 &parsed_ptr.ast_arena,
                 &parsed_ptr.diagnostics,
                 &self.interner,
+                parse_opts,
             ) catch return error.OutOfMemory;
             if (inc_stats.is_fast_splice) {
                 self.telemetry.incremental_reparse_fast_splices += 1;
@@ -8836,7 +9331,7 @@ pub const CompilerDb = struct {
             if (gop.found_existing) {
                 parsed_ptr.resetForReparse();
             }
-            root_node = parser.parseSource(
+            root_node = parser.parseSourceWithOptions(
                 source,
                 file_id,
                 &parsed_ptr.token_buffer,
@@ -8844,6 +9339,7 @@ pub const CompilerDb = struct {
                 &parsed_ptr.ast_arena,
                 &parsed_ptr.diagnostics,
                 &self.interner,
+                parse_opts,
             ) catch return error.OutOfMemory;
         }
 
@@ -9812,6 +10308,8 @@ pub const CompilerDb = struct {
             target_fid.asInt(),
         );
         _ = self.symbol_table.file_module_scopes.remove(target_fid.asInt());
+        self.symbol_table.clearFileOwnerDefMembers(target_fid);
+        self.symbol_table.purgeFileMembersFromPrimInherentScopes(target_fid) catch return error.OutOfMemory;
 
         const sym_start: u32 = self.symbol_table.countSymbols();
         // Preserve `< sym_start` entries in `deprecated_symbols` and `symbol_allow_masks`; backdated `def_signatures`
@@ -9872,8 +10370,34 @@ pub const CompilerDb = struct {
         }
 
         if (!mod_scope.isNone()) {
+            for (self.symbol_table.prim_inherent_scopes) |prim_sc| {
+                if (!prim_sc.isNone() and prim_sc.asInt() < self.symbol_table.scope_arena.countScopes()) {
+                    const p_rec = self.symbol_table.scope_arena.getScope(prim_sc);
+                    if (p_rec.file_id == target_fid) {
+                        self.symbol_table.scope_arena.scopes.items(.parent)[prim_sc.asInt()] = mod_scope;
+                        self.symbol_table.scope_arena.scopes.items(.enclosing_module)[prim_sc.asInt()] = mod_scope;
+                    }
+                }
+            }
             if (self.package_root_files.get(pkg_id) == target_fid) {
                 try self.symbol_table.setPackageRootScope(pkg_id, mod_scope);
+            }
+            if (!self.cx_stdlib_root_fid.isNone() and target_fid == self.cx_stdlib_root_fid) {
+                self.symbol_table.syncCxPreludeScope(&self.interner, mod_scope) catch return error.OutOfMemory;
+            } else if (pkg_id == .std_core and self.symbol_table.isCoreKernelFile(target_fid)) {
+                if (self.interner.lookup("core")) |core_sym_id| {
+                    if (self.root_module_files.get(core_sym_id.asInt()) == target_fid) {
+                        try self.symbol_table.named_module_scopes.put(self.allocator, core_sym_id.asInt(), mod_scope);
+                        const ex_core = self.symbol_table.lookupInScopeDirect(
+                            self.symbol_table.prelude_scope,
+                            core_sym_id,
+                            symbol_resolver.NamespaceMask.VALUE_ONLY,
+                        );
+                        if (!ex_core.isNone()) {
+                            self.symbol_table.getSymbolMut(ex_core).target_scope = mod_scope;
+                        }
+                    }
+                }
             }
         }
 
@@ -9922,27 +10446,117 @@ pub const CompilerDb = struct {
             }
         }
 
+        var needs_subtree_recollect = false;
         for (subtree_files.items) |member_fid| {
-            if (member_fid == caller_fid and is_skipping_caller_pass1) {
-                continue;
-            } else if (member_fid != caller_fid and
-                !self.in_flight_keys.contains(QueryKey.forFile(.item_tree, member_fid).asU64()))
-            {
+            var has_matching_pass1 = false;
+            const has_current_rev_pass1 = if (self.file_pass1_states.get(member_fid.asInt())) |p1_cur|
+                (!p1_cur.mod_scope.isNone() and p1_cur.created_revision == self.current_revision)
+            else
+                false;
+            if (!self.in_flight_keys.contains(QueryKey.forFile(.item_tree, member_fid).asU64())) {
                 const member_tree = try self.extractItemTree(member_fid);
-                hasher.updateFingerprint(member_tree.tree_fingerprint);
+                if (member_fid != caller_fid) {
+                    hasher.updateFingerprint(member_tree.tree_fingerprint);
+                }
                 if (self.file_pass1_states.get(member_fid.asInt())) |existing_p1| {
                     if (!existing_p1.mod_scope.isNone() and
                         Fingerprint128.eql(existing_p1.tree_fingerprint, member_tree.tree_fingerprint) and
                         self.symbol_table.file_module_scopes.get(member_fid.asInt()) == existing_p1.mod_scope)
                     {
+                        has_matching_pass1 = true;
                         if (self.package_root_files.get(pkg_id) == member_fid) {
                             try self.symbol_table.setPackageRootScope(pkg_id, existing_p1.mod_scope);
                         }
-                        continue;
+                    }
+                }
+            } else if (member_fid == caller_fid and is_skipping_caller_pass1) {
+                has_matching_pass1 = true;
+            }
+            if (!has_matching_pass1 or
+                (member_fid == caller_fid and !is_skipping_caller_pass1 and !has_current_rev_pass1))
+            {
+                needs_subtree_recollect = true;
+            }
+        }
+
+        if (needs_subtree_recollect) {
+            for (subtree_files.items) |member_fid| {
+                const already_collected_in_rev = if (self.file_pass1_states.get(member_fid.asInt())) |p1_prev|
+                    (!p1_prev.mod_scope.isNone() and p1_prev.created_revision == self.current_revision)
+                else
+                    false;
+                if (already_collected_in_rev) continue;
+                _ = try self.ensureFilePass1Collected(member_fid, pkg_id);
+                _ = self.resolved_signatures.remove(member_fid.asInt());
+                const sig_qkey = QueryKey.forFile(.resolve_signatures, member_fid).asU64();
+                if (!self.in_flight_keys.contains(sig_qkey)) {
+                    if (self.memos.getPtr(sig_qkey)) |memo_ptr| {
+                        memo_ptr.has_overflowed_deps = true;
+                        memo_ptr.verified_at = .initial;
+                        memo_ptr.output_fingerprint.low ^= 1;
+                    }
+                }
+                const proj_qkey = QueryKey.forFile(.project_file_diagnostics, member_fid).asU64();
+                if (!self.in_flight_keys.contains(proj_qkey)) {
+                    if (self.memos.getPtr(proj_qkey)) |memo_ptr| {
+                        memo_ptr.has_overflowed_deps = true;
+                        memo_ptr.verified_at = .initial;
+                        memo_ptr.output_fingerprint.low ^= 1;
+                    }
+                }
+                if (self.item_trees.getPtr(member_fid.asInt())) |mtree| {
+                    for (mtree.entries) |mentry| {
+                        if (mentry.def_id.isNone()) continue;
+                        const def_raw = mentry.def_id.asInt();
+                        for ([_]QueryStage{
+                            .def_signature,
+                            .typecheck_body,
+                            .verify_sast_mir,
+                            .lower_def_hir,
+                            .build_def_mir,
+                        }) |st| {
+                            const def_qkey = QueryKey.forDef(st, mentry.def_id).asU64();
+                            if (!self.in_flight_keys.contains(def_qkey)) {
+                                if (self.memos.getPtr(def_qkey)) |memo_ptr| {
+                                    memo_ptr.has_overflowed_deps = true;
+                                    memo_ptr.verified_at = .initial;
+                                    memo_ptr.output_fingerprint.low ^= 1;
+                                }
+                            }
+                        }
+                        const sast_proj_qkey = QueryKey.forSastSummaryProj(mentry.def_id).asU64();
+                        if (!self.in_flight_keys.contains(sast_proj_qkey)) {
+                            if (self.memos.getPtr(sast_proj_qkey)) |memo_ptr| {
+                                memo_ptr.has_overflowed_deps = true;
+                                memo_ptr.verified_at = .initial;
+                                memo_ptr.output_fingerprint.low ^= 1;
+                            }
+                        }
+                        if (!self.in_flight_keys.contains(QueryKey.forDef(.typecheck_body, mentry.def_id).asU64())) {
+                            if (self.def_side_tables.fetchRemove(def_raw)) |removed_st| {
+                                var side_val = removed_st.value;
+                                side_val.deinit();
+                            }
+                        }
+                        if (!self.in_flight_keys.contains(QueryKey.forDef(.lower_def_hir, mentry.def_id).asU64())) {
+                            if (self.lowered_def_hirs.fetchRemove(def_raw)) |removed_hir| {
+                                var hir_val = removed_hir.value;
+                                hir_val.deinit();
+                            }
+                        }
+                        if (!self.in_flight_keys.contains(QueryKey.forDef(.build_def_mir, mentry.def_id).asU64())) {
+                            if (self.built_def_mirs.fetchRemove(def_raw)) |removed_mir| {
+                                var mir_val = removed_mir.value;
+                                mir_val.deinit();
+                            }
+                            if (self.comptime_elab_mirs.fetchRemove(def_raw)) |removed_elab| {
+                                var elab_val = removed_elab.value;
+                                elab_val.deinit();
+                            }
+                        }
                     }
                 }
             }
-            _ = try self.ensureFilePass1Collected(member_fid, pkg_id);
         }
 
         for (mod_links.items) |link| {
@@ -10078,7 +10692,7 @@ pub const CompilerDb = struct {
                         cached_scope,
                     );
                     if (!self.cx_stdlib_root_fid.isNone() and root_fid == self.cx_stdlib_root_fid) {
-                        self.symbol_table.cx_prelude_scope = cached_scope;
+                        self.symbol_table.syncCxPreludeScope(&self.interner, cached_scope) catch return error.OutOfMemory;
                     }
                 }
                 continue;
@@ -10097,7 +10711,8 @@ pub const CompilerDb = struct {
                         root_sigs.module_scope,
                     );
                     if (!self.cx_stdlib_root_fid.isNone() and root_fid == self.cx_stdlib_root_fid) {
-                        self.symbol_table.cx_prelude_scope = root_sigs.module_scope;
+                        self.symbol_table.syncCxPreludeScope(&self.interner, root_sigs.module_scope) catch
+                            return error.OutOfMemory;
                     }
                     if (self.symbol_table.getFilePackageId(root_fid) == .std_core and
                         (self.cx_stdlib_root_fid.isNone() or root_fid != self.cx_stdlib_root_fid))
@@ -10187,7 +10802,8 @@ pub const CompilerDb = struct {
                     if (!std_scope.isNone()) {
                         try self.symbol_table.named_module_scopes.put(self.allocator, std_sym_raw, std_scope);
                         if (!self.cx_stdlib_root_fid.isNone() and std_root_fid == self.cx_stdlib_root_fid) {
-                            self.symbol_table.cx_prelude_scope = std_scope;
+                            self.symbol_table.syncCxPreludeScope(&self.interner, std_scope) catch
+                                return error.OutOfMemory;
                         } else {
                             try self.symbol_table.setPackageRootScope(.std_core, std_scope);
                         }
@@ -10215,6 +10831,9 @@ pub const CompilerDb = struct {
                 }
             }
         }
+        if (is_eligible_for_sig_reuse and !self.resolved_signatures.contains(file_id.asInt())) {
+            is_eligible_for_sig_reuse = false;
+        }
 
         // Collect Pass-1 items for `file_id` BEFORE recursing into `mod` children (`super.` & `pkg.` visibility):
         var pass1_state = FilePass1State{ .created_revision = self.current_revision };
@@ -10228,9 +10847,8 @@ pub const CompilerDb = struct {
             }
             if (!pass1_state.mod_scope.isNone()) {
                 if (!self.cx_stdlib_root_fid.isNone() and file_id == self.cx_stdlib_root_fid) {
-                    self.symbol_table.cx_prelude_scope = pass1_state.mod_scope;
-                    const cx_sym = try self.interner.intern("cx");
-                    try self.symbol_table.named_module_scopes.put(self.allocator, cx_sym.asInt(), pass1_state.mod_scope);
+                    self.symbol_table.syncCxPreludeScope(&self.interner, pass1_state.mod_scope) catch
+                        return error.OutOfMemory;
                 } else if (caller_pkg == .std_core and self.symbol_table.lookupPackageRootScope(.std_core) == null) {
                     var has_parent_mod = false;
                     var p_it = self.external_mod_files.valueIterator();
@@ -10314,8 +10932,14 @@ pub const CompilerDb = struct {
                 if (self.file_pass1_states.getPtr(file_id.asInt())) |p1_mut| {
                     p1_mut.has_consumed_pass2 = true;
                 }
-                if (!pass1_state.mod_scope.isNone() and self.package_root_files.get(caller_pkg) == file_id) {
-                    try self.symbol_table.setPackageRootScope(caller_pkg, pass1_state.mod_scope);
+                if (!pass1_state.mod_scope.isNone()) {
+                    if (!self.cx_stdlib_root_fid.isNone() and file_id == self.cx_stdlib_root_fid) {
+                        self.symbol_table.syncCxPreludeScope(&self.interner, pass1_state.mod_scope) catch
+                            return error.OutOfMemory;
+                    }
+                    if (self.package_root_files.get(caller_pkg) == file_id) {
+                        try self.symbol_table.setPackageRootScope(caller_pkg, pass1_state.mod_scope);
+                    }
                 }
             }
         }
@@ -10543,17 +11167,35 @@ pub const CompilerDb = struct {
                     return error.OutOfMemory;
                 errdefer file_st.deinit();
                 file_st.ast_fingerprint = post_parsed_ptr.ast_fingerprint;
+
+                const sig_ast_nodes = collectFileNonBodyAstNodes(self.allocator, post_parsed_ptr) catch
+                    return error.OutOfMemory;
+                defer if (sig_ast_nodes.len > 0) self.allocator.free(sig_ast_nodes);
+                const saved_sig_entries = self.allocator.alloc(SavedSigAstEntry, sig_ast_nodes.len) catch
+                    return error.OutOfMemory;
+                errdefer if (saved_sig_entries.len > 0) self.allocator.free(saved_sig_entries);
+                for (sig_ast_nodes, 0..) |sig_ast_id, idx| {
+                    saved_sig_entries[idx] = .{
+                        .sym_idx = file_st.getNodeSymbol(sig_ast_id),
+                        .type_id = file_st.getNodeType(sig_ast_id),
+                    };
+                }
+
                 if (try self.file_side_tables.fetchPut(self.allocator, file_id.asInt(), file_st)) |prev_kv| {
                     var old_st = prev_kv.value;
                     old_st.deinit();
                 }
                 _ = sym_end;
                 self.type_canon_hashes.clearRetainingCapacity();
-                try self.file_sig_sync_states.put(self.allocator, file_id.asInt(), .{
+                if (try self.file_sig_sync_states.fetchPut(self.allocator, file_id.asInt(), .{
                     .sym_start = sym_start,
                     .sym_end = post_sig_sym_end,
                     .ast_fingerprint = post_parsed_ptr.ast_fingerprint,
-                });
+                    .sig_ast_entries = saved_sig_entries,
+                })) |prev_sync| {
+                    var old_sync = prev_sync.value;
+                    old_sync.deinit(self.allocator);
+                }
             }
         } else {
             for ((try self.extractItemTree(file_id)).entries) |entry| {
@@ -10737,13 +11379,146 @@ pub const CompilerDb = struct {
         }
     }
 
-    /// Synchronizes `.fn_sym` AST/CST handles and default-argument side tables after Early Cutoff (`SE-07`).
+    /// Collects all unique `NodeIndex`s mapped from non-body CST nodes in deterministic pre-order.
+    fn collectFileNonBodyAstNodes(
+        allocator: std.mem.Allocator,
+        parsed_ptr: *const ParsedCstArtifact,
+    ) ![]NodeIndex {
+        const cst_total = parsed_ptr.cst_arena.countNodes();
+        const ast_total = parsed_ptr.ast_arena.countNodes();
+        if (cst_total == 0 or ast_total == 0) return &.{};
+
+        var seen = try allocator.alloc(bool, ast_total);
+        defer allocator.free(seen);
+        @memset(seen, false);
+
+        var list: std.ArrayListUnmanaged(NodeIndex) = .empty;
+        errdefer list.deinit(allocator);
+
+        var cur: usize = 0;
+        while (cur < cst_total) {
+            const cid = CstNodeIndex.fromInt(@intCast(cur));
+            const crec = parsed_ptr.cst_arena.getNode(cid);
+            if (crec.kind == .block or crec.kind == .fn_expr_body) {
+                cur += @max(@as(usize, crec.subtree_size), 1);
+                continue;
+            }
+            if (cur < parsed_ptr.cst_to_ast.len) {
+                const aid = parsed_ptr.cst_to_ast[cur];
+                if (!aid.isNone() and aid.asInt() < ast_total and !seen[aid.asInt()]) {
+                    seen[aid.asInt()] = true;
+                    try list.append(allocator, aid);
+                }
+            }
+            cur += 1;
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
+    /// Synchronizes item/member/import AST/CST handles, `decl_span`s, and `file_side_tables` after Early Cutoff.
     fn ensureFreshSignatureAstAndSideTables(self: *CompilerDb, file_id: FileId) QueryError!void {
         const sync_ptr = self.file_sig_sync_states.getPtr(file_id.asInt()) orelse return;
         const parsed_ptr = self.parsed_artifacts.getPtr(file_id.asInt()) orelse return;
         if (Fingerprint128.eql(sync_ptr.ast_fingerprint, parsed_ptr.ast_fingerprint)) return;
         const input_ptr = self.source_inputs.getPtr(file_id.asInt()) orelse return;
         const is_including_tests = try self.isIncludingTestsForFile(file_id);
+
+        // [1] Refresh top-level `ItemTree` symbol handles, `decl_span`s, and nominal/impl member CSTs:
+        if (self.item_trees.getPtr(file_id.asInt())) |tree_ptr| {
+            for (tree_ptr.entries) |entry| {
+                if (self.symbol_table.def_to_symbol.get(entry.def_id.asInt())) |item_sym_idx| {
+                    if (!item_sym_idx.isNone() and item_sym_idx.asInt() < self.symbol_table.countSymbols()) {
+                        const sym_mut = self.symbol_table.getSymbolMut(item_sym_idx);
+                        sym_mut.ast_node = entry.ast_node;
+                        if (!sym_mut.flags.is_glob_use_alias) {
+                            sym_mut.cst_node = entry.cst_node;
+                        }
+                        if (sym_mut.name_text.len > 0) {
+                            if (findHeaderIdentSpanInCst(
+                                input_ptr.owned_text,
+                                file_id,
+                                &parsed_ptr.token_buffer,
+                                &parsed_ptr.cst_arena,
+                                entry.cst_node,
+                                sym_mut.name_text,
+                                false,
+                            )) |live_sp| {
+                                sym_mut.decl_span = live_sp;
+                            }
+                        }
+                        if (!sym_mut.target_scope.isNone()) {
+                            for (self.symbol_table.getScopeMembers(sym_mut.target_scope)) |mem_idx| {
+                                const mem_rec = self.symbol_table.getSymbol(mem_idx).*;
+                                if (mem_rec.flags.is_builtin or mem_rec.decl_span.file_id != file_id) continue;
+                                if (mem_rec.kind != .field_sym and mem_rec.kind != .enum_variant_sym and mem_rec.kind != .fn_sym) continue;
+                                if (findMemberIdentSpanInOwnerCst(
+                                    input_ptr.owned_text,
+                                    file_id,
+                                    &parsed_ptr.token_buffer,
+                                    &parsed_ptr.cst_arena,
+                                    entry.cst_node,
+                                    mem_rec.kind,
+                                    mem_rec.name_text,
+                                    mem_rec.decl_span.start_byte,
+                                )) |mem_sp| {
+                                    const mem_mut = self.symbol_table.getSymbolMut(mem_idx);
+                                    mem_mut.decl_span = mem_sp;
+                                    if (findEnclosingMemberDeclCst(
+                                        &parsed_ptr.token_buffer,
+                                        &parsed_ptr.cst_arena,
+                                        entry.cst_node,
+                                        mem_rec.kind,
+                                        mem_sp.start_byte,
+                                    )) |mem_cst| {
+                                        mem_mut.cst_node = mem_cst;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (self.symbol_table.owner_def_members.getPtr(entry.def_id.asInt())) |mem_list| {
+                    for (mem_list.items) |mem_idx| {
+                        if (mem_idx.isNone() or mem_idx.asInt() >= self.symbol_table.countSymbols()) continue;
+                        const mem_rec = self.symbol_table.getSymbol(mem_idx).*;
+                        if (mem_rec.flags.is_builtin or mem_rec.decl_span.file_id != file_id) continue;
+                        if (findMemberIdentSpanInOwnerCst(
+                            input_ptr.owned_text,
+                            file_id,
+                            &parsed_ptr.token_buffer,
+                            &parsed_ptr.cst_arena,
+                            entry.cst_node,
+                            mem_rec.kind,
+                            mem_rec.name_text,
+                            mem_rec.decl_span.start_byte,
+                        )) |mem_sp| {
+                            const mem_mut = self.symbol_table.getSymbolMut(mem_idx);
+                            mem_mut.decl_span = mem_sp;
+                            if (findEnclosingMemberDeclCst(
+                                &parsed_ptr.token_buffer,
+                                &parsed_ptr.cst_arena,
+                                entry.cst_node,
+                                mem_rec.kind,
+                                mem_sp.start_byte,
+                            )) |mem_cst| {
+                                mem_mut.cst_node = mem_cst;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // [2] Refresh `use_leaf_records` CST handles and `report_span`s for `file_id`:
+        symbol_resolver.refreshFileUseLeafRecordsLiveCst(
+            self.allocator,
+            &self.symbol_table,
+            &self.interner,
+            file_id,
+            input_ptr.owned_text,
+            &parsed_ptr.token_buffer,
+            &parsed_ptr.cst_arena,
+        ) catch return error.OutOfMemory;
 
         const fn_handles = try symbol_resolver.collectFileFnDeclHandlesWithOptions(
             self.allocator,
@@ -10777,6 +11552,36 @@ pub const CompilerDb = struct {
                     try default_fn_syms.append(self.allocator, sym_idx);
                     break;
                 }
+            }
+        }
+
+        // [3] Rebase `file_side_tables` onto `[0 .. parsed_ptr.ast_arena.countNodes())` using `sig_ast_entries`:
+        if (self.file_side_tables.getPtr(file_id.asInt())) |file_st_ptr| {
+            const live_ast_count = parsed_ptr.ast_arena.countNodes();
+            const live_sig_nodes = collectFileNonBodyAstNodes(self.allocator, parsed_ptr) catch
+                return error.OutOfMemory;
+            defer if (live_sig_nodes.len > 0) self.allocator.free(live_sig_nodes);
+
+            if (live_sig_nodes.len == sync_ptr.sig_ast_entries.len) {
+                const new_syms = self.allocator.alloc(SymbolIndex, live_ast_count) catch return error.OutOfMemory;
+                errdefer self.allocator.free(new_syms);
+                @memset(new_syms, .none);
+                const new_tys = self.allocator.alloc(TypeId, live_ast_count) catch return error.OutOfMemory;
+                @memset(new_tys, .err_ty);
+
+                for (live_sig_nodes, 0..) |live_aid, idx| {
+                    if (live_aid.asInt() < live_ast_count) {
+                        new_syms[live_aid.asInt()] = sync_ptr.sig_ast_entries[idx].sym_idx;
+                        new_tys[live_aid.asInt()] = sync_ptr.sig_ast_entries[idx].type_id;
+                    }
+                }
+                if (file_st_ptr.node_symbols.len > 0) file_st_ptr.allocator.free(file_st_ptr.node_symbols);
+                if (file_st_ptr.node_types.len > 0) file_st_ptr.allocator.free(file_st_ptr.node_types);
+                file_st_ptr.node_symbols = new_syms;
+                file_st_ptr.node_types = new_tys;
+                file_st_ptr.ast_start = 0;
+                file_st_ptr.ast_end = @intCast(live_ast_count);
+                file_st_ptr.ast_fingerprint = parsed_ptr.ast_fingerprint;
             }
         }
 
@@ -10825,17 +11630,61 @@ pub const CompilerDb = struct {
             errdefer new_file_st.deinit();
 
             if (self.file_side_tables.getPtr(file_id.asInt())) |prev_st_ptr| {
+                const merge_len = @min(prev_st_ptr.node_symbols.len, new_file_st.node_symbols.len);
+                for (0..merge_len) |m_i| {
+                    if (new_file_st.node_symbols[m_i].isNone() and !prev_st_ptr.node_symbols[m_i].isNone()) {
+                        new_file_st.node_symbols[m_i] = prev_st_ptr.node_symbols[m_i];
+                    }
+                    if (new_file_st.node_types[m_i].isError() and !prev_st_ptr.node_types[m_i].isError()) {
+                        new_file_st.node_types[m_i] = prev_st_ptr.node_types[m_i];
+                    }
+                }
                 if (prev_st_ptr.attr_instances.len > 0 and new_file_st.attr_instances.len == 0) {
                     new_file_st.attr_instances = prev_st_ptr.attr_instances;
                     prev_st_ptr.attr_instances = &.{};
                 }
             }
+            new_file_st.ast_fingerprint = parsed_ptr.ast_fingerprint;
             if (try self.file_side_tables.fetchPut(self.allocator, file_id.asInt(), new_file_st)) |prev_kv| {
                 var old_st = prev_kv.value;
                 old_st.deinit();
             }
         }
         sync_ptr.ast_fingerprint = parsed_ptr.ast_fingerprint;
+    }
+
+    /// Finds the enclosing `.struct_field`, `.enum_variant`, or `.fn_item` CST node inside `owner_cst` covering `ident_byte`.
+    fn findEnclosingMemberDeclCst(
+        token_buffer: *const TokenBuffer,
+        cst_arena: *const LosslessCstArena,
+        owner_cst: CstNodeIndex,
+        sym_kind: symbol_resolver.SymbolKind,
+        ident_byte: u32,
+    ) ?CstNodeIndex {
+        if (owner_cst.isNone() or owner_cst.asInt() >= cst_arena.countNodes()) return null;
+        const start_idx: usize = owner_cst.asInt();
+        const end_idx: usize = @min(
+            start_idx + @max(@as(usize, cst_arena.getNode(owner_cst).subtree_size), 1),
+            cst_arena.countNodes(),
+        );
+        var cur = start_idx + 1;
+        while (cur < end_idx) : (cur += 1) {
+            const cid = CstNodeIndex.fromInt(@intCast(cur));
+            const crec = cst_arena.getNode(cid);
+            const matches_kind = switch (sym_kind) {
+                .field_sym => crec.kind == .struct_field,
+                .enum_variant_sym => crec.kind == .enum_variant,
+                .fn_sym => crec.kind == .fn_item,
+                else => false,
+            };
+            if (!matches_kind) continue;
+            if (symbol_resolver.computeCstSubtreeSpan(.none, token_buffer, cst_arena, cid)) |sp| {
+                if (ident_byte >= sp.start_byte and ident_byte < sp.end_byte) {
+                    return cid;
+                }
+            }
+        }
+        return null;
     }
 
     /// Stage 7 implementation: computes `DefSignatureArtifact` for `def_id`.
@@ -10927,11 +11776,56 @@ pub const CompilerDb = struct {
         return def_sig_fp;
     }
 
+    /// Returns `true` when `root_fid` already has resolved signatures matching its live `ItemTree` and Pass-1 scope.
+    fn isRootSignaturesCurrent(self: *CompilerDb, root_fid: FileId) QueryError!bool {
+        const prev_sigs = self.resolved_signatures.get(root_fid.asInt()) orelse return false;
+        if (prev_sigs.error_count > 0 or prev_sigs.module_scope.isNone()) return false;
+        const p1_state = self.file_pass1_states.get(root_fid.asInt()) orelse return false;
+        if (p1_state.mod_scope != prev_sigs.module_scope) return false;
+        if (self.symbol_table.file_module_scopes.get(root_fid.asInt()) != prev_sigs.module_scope) return false;
+        const root_tree = try self.extractItemTree(root_fid);
+        return Fingerprint128.eql(p1_state.tree_fingerprint, root_tree.tree_fingerprint);
+    }
+
+    /// Resolves `root_fid`'s module signatures only when missing or invalidated by an `ItemTree` change.
+    fn ensureSingleRootSignatureCurrent(self: *CompilerDb, root_fid: FileId, caller_fid: FileId) QueryError!void {
+        if (root_fid.isNone() or root_fid == caller_fid) return;
+        if (self.in_flight_keys.contains(QueryKey.forFile(.resolve_signatures, root_fid).asU64())) return;
+        if (try self.isRootSignaturesCurrent(root_fid)) return;
+        _ = try self.resolveSignatures(root_fid);
+    }
+
+    /// Ensures enclosing package/stdlib root module signatures are resolved before submodule bodies run.
+    fn ensureEnclosingRootSignatures(self: *CompilerDb, file_id: FileId) QueryError!void {
+        const pkg_id = self.symbol_table.getFilePackageId(file_id);
+        var core_root: FileId = .none;
+        var std_root: FileId = .none;
+        var pkg_root: FileId = .none;
+        if (pkg_id == .std_core) {
+            if (self.interner.lookup("core")) |core_sym| {
+                core_root = self.root_module_files.get(core_sym.asInt()) orelse .none;
+            }
+            if (!self.cx_stdlib_root_fid.isNone() and !self.symbol_table.isCoreKernelFile(file_id)) {
+                std_root = self.cx_stdlib_root_fid;
+            }
+        } else {
+            pkg_root = self.package_root_files.get(pkg_id) orelse .none;
+        }
+        try self.ensureSingleRootSignatureCurrent(core_root, file_id);
+        try self.ensureSingleRootSignatureCurrent(std_root, file_id);
+        try self.ensureSingleRootSignatureCurrent(pkg_root, file_id);
+        _ = try self.resolveSignatures(file_id);
+        try self.ensureSingleRootSignatureCurrent(core_root, file_id);
+        try self.ensureSingleRootSignatureCurrent(std_root, file_id);
+        try self.ensureSingleRootSignatureCurrent(pkg_root, file_id);
+    }
+
     /// Stage 8 implementation: type-checks `def_id`'s body in isolation from sibling definitions.
     fn computeTypecheckBody(self: *CompilerDb, def_id: DefId) QueryError!Fingerprint128 {
         if (def_id.isNone()) return error.InvalidDefId;
         const file_id = def_id.fileId();
-        _ = try self.resolveSignatures(file_id);
+        _ = try self.getLintSemanticSettings(self.symbol_table.getFilePackageId(file_id));
+        try self.ensureEnclosingRootSignatures(file_id);
         const def_sig = try self.getDefSignature(def_id);
         const body_window = try self.getBodyAstProj(def_id);
         const active_layout = try self.readTargetLayout();
@@ -10940,6 +11834,7 @@ pub const CompilerDb = struct {
         const is_core_allowed = self.isCoreAllowedForFile(file_id);
         const pkg_cfg_fp = self.getPackageCfgFingerprint(file_id);
         const eff_cfg = self.resolveCfgEnvForFile(file_id, is_including_tests);
+        const lint_settings = try self.getLintSemanticSettings(self.symbol_table.getFilePackageId(file_id));
         try self.unwindIfCanceled();
 
         var body_err_count: u32 = 0;
@@ -10949,11 +11844,14 @@ pub const CompilerDb = struct {
             if (self.parsed_artifacts.getPtr(file_id.asInt())) |parsed_ptr| {
                 const was_core_allowed = self.symbol_table.is_internal_core;
                 const prev_cfg = self.symbol_table.cfg_env;
+                const prev_lint_settings = self.symbol_table.active_lint_settings;
                 self.symbol_table.is_internal_core = is_core_allowed;
                 self.symbol_table.cfg_env = eff_cfg;
+                self.symbol_table.active_lint_settings = lint_settings;
                 defer {
                     self.symbol_table.is_internal_core = was_core_allowed;
                     self.symbol_table.cfg_env = prev_cfg;
+                    self.symbol_table.active_lint_settings = prev_lint_settings;
                 }
 
                 const body_sink = try resetOrCreateDefDiagSink(
@@ -11019,9 +11917,11 @@ pub const CompilerDb = struct {
                                 for (self.symbol_table.getScopeMembers(sym_rec.target_scope)) |mem_idx| {
                                     const mem_sym = self.symbol_table.getSymbol(mem_idx).*;
                                     if (mem_sym.kind == .param_sym) {
-                                        self.symbol_table.getSymbolMut(mem_idx).flags.is_used =
+                                        const p_mut = self.symbol_table.getSymbolMut(mem_idx);
+                                        p_mut.flags.is_used =
                                             mem_sym.member_ordinal < param_specs.len and
                                             param_specs[mem_sym.member_ordinal].is_used_by_default;
+                                        p_mut.flags.is_mutated = false;
                                     }
                                 }
                             }
@@ -11382,6 +12282,7 @@ pub const CompilerDb = struct {
         }
 
         const typed_fp = hasher.final();
+        const item_bounds = self.computeLiveDefBoundsAndHash(def_id);
 
         try self.typed_bodies.put(self.allocator, def_id.asInt(), .{
             .def_id = def_id,
@@ -11389,6 +12290,8 @@ pub const CompilerDb = struct {
             .body_ast_node = body_window.body_ast_node,
             .error_count = body_err_count,
             .warning_count = body_warn_count,
+            .origin_item_start_byte = if (item_bounds) |bounds| bounds.start_byte else 0,
+            .origin_item_byte_hash = if (item_bounds) |bounds| bounds.byte_hash else 0,
             .signature_fingerprint = def_sig.signature_fingerprint,
             .body_fingerprint = body_window.body_fingerprint,
             .typed_fingerprint = typed_fp,
@@ -11531,12 +12434,29 @@ pub const CompilerDb = struct {
         if (!callee_sym.isNone() and callee_sym.asInt() < db.symbol_table.symbols.items.len) {
             const sym_rec = db.symbol_table.getSymbol(callee_sym).*;
             if (sym_rec.def_id.isNone()) {
-                if (db.sast_sym_summaries.get(callee_sym.asInt())) |method_sum| {
+                if (db.lookupMethodSastSummary(callee_sym)) |method_sum| {
                     return method_sum;
                 }
             }
         }
         return def_summary;
+    }
+
+    /// Resolves a per-symbol or revision-invariant `(owner_def_id, name)` `FnRegionSummary` for `sym_idx`.
+    fn lookupMethodSastSummary(self: *const CompilerDb, sym_idx: SymbolIndex) ?mir_sast.FnRegionSummary {
+        if (sym_idx.isNone()) return null;
+        if (self.sast_sym_summaries.get(sym_idx.asInt())) |method_sum| {
+            return method_sum;
+        }
+        if (sym_idx.asInt() < self.symbol_table.symbols.items.len) {
+            const sym_rec = self.symbol_table.getSymbol(sym_idx).*;
+            if (sym_rec.def_id.isNone() and !sym_rec.owner_def_id.isNone()) {
+                return self.sast_owner_method_summaries.get(
+                    packOwnerMethodSummaryKey(sym_rec.owner_def_id, sym_rec),
+                );
+            }
+        }
+        return null;
     }
 
     /// Lowers clean pre-SAST `MirBody` records for `target_def` into `out_bodies` for Stage 9 SAST analysis.
@@ -11725,7 +12645,9 @@ pub const CompilerDb = struct {
             if (!sym_idx.isNone()) {
                 const sym_mut = self.symbol_table.getSymbolMut(sym_idx);
                 sym_mut.ast_node = item_ast_node;
-                sym_mut.cst_node = item_cst;
+                if (!sym_mut.flags.is_glob_use_alias) {
+                    sym_mut.cst_node = item_cst;
+                }
             }
         }
         if (self.def_side_tables.getPtr(def_id.asInt())) |st_ptr| {
@@ -11792,6 +12714,7 @@ pub const CompilerDb = struct {
     /// Stage 9 implementation: runs Phase 6 MIR SAST & elaboration on `def_id`'s typed body.
     fn computeVerifySastMir(self: *CompilerDb, def_id: DefId) QueryError!Fingerprint128 {
         if (def_id.isNone()) return error.InvalidDefId;
+        const lint_settings = try self.getLintSemanticSettings(self.symbol_table.getFilePackageId(def_id.fileId()));
         const typed_body = try self.typecheckBody(def_id);
         const active_layout = try self.readTargetLayout();
         const is_strict = try self.readSastStrict();
@@ -11817,12 +12740,18 @@ pub const CompilerDb = struct {
         var elim_narrow: u32 = 0;
         var emitted_drops: u32 = 0;
 
-        if (!has_front_errors and
-            self.parsed_artifacts.contains(file_id.asInt()) and
+        if (has_front_errors) {
+            if (parsed_init_opt) |parsed_ptr| {
+                if (parsed_ptr.has_parse_errors) {
+                    _ = try self.parseCst(file_id);
+                }
+            }
+        } else if (self.parsed_artifacts.contains(file_id.asInt()) and
             self.source_inputs.contains(file_id.asInt()))
         {
             var local_tok_buf = self.parsed_artifacts.getPtr(file_id.asInt()).?.token_buffer;
             var local_cst_arena = self.parsed_artifacts.getPtr(file_id.asInt()).?.cst_arena;
+            var local_ast_arena = self.parsed_artifacts.getPtr(file_id.asInt()).?.ast_arena;
             const src_text = self.source_inputs.getPtr(file_id.asInt()).?.owned_text;
             const has_ct_io = self.hasComptimeIoCapForFile(file_id);
             const was_sast_core = self.symbol_table.is_internal_core;
@@ -11844,6 +12773,7 @@ pub const CompilerDb = struct {
             );
 
             const primary_len = active_bodies.items.len;
+            var active_primary_len = primary_len;
             if (primary_len > 0) {
                 var sast_res = mir_sast.analyzeAndElaborateMirModule(
                     self.allocator,
@@ -11860,6 +12790,11 @@ pub const CompilerDb = struct {
                         .source_text = src_text,
                         .token_buffer = &local_tok_buf,
                         .cst_arena = &local_cst_arena,
+                        .ast_arena = &local_ast_arena,
+                        .interner_mut = &self.interner,
+                        .trivial_copy_max_bytes = lint_settings.trivial_copy_max_bytes,
+                        .has_db_lint_gate = true,
+                        .is_lint_target_file = self.isLintTargetFile(file_id),
                         .external_resolver = .{
                             .compiler_db = self,
                             .resolve_fn = resolveDbCalleeSummary,
@@ -11880,7 +12815,7 @@ pub const CompilerDb = struct {
                 // expand `active_bodies` with all peer `DefId`s and converge the full Tarjan SCC precisely:
                 var cycle_round: usize = 0;
                 var prev_peer_count: usize = 0;
-                while (cycle_round < 4) : (cycle_round += 1) {
+                while (cycle_round < 8) : (cycle_round += 1) {
                     const cur_peer_count = if (self.sast_cycle_peers.getPtr(def_id.asInt())) |peer_list|
                         peer_list.items.len
                     else
@@ -11910,6 +12845,7 @@ pub const CompilerDb = struct {
                         &local_sast_sink,
                     );
                     const rerun_primary_len = active_bodies.items.len;
+                    active_primary_len = rerun_primary_len;
                     for (peers_snapshot) |peer_def| {
                         const peer_tb = self.typecheckBody(peer_def) catch |err| switch (err) {
                             error.OutOfMemory => return error.OutOfMemory,
@@ -11930,6 +12866,7 @@ pub const CompilerDb = struct {
 
                     local_tok_buf = self.parsed_artifacts.getPtr(file_id.asInt()).?.token_buffer;
                     local_cst_arena = self.parsed_artifacts.getPtr(file_id.asInt()).?.cst_arena;
+                    local_ast_arena = self.parsed_artifacts.getPtr(file_id.asInt()).?.ast_arena;
                     const refreshed_src = self.source_inputs.getPtr(file_id.asInt()).?.owned_text;
                     sast_res = mir_sast.analyzeAndElaborateMirModule(
                         self.allocator,
@@ -11946,6 +12883,11 @@ pub const CompilerDb = struct {
                             .source_text = refreshed_src,
                             .token_buffer = &local_tok_buf,
                             .cst_arena = &local_cst_arena,
+                            .ast_arena = &local_ast_arena,
+                            .interner_mut = &self.interner,
+                            .trivial_copy_max_bytes = lint_settings.trivial_copy_max_bytes,
+                            .has_db_lint_gate = true,
+                            .is_lint_target_file = self.isLintTargetFile(file_id),
                             .external_resolver = .{
                                 .compiler_db = self,
                                 .resolve_fn = resolveDbCalleeSummary,
@@ -11960,6 +12902,26 @@ pub const CompilerDb = struct {
                         else => return error.OutOfMemory,
                     };
                     has_live_sast_res = true;
+                }
+
+                // Read-only `W0501` (`inlining-budget-exceeded`) check during `verifySastMir` (`DR-25` §2.2):
+                if (local_sast_sink.error_count == 0 and active_primary_len > 0 and self.isLintTargetFile(file_id)) {
+                    const latest_src = self.source_inputs.getPtr(file_id.asInt()).?.owned_text;
+                    mir_opt.auditInlineBudgetLintsForBodies(
+                        self.allocator,
+                        active_bodies.items,
+                        active_primary_len,
+                        &self.symbol_table,
+                        .{
+                            .target_layout = active_layout,
+                            .syntax_view = .{
+                                .source = latest_src,
+                                .tokens = &local_tok_buf,
+                                .cst_arena = &local_cst_arena,
+                            },
+                        },
+                        &local_sast_sink,
+                    ) catch return error.OutOfMemory;
                 }
 
                 elim_bounds = sast_res.eliminated_bounds_checks;
@@ -11982,6 +12944,16 @@ pub const CompilerDb = struct {
                             slot_sym.asInt(),
                             slot_sum,
                         );
+                        if (slot_sym.asInt() < self.symbol_table.countSymbols()) {
+                            const slot_sym_rec = self.symbol_table.getSymbol(slot_sym).*;
+                            if (slot_sym_rec.def_id.isNone() and !slot_sym_rec.owner_def_id.isNone()) {
+                                try self.sast_owner_method_summaries.put(
+                                    self.allocator,
+                                    packOwnerMethodSummaryKey(slot_sym_rec.owner_def_id, slot_sym_rec),
+                                    slot_sum,
+                                );
+                            }
+                        }
                         if (self.file_sig_sync_states.get(file_id.asInt())) |sync_st| {
                             if (slot_sym.asInt() < sync_st.sym_start and
                                 slot_sym.asInt() < self.symbol_table.countSymbols())
@@ -12042,6 +13014,7 @@ pub const CompilerDb = struct {
         hasher.updateBytes(&obs_bytes);
         hasher.updateFingerprint(typed_body.typed_fingerprint);
         const sast_fp = hasher.final();
+        const item_bounds = self.computeLiveDefBoundsAndHash(def_id);
 
         try self.sast_results.put(self.allocator, def_id.asInt(), .{
             .def_id = def_id,
@@ -12049,6 +13022,8 @@ pub const CompilerDb = struct {
             .is_verified_sound = is_sound,
             .error_count = total_sast_errors,
             .warning_count = total_sast_warnings,
+            .origin_item_start_byte = if (item_bounds) |bounds| bounds.start_byte else 0,
+            .origin_item_byte_hash = if (item_bounds) |bounds| bounds.byte_hash else 0,
             .eliminated_bounds_checks = elim_bounds,
             .eliminated_narrow_checks = elim_narrow,
             .emitted_drops = emitted_drops,
@@ -12056,6 +13031,3263 @@ pub const CompilerDb = struct {
             .sast_fingerprint = sast_fp,
         });
         return sast_fp;
+    }
+
+    /// Live top-level CST item byte start and content hash used for `Ruling 3.4` span rebasing.
+    const LiveDefBoundsAndHash = struct {
+        start_byte: u32,
+        byte_hash: u64,
+    };
+
+    /// Computes live `(start_byte, byte_hash)` of `def_id`'s top-level CST item for `Ruling 3.4` span rebasing.
+    fn computeLiveDefBoundsAndHash(
+        self: *const CompilerDb,
+        def_id: DefId,
+    ) ?LiveDefBoundsAndHash {
+        const file_id = def_id.fileId();
+        const input_ptr = self.source_inputs.getPtr(file_id.asInt()) orelse return null;
+        const parsed_ptr = self.parsed_artifacts.getPtr(file_id.asInt()) orelse return null;
+        const tree_ptr = self.item_trees.getPtr(file_id.asInt()) orelse return null;
+        const entry = tree_ptr.getEntry(def_id) orelse return null;
+        return computeCstItemBoundsAndHash(file_id, input_ptr.owned_text, parsed_ptr, entry.cst_node);
+    }
+
+    /// Computes `(start_byte, byte_hash)` over `cst_node` inside `parsed_ptr`.
+    fn computeCstItemBoundsAndHash(
+        file_id: FileId,
+        source: []const u8,
+        parsed_ptr: *const ParsedCstArtifact,
+        cst_node: CstNodeIndex,
+    ) ?LiveDefBoundsAndHash {
+        const item_span = symbol_resolver.computeCstSubtreeSpan(
+            file_id,
+            &parsed_ptr.token_buffer,
+            &parsed_ptr.cst_arena,
+            cst_node,
+        ) orelse return null;
+        const end_clamped = @min(@as(usize, item_span.end_byte), source.len);
+        const start_clamped = @min(@as(usize, item_span.start_byte), end_clamped);
+        return .{
+            .start_byte = @intCast(start_clamped),
+            .byte_hash = std.hash.Wyhash.hash(0, source[start_clamped..end_clamped]),
+        };
+    }
+
+    /// Resolves `file_id`'s package-relative forward-slash POSIX path into `scratch_buf` (`0` heap allocs).
+    fn resolvePackageRelativeLintPath(
+        self: *const CompilerDb,
+        file_id: FileId,
+        pkg_root_dir: []const u8,
+        scratch_buf: *[1024]u8,
+    ) []const u8 {
+        const raw_path = self.file_paths.get(file_id.asInt()) orelse return "";
+        const copy_len = @min(raw_path.len, scratch_buf.len);
+        for (raw_path[0..copy_len], 0..) |ch_b, i| {
+            scratch_buf[i] = if (ch_b == '\\') '/' else ch_b;
+        }
+        var path_view: []const u8 = scratch_buf[0..copy_len];
+
+        const root_raw = if (pkg_root_dir.len > 0) pkg_root_dir else (self.workspace_root orelse "");
+        if (root_raw.len > 0 and root_raw.len < 512) {
+            var root_buf: [512]u8 = undefined;
+            for (root_raw, 0..) |ch_b, i| {
+                root_buf[i] = if (ch_b == '\\') '/' else ch_b;
+            }
+            const trimmed_root = std.mem.trimEnd(u8, root_buf[0..root_raw.len], "/");
+            if (trimmed_root.len > 0 and path_view.len > trimmed_root.len and
+                std.ascii.eqlIgnoreCase(path_view[0..trimmed_root.len], trimmed_root) and
+                path_view[trimmed_root.len] == '/')
+            {
+                path_view = path_view[trimmed_root.len + 1 ..];
+            }
+        }
+        while (std.mem.startsWith(u8, path_view, "./")) {
+            path_view = path_view[2..];
+        }
+        return path_view;
+    }
+
+    /// Computes the combined 128-bit fingerprint for `QueryStage.lint_disabled_matrix` (`pkg_id` + CLI + targets).
+    fn computeLintDisabledMatrixFingerprint(self: *const CompilerDb, pkg_id: PackageId) Fingerprint128 {
+        var hasher = StructuralHasher.init();
+        hasher.updateU16(pkg_id.asInt());
+        if (self.package_lint_filters.get(pkg_id)) |entry| {
+            hasher.updateU8(1);
+            hasher.updateU64(entry.matrix_fingerprint);
+        } else {
+            hasher.updateU8(0);
+        }
+        hasher.updateU8(@intFromBool(self.cli_lint_filter.has_only));
+        hasher.updateU64(self.cli_lint_filter.only_mask);
+        hasher.updateU64(self.cli_lint_filter.disable_mask);
+        hasher.updateU64(self.explicit_lint_targets_epoch);
+        return hasher.final();
+    }
+
+    /// Stage 14 compute routine: returns the 128-bit semantic `[lint.settings]` digest for `pkg_id`.
+    fn computeLintSemanticSettings(self: *CompilerDb, pkg_id: PackageId) QueryError!Fingerprint128 {
+        if (self.package_lint_semantics.get(pkg_id)) |entry| {
+            return entry.semantic_fingerprint;
+        }
+        const def_digest = (lint_filter.LintSettings{}).computeSemanticFingerprint(&self.interner);
+        return .{ .low = def_digest.low, .high = def_digest.high };
+    }
+
+    /// Stage 16 compute routine: returns the 128-bit disabled-rule matrix digest for `pkg_id`.
+    fn computeLintDisabledMatrix(self: *CompilerDb, pkg_id: PackageId) QueryError!Fingerprint128 {
+        return self.computeLintDisabledMatrixFingerprint(pkg_id);
+    }
+
+    /// Stage 15 compute routine: builds and memoizes the Four-Scope `SuppressionTable` for `file_id`.
+    fn computeSuppressionTable(self: *CompilerDb, file_id: FileId) QueryError!Fingerprint128 {
+        const source = try self.getSourceText(file_id);
+        const parsed = try self.parseCst(file_id);
+        try self.unwindIfCanceled();
+
+        var line_index = vfs_sourcemap.LineIndex.build(self.allocator, source) catch return error.OutOfMemory;
+        defer line_index.deinit(self.allocator);
+
+        var table = lint_filter.extractFileSuppressionTable(
+            self.allocator,
+            file_id,
+            source,
+            &parsed.token_buffer,
+            &parsed.cst_arena,
+            &line_index,
+        ) catch return error.OutOfMemory;
+        errdefer table.deinit(self.allocator);
+
+        var hasher = StructuralHasher.init();
+        hasher.updateU32(file_id.asInt());
+        hasher.updateU8(@intFromBool(table.is_generated_file));
+        hasher.updateU64(table.any_suppressed_mask);
+        hasher.updateU64(table.file_allow_mask);
+        hasher.updateU64(table.file_expect_mask);
+        hasher.updateU32(@intCast(table.file_directives.len));
+        hasher.updateU32(@intCast(table.ast_spans.len));
+        hasher.updateU32(@intCast(table.line_spans.len));
+        hasher.updateU32(@intCast(table.directive_errors.len));
+        hasher.updateU32(@intCast(table.mid_file_directives.len));
+        hasher.updateU32(@intCast(table.above_line_hoists.len));
+        for (0..table.ast_spans.len) |idx| {
+            hasher.updateU32(table.ast_spans.items(.start_byte)[idx]);
+            hasher.updateU32(table.ast_spans.items(.end_byte)[idx]);
+            hasher.updateU64(table.ast_spans.items(.own_mask)[idx]);
+            hasher.updateU8(@intFromEnum(table.ast_spans.items(.mode)[idx]));
+            hasher.updateU32(table.ast_spans.items(.reason_start)[idx]);
+            hasher.updateU32(table.ast_spans.items(.reason_end)[idx]);
+        }
+        for (table.line_spans) |line_sp| {
+            hasher.updateU32(line_sp.line_start_byte);
+            hasher.updateU32(line_sp.line_end_byte);
+            hasher.updateU64(line_sp.own_mask);
+            hasher.updateU8(line_sp.mode);
+            hasher.updateU32(line_sp.reason_start);
+            hasher.updateU32(line_sp.reason_end);
+        }
+        const table_fp = hasher.final();
+
+        if (try self.suppression_tables.fetchPut(self.allocator, file_id.asInt(), table)) |prev_kv| {
+            var old_table = prev_kv.value;
+            old_table.deinit(self.allocator);
+        }
+        return table_fp;
+    }
+
+    /// Shifts `raw_offset` by `byte_delta` when `raw_offset >= min_origin_byte`.
+    inline fn rebaseByteOffset(raw_offset: u32, min_origin_byte: u32, byte_delta: i64) u32 {
+        if (byte_delta == 0 or raw_offset < min_origin_byte) return raw_offset;
+        return @intCast(@max(0, @as(i64, raw_offset) + byte_delta));
+    }
+
+    /// Shifts `span` by `byte_delta` when targeting `file_id` at or after `min_origin_byte`.
+    inline fn rebaseSpanForFile(
+        span: Span,
+        file_id: FileId,
+        min_origin_byte: u32,
+        byte_delta: i64,
+    ) Span {
+        if (byte_delta == 0 or span.file_id != file_id) return span;
+        return Span.init(
+            file_id,
+            rebaseByteOffset(span.start_byte, min_origin_byte, byte_delta),
+            rebaseByteOffset(span.end_byte, min_origin_byte, byte_delta),
+        );
+    }
+
+    /// Filters `diag_item` through `eff_rules` and `sup_table` (rebasing by `byte_delta`) and appends to `proj_sink`.
+    fn filterAndRebaseDiagnosticIntoSink(
+        proj_sink: *DiagnosticSink,
+        sup_table: *const lint_filter.SuppressionTable,
+        tracker: *lint_filter.FulfillmentTracker,
+        eff_rules: lint_filter.EffectiveFileRules,
+        is_lint_target: bool,
+        file_id: FileId,
+        diag_item: diagnostic.Diagnostic,
+        min_origin_byte: u32,
+        byte_delta: i64,
+    ) !void {
+        if (!diag_item.primary_span.file_id.isNone() and diag_item.primary_span.file_id != file_id) return;
+
+        const rebased_primary = rebaseSpanForFile(diag_item.primary_span, file_id, min_origin_byte, byte_delta);
+        var effective_severity = diag_item.severity;
+        if (diag_item.severity != .err) {
+            if (diag_item.code.asLintRuleId()) |rule_id| {
+                if (!is_lint_target or !eff_rules.isEnabled(rule_id)) return;
+                if (lint_filter.isCandidateSuppressed(sup_table, tracker, .{
+                    .rule_id = rule_id,
+                    .start_byte = rebased_primary.start_byte,
+                    .end_byte = rebased_primary.end_byte,
+                })) {
+                    return;
+                }
+                effective_severity = .warning;
+            }
+        }
+
+        if (byte_delta == 0) {
+            var copy_diag = diag_item;
+            copy_diag.severity = effective_severity;
+            try proj_sink.emit(copy_diag);
+            return;
+        }
+
+        const arena_alloc = proj_sink.arena.asAllocator();
+        const rebased_labels = try arena_alloc.alloc(LabeledSpan, diag_item.labels.len);
+        for (diag_item.labels, 0..) |lbl, i| {
+            rebased_labels[i] = .{
+                .span = rebaseSpanForFile(lbl.span, file_id, min_origin_byte, byte_delta),
+                .label = lbl.label,
+                .style = lbl.style,
+            };
+        }
+
+        const rebased_suggestions = try arena_alloc.alloc(SuggestedFix, diag_item.suggestions.len);
+        for (diag_item.suggestions, 0..) |sug, s_i| {
+            const rebased_edits = try arena_alloc.alloc(diagnostic.TextEdit, sug.edits.len);
+            for (sug.edits, 0..) |ed, e_i| {
+                rebased_edits[e_i] = if (ed.file_id == file_id) .{
+                    .file_id = file_id,
+                    .start_byte = rebaseByteOffset(ed.start_byte, min_origin_byte, byte_delta),
+                    .end_byte = rebaseByteOffset(ed.end_byte, min_origin_byte, byte_delta),
+                    .replacement_id = ed.replacement_id,
+                } else ed;
+            }
+            rebased_suggestions[s_i] = .{
+                .message = sug.message,
+                .applicability = sug.applicability,
+                .priority = sug.priority,
+                .edits = rebased_edits,
+            };
+        }
+
+        try proj_sink.emit(.{
+            .code = diag_item.code,
+            .severity = effective_severity,
+            .primary_span = rebased_primary,
+            .message = diag_item.message,
+            .labels = rebased_labels,
+            .notes = diag_item.notes,
+            .suggestions = rebased_suggestions,
+        });
+    }
+
+    /// Filters `diag_item` and deep-copies its arena-owned slices into `proj_sink` before scratch sink teardown.
+    fn filterAndCloneSweepDiagnosticIntoSink(
+        proj_sink: *DiagnosticSink,
+        sup_table: *const lint_filter.SuppressionTable,
+        tracker: *lint_filter.FulfillmentTracker,
+        eff_rules: lint_filter.EffectiveFileRules,
+        is_lint_target: bool,
+        file_id: FileId,
+        diag_item: diagnostic.Diagnostic,
+    ) !void {
+        if (!diag_item.primary_span.file_id.isNone() and diag_item.primary_span.file_id != file_id) return;
+        var effective_severity = diag_item.severity;
+        if (diag_item.severity != .err) {
+            if (diag_item.code.asLintRuleId()) |rule_id| {
+                if (!is_lint_target or !eff_rules.isEnabled(rule_id)) return;
+                if (lint_filter.isCandidateSuppressed(sup_table, tracker, .{
+                    .rule_id = rule_id,
+                    .start_byte = diag_item.primary_span.start_byte,
+                    .end_byte = diag_item.primary_span.end_byte,
+                })) {
+                    return;
+                }
+                effective_severity = .warning;
+            }
+        }
+
+        const arena_alloc = proj_sink.arena.asAllocator();
+        const dup_msg = try arena_alloc.dupe(u8, diag_item.message);
+        const dup_labels = try arena_alloc.alloc(LabeledSpan, diag_item.labels.len);
+        for (diag_item.labels, 0..) |lbl, idx| {
+            dup_labels[idx] = .{
+                .span = lbl.span,
+                .label = try arena_alloc.dupe(u8, lbl.label),
+                .style = lbl.style,
+            };
+        }
+        const dup_notes = try arena_alloc.alloc([]const u8, diag_item.notes.len);
+        for (diag_item.notes, 0..) |note_str, idx| {
+            dup_notes[idx] = try arena_alloc.dupe(u8, note_str);
+        }
+        const dup_fixes = try arena_alloc.alloc(SuggestedFix, diag_item.suggestions.len);
+        for (diag_item.suggestions, 0..) |sug, s_i| {
+            const dup_edits = try arena_alloc.dupe(diagnostic.TextEdit, sug.edits);
+            dup_fixes[s_i] = .{
+                .message = try arena_alloc.dupe(u8, sug.message),
+                .applicability = sug.applicability,
+                .priority = sug.priority,
+                .edits = dup_edits,
+            };
+        }
+        try proj_sink.emit(.{
+            .code = diag_item.code,
+            .severity = effective_severity,
+            .primary_span = diag_item.primary_span,
+            .message = dup_msg,
+            .labels = dup_labels,
+            .notes = dup_notes,
+            .suggestions = dup_fixes,
+        });
+    }
+
+    /// Unwraps `.use_alias_sym` chains to the underlying canonical `SymbolIndex`.
+    fn unwrapToCanonicalRenameTarget(sym_table: *const SymbolTable, raw_idx: SymbolIndex) SymbolIndex {
+        var cur = raw_idx;
+        var steps: usize = 0;
+        while (!cur.isNone() and cur.asInt() < sym_table.countSymbols() and steps < 16) : (steps += 1) {
+            const rec = sym_table.getSymbol(cur);
+            if (rec.kind == .use_alias_sym and !rec.target_symbol.isNone() and
+                rec.target_symbol.asInt() < sym_table.countSymbols())
+            {
+                cur = rec.target_symbol;
+                continue;
+            }
+            break;
+        }
+        return cur;
+    }
+
+    /// Finds the focal identifier `TokenIndex` on `ast_id` matching `expected_lexeme` in `src`.
+    fn findMatchingFocalTokenInAstNode(
+        src: []const u8,
+        parsed_art: *const ParsedCstArtifact,
+        ast_id: NodeIndex,
+        expected_lexeme: []const u8,
+    ) TokenIndex {
+        if (ast_id.isNone() or ast_id.asInt() >= parsed_art.ast_arena.countNodes()) return .none;
+        const ast_node = parsed_art.ast_arena.getNode(ast_id);
+        const tok_count = parsed_art.token_buffer.countTokens();
+
+        switch (ast_node.tag) {
+            .field_access => {
+                if (ast_node.rhs.tag == .token) {
+                    const rhs_tok = TokenIndex.fromInt(ast_node.rhs.payload);
+                    if (!rhs_tok.isNone() and rhs_tok.asInt() < tok_count and
+                        std.mem.eql(u8, symbol_resolver.extractTokenSlice(src, &parsed_art.token_buffer, rhs_tok), expected_lexeme))
+                    {
+                        return rhs_tok;
+                    }
+                }
+            },
+            .method_call => {
+                if (ast_node.rhs.tag == .extra and ast_id.asInt() < parsed_art.node_extra_end.len) {
+                    const start_i: usize = ast_node.rhs.payload;
+                    const end_i: usize = @min(
+                        @as(usize, parsed_art.node_extra_end[ast_id.asInt()]),
+                        parsed_art.ast_arena.extra_data.items.len,
+                    );
+                    if (start_i < end_i) {
+                        const member_tok = TokenIndex.fromInt(parsed_art.ast_arena.extra_data.items[start_i]);
+                        if (!member_tok.isNone() and member_tok.asInt() < tok_count and
+                            std.mem.eql(
+                                u8,
+                                symbol_resolver.extractTokenSlice(src, &parsed_art.token_buffer, member_tok),
+                                expected_lexeme,
+                            ))
+                        {
+                            return member_tok;
+                        }
+                    }
+                }
+            },
+            .path_expr, .named_type => {
+                if (ast_node.lhs.tag == .extra and ast_node.rhs.tag == .extra and ast_node.rhs.payload > 0) {
+                    const segs = parsed_art.ast_arena.getExtraSlice(
+                        ExtraIndex.fromInt(ast_node.lhs.payload),
+                        ast_node.rhs.payload,
+                    );
+                    const last_tok = TokenIndex.fromInt(segs[segs.len - 1]);
+                    if (!last_tok.isNone() and last_tok.asInt() < tok_count and
+                        std.mem.eql(u8, symbol_resolver.extractTokenSlice(src, &parsed_art.token_buffer, last_tok), expected_lexeme))
+                    {
+                        return last_tok;
+                    }
+                }
+            },
+            .call_expr, .generic_call, .incomplete_call => {
+                if (ast_node.lhs.tag == .node) {
+                    return findMatchingFocalTokenInAstNode(
+                        src,
+                        parsed_art,
+                        NodeIndex.fromInt(ast_node.lhs.payload),
+                        expected_lexeme,
+                    );
+                }
+            },
+            else => {},
+        }
+
+        if (!ast_node.main_token.isNone() and ast_node.main_token.asInt() < tok_count and
+            std.mem.eql(
+                u8,
+                symbol_resolver.extractTokenSlice(src, &parsed_art.token_buffer, ast_node.main_token),
+                expected_lexeme,
+            ))
+        {
+            return ast_node.main_token;
+        }
+
+        const cst_orig = parsed_art.ast_arena.getCstOrigin(ast_id);
+        if (!cst_orig.isNone() and cst_orig.asInt() < parsed_art.cst_arena.countNodes()) {
+            const start_i: usize = cst_orig.asInt();
+            const end_i: usize = @min(
+                start_i + @max(@as(usize, parsed_art.cst_arena.getNode(cst_orig).subtree_size), 1),
+                parsed_art.cst_arena.countNodes(),
+            );
+            var last_match: TokenIndex = .none;
+            var cur = start_i;
+            while (cur < end_i) : (cur += 1) {
+                const sub = parsed_art.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+                if (sub.kind == .param_list or sub.kind == .type_args or sub.kind == .block) {
+                    if (cur > start_i) {
+                        cur += @max(@as(usize, sub.subtree_size), 1) - 1;
+                        continue;
+                    }
+                }
+                if (sub.subtree_size <= 1 and !sub.flags.is_missing_or_injected and
+                    !sub.token.isNone() and sub.token.asInt() < tok_count)
+                {
+                    const tk = parsed_art.token_buffer.getToken(sub.token).kind;
+                    if (symbol_resolver.isIdentifierToken(tk) and
+                        std.mem.eql(
+                            u8,
+                            symbol_resolver.extractTokenSlice(src, &parsed_art.token_buffer, sub.token),
+                            expected_lexeme,
+                        ))
+                    {
+                        last_match = sub.token;
+                    }
+                }
+            }
+            return last_match;
+        }
+        return .none;
+    }
+
+    /// Appends a `TextEdit` to `edits` if not already present, returning `false` on conflicting replacements.
+    fn appendUniqueRenameEdit(
+        allocator: std.mem.Allocator,
+        edits: *std.ArrayListUnmanaged(diagnostic.TextEdit),
+        candidate_edit: diagnostic.TextEdit,
+    ) !bool {
+        for (edits.items) |existing| {
+            if (existing.file_id == candidate_edit.file_id and
+                existing.start_byte < candidate_edit.end_byte and
+                candidate_edit.start_byte < existing.end_byte)
+            {
+                if (existing.start_byte == candidate_edit.start_byte and
+                    existing.end_byte == candidate_edit.end_byte and
+                    existing.replacement_id == candidate_edit.replacement_id)
+                {
+                    return true;
+                }
+                return false;
+            }
+        }
+        try edits.append(allocator, candidate_edit);
+        return true;
+    }
+
+    /// Materializes `W0201` (`non-canonical-case`) with collision-checked intra-package reference renames (`DR-25` §2.2).
+    fn emitProjectedNonCanonicalCaseDiagnostic(
+        self: *CompilerDb,
+        proj_sink: *DiagnosticSink,
+        decl_file_id: FileId,
+        pkg_id: PackageId,
+        pkg_files: []const FileId,
+        decl_source: []const u8,
+        cand: lint_filter.RawLintCandidate,
+        surviving_cands: []const lint_filter.RawLintCandidate,
+    ) !void {
+        const arena_alloc = proj_sink.arena.asAllocator();
+        const decl_span = Span.init(decl_file_id, cand.start_byte, cand.end_byte);
+        const start_i: usize = @min(@as(usize, cand.start_byte), decl_source.len);
+        const end_i: usize = @min(@max(@as(usize, cand.end_byte), start_i), decl_source.len);
+        const old_name = decl_source[start_i..end_i];
+        if (old_name.len == 0) return;
+
+        const label_msg: []const u8 = switch (cand.fix_kind) {
+            1 => "value/function identifiers must use `snake_case`",
+            2 => "type/variant identifiers must use `PascalCase` without underscores",
+            3 => "constant identifiers must use `SCREAMING_SNAKE_CASE`",
+            else => "identifier does not follow canonical CoreX casing",
+        };
+        const labels = try arena_alloc.alloc(LabeledSpan, 1);
+        labels[0] = .{
+            .span = decl_span,
+            .label = label_msg,
+            .style = .primary,
+        };
+
+        const converted = switch (cand.fix_kind) {
+            1 => try lexer.toSnakeCase(arena_alloc, old_name),
+            2 => try lexer.toPascalCase(arena_alloc, old_name),
+            3 => try lexer.toScreamingSnakeCase(arena_alloc, old_name),
+            else => old_name,
+        };
+
+        var fixes_slice: []const SuggestedFix = &.{};
+        const can_rename = cand.fix_kind >= 1 and cand.fix_kind <= 3 and
+            converted.len > 0 and !std.mem.eql(u8, converted, old_name) and
+            lexer.lookupKeywordOrPrim(converted) == null;
+
+        if (can_rename) {
+            const new_name_id = try self.interner.intern(converted);
+
+            // Locate live `SymbolIndex` matching `decl_span`:
+            var canonical_sym_idx: SymbolIndex = .none;
+            var owner_def_for_local: DefId = .NONE;
+            if (self.item_trees.getPtr(decl_file_id.asInt())) |decl_tree| {
+                for (decl_tree.entries) |entry| {
+                    if (try self.getDefSideTables(entry.def_id)) |st_ptr| {
+                        for (st_ptr.node_symbols) |rec_sym| {
+                            if (rec_sym.isNone() or rec_sym.asInt() >= self.symbol_table.countSymbols()) continue;
+                            const sp = try self.resolveLiveSymbolDeclSpan(rec_sym);
+                            if (sp.file_id == decl_file_id and
+                                sp.start_byte == cand.start_byte and sp.end_byte == cand.end_byte)
+                            {
+                                canonical_sym_idx = rec_sym;
+                                owner_def_for_local = entry.def_id;
+                                break;
+                            }
+                        }
+                    }
+                    if (!canonical_sym_idx.isNone()) break;
+                }
+            }
+            if (canonical_sym_idx.isNone()) {
+                var idx_rev = self.symbol_table.countSymbols();
+                while (idx_rev > 0) {
+                    idx_rev -= 1;
+                    const s_idx = SymbolIndex.fromInt(idx_rev);
+                    const s_rec = self.symbol_table.getSymbol(s_idx);
+                    if (s_rec.flags.is_builtin or s_rec.decl_span.file_id != decl_file_id) continue;
+                    const live_sp = try self.resolveLiveSymbolDeclSpan(s_idx);
+                    if (live_sp.file_id == decl_file_id and
+                        live_sp.start_byte == cand.start_byte and
+                        live_sp.end_byte == cand.end_byte)
+                    {
+                        canonical_sym_idx = s_idx;
+                        break;
+                    }
+                }
+            }
+
+            // Check same-scope collision hazard against `converted`:
+            var has_collision = false;
+            if (!canonical_sym_idx.isNone()) {
+                const target_sym = self.symbol_table.getSymbol(canonical_sym_idx).*;
+                if (self.interner.lookup(converted)) |existing_conv_sym_id| {
+                    const ns_mask: symbol_resolver.NamespaceMask = switch (target_sym.namespace) {
+                        .type_ns => symbol_resolver.NamespaceMask.TYPE_ONLY,
+                        .value_ns => symbol_resolver.NamespaceMask.VALUE_ONLY,
+                        .const_ns => symbol_resolver.NamespaceMask.CONST_ONLY,
+                    };
+                    if (!self.symbol_table.lookupInScopeDirect(target_sym.scope_id, existing_conv_sym_id, ns_mask).isNone()) {
+                        has_collision = true;
+                    }
+                    if (!has_collision and !owner_def_for_local.isNone()) {
+                        if (try self.getDefSideTables(owner_def_for_local)) |st_ptr| {
+                            for (st_ptr.node_symbols) |other_s| {
+                                if (!other_s.isNone() and other_s != canonical_sym_idx and
+                                    self.symbol_table.getSymbol(other_s).name == existing_conv_sym_id)
+                                {
+                                    has_collision = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!has_collision) {
+                var edits: std.ArrayListUnmanaged(diagnostic.TextEdit) = .empty;
+                var is_edit_set_clean = true;
+
+                // [A] Emit the declaration edit (expanding struct pattern shorthand `Point { badVar }` -> `Point { badVar: bad_var }`):
+                var decl_edit_start = cand.start_byte;
+                var decl_repl_id = new_name_id;
+                if (!canonical_sym_idx.isNone()) {
+                    const decl_sym = self.symbol_table.getSymbol(canonical_sym_idx).*;
+                    if (decl_sym.flags.is_shorthand_field_pat) {
+                        var is_struct_field_also_renaming = false;
+                        for (surviving_cands) |other_c| {
+                            if (other_c.rule_id == .non_canonical_case and other_c.start_byte != cand.start_byte) {
+                                const os: usize = @min(@as(usize, other_c.start_byte), decl_source.len);
+                                const oe: usize = @min(@max(@as(usize, other_c.end_byte), os), decl_source.len);
+                                if (std.mem.eql(u8, decl_source[os..oe], old_name)) {
+                                    is_struct_field_also_renaming = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!is_struct_field_also_renaming) {
+                            if (decl_sym.flags.shorthand_field_mod != 0 and
+                                cand.start_byte >= decl_sym.flags.shorthand_lead_bytes)
+                            {
+                                decl_edit_start = cand.start_byte - decl_sym.flags.shorthand_lead_bytes;
+                            }
+                            const mod_pref: []const u8 = switch (decl_sym.flags.shorthand_field_mod) {
+                                1 => "var ",
+                                2 => "&",
+                                3 => "&mut ",
+                                else => "",
+                            };
+                            const expanded = try std.fmt.allocPrint(
+                                arena_alloc,
+                                "{s}: {s}{s}",
+                                .{ old_name, mod_pref, converted },
+                            );
+                            decl_repl_id = try self.interner.intern(expanded);
+                        }
+                    }
+                }
+                is_edit_set_clean = try appendUniqueRenameEdit(arena_alloc, &edits, .{
+                    .file_id = decl_file_id,
+                    .start_byte = decl_edit_start,
+                    .end_byte = cand.end_byte,
+                    .replacement_id = decl_repl_id,
+                });
+
+                // [B] Collect intra-package reference edits when `canonical_sym_idx` resolved:
+                if (is_edit_set_clean and !canonical_sym_idx.isNone()) {
+                    const target_sym = self.symbol_table.getSymbol(canonical_sym_idx).*;
+                    const is_explicit_use_alias = (target_sym.kind == .use_alias_sym);
+                    const is_strictly_file_local = is_explicit_use_alias or
+                        target_sym.kind == .local_let_sym or
+                        target_sym.kind == .local_var_sym or
+                        target_sym.kind == .type_param_sym or
+                        target_sym.kind == .const_param_sym or
+                        (target_sym.visibility == .private and target_sym.kind != .enum_variant_sym);
+
+                    const single_file_buf = [1]FileId{decl_file_id};
+                    const scan_files: []const FileId = if (is_strictly_file_local or pkg_files.len == 0)
+                        &single_file_buf
+                    else
+                        pkg_files;
+
+                    for (scan_files) |scan_fid| {
+                        if (!is_edit_set_clean) break;
+                        if (self.symbol_table.getFilePackageId(scan_fid) != pkg_id) continue;
+                        try self.ensureFreshSignatureAstAndSideTables(scan_fid);
+                        const scan_src = self.getSourceText(scan_fid) catch continue;
+                        if (std.mem.indexOf(u8, scan_src, old_name) == null) continue;
+                        const scan_parsed = self.parsed_artifacts.getPtr(scan_fid.asInt()) orelse continue;
+                        const tok_count = scan_parsed.token_buffer.countTokens();
+
+                        // [B.1] Scan `file_side_tables` (signatures, field types, return types, consts):
+                        if (self.file_side_tables.getPtr(scan_fid.asInt())) |file_st| {
+                            const file_ast_lim = @min(file_st.ast_end, @as(u32, @intCast(scan_parsed.ast_arena.countNodes())));
+                            var f_ast_raw = file_st.ast_start;
+                            while (f_ast_raw < file_ast_lim) : (f_ast_raw += 1) {
+                                const ast_id = NodeIndex.fromInt(f_ast_raw);
+                                const raw_ns = file_st.getNodeSymbol(ast_id);
+                                if (raw_ns.isNone()) continue;
+                                const matched = if (is_explicit_use_alias)
+                                    raw_ns == canonical_sym_idx
+                                else
+                                    unwrapToCanonicalRenameTarget(&self.symbol_table, raw_ns) == canonical_sym_idx;
+                                if (!matched) continue;
+                                const focal_tok = findMatchingFocalTokenInAstNode(scan_src, scan_parsed, ast_id, old_name);
+                                if (!focal_tok.isNone()) {
+                                    const sp = scan_parsed.token_buffer.getTokenSpan(scan_fid, focal_tok);
+                                    if (sp.file_id == decl_file_id and sp.start_byte == cand.start_byte) continue;
+                                    if (!(try appendUniqueRenameEdit(arena_alloc, &edits, .{
+                                        .file_id = scan_fid,
+                                        .start_byte = sp.start_byte,
+                                        .end_byte = sp.end_byte,
+                                        .replacement_id = new_name_id,
+                                    }))) {
+                                        is_edit_set_clean = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        // [B.2] Scan `use` trees and `impl` headers in `scan_fid` with `SymbolIndex` verification:
+                        if (is_edit_set_clean and !is_explicit_use_alias and
+                            target_sym.kind != .local_let_sym and target_sym.kind != .local_var_sym and
+                            target_sym.kind != .param_sym)
+                        {
+                            // [B.2a] Verified `.use_item` leaf specifiers via `use_leaf_records`:
+                            for (self.symbol_table.use_leaf_records.items) |urec| {
+                                if (!is_edit_set_clean) break;
+                                if (urec.file_id != scan_fid or urec.alias_sym.isNone()) continue;
+                                if (unwrapToCanonicalRenameTarget(&self.symbol_table, urec.alias_sym) != canonical_sym_idx) continue;
+                                if (urec.leaf_tree_cst.isNone() or urec.leaf_tree_cst.asInt() >= scan_parsed.cst_arena.countNodes()) continue;
+
+                                const lt_s: usize = urec.leaf_tree_cst.asInt();
+                                const lt_e: usize = @min(
+                                    lt_s + @max(@as(usize, scan_parsed.cst_arena.getNode(urec.leaf_tree_cst).subtree_size), 1),
+                                    scan_parsed.cst_arena.countNodes(),
+                                );
+                                var has_as_kw = false;
+                                var matched_src_tok: TokenIndex = .none;
+                                var lc = lt_s + 1;
+                                while (lc < lt_e) : (lc += 1) {
+                                    const lf = scan_parsed.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(lc)));
+                                    if (lf.subtree_size > 1 or lf.flags.is_missing_or_injected or
+                                        lf.token.isNone() or lf.token.asInt() >= tok_count) continue;
+                                    const lk = scan_parsed.token_buffer.getToken(lf.token).kind;
+                                    if (lk == .kw_as) {
+                                        has_as_kw = true;
+                                        break;
+                                    }
+                                    if (symbol_resolver.isIdentifierToken(lk) and
+                                        std.mem.eql(
+                                            u8,
+                                            symbol_resolver.extractTokenSlice(scan_src, &scan_parsed.token_buffer, lf.token),
+                                            old_name,
+                                        ))
+                                    {
+                                        matched_src_tok = lf.token;
+                                    }
+                                }
+                                if (matched_src_tok.isNone()) continue;
+                                if (!has_as_kw) {
+                                    if (self.interner.lookup(converted)) |conv_id| {
+                                        const ns_mask: symbol_resolver.NamespaceMask = switch (target_sym.namespace) {
+                                            .type_ns => symbol_resolver.NamespaceMask.TYPE_ONLY,
+                                            .value_ns => symbol_resolver.NamespaceMask.VALUE_ONLY,
+                                            .const_ns => symbol_resolver.NamespaceMask.CONST_ONLY,
+                                        };
+                                        if (!self.symbol_table.lookupInScopeDirect(urec.scope_id, conv_id, ns_mask).isNone()) {
+                                            is_edit_set_clean = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                const sp = scan_parsed.token_buffer.getTokenSpan(scan_fid, matched_src_tok);
+                                if (!(sp.file_id == decl_file_id and sp.start_byte == cand.start_byte)) {
+                                    if (!(try appendUniqueRenameEdit(arena_alloc, &edits, .{
+                                        .file_id = scan_fid,
+                                        .start_byte = sp.start_byte,
+                                        .end_byte = sp.end_byte,
+                                        .replacement_id = new_name_id,
+                                    }))) {
+                                        is_edit_set_clean = false;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            // [B.2b] Also check `pub use` re-exports in `scan_fid` via `file_module_scopes`:
+                            if (is_edit_set_clean) {
+                                if (self.symbol_table.file_module_scopes.get(scan_fid.asInt())) |scan_mod_scope| {
+                                    for (self.symbol_table.getScopeMembers(scan_mod_scope)) |m_idx| {
+                                        if (!is_edit_set_clean) break;
+                                        const m_sym = self.symbol_table.getSymbol(m_idx).*;
+                                        if (!m_sym.flags.is_imported or m_sym.visibility == .private) continue;
+                                        if (unwrapToCanonicalRenameTarget(&self.symbol_table, m_idx) != canonical_sym_idx) continue;
+                                        if (m_sym.cst_node.isNone() or m_sym.cst_node.asInt() >= scan_parsed.cst_arena.countNodes()) continue;
+                                        const u_s: usize = m_sym.cst_node.asInt();
+                                        const u_e: usize = @min(
+                                            u_s + @max(@as(usize, scan_parsed.cst_arena.getNode(m_sym.cst_node).subtree_size), 1),
+                                            scan_parsed.cst_arena.countNodes(),
+                                        );
+                                        var seen_as = false;
+                                        var u_c = u_s + 1;
+                                        while (u_c < u_e) : (u_c += 1) {
+                                            const lf = scan_parsed.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(u_c)));
+                                            if (lf.kind == .use_tree) seen_as = false;
+                                            if (lf.subtree_size <= 1 and !lf.flags.is_missing_or_injected and
+                                                !lf.token.isNone() and lf.token.asInt() < tok_count)
+                                            {
+                                                const lk = scan_parsed.token_buffer.getToken(lf.token).kind;
+                                                if (lk == .kw_as) {
+                                                    seen_as = true;
+                                                    continue;
+                                                }
+                                                if (lk == .comma or lk == .lbrace or lk == .rbrace) {
+                                                    seen_as = false;
+                                                    continue;
+                                                }
+                                                if (!seen_as and symbol_resolver.isIdentifierToken(lk) and
+                                                    std.mem.eql(
+                                                        u8,
+                                                        symbol_resolver.extractTokenSlice(scan_src, &scan_parsed.token_buffer, lf.token),
+                                                        old_name,
+                                                    ))
+                                                {
+                                                    const sp = scan_parsed.token_buffer.getTokenSpan(scan_fid, lf.token);
+                                                    if (!(sp.file_id == decl_file_id and sp.start_byte == cand.start_byte)) {
+                                                        if (!(try appendUniqueRenameEdit(arena_alloc, &edits, .{
+                                                            .file_id = scan_fid,
+                                                            .start_byte = sp.start_byte,
+                                                            .end_byte = sp.end_byte,
+                                                            .replacement_id = new_name_id,
+                                                        }))) {
+                                                            is_edit_set_clean = false;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // [B.2c] Verified `.impl_item` headers (`file_side_tables` AST symbol or lexical scope check):
+                            if (is_edit_set_clean and target_sym.namespace == .type_ns) {
+                                const scan_mod_sc = self.symbol_table.file_module_scopes.get(scan_fid.asInt()) orelse .none;
+                                const scan_file_st = self.file_side_tables.getPtr(scan_fid.asInt());
+                                const cst_len = scan_parsed.cst_arena.countNodes();
+                                var cst_cur: usize = 0;
+                                while (cst_cur < cst_len and is_edit_set_clean) {
+                                    const cst_id = CstNodeIndex.fromInt(@intCast(cst_cur));
+                                    const cst_rec = scan_parsed.cst_arena.getNode(cst_id);
+                                    if (cst_rec.kind == .impl_item) {
+                                        const sub_end = @min(
+                                            cst_cur + @max(@as(usize, cst_rec.subtree_size), 1),
+                                            cst_len,
+                                        );
+                                        var header_end = sub_end;
+                                        var h_scan = cst_cur + 1;
+                                        while (h_scan < sub_end) : (h_scan += 1) {
+                                            if (scan_parsed.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(h_scan))).kind == .block) {
+                                                header_end = h_scan;
+                                                break;
+                                            }
+                                        }
+
+                                        var inner_c = cst_cur + 1;
+                                        while (inner_c < header_end and is_edit_set_clean) : (inner_c += 1) {
+                                            if (inner_c < scan_parsed.cst_to_ast.len and scan_file_st != null) {
+                                                const mapped_aid = scan_parsed.cst_to_ast[inner_c];
+                                                if (!mapped_aid.isNone()) {
+                                                    const ns = scan_file_st.?.getNodeSymbol(mapped_aid);
+                                                    if (!ns.isNone() and
+                                                        unwrapToCanonicalRenameTarget(&self.symbol_table, ns) == canonical_sym_idx)
+                                                    {
+                                                        const ftok = findMatchingFocalTokenInAstNode(scan_src, scan_parsed, mapped_aid, old_name);
+                                                        if (!ftok.isNone()) {
+                                                            const sp = scan_parsed.token_buffer.getTokenSpan(scan_fid, ftok);
+                                                            if (!(sp.file_id == decl_file_id and sp.start_byte == cand.start_byte)) {
+                                                                if (!(try appendUniqueRenameEdit(arena_alloc, &edits, .{
+                                                                    .file_id = scan_fid,
+                                                                    .start_byte = sp.start_byte,
+                                                                    .end_byte = sp.end_byte,
+                                                                    .replacement_id = new_name_id,
+                                                                }))) {
+                                                                    is_edit_set_clean = false;
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            const leaf = scan_parsed.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(inner_c)));
+                                            if (leaf.subtree_size <= 1 and !leaf.flags.is_missing_or_injected and
+                                                !leaf.token.isNone() and leaf.token.asInt() < tok_count)
+                                            {
+                                                const lk = scan_parsed.token_buffer.getToken(leaf.token).kind;
+                                                if (symbol_resolver.isIdentifierToken(lk) and
+                                                    std.mem.eql(
+                                                        u8,
+                                                        symbol_resolver.extractTokenSlice(scan_src, &scan_parsed.token_buffer, leaf.token),
+                                                        old_name,
+                                                    ) and !scan_mod_sc.isNone())
+                                                {
+                                                    // Verify unqualified header token resolves to `canonical_sym_idx` in `scan_mod_sc`:
+                                                    const is_after_dot = leaf.token.asInt() > 0 and
+                                                        scan_parsed.token_buffer.getToken(TokenIndex.fromInt(leaf.token.asInt() - 1)).kind == .dot;
+                                                    if (!is_after_dot) {
+                                                        if (self.interner.lookup(old_name)) |old_id| {
+                                                            const lres = self.symbol_table.lookupLexical(
+                                                                scan_mod_sc,
+                                                                old_id,
+                                                                symbol_resolver.NamespaceMask.TYPE_ONLY,
+                                                            );
+                                                            if (lres == .found and
+                                                                unwrapToCanonicalRenameTarget(&self.symbol_table, lres.found) == canonical_sym_idx)
+                                                            {
+                                                                const sp = scan_parsed.token_buffer.getTokenSpan(scan_fid, leaf.token);
+                                                                if (!(sp.file_id == decl_file_id and sp.start_byte == cand.start_byte)) {
+                                                                    if (!(try appendUniqueRenameEdit(arena_alloc, &edits, .{
+                                                                        .file_id = scan_fid,
+                                                                        .start_byte = sp.start_byte,
+                                                                        .end_byte = sp.end_byte,
+                                                                        .replacement_id = new_name_id,
+                                                                    }))) {
+                                                                        is_edit_set_clean = false;
+                                                                        break;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        cst_cur = sub_end;
+                                        continue;
+                                    }
+                                    cst_cur += 1;
+                                }
+                            }
+                        }
+
+                        // [B.3] Scan `def_side_tables` (`node_symbols`, `.struct_lit`/`.struct_pat` fields, `.named_arg`, `string_interps`):
+                        if (is_edit_set_clean) {
+                            if (self.item_trees.getPtr(scan_fid.asInt())) |scan_tree| {
+                                for (scan_tree.entries) |entry| {
+                                    if (!is_edit_set_clean) break;
+                                    if (!owner_def_for_local.isNone() and
+                                        (target_sym.kind == .local_let_sym or target_sym.kind == .local_var_sym) and
+                                        entry.def_id != owner_def_for_local)
+                                    {
+                                        continue;
+                                    }
+                                    const st_ptr = (try self.getDefSideTables(entry.def_id)) orelse continue;
+                                    const ast_lim = @min(st_ptr.ast_end, @as(u32, @intCast(scan_parsed.ast_arena.countNodes())));
+
+                                    var ast_raw = st_ptr.ast_start;
+                                    while (ast_raw < ast_lim and is_edit_set_clean) : (ast_raw += 1) {
+                                        const ast_id = NodeIndex.fromInt(ast_raw);
+                                        const ast_node = scan_parsed.ast_arena.getNode(ast_id);
+                                        const raw_ns = st_ptr.getNodeSymbol(ast_id);
+                                        if (!raw_ns.isNone()) {
+                                            const matched = if (is_explicit_use_alias)
+                                                raw_ns == canonical_sym_idx
+                                            else
+                                                unwrapToCanonicalRenameTarget(&self.symbol_table, raw_ns) == canonical_sym_idx;
+                                            if (matched) {
+                                                const focal_tok = findMatchingFocalTokenInAstNode(scan_src, scan_parsed, ast_id, old_name);
+                                                if (!focal_tok.isNone()) {
+                                                    const sp = scan_parsed.token_buffer.getTokenSpan(scan_fid, focal_tok);
+                                                    if (!(sp.file_id == decl_file_id and sp.start_byte == cand.start_byte)) {
+                                                        var ref_repl_id = new_name_id;
+                                                        // Check struct literal shorthand `Point { badVar }` where `badVar` is a local variable:
+                                                        if (ast_node.tag == .ident_expr and target_sym.kind != .field_sym) {
+                                                            const expr_cst = scan_parsed.ast_arena.getCstOrigin(ast_id);
+                                                            if (!expr_cst.isNone() and expr_cst.asInt() > 0) {
+                                                                const prev_cst = CstNodeIndex.fromInt(expr_cst.asInt() - 1);
+                                                                if (scan_parsed.cst_arena.getNode(prev_cst).kind == .field_init) {
+                                                                    const prev_sz: usize = @max(
+                                                                        @as(usize, scan_parsed.cst_arena.getNode(prev_cst).subtree_size),
+                                                                        1,
+                                                                    );
+                                                                    const fi_end = @min(
+                                                                        @as(usize, prev_cst.asInt()) + prev_sz,
+                                                                        scan_parsed.cst_arena.countNodes(),
+                                                                    );
+                                                                    var has_colon = false;
+                                                                    var fc: usize = prev_cst.asInt() + 1;
+                                                                    while (fc < fi_end) : (fc += 1) {
+                                                                        const fl = scan_parsed.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(fc)));
+                                                                        if (fl.subtree_size <= 1 and !fl.token.isNone() and
+                                                                            fl.token.asInt() < tok_count and
+                                                                            scan_parsed.token_buffer.getToken(fl.token).kind == .colon)
+                                                                        {
+                                                                            has_colon = true;
+                                                                            break;
+                                                                        }
+                                                                    }
+                                                                    if (!has_colon) {
+                                                                        const exp_init = try std.fmt.allocPrint(
+                                                                            arena_alloc,
+                                                                            "{s}: {s}",
+                                                                            .{ old_name, converted },
+                                                                        );
+                                                                        ref_repl_id = try self.interner.intern(exp_init);
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        if (!(try appendUniqueRenameEdit(arena_alloc, &edits, .{
+                                                            .file_id = scan_fid,
+                                                            .start_byte = sp.start_byte,
+                                                            .end_byte = sp.end_byte,
+                                                            .replacement_id = ref_repl_id,
+                                                        }))) {
+                                                            is_edit_set_clean = false;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // Struct field label in `.struct_lit` or `.struct_pat`:
+                                        if (target_sym.kind == .field_sym and
+                                            (ast_node.tag == .struct_lit or ast_node.tag == .struct_pat))
+                                        {
+                                            const raw_nt = st_ptr.getNodeType(ast_id);
+                                            const deref_nt = if (self.type_pool.getTag(raw_nt) == .ref_ty or
+                                                self.type_pool.getTag(raw_nt) == .mut_ref_ty)
+                                                TypeId.fromInt(self.type_pool.getNode(raw_nt).lhs)
+                                            else
+                                                raw_nt;
+                                            const st_ty = self.type_pool.unwrapUnderlyingType(deref_nt);
+                                            const st_node = self.type_pool.getNode(st_ty);
+                                            if ((st_node.tag == .struct_ty or st_node.tag == .union_ty or st_node.tag == .bit_field_ty) and
+                                                self.symbol_table.getSymbol(SymbolIndex.fromInt(st_node.rhs)).target_scope == target_sym.scope_id)
+                                            {
+                                                const sc_cst = scan_parsed.ast_arena.getCstOrigin(ast_id);
+                                                if (!sc_cst.isNone() and sc_cst.asInt() < scan_parsed.cst_arena.countNodes()) {
+                                                    const sc_s: usize = sc_cst.asInt();
+                                                    const sc_e: usize = @min(
+                                                        sc_s + @max(@as(usize, scan_parsed.cst_arena.getNode(sc_cst).subtree_size), 1),
+                                                        scan_parsed.cst_arena.countNodes(),
+                                                    );
+                                                    var f_cur = sc_s + 1;
+                                                    while (f_cur < sc_e and is_edit_set_clean) {
+                                                        const f_cst = CstNodeIndex.fromInt(@intCast(f_cur));
+                                                        const f_rec = scan_parsed.cst_arena.getNode(f_cst);
+                                                        if (f_rec.kind == .field_init or f_rec.kind == .field_pat) {
+                                                            const f_end = @min(f_cur + @max(@as(usize, f_rec.subtree_size), 1), sc_e);
+                                                            var first_id_tok: TokenIndex = .none;
+                                                            var has_colon = false;
+                                                            var in_c = f_cur + 1;
+                                                            while (in_c < f_end) : (in_c += 1) {
+                                                                const lf = scan_parsed.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(in_c)));
+                                                                if (lf.subtree_size <= 1 and !lf.flags.is_missing_or_injected and
+                                                                    !lf.token.isNone() and lf.token.asInt() < tok_count)
+                                                                {
+                                                                    const lkind = scan_parsed.token_buffer.getToken(lf.token).kind;
+                                                                    if (first_id_tok.isNone() and symbol_resolver.isIdentifierToken(lkind)) {
+                                                                        first_id_tok = lf.token;
+                                                                    } else if (lkind == .colon) {
+                                                                        has_colon = true;
+                                                                        break;
+                                                                    }
+                                                                }
+                                                            }
+                                                            if (!first_id_tok.isNone() and
+                                                                std.mem.eql(
+                                                                    u8,
+                                                                    symbol_resolver.extractTokenSlice(
+                                                                        scan_src,
+                                                                        &scan_parsed.token_buffer,
+                                                                        first_id_tok,
+                                                                    ),
+                                                                    old_name,
+                                                                ))
+                                                            {
+                                                                const f_sp = scan_parsed.token_buffer.getTokenSpan(scan_fid, first_id_tok);
+                                                                const f_repl_id = if (has_colon)
+                                                                    new_name_id
+                                                                else blk_sh: {
+                                                                    var is_val_also_renaming = false;
+                                                                    for (surviving_cands) |oc| {
+                                                                        if (oc.rule_id == .non_canonical_case and oc.start_byte != cand.start_byte) {
+                                                                            const os: usize = @min(@as(usize, oc.start_byte), decl_source.len);
+                                                                            const oe: usize = @min(
+                                                                                @max(@as(usize, oc.end_byte), os),
+                                                                                decl_source.len,
+                                                                            );
+                                                                            if (std.mem.eql(u8, decl_source[os..oe], old_name)) {
+                                                                                is_val_also_renaming = true;
+                                                                                break;
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    if (is_val_also_renaming) break :blk_sh new_name_id;
+                                                                    const exp_f = try std.fmt.allocPrint(
+                                                                        arena_alloc,
+                                                                        "{s}: {s}",
+                                                                        .{ converted, old_name },
+                                                                    );
+                                                                    break :blk_sh try self.interner.intern(exp_f);
+                                                                };
+                                                                if (!(try appendUniqueRenameEdit(arena_alloc, &edits, .{
+                                                                    .file_id = scan_fid,
+                                                                    .start_byte = f_sp.start_byte,
+                                                                    .end_byte = f_sp.end_byte,
+                                                                    .replacement_id = f_repl_id,
+                                                                }))) {
+                                                                    is_edit_set_clean = false;
+                                                                }
+                                                            }
+                                                            f_cur = f_end;
+                                                            continue;
+                                                        }
+                                                        f_cur += 1;
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // Named call argument `foo(badParam: val)` when renaming parameter `badParam`:
+                                        if (target_sym.kind == .param_sym and
+                                            (ast_node.tag == .call_expr or ast_node.tag == .generic_call or
+                                                ast_node.tag == .method_call or ast_node.tag == .pipe_expr))
+                                        {
+                                            var callee_sym = st_ptr.getNodeSymbol(ast_id);
+                                            if (callee_sym.isNone() and ast_node.lhs.tag == .node) {
+                                                callee_sym = st_ptr.getNodeSymbol(NodeIndex.fromInt(ast_node.lhs.payload));
+                                            }
+                                            const unwrapped_callee = unwrapToCanonicalRenameTarget(&self.symbol_table, callee_sym);
+                                            const param_sc_owner = if (!target_sym.scope_id.isNone() and
+                                                target_sym.scope_id.asInt() < self.symbol_table.scope_arena.countScopes())
+                                                self.symbol_table.scope_arena.getScope(target_sym.scope_id).owner_def_id
+                                            else
+                                                DefId.NONE;
+                                            const is_matching_callee = !unwrapped_callee.isNone() and
+                                                (self.symbol_table.getSymbol(unwrapped_callee).target_scope == target_sym.scope_id or
+                                                    (!param_sc_owner.isNone() and
+                                                        self.symbol_table.def_to_symbol.get(param_sc_owner.asInt()) == unwrapped_callee));
+                                            const call_cst = scan_parsed.ast_arena.getCstOrigin(ast_id);
+                                            if (is_matching_callee and !call_cst.isNone() and
+                                                call_cst.asInt() < scan_parsed.cst_arena.countNodes())
+                                            {
+                                                const cc_s: usize = call_cst.asInt();
+                                                const cc_e: usize = @min(
+                                                    cc_s + @max(@as(usize, scan_parsed.cst_arena.getNode(call_cst).subtree_size), 1),
+                                                    scan_parsed.cst_arena.countNodes(),
+                                                );
+                                                var p_depth: u32 = 0;
+                                                var bk_depth: u32 = 0;
+                                                var br_depth: u32 = 0;
+                                                var is_at_arg_start = false;
+                                                var pending_lbl_tok: TokenIndex = .none;
+                                                var cc_cur = cc_s + 1;
+                                                while (cc_cur < cc_e) : (cc_cur += 1) {
+                                                    const clf = scan_parsed.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cc_cur)));
+                                                    if (clf.subtree_size > 1 or clf.flags.is_missing_or_injected or
+                                                        clf.token.isNone() or clf.token.asInt() >= tok_count)
+                                                    {
+                                                        continue;
+                                                    }
+                                                    const ckind = scan_parsed.token_buffer.getToken(clf.token).kind;
+                                                    if (p_depth == 1 and bk_depth == 0 and br_depth == 0) {
+                                                        if (!pending_lbl_tok.isNone()) {
+                                                            const lbl_tok = pending_lbl_tok;
+                                                            pending_lbl_tok = .none;
+                                                            if (ckind == .colon and std.mem.eql(
+                                                                u8,
+                                                                symbol_resolver.extractTokenSlice(
+                                                                    scan_src,
+                                                                    &scan_parsed.token_buffer,
+                                                                    lbl_tok,
+                                                                ),
+                                                                old_name,
+                                                            )) {
+                                                                const arg_sp = scan_parsed.token_buffer.getTokenSpan(scan_fid, lbl_tok);
+                                                                if (!(try appendUniqueRenameEdit(arena_alloc, &edits, .{
+                                                                    .file_id = scan_fid,
+                                                                    .start_byte = arg_sp.start_byte,
+                                                                    .end_byte = arg_sp.end_byte,
+                                                                    .replacement_id = new_name_id,
+                                                                }))) {
+                                                                    is_edit_set_clean = false;
+                                                                    break;
+                                                                }
+                                                            }
+                                                        } else if (is_at_arg_start and symbol_resolver.isIdentifierToken(ckind)) {
+                                                            pending_lbl_tok = clf.token;
+                                                            is_at_arg_start = false;
+                                                            continue;
+                                                        }
+                                                    } else {
+                                                        pending_lbl_tok = .none;
+                                                    }
+                                                    switch (ckind) {
+                                                        .lparen => {
+                                                            p_depth += 1;
+                                                            is_at_arg_start = (p_depth == 1 and bk_depth == 0 and br_depth == 0);
+                                                        },
+                                                        .rparen => {
+                                                            p_depth -|= 1;
+                                                            is_at_arg_start = false;
+                                                        },
+                                                        .lbracket => {
+                                                            bk_depth += 1;
+                                                            is_at_arg_start = false;
+                                                        },
+                                                        .rbracket => {
+                                                            bk_depth -|= 1;
+                                                            is_at_arg_start = false;
+                                                        },
+                                                        .lbrace => {
+                                                            br_depth += 1;
+                                                            is_at_arg_start = false;
+                                                        },
+                                                        .rbrace => {
+                                                            br_depth -|= 1;
+                                                            is_at_arg_start = false;
+                                                        },
+                                                        .comma => {
+                                                            is_at_arg_start = (p_depth == 1 and bk_depth == 0 and br_depth == 0);
+                                                        },
+                                                        else => {
+                                                            is_at_arg_start = false;
+                                                        },
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // [B.4] `f"…"` interpolation hole tokens via `st_ptr.string_interps`:
+                                    var interp_it = st_ptr.string_interps.iterator();
+                                    while (interp_it.next()) |interp_kv| {
+                                        if (!is_edit_set_clean) break;
+                                        const fmt_ast_raw = st_ptr.ast_start + interp_kv.key_ptr.*;
+                                        if (fmt_ast_raw >= ast_lim) continue;
+                                        const fmt_tok = scan_parsed.ast_arena.getNode(NodeIndex.fromInt(fmt_ast_raw)).main_token;
+                                        if (fmt_tok.isNone() or fmt_tok.asInt() >= tok_count) continue;
+                                        const fmt_base = scan_parsed.token_buffer.getToken(fmt_tok).byte_offset;
+                                        for (interp_kv.value_ptr.holes) |hole| {
+                                            for (hole.tokens) |htok| {
+                                                if (htok.byte_len == 0 or htok.symbol_index.isNone()) continue;
+                                                const matched = if (is_explicit_use_alias)
+                                                    htok.symbol_index == canonical_sym_idx
+                                                else
+                                                    unwrapToCanonicalRenameTarget(&self.symbol_table, htok.symbol_index) == canonical_sym_idx;
+                                                if (!matched) continue;
+                                                const hs = fmt_base +| htok.rel_byte;
+                                                const he = hs +| @as(u32, htok.byte_len);
+                                                const hs_u: usize = @min(@as(usize, hs), scan_src.len);
+                                                const he_u: usize = @min(@max(@as(usize, he), hs_u), scan_src.len);
+                                                if (!std.mem.eql(u8, scan_src[hs_u..he_u], old_name)) continue;
+                                                if (!(try appendUniqueRenameEdit(arena_alloc, &edits, .{
+                                                    .file_id = scan_fid,
+                                                    .start_byte = hs,
+                                                    .end_byte = he,
+                                                    .replacement_id = new_name_id,
+                                                }))) {
+                                                    is_edit_set_clean = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (is_edit_set_clean and edits.items.len > 0) {
+                    std.mem.sort(diagnostic.TextEdit, edits.items, {}, struct {
+                        fn lessThan(_: void, lhs: diagnostic.TextEdit, rhs: diagnostic.TextEdit) bool {
+                            if (lhs.file_id.asInt() != rhs.file_id.asInt()) {
+                                return lhs.file_id.asInt() < rhs.file_id.asInt();
+                            }
+                            if (lhs.start_byte != rhs.start_byte) return lhs.start_byte < rhs.start_byte;
+                            return lhs.end_byte < rhs.end_byte;
+                        }
+                    }.lessThan);
+                    const fix_arr = try arena_alloc.alloc(SuggestedFix, 1);
+                    fix_arr[0] = .{
+                        .message = "convert identifier and intra-package references to canonical CoreX casing",
+                        .applicability = .machine_applicable,
+                        .priority = .lint_idiom,
+                        .edits = edits.items,
+                    };
+                    fixes_slice = fix_arr;
+                }
+            }
+        }
+
+        try proj_sink.emit(.{
+            .code = .w0201_non_canonical_identifier_case,
+            .severity = .warning,
+            .primary_span = decl_span,
+            .message = "identifier does not follow canonical CoreX casing",
+            .labels = labels,
+            .suggestions = fixes_slice,
+        });
+    }
+
+    /// Fuses co-firing `W0402` + `W0405` on struct-pattern shorthand `Point { var x }` (`Ruling 4.1 #5`).
+    fn fuseStructShorthandUnusedVarEdits(
+        self: *CompilerDb,
+        proj_sink: *DiagnosticSink,
+    ) !void {
+        const arena_alloc = proj_sink.arena.asAllocator();
+        for (proj_sink.diagnostics.items, 0..) |*diag_item, idx| {
+            if (diag_item.code != .w0402_unused_binding or diag_item.suggestions.len == 0) continue;
+            const sug = diag_item.suggestions[0];
+            if (sug.edits.len != 1) continue;
+            const ed = sug.edits[0];
+            const repl_str = self.interner.get(ed.replacement_id);
+            const marker_pos = std.mem.indexOf(u8, repl_str, ": var _") orelse continue;
+
+            var has_paired_w0405 = false;
+            for (proj_sink.diagnostics.items, 0..) |other_diag, other_idx| {
+                if (other_idx == idx or other_diag.code != .w0405_unused_mut_binding) continue;
+                if (other_diag.suggestions.len == 0 or other_diag.suggestions[0].edits.len != 1) continue;
+                const w0405_ed = other_diag.suggestions[0].edits[0];
+                if (w0405_ed.file_id == ed.file_id and
+                    w0405_ed.start_byte == ed.start_byte and
+                    w0405_ed.end_byte < ed.end_byte and
+                    self.interner.get(w0405_ed.replacement_id).len == 0)
+                {
+                    has_paired_w0405 = true;
+                    break;
+                }
+            }
+            if (!has_paired_w0405) continue;
+
+            const fused_repl = try std.fmt.allocPrint(
+                arena_alloc,
+                "{s}: _{s}",
+                .{ repl_str[0..marker_pos], repl_str[marker_pos + ": var _".len ..] },
+            );
+            const fused_edits = try arena_alloc.alloc(diagnostic.TextEdit, 1);
+            fused_edits[0] = .{
+                .file_id = ed.file_id,
+                .start_byte = ed.start_byte,
+                .end_byte = ed.end_byte,
+                .replacement_id = try self.interner.intern(fused_repl),
+            };
+            const fused_fixes = try arena_alloc.alloc(SuggestedFix, 1);
+            fused_fixes[0] = .{
+                .message = sug.message,
+                .applicability = sug.applicability,
+                .priority = .type_migration,
+                .edits = fused_edits,
+            };
+            diag_item.suggestions = fused_fixes;
+        }
+    }
+
+    /// Augments `W0206` / `W0207` method-rename `SuggestedFix`es with all intra-package call sites (`DR-25` §2.2).
+    fn augmentMethodRenameSuggestionsInPkg(
+        self: *CompilerDb,
+        proj_sink: *DiagnosticSink,
+        decl_file_id: FileId,
+        pkg_id: PackageId,
+        pkg_files: []const FileId,
+        decl_source: []const u8,
+        diag_item: *diagnostic.Diagnostic,
+    ) !void {
+        if (diag_item.suggestions.len == 0 or diag_item.suggestions[0].edits.len != 1) return;
+        const decl_ed = diag_item.suggestions[0].edits[0];
+        if (decl_ed.file_id != decl_file_id) return;
+        const start_u = @min(@as(usize, decl_ed.start_byte), decl_source.len);
+        const end_u = @min(@max(@as(usize, decl_ed.end_byte), start_u), decl_source.len);
+        const old_name = decl_source[start_u..end_u];
+        if (old_name.len == 0) return;
+        const new_name_id = decl_ed.replacement_id;
+
+        var target_sym_idx: SymbolIndex = .none;
+        var fallback_sym_idx: SymbolIndex = .none;
+        var idx_rev = self.symbol_table.countSymbols();
+        while (idx_rev > 0) {
+            idx_rev -= 1;
+            const cand_idx = SymbolIndex.fromInt(idx_rev);
+            const srec = self.symbol_table.getSymbol(cand_idx);
+            if (srec.flags.is_builtin or srec.kind != .fn_sym) continue;
+            if (srec.decl_span.file_id != decl_file_id or !std.mem.eql(u8, srec.name_text, old_name)) continue;
+            const live_decl_sp = try self.resolveLiveSymbolDeclSpan(cand_idx);
+            if (live_decl_sp.start_byte == decl_ed.start_byte and live_decl_sp.end_byte == decl_ed.end_byte) {
+                target_sym_idx = cand_idx;
+                break;
+            }
+            if (fallback_sym_idx.isNone()) fallback_sym_idx = cand_idx;
+        }
+        if (target_sym_idx.isNone()) target_sym_idx = fallback_sym_idx;
+        if (target_sym_idx.isNone()) return;
+
+        const arena_alloc = proj_sink.arena.asAllocator();
+        var edits: std.ArrayListUnmanaged(diagnostic.TextEdit) = .empty;
+        try edits.append(arena_alloc, decl_ed);
+        var is_clean = true;
+
+        for (pkg_files) |scan_fid| {
+            if (!is_clean) break;
+            if (self.symbol_table.getFilePackageId(scan_fid) != pkg_id) continue;
+            try self.ensureFreshSignatureAstAndSideTables(scan_fid);
+            const scan_src = self.getSourceText(scan_fid) catch continue;
+            if (std.mem.indexOf(u8, scan_src, old_name) == null) continue;
+            const scan_parsed = self.parsed_artifacts.getPtr(scan_fid.asInt()) orelse continue;
+            const tok_count = scan_parsed.token_buffer.countTokens();
+
+            if (self.file_side_tables.getPtr(scan_fid.asInt())) |file_st| {
+                const file_ast_lim = @min(file_st.ast_end, @as(u32, @intCast(scan_parsed.ast_arena.countNodes())));
+                var f_ast_raw = file_st.ast_start;
+                while (f_ast_raw < file_ast_lim and is_clean) : (f_ast_raw += 1) {
+                    const ast_id = NodeIndex.fromInt(f_ast_raw);
+                    const raw_ns = file_st.getNodeSymbol(ast_id);
+                    if (raw_ns.isNone()) continue;
+                    if (unwrapToCanonicalRenameTarget(&self.symbol_table, raw_ns) != target_sym_idx) continue;
+                    const focal_tok = findMatchingFocalTokenInAstNode(scan_src, scan_parsed, ast_id, old_name);
+                    if (!focal_tok.isNone()) {
+                        const sp = scan_parsed.token_buffer.getTokenSpan(scan_fid, focal_tok);
+                        if (sp.file_id == decl_file_id and sp.start_byte == decl_ed.start_byte) continue;
+                        if (!(try appendUniqueRenameEdit(arena_alloc, &edits, .{
+                            .file_id = scan_fid,
+                            .start_byte = sp.start_byte,
+                            .end_byte = sp.end_byte,
+                            .replacement_id = new_name_id,
+                        }))) {
+                            is_clean = false;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (is_clean) {
+                if (self.item_trees.getPtr(scan_fid.asInt())) |scan_tree| {
+                    for (scan_tree.entries) |entry| {
+                        if (!is_clean) break;
+                        const st_ptr = (try self.getDefSideTables(entry.def_id)) orelse continue;
+                        const ast_lim = @min(st_ptr.ast_end, @as(u32, @intCast(scan_parsed.ast_arena.countNodes())));
+                        var ast_raw = st_ptr.ast_start;
+                        while (ast_raw < ast_lim and is_clean) : (ast_raw += 1) {
+                            const ast_id = NodeIndex.fromInt(ast_raw);
+                            const raw_ns = st_ptr.getNodeSymbol(ast_id);
+                            if (raw_ns.isNone()) continue;
+                            if (unwrapToCanonicalRenameTarget(&self.symbol_table, raw_ns) != target_sym_idx) continue;
+                            const focal_tok = findMatchingFocalTokenInAstNode(scan_src, scan_parsed, ast_id, old_name);
+                            if (!focal_tok.isNone()) {
+                                const sp = scan_parsed.token_buffer.getTokenSpan(scan_fid, focal_tok);
+                                if (sp.file_id == decl_file_id and sp.start_byte == decl_ed.start_byte) continue;
+                                if (!(try appendUniqueRenameEdit(arena_alloc, &edits, .{
+                                    .file_id = scan_fid,
+                                    .start_byte = sp.start_byte,
+                                    .end_byte = sp.end_byte,
+                                    .replacement_id = new_name_id,
+                                }))) {
+                                    is_clean = false;
+                                    break;
+                                }
+                            }
+                        }
+
+                        var interp_it = st_ptr.string_interps.iterator();
+                        while (interp_it.next()) |interp_kv| {
+                            if (!is_clean) break;
+                            const fmt_ast_raw = st_ptr.ast_start + interp_kv.key_ptr.*;
+                            if (fmt_ast_raw >= ast_lim) continue;
+                            const fmt_tok = scan_parsed.ast_arena.getNode(NodeIndex.fromInt(fmt_ast_raw)).main_token;
+                            if (fmt_tok.isNone() or fmt_tok.asInt() >= tok_count) continue;
+                            const fmt_base = scan_parsed.token_buffer.getToken(fmt_tok).byte_offset;
+                            for (interp_kv.value_ptr.holes) |hole| {
+                                for (hole.tokens) |htok| {
+                                    if (htok.byte_len == 0 or htok.symbol_index.isNone()) continue;
+                                    if (unwrapToCanonicalRenameTarget(&self.symbol_table, htok.symbol_index) != target_sym_idx) continue;
+                                    const hs = fmt_base +| htok.rel_byte;
+                                    const he = hs +| @as(u32, htok.byte_len);
+                                    const hs_u = @min(@as(usize, hs), scan_src.len);
+                                    const he_u = @min(@max(@as(usize, he), hs_u), scan_src.len);
+                                    if (!std.mem.eql(u8, scan_src[hs_u..he_u], old_name)) continue;
+                                    if (!(try appendUniqueRenameEdit(arena_alloc, &edits, .{
+                                        .file_id = scan_fid,
+                                        .start_byte = hs,
+                                        .end_byte = he,
+                                        .replacement_id = new_name_id,
+                                    }))) {
+                                        is_clean = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!is_clean) {
+            diag_item.suggestions = &.{};
+            return;
+        }
+        std.mem.sort(diagnostic.TextEdit, edits.items, {}, struct {
+            fn lessThan(_: void, lhs: diagnostic.TextEdit, rhs: diagnostic.TextEdit) bool {
+                if (lhs.file_id.asInt() != rhs.file_id.asInt()) return lhs.file_id.asInt() < rhs.file_id.asInt();
+                if (lhs.start_byte != rhs.start_byte) return lhs.start_byte < rhs.start_byte;
+                return lhs.end_byte < rhs.end_byte;
+            }
+        }.lessThan);
+        const orig_sug = diag_item.suggestions[0];
+        const fix_arr = try arena_alloc.alloc(SuggestedFix, 1);
+        fix_arr[0] = .{
+            .message = orig_sug.message,
+            .applicability = orig_sug.applicability,
+            .priority = orig_sug.priority,
+            .edits = edits.items,
+        };
+        diag_item.suggestions = fix_arr;
+    }
+
+    /// Returns `true` when `tag` is a syntax type node inside a generic call `extra_data` slice.
+    fn isCallSliceTypeAstTag(tag: AstTag) bool {
+        return switch (tag) {
+            .type_hole,
+            .prim_type,
+            .named_type,
+            .generic_type,
+            .tuple_type,
+            .array_type,
+            .slice_type,
+            .ref_type,
+            .ptr_type,
+            .optional_type,
+            .result_type,
+            .refined_type,
+            .fn_type,
+            .closure_type,
+            .mode_type,
+            .union_bound_type,
+            .intersect_bound_type,
+            => true,
+            else => false,
+        };
+    }
+
+    /// Rewrites a single call-site argument (`&arg` -> `arg` or `ref_val` -> `ref_val.*`) for `W0413`.
+    fn appendPassByValueArgEditW0413(
+        self: *CompilerDb,
+        arena_alloc: std.mem.Allocator,
+        edits: *std.ArrayListUnmanaged(diagnostic.TextEdit),
+        scan_fid: FileId,
+        scan_src: []const u8,
+        scan_parsed: *const ParsedCstArtifact,
+        raw_slot_arg_id: NodeIndex,
+        deref_suffix_id: SymbolId,
+    ) !bool {
+        var val_ast_id = raw_slot_arg_id;
+        if (val_ast_id.isNone() or val_ast_id.asInt() >= scan_parsed.ast_arena.countNodes()) return true;
+        const raw_arg_node = scan_parsed.ast_arena.getNode(val_ast_id);
+        if (raw_arg_node.tag == .named_arg and raw_arg_node.rhs.tag == .node) {
+            val_ast_id = NodeIndex.fromInt(raw_arg_node.rhs.payload);
+        }
+        if (val_ast_id.isNone() or val_ast_id.asInt() >= scan_parsed.ast_arena.countNodes()) return true;
+        const val_node = scan_parsed.ast_arena.getNode(val_ast_id);
+        const val_cst = scan_parsed.ast_arena.getCstOrigin(val_ast_id);
+        if (val_cst.isNone()) return true;
+        const val_sp = symbol_resolver.computeCstSubtreeSpan(
+            scan_fid,
+            &scan_parsed.token_buffer,
+            &scan_parsed.cst_arena,
+            val_cst,
+        ) orelse return true;
+
+        if (val_node.tag == .unary_expr and !val_node.main_token.isNone() and
+            val_node.main_token.asInt() < scan_parsed.token_buffer.countTokens() and
+            scan_parsed.token_buffer.getToken(val_node.main_token).kind == .amp and
+            val_node.lhs.tag == .node)
+        {
+            const amp_byte = scan_parsed.token_buffer.getToken(val_node.main_token).byte_offset;
+            const inner_id = NodeIndex.fromInt(val_node.lhs.payload);
+            const inner_cst = scan_parsed.ast_arena.getCstOrigin(inner_id);
+            if (!inner_cst.isNone()) {
+                if (symbol_resolver.computeCstSubtreeSpan(
+                    scan_fid,
+                    &scan_parsed.token_buffer,
+                    &scan_parsed.cst_arena,
+                    inner_cst,
+                )) |inner_sp| {
+                    if (inner_sp.start_byte > amp_byte and amp_byte >= val_sp.start_byte) {
+                        return appendUniqueRenameEdit(arena_alloc, edits, .{
+                            .file_id = scan_fid,
+                            .start_byte = amp_byte,
+                            .end_byte = inner_sp.start_byte,
+                            .replacement_id = .empty,
+                        });
+                    }
+                }
+            }
+        }
+
+        const needs_parens = switch (val_node.tag) {
+            .ident_expr,
+            .self_val,
+            .path_expr,
+            .field_access,
+            .index_expr,
+            .call_expr,
+            .generic_call,
+            .method_call,
+            .deref_expr,
+            .try_expr,
+            .await_expr,
+            => false,
+            else => true,
+        };
+        if (needs_parens) {
+            const sub_txt = scan_src[val_sp.start_byte..@min(scan_src.len, val_sp.end_byte)];
+            const wrapped = try std.fmt.allocPrint(arena_alloc, "({s}).*", .{sub_txt});
+            return appendUniqueRenameEdit(arena_alloc, edits, .{
+                .file_id = scan_fid,
+                .start_byte = val_sp.start_byte,
+                .end_byte = val_sp.end_byte,
+                .replacement_id = try self.interner.intern(wrapped),
+            });
+        }
+        return appendUniqueRenameEdit(arena_alloc, edits, .{
+            .file_id = scan_fid,
+            .start_byte = val_sp.end_byte,
+            .end_byte = val_sp.end_byte,
+            .replacement_id = deref_suffix_id,
+        });
+    }
+
+    /// Finds the `.` byte offset in a `.postfix_deref_expr` CST node (`null` if absent).
+    fn findPostfixDerefDotByteInCst(
+        tokens: *const TokenBuffer,
+        cst: *const LosslessCstArena,
+        deref_cst: CstNodeIndex,
+    ) ?u32 {
+        if (deref_cst.isNone() or deref_cst.asInt() >= cst.countNodes()) return null;
+        const d_start: usize = deref_cst.asInt();
+        const d_rec = cst.getNode(deref_cst);
+        const d_end: usize = @min(d_start + @max(@as(usize, d_rec.subtree_size), 1), cst.countNodes());
+        var child = d_start + 1;
+        while (child < d_end) {
+            const sub = cst.getNode(CstNodeIndex.fromInt(@intCast(child)));
+            if (sub.subtree_size <= 1) {
+                if (!sub.flags.is_missing_or_injected and !sub.token.isNone() and
+                    sub.token.asInt() < tokens.countTokens())
+                {
+                    const tk = tokens.getToken(sub.token);
+                    if (tk.kind == .dot) return tk.byte_offset;
+                }
+                child += 1;
+            } else {
+                child += @as(usize, sub.subtree_size);
+            }
+        }
+        return null;
+    }
+
+    /// Augments `W0413` (`trivially-copy-pass-by-ref`) fixes with `DefSideTables`-verified body & intra-package call edits.
+    fn augmentPassByValueCallSuggestionsW0413(
+        self: *CompilerDb,
+        proj_sink: *DiagnosticSink,
+        decl_file_id: FileId,
+        pkg_id: PackageId,
+        pkg_files: []const FileId,
+        diag_item: *diagnostic.Diagnostic,
+    ) !void {
+        if (diag_item.suggestions.len == 0) return;
+        try self.ensureFreshSignatureAstAndSideTables(decl_file_id);
+        const decl_src = self.getSourceText(decl_file_id) catch return;
+        const decl_parsed = self.parsed_artifacts.getPtr(decl_file_id.asInt()) orelse return;
+        const pspan = diag_item.primary_span;
+
+        // Locate owning `fn_sym_idx`, `param_cst`, and `param_ord` matching `pspan`:
+        var target_fn_sym: SymbolIndex = .none;
+        var target_param_cst: CstNodeIndex = .none;
+        var target_param_ord: u16 = std.math.maxInt(u16);
+        var idx_rev = self.symbol_table.countSymbols();
+        while (idx_rev > 0) {
+            idx_rev -= 1;
+            const cand_idx = SymbolIndex.fromInt(idx_rev);
+            const srec = self.symbol_table.getSymbol(cand_idx);
+            if (srec.flags.is_builtin or srec.kind != .fn_sym or srec.decl_span.file_id != decl_file_id) continue;
+            if (srec.cst_node.isNone() or srec.cst_node.asInt() >= decl_parsed.cst_arena.countNodes()) continue;
+            const fn_sp = symbol_resolver.computeCstSubtreeSpan(
+                decl_file_id,
+                &decl_parsed.token_buffer,
+                &decl_parsed.cst_arena,
+                srec.cst_node,
+            ) orelse continue;
+            if (pspan.start_byte < fn_sp.start_byte or pspan.end_byte > fn_sp.end_byte) continue;
+
+            const f_start: usize = srec.cst_node.asInt();
+            const f_end: usize = @min(
+                f_start + @max(@as(usize, decl_parsed.cst_arena.getNode(srec.cst_node).subtree_size), 1),
+                decl_parsed.cst_arena.countNodes(),
+            );
+            var cur = f_start + 1;
+            while (cur < f_end) {
+                const sub = decl_parsed.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+                if (sub.kind == .block or sub.kind == .fn_expr_body) break;
+                if (sub.kind == .param_list) {
+                    const pl_end = @min(cur + @max(@as(usize, sub.subtree_size), 1), f_end);
+                    var ord: u16 = 0;
+                    var pc = cur + 1;
+                    while (pc < pl_end) {
+                        const pn = decl_parsed.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(pc)));
+                        if (pn.kind == .fn_param) {
+                            const pcst = CstNodeIndex.fromInt(@intCast(pc));
+                            if (symbol_resolver.computeCstSubtreeSpan(
+                                decl_file_id,
+                                &decl_parsed.token_buffer,
+                                &decl_parsed.cst_arena,
+                                pcst,
+                            )) |csp| {
+                                if (csp.start_byte == pspan.start_byte and csp.end_byte == pspan.end_byte) {
+                                    target_fn_sym = cand_idx;
+                                    target_param_cst = pcst;
+                                    target_param_ord = ord;
+                                    break;
+                                }
+                            }
+                            ord += 1;
+                            pc += @max(@as(usize, pn.subtree_size), 1);
+                            continue;
+                        }
+                        pc += 1;
+                    }
+                    break;
+                }
+                cur += 1;
+            }
+            if (!target_fn_sym.isNone()) break;
+        }
+        if (target_fn_sym.isNone() or target_param_ord == std.math.maxInt(u16)) {
+            if (diag_item.suggestions[0].edits.len == 0) diag_item.suggestions = &.{};
+            return;
+        }
+
+        const fn_srec = self.symbol_table.getSymbol(target_fn_sym).*;
+        const param_specs = self.symbol_table.getFnParamSpecs(target_fn_sym);
+        const has_self_spec = param_specs.len > 0 and std.mem.eql(u8, param_specs[0].name_text, "self");
+        const param_name = if (target_param_ord < param_specs.len) param_specs[target_param_ord].name_text else "";
+
+        const arena_alloc = proj_sink.arena.asAllocator();
+        const deref_suffix_id = try self.interner.intern(".*");
+        var edits: std.ArrayListUnmanaged(diagnostic.TextEdit) = .empty;
+        var is_clean = true;
+
+        // [1] Rebuild callee parameter `&` + body edits via `DefSideTables` (`SymbolIndex`-verified!):
+        const callee_def: DefId = if (!fn_srec.def_id.isNone()) fn_srec.def_id else fn_srec.owner_def_id;
+        var rebuilt_callee = false;
+        if (!callee_def.isNone() and !target_param_cst.isNone() and param_name.len > 0) {
+            if (try self.getDefSideTables(callee_def)) |callee_st| {
+                // Find `&` token after `:` in `target_param_cst`:
+                const p_s: usize = target_param_cst.asInt();
+                const p_e: usize = @min(
+                    p_s + @max(@as(usize, decl_parsed.cst_arena.getNode(target_param_cst).subtree_size), 1),
+                    decl_parsed.cst_arena.countNodes(),
+                );
+                var amp_tok: TokenIndex = .none;
+                var after_amp_byte: u32 = 0;
+                var seen_colon = false;
+                var pcur = p_s + 1;
+                while (pcur < p_e) : (pcur += 1) {
+                    const lf = decl_parsed.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(pcur)));
+                    if (lf.subtree_size <= 1 and !lf.token.isNone() and lf.token.asInt() < decl_parsed.token_buffer.countTokens()) {
+                        const tk = decl_parsed.token_buffer.getToken(lf.token);
+                        if (!seen_colon) {
+                            if (tk.kind == .colon) seen_colon = true;
+                        } else if (amp_tok.isNone() and tk.kind == .amp) {
+                            amp_tok = lf.token;
+                            after_amp_byte = tk.byte_offset + tk.byte_len;
+                            while (after_amp_byte < decl_src.len and
+                                (decl_src[after_amp_byte] == ' ' or decl_src[after_amp_byte] == '\t'))
+                            {
+                                after_amp_byte += 1;
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                // Resolve `param_sym_idx` inside `fn_srec.target_scope` (or `callee_st.node_symbols`):
+                var param_sym_idx: SymbolIndex = .none;
+                if (!fn_srec.target_scope.isNone()) {
+                    for (self.symbol_table.getScopeMembers(fn_srec.target_scope)) |mem_idx| {
+                        const mrec = self.symbol_table.getSymbol(mem_idx).*;
+                        if (mrec.kind == .param_sym and std.mem.eql(u8, mrec.name_text, param_name)) {
+                            param_sym_idx = mem_idx;
+                            break;
+                        }
+                    }
+                }
+                if (param_sym_idx.isNone()) {
+                    for (callee_st.node_symbols) |ns| {
+                        if (ns.isNone() or ns.asInt() >= self.symbol_table.countSymbols()) continue;
+                        const nrec = self.symbol_table.getSymbol(ns).*;
+                        if (nrec.kind == .param_sym and std.mem.eql(u8, nrec.name_text, param_name)) {
+                            param_sym_idx = ns;
+                            break;
+                        }
+                    }
+                }
+
+                if (!amp_tok.isNone() and !param_sym_idx.isNone()) {
+                    rebuilt_callee = true;
+                    const amp_start = decl_parsed.token_buffer.getToken(amp_tok).byte_offset;
+                    is_clean = try appendUniqueRenameEdit(arena_alloc, &edits, .{
+                        .file_id = decl_file_id,
+                        .start_byte = amp_start,
+                        .end_byte = after_amp_byte,
+                        .replacement_id = .empty,
+                    });
+
+                    const fn_full_sp = symbol_resolver.computeCstSubtreeSpan(
+                        decl_file_id,
+                        &decl_parsed.token_buffer,
+                        &decl_parsed.cst_arena,
+                        fn_srec.cst_node,
+                    ) orelse fn_srec.decl_span;
+
+                    const decl_ast_total: u32 = @intCast(decl_parsed.ast_arena.countNodes());
+                    const c_lim = @min(callee_st.ast_end, decl_ast_total);
+                    const win_len: usize = c_lim -| callee_st.ast_start;
+                    var deref_dot_by_rel = try arena_alloc.alloc(u32, win_len);
+                    @memset(deref_dot_by_rel, std.math.maxInt(u32));
+                    var deref_end_by_rel = try arena_alloc.alloc(u32, win_len);
+                    @memset(deref_end_by_rel, 0);
+                    var is_recv_by_rel = try arena_alloc.alloc(bool, win_len);
+                    @memset(is_recv_by_rel, false);
+
+                    var p_raw = callee_st.ast_start;
+                    while (p_raw < c_lim) : (p_raw += 1) {
+                        const pid = NodeIndex.fromInt(p_raw);
+                        const pnode = decl_parsed.ast_arena.getNode(pid);
+                        if (pnode.tag == .deref_expr and pnode.lhs.tag == .node) {
+                            const lhs_r = pnode.lhs.payload;
+                            if (lhs_r >= callee_st.ast_start and lhs_r < c_lim) {
+                                const dcst = decl_parsed.ast_arena.getCstOrigin(pid);
+                                if (!dcst.isNone()) {
+                                    if (symbol_resolver.computeCstSubtreeSpan(
+                                        decl_file_id,
+                                        &decl_parsed.token_buffer,
+                                        &decl_parsed.cst_arena,
+                                        dcst,
+                                    )) |dsp| {
+                                        if (findPostfixDerefDotByteInCst(&decl_parsed.token_buffer, &decl_parsed.cst_arena, dcst)) |dbyte| {
+                                            deref_dot_by_rel[lhs_r - callee_st.ast_start] = dbyte;
+                                            deref_end_by_rel[lhs_r - callee_st.ast_start] = dsp.end_byte;
+                                        }
+                                    }
+                                }
+                            }
+                        } else if ((pnode.tag == .field_access or pnode.tag == .method_call or
+                            pnode.tag == .index_expr) and pnode.lhs.tag == .node)
+                        {
+                            const lhs_r = pnode.lhs.payload;
+                            if (lhs_r >= callee_st.ast_start and lhs_r < c_lim) {
+                                is_recv_by_rel[lhs_r - callee_st.ast_start] = true;
+                            }
+                        }
+                    }
+
+                    var c_raw = callee_st.ast_start;
+                    while (c_raw < c_lim and is_clean) : (c_raw += 1) {
+                        const aid = NodeIndex.fromInt(c_raw);
+                        if (callee_st.getNodeSymbol(aid) != param_sym_idx) continue;
+                        const anode = decl_parsed.ast_arena.getNode(aid);
+                        if (anode.tag != .ident_expr or anode.main_token.isNone() or
+                            anode.main_token.asInt() >= decl_parsed.token_buffer.countTokens()) continue;
+                        const id_tok = decl_parsed.token_buffer.getToken(anode.main_token);
+                        if (id_tok.byte_offset <= pspan.end_byte or id_tok.byte_offset >= fn_full_sp.end_byte) continue;
+
+                        const rel = c_raw - callee_st.ast_start;
+                        if (deref_dot_by_rel[rel] != std.math.maxInt(u32)) {
+                            if (!(try appendUniqueRenameEdit(arena_alloc, &edits, .{
+                                .file_id = decl_file_id,
+                                .start_byte = deref_dot_by_rel[rel],
+                                .end_byte = deref_end_by_rel[rel],
+                                .replacement_id = .empty,
+                            }))) {
+                                is_clean = false;
+                            }
+                        } else if (!is_recv_by_rel[rel]) {
+                            const ref_repl = try std.fmt.allocPrint(arena_alloc, "&{s}", .{param_name});
+                            if (!(try appendUniqueRenameEdit(arena_alloc, &edits, .{
+                                .file_id = decl_file_id,
+                                .start_byte = id_tok.byte_offset,
+                                .end_byte = id_tok.byte_offset + id_tok.byte_len,
+                                .replacement_id = try self.interner.intern(ref_repl),
+                            }))) {
+                                is_clean = false;
+                            }
+                        }
+                    }
+
+                    // Check `f"…"` interpolation holes inside callee for `param_sym_idx`:
+                    var c_interp_it = callee_st.string_interps.iterator();
+                    while (c_interp_it.next()) |ikv| {
+                        if (!is_clean) break;
+                        const fmt_raw = callee_st.ast_start + ikv.key_ptr.*;
+                        if (fmt_raw >= c_lim) continue;
+                        const fmt_tok = decl_parsed.ast_arena.getNode(NodeIndex.fromInt(fmt_raw)).main_token;
+                        if (fmt_tok.isNone() or fmt_tok.asInt() >= decl_parsed.token_buffer.countTokens()) continue;
+                        const fmt_base = decl_parsed.token_buffer.getToken(fmt_tok).byte_offset;
+                        for (ikv.value_ptr.holes) |hole| {
+                            for (hole.tokens) |htok| {
+                                if (htok.byte_len == 0 or htok.symbol_index != param_sym_idx) continue;
+                                const hs: usize = @min(@as(usize, fmt_base +| htok.rel_byte), decl_src.len);
+                                const he: usize = @min(@as(usize, fmt_base +| htok.rel_byte +| htok.byte_len), decl_src.len);
+                                if (he < fn_full_sp.start_byte or hs >= fn_full_sp.end_byte) continue;
+                                if (he + 2 <= decl_src.len and std.mem.eql(u8, decl_src[he .. he + 2], ".*")) {
+                                    if (!(try appendUniqueRenameEdit(arena_alloc, &edits, .{
+                                        .file_id = decl_file_id,
+                                        .start_byte = @intCast(he),
+                                        .end_byte = @intCast(he + 2),
+                                        .replacement_id = .empty,
+                                    }))) {
+                                        is_clean = false;
+                                    }
+                                } else {
+                                    // Allow `{param}`, `{param:spec}`, `{param.field}`, or `{param[i]}`:
+                                    var before_i = hs;
+                                    while (before_i > 0 and (decl_src[before_i - 1] == ' ' or decl_src[before_i - 1] == '\t')) : (before_i -= 1) {}
+                                    var after_i = he;
+                                    while (after_i < decl_src.len and (decl_src[after_i] == ' ' or decl_src[after_i] == '\t')) : (after_i += 1) {}
+                                    const is_safe_fmt_hole = before_i > 0 and decl_src[before_i - 1] == '{' and
+                                        after_i < decl_src.len and
+                                        (decl_src[after_i] == '}' or decl_src[after_i] == ':' or
+                                            decl_src[after_i] == '.' or decl_src[after_i] == '[');
+                                    if (!is_safe_fmt_hole) {
+                                        is_clean = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (!rebuilt_callee) {
+            if (diag_item.suggestions[0].edits.len == 0) {
+                diag_item.suggestions = &.{};
+                return;
+            }
+            for (diag_item.suggestions[0].edits) |init_ed| {
+                try edits.append(arena_alloc, init_ed);
+            }
+        }
+
+        // [2] Rewrite all intra-package call sites (including `.pipe_expr` and `string_interps`):
+        for (pkg_files) |scan_fid| {
+            if (!is_clean) break;
+            if (self.symbol_table.getFilePackageId(scan_fid) != pkg_id) continue;
+            try self.ensureFreshSignatureAstAndSideTables(scan_fid);
+            const scan_src = self.getSourceText(scan_fid) catch continue;
+            const scan_parsed = self.parsed_artifacts.getPtr(scan_fid.asInt()) orelse continue;
+            const scan_tree = self.item_trees.getPtr(scan_fid.asInt()) orelse continue;
+            const ast_total: u32 = @intCast(scan_parsed.ast_arena.countNodes());
+
+            for (scan_tree.entries) |entry| {
+                if (!is_clean) break;
+                const st_ptr = (try self.getDefSideTables(entry.def_id)) orelse continue;
+                const ast_lim = @min(st_ptr.ast_end, ast_total);
+                const def_win_len: usize = ast_lim -| st_ptr.ast_start;
+                var is_pipe_rhs = try arena_alloc.alloc(bool, def_win_len);
+                @memset(is_pipe_rhs, false);
+                {
+                    var pr = st_ptr.ast_start;
+                    while (pr < ast_lim) : (pr += 1) {
+                        const pn = scan_parsed.ast_arena.getNode(NodeIndex.fromInt(pr));
+                        if (pn.tag == .pipe_expr and pn.rhs.tag == .node) {
+                            const rhs_r = pn.rhs.payload;
+                            if (rhs_r >= st_ptr.ast_start and rhs_r < ast_lim) {
+                                is_pipe_rhs[rhs_r - st_ptr.ast_start] = true;
+                            }
+                        }
+                    }
+                }
+
+                var ast_raw = st_ptr.ast_start;
+                while (ast_raw < ast_lim and is_clean) : (ast_raw += 1) {
+                    if (is_pipe_rhs[ast_raw - st_ptr.ast_start]) continue;
+                    const call_ast_id = NodeIndex.fromInt(ast_raw);
+                    const call_node = scan_parsed.ast_arena.getNode(call_ast_id);
+                    if (call_node.tag != .call_expr and call_node.tag != .generic_call and
+                        call_node.tag != .method_call and call_node.tag != .pipe_expr)
+                    {
+                        continue;
+                    }
+
+                    const is_pipe_method_self = blk_pm: {
+                        if (call_node.tag == .pipe_expr and call_node.rhs.tag == .node) {
+                            const prhs = NodeIndex.fromInt(call_node.rhs.payload);
+                            if (prhs.asInt() < ast_total and scan_parsed.ast_arena.getNode(prhs).tag == .method_call) {
+                                break :blk_pm has_self_spec;
+                            }
+                        }
+                        break :blk_pm false;
+                    };
+
+                    if (st_ptr.call_arg_mappings.get(ast_raw - st_ptr.ast_start)) |mapping| {
+                        if (mapping.callee_sym.isNone()) continue;
+                        if (unwrapToCanonicalRenameTarget(&self.symbol_table, mapping.callee_sym) != target_fn_sym) {
+                            continue;
+                        }
+                        const is_inst_self = (call_node.tag == .method_call or is_pipe_method_self) and has_self_spec and
+                            mapping.total_params + 1 == param_specs.len;
+                        if (is_inst_self and target_param_ord == 0) continue;
+                        const expected_slot_idx: u16 = if (is_inst_self) target_param_ord - 1 else target_param_ord;
+                        for (mapping.provided_slots) |slot| {
+                            if (slot.param_index != expected_slot_idx) continue;
+                            if (!(try self.appendPassByValueArgEditW0413(
+                                arena_alloc,
+                                &edits,
+                                scan_fid,
+                                scan_src,
+                                scan_parsed,
+                                slot.arg_ast_node,
+                                deref_suffix_id,
+                            ))) {
+                                is_clean = false;
+                            }
+                            break;
+                        }
+                        continue;
+                    }
+
+                    // Positional call (`call_arg_mappings` only stores named/default/incomplete calls):
+                    var callee_sym = st_ptr.getNodeSymbol(call_ast_id);
+                    if (callee_sym.isNone() and call_node.tag == .pipe_expr and call_node.rhs.tag == .node) {
+                        const prhs = NodeIndex.fromInt(call_node.rhs.payload);
+                        if (prhs.asInt() < ast_total) {
+                            callee_sym = st_ptr.getNodeSymbol(prhs);
+                        }
+                    }
+                    if (callee_sym.isNone() and
+                        (call_node.tag == .call_expr or call_node.tag == .generic_call) and
+                        call_node.lhs.tag == .node)
+                    {
+                        var cal_id = NodeIndex.fromInt(call_node.lhs.payload);
+                        if (cal_id.asInt() < ast_total and
+                            scan_parsed.ast_arena.getNode(cal_id).tag == .generic_call and
+                            scan_parsed.ast_arena.getNode(cal_id).lhs.tag == .node)
+                        {
+                            cal_id = NodeIndex.fromInt(scan_parsed.ast_arena.getNode(cal_id).lhs.payload);
+                        }
+                        callee_sym = st_ptr.getNodeSymbol(cal_id);
+                    }
+                    if (callee_sym.isNone()) continue;
+                    if (unwrapToCanonicalRenameTarget(&self.symbol_table, callee_sym) != target_fn_sym) continue;
+
+                    var val_args: std.ArrayListUnmanaged(NodeIndex) = .empty;
+                    if (call_node.tag == .pipe_expr) {
+                        if (call_node.lhs.tag == .node) {
+                            try val_args.append(arena_alloc, NodeIndex.fromInt(call_node.lhs.payload));
+                        }
+                        if (call_node.rhs.tag == .node) {
+                            const rhs_id = NodeIndex.fromInt(call_node.rhs.payload);
+                            if (rhs_id.asInt() < ast_total) {
+                                const rhs_n = scan_parsed.ast_arena.getNode(rhs_id);
+                                if ((rhs_n.tag == .call_expr or rhs_n.tag == .generic_call) and rhs_n.rhs.tag == .node) {
+                                    const rarg = NodeIndex.fromInt(rhs_n.rhs.payload);
+                                    if (!rarg.isNone() and rarg.asInt() < ast_total and
+                                        !isCallSliceTypeAstTag(scan_parsed.ast_arena.getNode(rarg).tag))
+                                    {
+                                        try val_args.append(arena_alloc, rarg);
+                                    }
+                                } else if ((rhs_n.tag == .call_expr or rhs_n.tag == .generic_call or rhs_n.tag == .method_call) and
+                                    rhs_n.rhs.tag == .extra and rhs_id.asInt() < scan_parsed.node_extra_end.len)
+                                {
+                                    const s_i: usize = rhs_n.rhs.payload;
+                                    const e_i: usize = @min(
+                                        @as(usize, scan_parsed.node_extra_end[rhs_id.asInt()]),
+                                        scan_parsed.ast_arena.extra_data.items.len,
+                                    );
+                                    if (s_i < e_i) {
+                                        const full_s = scan_parsed.ast_arena.extra_data.items[s_i..e_i];
+                                        const skip_m: usize = if (rhs_n.tag == .method_call) 1 else 0;
+                                        if (skip_m <= full_s.len) {
+                                            for (full_s[skip_m..]) |ri| {
+                                                const cid = NodeIndex.fromInt(ri);
+                                                if (!cid.isNone() and cid.asInt() < ast_total and
+                                                    !isCallSliceTypeAstTag(scan_parsed.ast_arena.getNode(cid).tag))
+                                                {
+                                                    try val_args.append(arena_alloc, cid);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        var single_arg_buf: [1]u32 = .{0};
+                        var raw_items: []const u32 = &.{};
+                        if ((call_node.tag == .call_expr or call_node.tag == .generic_call) and
+                            call_node.rhs.tag == .node)
+                        {
+                            single_arg_buf[0] = call_node.rhs.payload;
+                            raw_items = &single_arg_buf;
+                        } else if (call_node.rhs.tag == .extra and ast_raw < scan_parsed.node_extra_end.len) {
+                            const start_i: usize = call_node.rhs.payload;
+                            const end_i: usize = @min(
+                                @as(usize, scan_parsed.node_extra_end[ast_raw]),
+                                scan_parsed.ast_arena.extra_data.items.len,
+                            );
+                            if (start_i < end_i) {
+                                const full_slice = scan_parsed.ast_arena.extra_data.items[start_i..end_i];
+                                const skip_member: usize = if (call_node.tag == .method_call) 1 else 0;
+                                if (skip_member <= full_slice.len) {
+                                    raw_items = full_slice[skip_member..];
+                                }
+                            }
+                        }
+                        for (raw_items) |raw_item| {
+                            const cand_id = NodeIndex.fromInt(raw_item);
+                            if (cand_id.isNone() or cand_id.asInt() >= ast_total) continue;
+                            if (isCallSliceTypeAstTag(scan_parsed.ast_arena.getNode(cand_id).tag)) continue;
+                            try val_args.append(arena_alloc, cand_id);
+                        }
+                    }
+
+                    const is_inst_self = (call_node.tag == .method_call or is_pipe_method_self) and has_self_spec and
+                        val_args.items.len + 1 == param_specs.len;
+                    if (is_inst_self and target_param_ord == 0) continue;
+                    const expected_slot_idx: usize = if (is_inst_self)
+                        @as(usize, target_param_ord - 1)
+                    else
+                        @as(usize, target_param_ord);
+
+                    if (expected_slot_idx < val_args.items.len) {
+                        if (!(try self.appendPassByValueArgEditW0413(
+                            arena_alloc,
+                            &edits,
+                            scan_fid,
+                            scan_src,
+                            scan_parsed,
+                            val_args.items[expected_slot_idx],
+                            deref_suffix_id,
+                        ))) {
+                            is_clean = false;
+                        }
+                    }
+                }
+
+                // Scan `string_interps` in caller for `f"…{callee(…)}…"`:
+                var s_interp_it = st_ptr.string_interps.iterator();
+                while (s_interp_it.next()) |ikv| {
+                    if (!is_clean) break;
+                    const fmt_raw = st_ptr.ast_start + ikv.key_ptr.*;
+                    if (fmt_raw >= ast_lim) continue;
+                    const fmt_tok = scan_parsed.ast_arena.getNode(NodeIndex.fromInt(fmt_raw)).main_token;
+                    if (fmt_tok.isNone() or fmt_tok.asInt() >= scan_parsed.token_buffer.countTokens()) continue;
+                    const fmt_base = scan_parsed.token_buffer.getToken(fmt_tok).byte_offset;
+                    for (ikv.value_ptr.holes) |hole| {
+                        for (hole.tokens) |htok| {
+                            if (htok.byte_len == 0 or htok.symbol_index.isNone()) continue;
+                            if (unwrapToCanonicalRenameTarget(&self.symbol_table, htok.symbol_index) != target_fn_sym) continue;
+                            // Rewrite simple `callee(&ident)` when `target_param_ord == 0`; else suppress fix cleanly:
+                            const he: usize = @min(@as(usize, fmt_base +| htok.rel_byte +| htok.byte_len), scan_src.len);
+                            var p_cur = he;
+                            while (p_cur < scan_src.len and (scan_src[p_cur] == ' ' or scan_src[p_cur] == '\t')) : (p_cur += 1) {}
+                            if (target_param_ord == 0 and p_cur < scan_src.len and scan_src[p_cur] == '(') {
+                                p_cur += 1;
+                                while (p_cur < scan_src.len and (scan_src[p_cur] == ' ' or scan_src[p_cur] == '\t')) : (p_cur += 1) {}
+                                if (p_cur < scan_src.len and scan_src[p_cur] == '&') {
+                                    const amp_pos = p_cur;
+                                    p_cur += 1;
+                                    while (p_cur < scan_src.len and (scan_src[p_cur] == ' ' or scan_src[p_cur] == '\t')) : (p_cur += 1) {}
+                                    const arg_start = p_cur;
+                                    while (p_cur < scan_src.len and
+                                        (std.ascii.isAlphanumeric(scan_src[p_cur]) or scan_src[p_cur] == '_')) : (p_cur += 1)
+                                    {}
+                                    if (p_cur > arg_start and p_cur < scan_src.len and
+                                        (scan_src[p_cur] == ')' or scan_src[p_cur] == ','))
+                                    {
+                                        if (!(try appendUniqueRenameEdit(arena_alloc, &edits, .{
+                                            .file_id = scan_fid,
+                                            .start_byte = @intCast(amp_pos),
+                                            .end_byte = @intCast(arg_start),
+                                            .replacement_id = .empty,
+                                        }))) {
+                                            is_clean = false;
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                            is_clean = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!is_clean) {
+            diag_item.suggestions = &.{};
+            return;
+        }
+        std.mem.sort(diagnostic.TextEdit, edits.items, {}, struct {
+            fn lessThan(_: void, lhs: diagnostic.TextEdit, rhs: diagnostic.TextEdit) bool {
+                if (lhs.file_id.asInt() != rhs.file_id.asInt()) return lhs.file_id.asInt() < rhs.file_id.asInt();
+                if (lhs.start_byte != rhs.start_byte) return lhs.start_byte < rhs.start_byte;
+                return lhs.end_byte < rhs.end_byte;
+            }
+        }.lessThan);
+        const orig_sug = diag_item.suggestions[0];
+        const fix_arr = try arena_alloc.alloc(SuggestedFix, 1);
+        fix_arr[0] = .{
+            .message = orig_sug.message,
+            .applicability = orig_sug.applicability,
+            .priority = orig_sug.priority,
+            .edits = edits.items,
+        };
+        diag_item.suggestions = fix_arr;
+    }
+
+    /// Returns `true` if `file_id` is mounted via a non-`pub` parent `mod` declaration in `pkg_id`.
+    fn isFileUnderNonPubModule(self: *const CompilerDb, file_id: FileId, pkg_id: PackageId) bool {
+        var cur_fid = file_id;
+        var hops: usize = 0;
+        while (hops < 16) : (hops += 1) {
+            var found_parent: ?FileId = null;
+            var parent_mod_sym: SymbolId = .none;
+            var pm_it = self.parent_to_child_mods.valueIterator();
+            outer: while (pm_it.next()) |links| {
+                for (links.items) |link| {
+                    if (link.child_fid == cur_fid and
+                        self.symbol_table.getFilePackageId(link.parent_fid) == pkg_id)
+                    {
+                        found_parent = link.parent_fid;
+                        parent_mod_sym = link.mod_sym;
+                        break :outer;
+                    }
+                }
+            }
+            const p_fid = found_parent orelse return false;
+            if (self.symbol_table.file_module_scopes.get(p_fid.asInt())) |p_scope| {
+                const mod_idx = self.symbol_table.lookupInScopeDirect(
+                    p_scope,
+                    parent_mod_sym,
+                    symbol_resolver.NamespaceMask.VALUE_ONLY,
+                );
+                if (!mod_idx.isNone() and self.symbol_table.getSymbol(mod_idx).visibility != .public) {
+                    return true;
+                }
+            }
+            cur_fid = p_fid;
+        }
+        return false;
+    }
+
+    /// Returns `true` if `file_id` has outgoing `mod <child>;` file links.
+    fn hasChildModuleFiles(self: *const CompilerDb, file_id: FileId) bool {
+        if (self.parent_to_child_mods.getPtr(file_id.asInt())) |links| {
+            for (links.items) |link| {
+                if (link.child_fid != file_id) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Returns `true` when `file_id` declares items requiring a sibling-file sweep (`W0406`, `W0333`, `W0201`, or child `mod` `W0402`).
+    fn fileNeedsSiblingLintSweep(
+        self: *const CompilerDb,
+        file_id: FileId,
+        pkg_id: PackageId,
+        eff_rules: lint_filter.EffectiveFileRules,
+        has_w0201_cand: bool,
+    ) bool {
+        if (has_w0201_cand) return true;
+        const check_w0406 = eff_rules.isEnabled(.unused_pkg_visibility);
+        const check_w0333 = eff_rules.isEnabled(.redundant_private_contract);
+        const check_child_w0402 = eff_rules.isEnabled(.unused_binding) and self.hasChildModuleFiles(file_id);
+        if (!check_w0406 and !check_w0333 and !check_child_w0402) return false;
+
+        const is_under_non_pub = if (check_w0406) self.isFileUnderNonPubModule(file_id, pkg_id) else false;
+        const sym_total = self.symbol_table.countSymbols();
+        var s_i: u32 = 0;
+        while (s_i < sym_total) : (s_i += 1) {
+            const sym_idx = SymbolIndex.fromInt(s_i);
+            const srec = self.symbol_table.getSymbol(sym_idx).*;
+            if (srec.flags.is_builtin or srec.flags.is_imported or srec.decl_span.file_id != file_id) continue;
+            if (srec.kind == .local_let_sym or srec.kind == .local_var_sym or srec.kind == .param_sym) continue;
+
+            if (check_w0406) {
+                if (srec.visibility == .pub_pkg or srec.visibility == .pub_super) return true;
+                if (srec.kind == .module_sym and srec.visibility != .public) return true;
+                if (is_under_non_pub and srec.visibility == .public) return true;
+            }
+            if (check_w0333 and srec.kind == .fn_sym and !self.symbol_table.isEffectivePubBoundary(sym_idx)) {
+                if (srec.contract_flags.is_no_alloc or
+                    srec.contract_flags.is_no_panic or
+                    srec.contract_flags.is_no_block)
+                {
+                    return true;
+                }
+            }
+            if (check_child_w0402 and srec.visibility == .private) return true;
+        }
+        return false;
+    }
+
+    /// Recursively marks nominal/alias symbols referenced inside `ty_id` as used from `caller_scope`.
+    fn replayTypeNominalUsage(
+        self: *CompilerDb,
+        caller_scope: ScopeId,
+        ty_id: TypeId,
+        depth: u32,
+    ) void {
+        if (depth > 24 or ty_id.isError() or ty_id.toU32() < TypeId.first_dynamic.toU32()) return;
+        if (self.symbol_table.type_to_symbol.get(ty_id.toU32())) |nom_sym| {
+            self.symbol_table.markTargetScopeSymbolUsed(caller_scope, nom_sym);
+        }
+        const tnode = self.type_pool.getNode(ty_id);
+        switch (tnode.tag) {
+            .ref_ty, .mut_ref_ty, .raw_ptr_ty, .slice_ty, .soa_slice_ty, .array_ty, .soa_array_ty, .optional_ty => {
+                self.replayTypeNominalUsage(caller_scope, TypeId.fromInt(tnode.lhs), depth + 1);
+            },
+            .result_ty => {
+                self.replayTypeNominalUsage(caller_scope, TypeId.fromInt(tnode.lhs), depth + 1);
+                self.replayTypeNominalUsage(caller_scope, TypeId.fromInt(tnode.rhs), depth + 1);
+            },
+            .tuple_ty => {
+                for (self.type_pool.getTupleElements(ty_id)) |raw_el| {
+                    self.replayTypeNominalUsage(caller_scope, TypeId.fromInt(raw_el), depth + 1);
+                }
+            },
+            .fn_ty, .closure_ty => {
+                if (self.type_pool.getFnSignatureView(ty_id)) |sig_v| {
+                    for (sig_v.param_types) |pt| {
+                        self.replayTypeNominalUsage(caller_scope, TypeId.fromInt(pt), depth + 1);
+                    }
+                    self.replayTypeNominalUsage(caller_scope, sig_v.ret_ty, depth + 1);
+                }
+            },
+            .struct_ty, .enum_ty, .union_ty, .bit_field_ty, .trait_ty, .dyn_trait_ty => {
+                const s_idx = SymbolIndex.fromInt(tnode.rhs);
+                if (!s_idx.isNone() and s_idx.asInt() < self.symbol_table.countSymbols()) {
+                    self.symbol_table.markTargetScopeSymbolUsed(caller_scope, s_idx);
+                }
+                for (self.type_pool.getGenericTypeArgs(ty_id)) |raw_ga| {
+                    self.replayTypeNominalUsage(caller_scope, TypeId.fromInt(raw_ga), depth + 1);
+                }
+            },
+            .distinct_ty, .refined_ty => {
+                self.replayTypeNominalUsage(caller_scope, self.type_pool.unwrapUnderlyingType(ty_id), depth + 1);
+            },
+            else => {},
+        }
+    }
+
+    /// Marks `sym_idx` (and any lexical `use` alias or trait import) referenced at `ast_id` in `scan_fid`.
+    fn replayAstNodeSymbolUsage(
+        self: *CompilerDb,
+        scan_src: []const u8,
+        scan_parsed: *const ParsedCstArtifact,
+        caller_scope: ScopeId,
+        ast_id: NodeIndex,
+        sym_idx: SymbolIndex,
+    ) void {
+        const ast_total = scan_parsed.ast_arena.countNodes();
+        if (ast_id.isNone() or ast_id.asInt() >= ast_total) return;
+        const ast_node = scan_parsed.ast_arena.getNode(ast_id);
+        const tok_count = scan_parsed.token_buffer.countTokens();
+
+        // Check leading module qualifier on `.ident_expr` (`mod_alias.foo`), `.named_type`, `.generic_type`, `.path_expr`:
+        if (sym_idx.isNone()) {
+            if (ast_node.tag == .ident_expr and !ast_node.main_token.isNone() and ast_node.main_token.asInt() < tok_count) {
+                const lex = symbol_resolver.extractTokenSlice(scan_src, &scan_parsed.token_buffer, ast_node.main_token);
+                if (self.interner.lookup(lex)) |lid| {
+                    const lres = self.symbol_table.lookupLexical(caller_scope, lid, symbol_resolver.NamespaceMask.VALUE_ONLY);
+                    if (lres == .found and self.symbol_table.getSymbol(lres.found).kind == .module_sym) {
+                        self.symbol_table.markLexicalSymbolUsed(caller_scope, lid, lres.found);
+                    }
+                }
+            }
+            return;
+        }
+        if (sym_idx.asInt() >= self.symbol_table.countSymbols()) return;
+
+        // Mark trait import if `sym_idx` is a method declared inside a `.trait_scope`:
+        const srec = self.symbol_table.getSymbol(sym_idx).*;
+        if (!srec.scope_id.isNone() and srec.scope_id.asInt() < self.symbol_table.scope_arena.countScopes()) {
+            const sc = self.symbol_table.scope_arena.getScope(srec.scope_id);
+            if (sc.kind == .trait_scope and !sc.owner_def_id.isNone()) {
+                if (self.symbol_table.def_to_symbol.get(sc.owner_def_id.asInt())) |tr_idx| {
+                    self.symbol_table.markImportedTraitUsed(caller_scope, tr_idx);
+                }
+            }
+        }
+
+        const is_member_proj = ast_node.tag == .field_access or ast_node.tag == .method_call or
+            (ast_node.tag == .pipe_expr and ast_node.rhs.tag == .node and
+                ast_node.rhs.payload < ast_total and
+                scan_parsed.ast_arena.getNode(NodeIndex.fromInt(ast_node.rhs.payload)).tag == .method_call);
+        if (is_member_proj) {
+            self.symbol_table.markTargetScopeSymbolUsed(caller_scope, sym_idx);
+            return;
+        }
+
+        // Extract first & last identifier tokens in `ast_id` CST (handles `alias` AND `mod_alias.Item`!):
+        var first_id_tok: TokenIndex = .none;
+        var last_id_tok: TokenIndex = .none;
+        var saw_dot_between = false;
+        const acst = scan_parsed.ast_arena.getCstOrigin(ast_id);
+        if (!acst.isNone() and acst.asInt() < scan_parsed.cst_arena.countNodes()) {
+            const c_s: usize = acst.asInt();
+            const c_e: usize = @min(
+                c_s + @max(@as(usize, scan_parsed.cst_arena.getNode(acst).subtree_size), 1),
+                scan_parsed.cst_arena.countNodes(),
+            );
+            var c_i = c_s + 1;
+            while (c_i < c_e) : (c_i += 1) {
+                const lf = scan_parsed.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(c_i)));
+                if (lf.subtree_size > 1 or lf.flags.is_missing_or_injected or
+                    lf.token.isNone() or lf.token.asInt() >= tok_count) continue;
+                const tk = scan_parsed.token_buffer.getToken(lf.token).kind;
+                if (tk == .lparen or tk == .lbracket or tk == .lbrace or tk == .pipe_gt) break;
+                if (tk == .dot and !first_id_tok.isNone()) saw_dot_between = true;
+                if (symbol_resolver.isIdentifierToken(tk)) {
+                    if (first_id_tok.isNone()) first_id_tok = lf.token;
+                    last_id_tok = lf.token;
+                }
+            }
+        } else if (!ast_node.main_token.isNone() and ast_node.main_token.asInt() < tok_count and
+            symbol_resolver.isIdentifierToken(scan_parsed.token_buffer.getToken(ast_node.main_token).kind))
+        {
+            first_id_tok = ast_node.main_token;
+            last_id_tok = ast_node.main_token;
+        }
+
+        if (saw_dot_between and !first_id_tok.isNone()) {
+            const lead_lex = symbol_resolver.extractTokenSlice(scan_src, &scan_parsed.token_buffer, first_id_tok);
+            if (self.interner.lookup(lead_lex)) |lead_id| {
+                const lres = self.symbol_table.lookupLexical(caller_scope, lead_id, symbol_resolver.NamespaceMask.ALL);
+                if (lres == .found) {
+                    self.symbol_table.markLexicalSymbolUsed(caller_scope, lead_id, lres.found);
+                }
+            }
+            self.symbol_table.markTargetScopeSymbolUsed(caller_scope, sym_idx);
+            return;
+        }
+
+        var queried_id: SymbolId = srec.name;
+        if (!last_id_tok.isNone()) {
+            const q_lex = symbol_resolver.extractTokenSlice(scan_src, &scan_parsed.token_buffer, last_id_tok);
+            if (self.interner.lookup(q_lex)) |qid| queried_id = qid;
+        }
+        self.symbol_table.markLexicalSymbolUsed(caller_scope, queried_id, sym_idx);
+        self.symbol_table.markTargetScopeSymbolUsed(caller_scope, sym_idx);
+    }
+
+    /// Deterministically recomputes `is_used`, `has_pkg_wide_ref`, and `has_parent_mod_ref` for `file_id` from live side tables.
+    fn recomputeLiveSymbolUsageForFile(
+        self: *CompilerDb,
+        file_id: FileId,
+        pkg_id: PackageId,
+        pkg_files: []const FileId,
+    ) QueryError!void {
+        // [1] Reset mutable usage/visibility flags on module/type/import symbols owned by `file_id`:
+        const sym_total = self.symbol_table.countSymbols();
+        var s_i: u32 = 0;
+        while (s_i < sym_total) : (s_i += 1) {
+            const sym_idx = SymbolIndex.fromInt(s_i);
+            const srec = self.symbol_table.getSymbol(sym_idx).*;
+            if (srec.flags.is_builtin or srec.decl_span.file_id != file_id) continue;
+            if (srec.kind == .local_let_sym or srec.kind == .local_var_sym or srec.kind == .param_sym) continue;
+            const sym_mut = self.symbol_table.getSymbolMut(sym_idx);
+            sym_mut.flags.is_used = (srec.flags.is_imported and srec.visibility != .private);
+            sym_mut.flags.has_pkg_wide_ref = false;
+            sym_mut.flags.has_parent_mod_ref = false;
+        }
+        for (self.symbol_table.use_leaf_records.items) |urec| {
+            if (urec.file_id != file_id) continue;
+            if (!urec.alias_sym.isNone() and urec.alias_sym.asInt() < sym_total) {
+                self.symbol_table.getSymbolMut(urec.alias_sym).flags.is_used = false;
+            }
+            if (urec.is_glob and !urec.scope_id.isNone()) {
+                for (self.symbol_table.getScopeMembers(urec.scope_id)) |g_idx| {
+                    const g_rec = self.symbol_table.getSymbol(g_idx);
+                    if (g_rec.kind == .use_alias_sym and g_rec.flags.is_glob_use_alias and
+                        g_rec.cst_node == urec.leaf_tree_cst)
+                    {
+                        self.symbol_table.getSymbolMut(g_idx).flags.is_used = false;
+                    }
+                }
+            }
+        }
+
+        const single_buf = [1]FileId{file_id};
+        const scan_files: []const FileId = if (pkg_files.len > 0) pkg_files else &single_buf;
+
+        // [2] Replay signature, `use` prefix, `impl` header, and `DefSideTables` references across `scan_files`:
+        for (scan_files) |scan_fid| {
+            if (self.symbol_table.getFilePackageId(scan_fid) != pkg_id) continue;
+            try self.ensureFreshSignatureAstAndSideTables(scan_fid);
+            const scan_src = self.getSourceText(scan_fid) catch continue;
+            const scan_parsed = self.parsed_artifacts.getPtr(scan_fid.asInt()) orelse continue;
+            const tok_count = scan_parsed.token_buffer.countTokens();
+            const file_mod_sc = self.symbol_table.file_module_scopes.get(scan_fid.asInt()) orelse .none;
+
+            // [2a] Replay `pub use` / `pub(pkg) use` re-exports and `use` prefix module chains in `scan_fid`:
+            if (!file_mod_sc.isNone()) {
+                for (self.symbol_table.getScopeMembers(file_mod_sc)) |m_idx| {
+                    const m_sym = self.symbol_table.getSymbol(m_idx).*;
+                    if (m_sym.flags.is_imported and m_sym.visibility != .private and !m_sym.target_symbol.isNone()) {
+                        self.symbol_table.markTargetScopeSymbolUsed(m_sym.scope_id, m_sym.target_symbol);
+                    }
+                }
+            }
+
+            // Walk `.use_item` prefix module segments and `.impl_item` headers in `scan_fid`:
+            if (!file_mod_sc.isNone()) {
+                const cst_len = scan_parsed.cst_arena.countNodes();
+                var cst_cur: usize = 0;
+                while (cst_cur < cst_len) {
+                    const cid = CstNodeIndex.fromInt(@intCast(cst_cur));
+                    const crec = scan_parsed.cst_arena.getNode(cid);
+                    if (crec.kind == .block or crec.kind == .fn_expr_body) {
+                        cst_cur += @max(@as(usize, crec.subtree_size), 1);
+                        continue;
+                    }
+                    if (crec.kind == .use_item) {
+                        const u_end = @min(cst_cur + @max(@as(usize, crec.subtree_size), 1), cst_len);
+                        // Mark leading identifier before `.` in `.use_item` if it resolves to a local/imported `module_sym`:
+                        var first_seg_tok: TokenIndex = .none;
+                        var has_dot_after = false;
+                        var u_i = cst_cur + 1;
+                        while (u_i < u_end) : (u_i += 1) {
+                            const lf = scan_parsed.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(u_i)));
+                            if (lf.kind == .attribute) {
+                                if (lf.subtree_size > 1) u_i += @as(usize, lf.subtree_size) - 1;
+                                continue;
+                            }
+                            if (lf.subtree_size > 1 or lf.flags.is_missing_or_injected or
+                                lf.token.isNone() or lf.token.asInt() >= tok_count) continue;
+                            const tk = scan_parsed.token_buffer.getToken(lf.token).kind;
+                            if (first_seg_tok.isNone() and symbol_resolver.isIdentifierToken(tk)) {
+                                first_seg_tok = lf.token;
+                            } else if (!first_seg_tok.isNone() and tk == .dot) {
+                                has_dot_after = true;
+                                break;
+                            } else if (!first_seg_tok.isNone()) {
+                                break;
+                            }
+                        }
+                        if (has_dot_after and !first_seg_tok.isNone()) {
+                            const seg_lex = symbol_resolver.extractTokenSlice(scan_src, &scan_parsed.token_buffer, first_seg_tok);
+                            if (self.interner.lookup(seg_lex)) |seg_id| {
+                                const lres = self.symbol_table.lookupLexical(file_mod_sc, seg_id, symbol_resolver.NamespaceMask.VALUE_ONLY);
+                                if (lres == .found and self.symbol_table.getSymbol(lres.found).kind == .module_sym) {
+                                    self.symbol_table.markLexicalSymbolUsed(file_mod_sc, seg_id, lres.found);
+                                }
+                            }
+                        }
+                        cst_cur = u_end;
+                        continue;
+                    }
+                    if (crec.kind == .impl_item) {
+                        const i_end = @min(cst_cur + @max(@as(usize, crec.subtree_size), 1), cst_len);
+                        var prev_was_dot = false;
+                        var i_c = cst_cur + 1;
+                        while (i_c < i_end) : (i_c += 1) {
+                            const lf = scan_parsed.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(i_c)));
+                            if (lf.kind == .block) break;
+                            if (lf.kind == .attribute) {
+                                if (lf.subtree_size > 1) i_c += @as(usize, lf.subtree_size) - 1;
+                                continue;
+                            }
+                            if (lf.subtree_size > 1 or lf.flags.is_missing_or_injected or
+                                lf.token.isNone() or lf.token.asInt() >= tok_count) continue;
+                            const tk = scan_parsed.token_buffer.getToken(lf.token).kind;
+                            if (tk == .dot) {
+                                prev_was_dot = true;
+                                continue;
+                            }
+                            if (!prev_was_dot and symbol_resolver.isIdentifierToken(tk)) {
+                                const h_lex = symbol_resolver.extractTokenSlice(scan_src, &scan_parsed.token_buffer, lf.token);
+                                if (self.interner.lookup(h_lex)) |hid| {
+                                    const lres = self.symbol_table.lookupLexical(file_mod_sc, hid, symbol_resolver.NamespaceMask.ALL);
+                                    if (lres == .found) {
+                                        self.symbol_table.markLexicalSymbolUsed(file_mod_sc, hid, lres.found);
+                                    }
+                                }
+                            }
+                            prev_was_dot = false;
+                        }
+                        cst_cur = i_end;
+                        continue;
+                    }
+                    cst_cur += 1;
+                }
+            }
+
+            // [2b] Replay `file_side_tables` of `scan_fid`:
+            if (self.file_side_tables.getPtr(scan_fid.asInt())) |file_st| {
+                const file_ast_lim = @min(file_st.ast_end, @as(u32, @intCast(scan_parsed.ast_arena.countNodes())));
+                var f_raw = file_st.ast_start;
+                while (f_raw < file_ast_lim) : (f_raw += 1) {
+                    const aid = NodeIndex.fromInt(f_raw);
+                    self.replayAstNodeSymbolUsage(scan_src, scan_parsed, file_mod_sc, aid, file_st.getNodeSymbol(aid));
+                    const nt = file_st.getNodeType(aid);
+                    if (!nt.isError()) self.replayTypeNominalUsage(file_mod_sc, nt, 0);
+                }
+                for (file_st.attr_instances) |attr_inst| {
+                    if (!attr_inst.schema_type_id.isError()) {
+                        self.replayTypeNominalUsage(file_mod_sc, attr_inst.schema_type_id, 0);
+                    }
+                }
+            }
+
+            // [2c] Replay every `ItemTree` entry in `scan_fid` via `getDefSideTables`:
+            const scan_tree = try self.extractItemTree(scan_fid);
+            const ast_total: u32 = @intCast(scan_parsed.ast_arena.countNodes());
+            for (scan_tree.entries) |entry| {
+                if (entry.kind == .use_decl) continue;
+                var caller_scope = file_mod_sc;
+                if (self.symbol_table.def_to_symbol.get(entry.def_id.asInt())) |def_sym| {
+                    if (!def_sym.isNone() and def_sym.asInt() < sym_total) {
+                        const ds = self.symbol_table.getSymbol(def_sym).*;
+                        if (!ds.scope_id.isNone() and ds.scope_id.asInt() < self.symbol_table.scope_arena.countScopes()) {
+                            const enc = self.symbol_table.scope_arena.getScope(ds.scope_id).enclosing_module;
+                            if (!enc.isNone()) caller_scope = enc;
+                        }
+                        if (!ds.type_id.isError()) self.replayTypeNominalUsage(caller_scope, ds.type_id, 0);
+                        if (!ds.target_scope.isNone()) {
+                            for (self.symbol_table.getScopeMembers(ds.target_scope)) |mem_idx| {
+                                const mt = self.symbol_table.getSymbol(mem_idx).type_id;
+                                if (!mt.isError()) self.replayTypeNominalUsage(caller_scope, mt, 0);
+                            }
+                        }
+                    }
+                }
+
+                const st_ptr = (try self.getDefSideTables(entry.def_id)) orelse continue;
+                const ast_lim = @min(st_ptr.ast_end, ast_total);
+                var ast_raw = st_ptr.ast_start;
+                while (ast_raw < ast_lim) : (ast_raw += 1) {
+                    const aid = NodeIndex.fromInt(ast_raw);
+                    const anode = scan_parsed.ast_arena.getNode(aid);
+                    self.replayAstNodeSymbolUsage(scan_src, scan_parsed, caller_scope, aid, st_ptr.getNodeSymbol(aid));
+                    const nt = st_ptr.getNodeType(aid);
+                    if (!nt.isError()) self.replayTypeNominalUsage(caller_scope, nt, 0);
+
+                    // Struct field accesses in `.struct_lit` and `.struct_pat`:
+                    if ((anode.tag == .struct_lit or anode.tag == .struct_pat) and !nt.isError()) {
+                        const deref_nt = if (self.type_pool.getTag(nt) == .ref_ty or self.type_pool.getTag(nt) == .mut_ref_ty)
+                            TypeId.fromInt(self.type_pool.getNode(nt).lhs)
+                        else
+                            nt;
+                        const st_ty = self.type_pool.unwrapUnderlyingType(deref_nt);
+                        const st_n = self.type_pool.getNode(st_ty);
+                        if (st_n.tag == .struct_ty or st_n.tag == .union_ty or st_n.tag == .bit_field_ty) {
+                            const nom_sym = SymbolIndex.fromInt(st_n.rhs);
+                            if (!nom_sym.isNone() and nom_sym.asInt() < sym_total) {
+                                const nom_scope = self.symbol_table.getSymbol(nom_sym).target_scope;
+                                const sc_cst = scan_parsed.ast_arena.getCstOrigin(aid);
+                                if (!nom_scope.isNone() and !sc_cst.isNone() and sc_cst.asInt() < scan_parsed.cst_arena.countNodes()) {
+                                    const sc_s: usize = sc_cst.asInt();
+                                    const sc_e: usize = @min(
+                                        sc_s + @max(@as(usize, scan_parsed.cst_arena.getNode(sc_cst).subtree_size), 1),
+                                        scan_parsed.cst_arena.countNodes(),
+                                    );
+                                    var f_cur = sc_s + 1;
+                                    while (f_cur < sc_e) {
+                                        const f_rec = scan_parsed.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(f_cur)));
+                                        if (f_rec.kind == .field_init or f_rec.kind == .field_pat) {
+                                            const f_end = @min(f_cur + @max(@as(usize, f_rec.subtree_size), 1), sc_e);
+                                            var in_c = f_cur + 1;
+                                            while (in_c < f_end) : (in_c += 1) {
+                                                const lf = scan_parsed.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(in_c)));
+                                                if (lf.subtree_size <= 1 and !lf.flags.is_missing_or_injected and
+                                                    !lf.token.isNone() and lf.token.asInt() < tok_count)
+                                                {
+                                                    const lk = scan_parsed.token_buffer.getToken(lf.token).kind;
+                                                    if (symbol_resolver.isIdentifierToken(lk)) {
+                                                        const flex = symbol_resolver.extractTokenSlice(
+                                                            scan_src,
+                                                            &scan_parsed.token_buffer,
+                                                            lf.token,
+                                                        );
+                                                        if (self.interner.lookup(flex)) |fid_id| {
+                                                            const f_idx = self.symbol_table.lookupInScopeDirect(
+                                                                nom_scope,
+                                                                fid_id,
+                                                                symbol_resolver.NamespaceMask.VALUE_ONLY,
+                                                            );
+                                                            if (!f_idx.isNone()) {
+                                                                self.symbol_table.markTargetScopeSymbolUsed(caller_scope, f_idx);
+                                                            }
+                                                        }
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            f_cur = f_end;
+                                            continue;
+                                        }
+                                        if (f_rec.subtree_size <= 1 and !f_rec.token.isNone() and f_rec.token.asInt() < tok_count and
+                                            scan_parsed.token_buffer.getToken(f_rec.token).kind == .dotdot)
+                                        {
+                                            for (self.symbol_table.getScopeMembers(nom_scope)) |mem_f| {
+                                                if (self.symbol_table.getSymbol(mem_f).kind == .field_sym) {
+                                                    self.symbol_table.markTargetScopeSymbolUsed(caller_scope, mem_f);
+                                                }
+                                            }
+                                        }
+                                        f_cur += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                var map_it = st_ptr.call_arg_mappings.valueIterator();
+                while (map_it.next()) |mp| {
+                    if (!mp.callee_sym.isNone()) self.symbol_table.markTargetScopeSymbolUsed(caller_scope, mp.callee_sym);
+                }
+                var conv_it = st_ptr.try_conversions.valueIterator();
+                while (conv_it.next()) |cdef| {
+                    if (self.symbol_table.def_to_symbol.get(cdef.*.asInt())) |csym| {
+                        self.symbol_table.markTargetScopeSymbolUsed(caller_scope, csym);
+                    }
+                }
+                var inst_it = st_ptr.call_instantiations.valueIterator();
+                while (inst_it.next()) |tys_ptr| {
+                    for (tys_ptr.*) |ity| {
+                        if (!ity.isError()) self.replayTypeNominalUsage(caller_scope, ity, 0);
+                    }
+                }
+                for (st_ptr.attr_instances) |attr_inst| {
+                    if (!attr_inst.schema_type_id.isError()) {
+                        self.replayTypeNominalUsage(caller_scope, attr_inst.schema_type_id, 0);
+                    }
+                }
+                var interp_it = st_ptr.string_interps.iterator();
+                while (interp_it.next()) |ikv| {
+                    const fmt_raw = st_ptr.ast_start + ikv.key_ptr.*;
+                    if (fmt_raw >= ast_lim) continue;
+                    const fmt_tok = scan_parsed.ast_arena.getNode(NodeIndex.fromInt(fmt_raw)).main_token;
+                    if (fmt_tok.isNone() or fmt_tok.asInt() >= tok_count) continue;
+                    const fmt_base = scan_parsed.token_buffer.getToken(fmt_tok).byte_offset;
+                    for (ikv.value_ptr.holes) |hole| {
+                        if (!hole.expr_type_id.isError()) self.replayTypeNominalUsage(caller_scope, hole.expr_type_id, 0);
+                        for (hole.tokens) |htok| {
+                            if (htok.byte_len == 0 or htok.symbol_index.isNone() or htok.symbol_index.asInt() >= sym_total) continue;
+                            const hs: usize = @min(@as(usize, fmt_base +| htok.rel_byte), scan_src.len);
+                            const he: usize = @min(@as(usize, fmt_base +| htok.rel_byte +| htok.byte_len), scan_src.len);
+                            const h_lex = scan_src[hs..he];
+                            const qid = self.interner.lookup(h_lex) orelse self.symbol_table.getSymbol(htok.symbol_index).name;
+                            self.symbol_table.markLexicalSymbolUsed(caller_scope, qid, htok.symbol_index);
+                            self.symbol_table.markTargetScopeSymbolUsed(caller_scope, htok.symbol_index);
+                            const hrec = self.symbol_table.getSymbol(htok.symbol_index).*;
+                            if (!hrec.scope_id.isNone() and hrec.scope_id.asInt() < self.symbol_table.scope_arena.countScopes()) {
+                                const hsc = self.symbol_table.scope_arena.getScope(hrec.scope_id);
+                                if (hsc.kind == .trait_scope and !hsc.owner_def_id.isNone()) {
+                                    if (self.symbol_table.def_to_symbol.get(hsc.owner_def_id.asInt())) |tr_idx| {
+                                        self.symbol_table.markImportedTraitUsed(caller_scope, tr_idx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stage 17 compute routine: filters, rebases, and sorts diagnostics for `file_id` (`DR-25` §3.2, `Ruling 3.4`).
+    fn computeProjectFileDiagnostics(self: *CompilerDb, file_id: FileId) QueryError!Fingerprint128 {
+        const source = try self.getSourceText(file_id);
+        const pkg_id = self.symbol_table.getFilePackageId(file_id);
+        const settings = try self.getLintSemanticSettings(pkg_id);
+        _ = try self.parseCst(file_id);
+        _ = try self.suppressionTable(file_id);
+        const eff_rules = try self.effectiveFileRules(file_id);
+        try self.ensureEnclosingRootSignatures(file_id);
+        const tree_view = try self.extractItemTree(file_id);
+        try self.unwindIfCanceled();
+
+        const DefCheckSnap = struct {
+            def_id: DefId,
+            kind: ItemKind,
+            cst_node: CstNodeIndex,
+            has_body_errors: bool = false,
+            body_origin_start: u32 = 0,
+            body_delta: i64 = 0,
+            sast_origin_start: u32 = 0,
+            sast_delta: i64 = 0,
+        };
+        var def_snaps = self.allocator.alloc(DefCheckSnap, tree_view.entries.len) catch return error.OutOfMemory;
+        defer if (def_snaps.len > 0) self.allocator.free(def_snaps);
+        for (tree_view.entries, 0..) |entry, i| {
+            def_snaps[i] = .{
+                .def_id = entry.def_id,
+                .kind = entry.kind,
+                .cst_node = entry.cst_node,
+            };
+        }
+
+        const has_parse_errs = if (self.parsed_artifacts.getPtr(file_id.asInt())) |pp| pp.has_parse_errors else false;
+        for (def_snaps) |*snap| {
+            var typed_body = try self.typecheckBody(snap.def_id);
+            if (typed_body.error_count > 0 or typed_body.warning_count > 0) {
+                if (self.parsed_artifacts.getPtr(file_id.asInt())) |pp| {
+                    if (computeCstItemBoundsAndHash(file_id, source, pp, snap.cst_node)) |live_b| {
+                        if (live_b.byte_hash != typed_body.origin_item_byte_hash) {
+                            _ = try self.computeTypecheckBody(snap.def_id);
+                            typed_body = self.typed_bodies.get(snap.def_id.asInt()).?;
+                        }
+                        snap.body_origin_start = typed_body.origin_item_start_byte;
+                        snap.body_delta = @as(i64, live_b.start_byte) - @as(i64, typed_body.origin_item_start_byte);
+                    }
+                }
+            }
+            snap.has_body_errors = typed_body.error_count > 0;
+        }
+
+        const sup_table_ptr = self.suppression_tables.getPtr(file_id.asInt()) orelse return error.MissingSourceInput;
+        var tracker = lint_filter.FulfillmentTracker.init(self.allocator, sup_table_ptr) catch return error.OutOfMemory;
+        defer tracker.deinit(self.allocator);
+
+        const is_lint_target = self.isLintTargetFile(file_id) and !sup_table_ptr.is_generated_file;
+
+        // Collect all non-virtual mounted files in `pkg_id` and pre-warm sibling bodies before SAST (`W0333`, `W0406`, `W0201`):
+        var pkg_files: std.ArrayListUnmanaged(FileId) = .empty;
+        defer pkg_files.deinit(self.allocator);
+        var has_w0201_cand = false;
+        if (is_lint_target) {
+            if (self.parsed_artifacts.getPtr(file_id.asInt())) |pp| {
+                for (pp.raw_lint_candidates.items) |cand| {
+                    if (cand.rule_id == .non_canonical_case and eff_rules.isEnabled(.non_canonical_case)) {
+                        has_w0201_cand = true;
+                        break;
+                    }
+                }
+            }
+            if (self.fileNeedsSiblingLintSweep(file_id, pkg_id, eff_rules, has_w0201_cand)) {
+                var src_it = self.source_inputs.keyIterator();
+                while (src_it.next()) |raw_fid_ptr| {
+                    const sib_fid = FileId.fromInt(raw_fid_ptr.*);
+                    if (sib_fid.asInt() >= VIRTUAL_C_IMPORT_FILE_ID_BASE) continue;
+                    if (self.symbol_table.getFilePackageId(sib_fid) != pkg_id) continue;
+                    pkg_files.append(self.allocator, sib_fid) catch return error.OutOfMemory;
+                }
+                std.mem.sort(FileId, pkg_files.items, {}, struct {
+                    fn lessThan(_: void, lhs: FileId, rhs: FileId) bool {
+                        return lhs.asInt() < rhs.asInt();
+                    }
+                }.lessThan);
+                for (pkg_files.items) |sib_fid| {
+                    if (sib_fid == file_id) continue;
+                    _ = try self.resolveSignatures(sib_fid);
+                    const sib_tree = try self.extractItemTree(sib_fid);
+                    for (sib_tree.entries) |sib_entry| {
+                        _ = try self.typecheckBody(sib_entry.def_id);
+                    }
+                }
+            }
+        }
+
+        for (def_snaps) |*snap| {
+            const can_run_sast = !has_parse_errs and !snap.has_body_errors and
+                snap.kind != .mod_decl and snap.kind != .use_decl and
+                snap.kind != .trait_decl and snap.kind != .type_alias_decl and
+                snap.kind != .extern_static and snap.kind != .ffi_extern_block;
+            if (can_run_sast) {
+                var sast_art = try self.verifySastMir(snap.def_id);
+                if (sast_art.error_count > 0 or sast_art.warning_count > 0) {
+                    if (self.parsed_artifacts.getPtr(file_id.asInt())) |pp| {
+                        if (computeCstItemBoundsAndHash(file_id, source, pp, snap.cst_node)) |live_b| {
+                            if (live_b.byte_hash != sast_art.origin_item_byte_hash) {
+                                _ = try self.computeVerifySastMir(snap.def_id);
+                                sast_art = self.sast_results.get(snap.def_id.asInt()).?;
+                            }
+                            snap.sast_origin_start = sast_art.origin_item_start_byte;
+                            snap.sast_delta = @as(i64, live_b.start_byte) - @as(i64, sast_art.origin_item_start_byte);
+                        }
+                    }
+                }
+                if (sast_art.is_verified_sound and (snap.kind == .const_decl or snap.kind == .extern_block)) {
+                    _ = self.evalComptimeDef(snap.def_id) catch |ct_err| switch (ct_err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.Canceled => return error.Canceled,
+                        else => {},
+                    };
+                }
+            }
+        }
+
+        const proj_sink = resetOrCreateDefDiagSink(
+            &self.projected_file_diagnostics,
+            self.allocator,
+            file_id.asInt(),
+        ) catch return error.OutOfMemory;
+
+        if (self.parsed_artifacts.getPtr(file_id.asInt())) |parsed_ptr| {
+            for (parsed_ptr.diagnostics.asSlice()) |diag_item| {
+                filterAndRebaseDiagnosticIntoSink(
+                    proj_sink,
+                    sup_table_ptr,
+                    &tracker,
+                    eff_rules,
+                    is_lint_target,
+                    file_id,
+                    diag_item,
+                    0,
+                    0,
+                ) catch return error.OutOfMemory;
+            }
+            if (is_lint_target and parsed_ptr.raw_lint_candidates.items.len > 0) {
+                var surviving_cands = self.allocator.alloc(
+                    lint_filter.RawLintCandidate,
+                    parsed_ptr.raw_lint_candidates.items.len,
+                ) catch return error.OutOfMemory;
+                defer self.allocator.free(surviving_cands);
+                var surviving_len: usize = 0;
+                for (parsed_ptr.raw_lint_candidates.items) |cand| {
+                    if (!eff_rules.isEnabled(cand.rule_id)) continue;
+                    if (lint_filter.isCandidateSuppressed(sup_table_ptr, &tracker, cand)) continue;
+                    surviving_cands[surviving_len] = cand;
+                    surviving_len += 1;
+                }
+
+                // Fuse co-firing `W0122` (`ungrouped_numeric_literal`) + `W0123` (`non_upper_hex_literal`) on same token:
+                for (surviving_cands[0..surviving_len], 0..) |*cand_ptr, idx| {
+                    if (cand_ptr.rule_id == .ungrouped_numeric_literal and cand_ptr.fix_kind == 1) {
+                        for (surviving_cands[0..surviving_len], 0..) |*other_ptr, other_idx| {
+                            if (other_idx != idx and other_ptr.rule_id == .non_upper_hex_literal and
+                                other_ptr.start_byte == cand_ptr.start_byte and
+                                other_ptr.end_byte == cand_ptr.end_byte)
+                            {
+                                cand_ptr.fix_kind = 2;
+                                other_ptr.fix_kind = 0;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                for (surviving_cands[0..surviving_len]) |cand| {
+                    if (cand.rule_id == .non_canonical_case) {
+                        try self.emitProjectedNonCanonicalCaseDiagnostic(
+                            proj_sink,
+                            file_id,
+                            pkg_id,
+                            pkg_files.items,
+                            source,
+                            cand,
+                            surviving_cands[0..surviving_len],
+                        );
+                    } else {
+                        lint_filter.materializeLexCstLintCandidate(
+                            source,
+                            file_id,
+                            &self.interner,
+                            cand,
+                            proj_sink,
+                        ) catch return error.OutOfMemory;
+                    }
+                }
+            }
+        }
+
+        if (self.sig_diagnostics.getPtr(file_id.asInt())) |sig_sink| {
+            for (sig_sink.asSlice()) |diag_item| {
+                filterAndRebaseDiagnosticIntoSink(
+                    proj_sink,
+                    sup_table_ptr,
+                    &tracker,
+                    eff_rules,
+                    is_lint_target,
+                    file_id,
+                    diag_item,
+                    0,
+                    0,
+                ) catch return error.OutOfMemory;
+            }
+        }
+
+        for (def_snaps) |snap| {
+            if (self.body_diagnostics.getPtr(snap.def_id.asInt())) |body_sink| {
+                for (body_sink.asSlice()) |diag_item| {
+                    filterAndRebaseDiagnosticIntoSink(
+                        proj_sink,
+                        sup_table_ptr,
+                        &tracker,
+                        eff_rules,
+                        is_lint_target,
+                        file_id,
+                        diag_item,
+                        snap.body_origin_start,
+                        snap.body_delta,
+                    ) catch return error.OutOfMemory;
+                }
+            }
+            if (self.sast_diagnostics.getPtr(snap.def_id.asInt())) |sast_sink| {
+                for (sast_sink.asSlice()) |diag_item| {
+                    filterAndRebaseDiagnosticIntoSink(
+                        proj_sink,
+                        sup_table_ptr,
+                        &tracker,
+                        eff_rules,
+                        is_lint_target,
+                        file_id,
+                        diag_item,
+                        snap.sast_origin_start,
+                        snap.sast_delta,
+                    ) catch return error.OutOfMemory;
+                }
+            }
+            if (self.comptime_diagnostics.getPtr(snap.def_id.asInt())) |ct_sink| {
+                for (ct_sink.asSlice()) |diag_item| {
+                    filterAndRebaseDiagnosticIntoSink(
+                        proj_sink,
+                        sup_table_ptr,
+                        &tracker,
+                        eff_rules,
+                        is_lint_target,
+                        file_id,
+                        diag_item,
+                        0,
+                        0,
+                    ) catch return error.OutOfMemory;
+                }
+            }
+        }
+
+        // Run Step 3A single-pass symbol, import, and package-visibility sweeps (`W0103`, `W0402`, `W0404`, `W0406`):
+        if (is_lint_target) {
+            try self.recomputeLiveSymbolUsageForFile(file_id, pkg_id, pkg_files.items);
+            if (self.parsed_artifacts.getPtr(file_id.asInt())) |parsed_ptr| {
+                const has_any_file_errors = has_parse_errs or (proj_sink.error_count > 0);
+                var file_inactive_cfg_idents: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
+                defer file_inactive_cfg_idents.deinit(self.allocator);
+                symbol_resolver.collectFileInactiveCfgIdents(
+                    self.allocator,
+                    &self.symbol_table,
+                    &self.interner,
+                    file_id,
+                    source,
+                    &parsed_ptr.token_buffer,
+                    &parsed_ptr.cst_arena,
+                    &file_inactive_cfg_idents,
+                ) catch return error.OutOfMemory;
+
+                var sym_sweep_sink = DiagnosticSink.init(self.allocator);
+                defer sym_sweep_sink.deinit();
+
+                if (eff_rules.isEnabled(.confusable_ident)) {
+                    symbol_resolver.emitFileConfusableIdentifierWarnings(
+                        &self.symbol_table,
+                        file_id,
+                        source,
+                        settings,
+                        &sym_sweep_sink,
+                    ) catch return error.OutOfMemory;
+                }
+                if (eff_rules.isEnabled(.unused_binding) and !has_any_file_errors) {
+                    symbol_resolver.emitFileUnusedPrivateItemWarnings(
+                        &self.symbol_table,
+                        &self.interner,
+                        file_id,
+                        source,
+                        &parsed_ptr.token_buffer,
+                        &parsed_ptr.cst_arena,
+                        &file_inactive_cfg_idents,
+                        &sym_sweep_sink,
+                    ) catch return error.OutOfMemory;
+                }
+                if (eff_rules.isEnabled(.unused_pkg_visibility) and !has_any_file_errors) {
+                    var pkg_inactive_cfg_idents: std.AutoHashMapUnmanaged(SymbolId, void) = .empty;
+                    defer pkg_inactive_cfg_idents.deinit(self.allocator);
+                    for (pkg_files.items) |sib_fid| {
+                        const sib_src = self.getSourceText(sib_fid) catch continue;
+                        if (self.parsed_artifacts.getPtr(sib_fid.asInt())) |sib_pp| {
+                            symbol_resolver.collectFileInactiveCfgIdents(
+                                self.allocator,
+                                &self.symbol_table,
+                                &self.interner,
+                                sib_fid,
+                                sib_src,
+                                &sib_pp.token_buffer,
+                                &sib_pp.cst_arena,
+                                &pkg_inactive_cfg_idents,
+                            ) catch return error.OutOfMemory;
+                        }
+                    }
+                    symbol_resolver.emitPackageUnusedVisibilityWarningsForFile(
+                        &self.symbol_table,
+                        &self.interner,
+                        &self.type_pool,
+                        pkg_id,
+                        pkg_files.items,
+                        file_id,
+                        source,
+                        &parsed_ptr.token_buffer,
+                        &parsed_ptr.cst_arena,
+                        &pkg_inactive_cfg_idents,
+                        &sym_sweep_sink,
+                    ) catch return error.OutOfMemory;
+                }
+
+                for (sym_sweep_sink.asSlice()) |sweep_diag| {
+                    filterAndCloneSweepDiagnosticIntoSink(
+                        proj_sink,
+                        sup_table_ptr,
+                        &tracker,
+                        eff_rules,
+                        is_lint_target,
+                        file_id,
+                        sweep_diag,
+                    ) catch return error.OutOfMemory;
+                }
+
+                if (eff_rules.isEnabled(.unused_import)) {
+                    symbol_resolver.emitFileUnusedImportWarnings(
+                        &self.symbol_table,
+                        &self.interner,
+                        file_id,
+                        source,
+                        &parsed_ptr.token_buffer,
+                        &parsed_ptr.cst_arena,
+                        &file_inactive_cfg_idents,
+                        sup_table_ptr,
+                        &tracker,
+                        eff_rules,
+                        proj_sink,
+                    ) catch return error.OutOfMemory;
+                }
+            }
+        }
+
+        const post_eff_rules: lint_filter.EffectiveFileRules = if (is_lint_target)
+            eff_rules
+        else
+            .{ .disabled_mask = diagnostic.ALL_RULES_MASK };
+        const audit_mask: diagnostic.RuleMask64 = if (has_parse_errs or proj_sink.error_count > 0)
+            0
+        else
+            self.cli_lint_filter.activeAuditMask();
+        lint_filter.collectStaleExpectDiagnosticsAndEdits(
+            self.allocator,
+            source,
+            file_id,
+            &self.interner,
+            sup_table_ptr,
+            &tracker,
+            post_eff_rules,
+            audit_mask,
+            settings.require_suppression_reason,
+            proj_sink,
+        ) catch return error.OutOfMemory;
+
+        if (is_lint_target) {
+            self.fuseStructShorthandUnusedVarEdits(proj_sink) catch return error.OutOfMemory;
+
+            var has_cross_file_fix_diag = false;
+            for (proj_sink.diagnostics.items) |diag_item| {
+                if (diag_item.suggestions.len > 0 and
+                    (diag_item.code == .w0206_getter_prefix_noise or
+                        diag_item.code == .w0207_conversion_prefix_mismatch or
+                        diag_item.code == .w0413_trivially_copy_pass_by_ref))
+                {
+                    has_cross_file_fix_diag = true;
+                    break;
+                }
+            }
+            if (has_cross_file_fix_diag) {
+                if (pkg_files.items.len == 0) {
+                    var src_it = self.source_inputs.keyIterator();
+                    while (src_it.next()) |raw_fid_ptr| {
+                        const sib_fid = FileId.fromInt(raw_fid_ptr.*);
+                        if (sib_fid.asInt() >= VIRTUAL_C_IMPORT_FILE_ID_BASE) continue;
+                        if (self.symbol_table.getFilePackageId(sib_fid) != pkg_id) continue;
+                        pkg_files.append(self.allocator, sib_fid) catch return error.OutOfMemory;
+                    }
+                    std.mem.sort(FileId, pkg_files.items, {}, struct {
+                        fn lessThan(_: void, lhs: FileId, rhs: FileId) bool {
+                            return lhs.asInt() < rhs.asInt();
+                        }
+                    }.lessThan);
+                    for (pkg_files.items) |sib_fid| {
+                        if (sib_fid == file_id) continue;
+                        _ = try self.resolveSignatures(sib_fid);
+                        const sib_tree = try self.extractItemTree(sib_fid);
+                        for (sib_tree.entries) |sib_entry| {
+                            _ = try self.typecheckBody(sib_entry.def_id);
+                        }
+                    }
+                }
+                for (proj_sink.diagnostics.items) |*diag_ptr| {
+                    if (diag_ptr.code == .w0206_getter_prefix_noise or
+                        diag_ptr.code == .w0207_conversion_prefix_mismatch)
+                    {
+                        try self.augmentMethodRenameSuggestionsInPkg(
+                            proj_sink,
+                            file_id,
+                            pkg_id,
+                            pkg_files.items,
+                            source,
+                            diag_ptr,
+                        );
+                    } else if (diag_ptr.code == .w0413_trivially_copy_pass_by_ref) {
+                        try self.augmentPassByValueCallSuggestionsW0413(
+                            proj_sink,
+                            file_id,
+                            pkg_id,
+                            pkg_files.items,
+                            diag_ptr,
+                        );
+                    }
+                }
+            }
+        }
+
+        std.mem.sort(diagnostic.Diagnostic, proj_sink.diagnostics.items, {}, struct {
+            /// Orders projected diagnostics deterministically by `(start_byte ASC, end_byte ASC, code ASC)`.
+            fn lessThan(_: void, lhs: diagnostic.Diagnostic, rhs: diagnostic.Diagnostic) bool {
+                if (lhs.primary_span.start_byte != rhs.primary_span.start_byte) {
+                    return lhs.primary_span.start_byte < rhs.primary_span.start_byte;
+                }
+                if (lhs.primary_span.end_byte != rhs.primary_span.end_byte) {
+                    return lhs.primary_span.end_byte < rhs.primary_span.end_byte;
+                }
+                return lhs.code.asInt() < rhs.code.asInt();
+            }
+        }.lessThan);
+
+        var dedup_len: usize = 0;
+        var recomputed_errs: u32 = 0;
+        var recomputed_warns: u32 = 0;
+        for (proj_sink.diagnostics.items) |diag_item| {
+            if (dedup_len > 0) {
+                const prev = proj_sink.diagnostics.items[dedup_len - 1];
+                if (prev.code == diag_item.code and
+                    prev.primary_span.start_byte == diag_item.primary_span.start_byte and
+                    prev.primary_span.end_byte == diag_item.primary_span.end_byte and
+                    (prev.code.asLintRuleId() != null or std.mem.eql(u8, prev.message, diag_item.message)))
+                {
+                    continue;
+                }
+            }
+            proj_sink.diagnostics.items[dedup_len] = diag_item;
+            dedup_len += 1;
+            if (diag_item.severity == .err) {
+                recomputed_errs += 1;
+            } else if (diag_item.severity == .warning) {
+                recomputed_warns += 1;
+            }
+        }
+        proj_sink.diagnostics.items.len = dedup_len;
+        proj_sink.error_count = recomputed_errs;
+        proj_sink.warning_count = recomputed_warns;
+
+        var proj_hasher = StructuralHasher.init();
+        proj_hasher.updateU32(file_id.asInt());
+        proj_hasher.updateU32(@intCast(dedup_len));
+        for (proj_sink.diagnostics.items) |diag_item| {
+            proj_hasher.updateU16(diag_item.code.asInt());
+            proj_hasher.updateU8(@backingInt(diag_item.severity));
+            proj_hasher.updateU32(diag_item.primary_span.start_byte);
+            proj_hasher.updateU32(diag_item.primary_span.end_byte);
+            proj_hasher.updateBytes(diag_item.message);
+            proj_hasher.updateU32(@intCast(diag_item.suggestions.len));
+        }
+        return proj_hasher.final();
     }
 
     /// Stage 10 implementation: lowers `def_id` into an isolated `HirStore`.
@@ -12645,6 +16877,40 @@ pub const CompilerDb = struct {
         };
         errdefer opt_res.deinit();
 
+        // Filter `mir_opt` lint warnings (`W0501`) through `SuppressionTable` and `EffectiveFileRules`:
+        if (opt_sink.warning_count > 0 and self.source_inputs.contains(file_id.asInt())) {
+            _ = try self.suppressionTable(file_id);
+            const eff_rules = try self.effectiveFileRules(file_id);
+            if (self.suppression_tables.getPtr(file_id.asInt())) |sup_ptr| {
+                var opt_tracker = lint_filter.FulfillmentTracker.init(self.allocator, sup_ptr) catch
+                    return error.OutOfMemory;
+                defer opt_tracker.deinit(self.allocator);
+                const is_lint_target = self.isLintTargetFile(file_id) and !sup_ptr.is_generated_file;
+                var opt_write: usize = 0;
+                for (opt_sink.diagnostics.items) |diag_item| {
+                    if (diag_item.severity != .err) {
+                        if (diag_item.code.asLintRuleId()) |rule_id| {
+                            const is_sup = !is_lint_target or !eff_rules.isEnabled(rule_id) or
+                                lint_filter.isCandidateSuppressed(sup_ptr, &opt_tracker, .{
+                                    .rule_id = rule_id,
+                                    .start_byte = diag_item.primary_span.start_byte,
+                                    .end_byte = diag_item.primary_span.end_byte,
+                                });
+                            if (is_sup) {
+                                if (diag_item.severity == .warning and opt_sink.warning_count > 0) {
+                                    opt_sink.warning_count -= 1;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    opt_sink.diagnostics.items[opt_write] = diag_item;
+                    opt_write += 1;
+                }
+                opt_sink.diagnostics.items.len = opt_write;
+            }
+        }
+
         var hasher = StructuralHasher.init();
         hasher.updateU32(file_id.asInt());
         hasher.updateU8(@intFromBool(is_release_mode));
@@ -12691,14 +16957,15 @@ pub const CompilerDb = struct {
             sig_hasher.updateU8(@intFromBool(pspec.has_default));
         }
         const sig_fp = sig_hasher.final();
-        var fn_sum = if (self.sast_sym_summaries.get(sym_idx.asInt())) |msum|
+        const method_sum_opt = self.lookupMethodSastSummary(sym_idx);
+        var fn_sum = if (method_sum_opt) |msum|
             msum
         else if (!sym.def_id.isNone())
             (self.sast_summaries.get(sym.def_id.asInt()) orelse mir_sast.FnRegionSummary{})
         else
             mir_sast.FnRegionSummary{};
         if ((sym.def_id.isNone() or !self.sast_summaries.contains(sym.def_id.asInt())) and
-            !self.sast_sym_summaries.contains(sym_idx.asInt()))
+            method_sum_opt == null)
         {
             const proto_bits = mir_sast.inferSymbolBoundaryOrPrototypeEffects(&self.symbol_table, sym_idx).asBits();
             fn_sum.direct_effects_bits |= proto_bits;
@@ -12910,7 +17177,7 @@ pub const CompilerDb = struct {
             return bits & mir_sast.EffectCapabilityMask.LOCKFILE_CAP_BITS;
         }
 
-        if (self.sast_sym_summaries.get(sym_idx.asInt())) |msum| {
+        if (self.lookupMethodSastSummary(sym_idx)) |msum| {
             bits |= msum.inferred_effects_bits | msum.direct_effects_bits;
         } else if (!sym.def_id.isNone()) {
             if (!self.sast_summaries.contains(sym.def_id.asInt()) and
@@ -13815,12 +18082,28 @@ pub const CompilerDb = struct {
         defer cap_inputs.deinit(self.allocator);
         try cap_inputs.ensureTotalCapacity(self.allocator, pkg_order.len);
 
+        var is_w0330_enabled = (self.cli_lint_filter.activeAuditMask() &
+            diagnostic.RuleId.ambient_dead_capability.bit()) != 0;
+        if (is_w0330_enabled) {
+            if (self.package_root_files.get(.root)) |root_fid| {
+                if (self.source_inputs.contains(root_fid.asInt())) {
+                    const root_rules = try self.effectiveFileRules(root_fid);
+                    if (!root_rules.isEnabled(.ambient_dead_capability)) is_w0330_enabled = false;
+                }
+            } else if (self.package_lint_filters.getPtr(.root)) |root_lcfg| {
+                if ((root_lcfg.config.disable_mask & diagnostic.RuleId.ambient_dead_capability.bit()) != 0) {
+                    is_w0330_enabled = false;
+                }
+            }
+        }
+
         for (pkg_order, 0..) |pkg_id, idx| {
             const art = cxi_artifacts.items[idx];
-            const policy = self.package_cap_policies.get(pkg_id) orelse mir_sast.PackageCapPolicy{
+            var policy = self.package_cap_policies.get(pkg_id) orelse mir_sast.PackageCapPolicy{
                 .package_name = if (self.symbol_table.package_metas.get(pkg_id)) |meta| meta.canonical_name else "root",
                 .is_third_party_dependency = pkg_id.asInt() >= 2,
             };
+            if (!is_w0330_enabled) policy.is_warning_ambient_dead_caps = false;
             const reach_mask = mir_sast.EffectCapabilityMask.fromBits(reachable_by_pkg.get(pkg_id) orelse 0);
             cap_inputs.appendAssumeCapacity(.{
                 .pkg_id = pkg_id,
@@ -15791,3 +20074,82 @@ test "test_phase9_pub_use_reexport_caps_const_cxi_boundary_inactive_cfg_and_comp
         try std.testing.expect(has_e0326);
     }
 }
+
+test "test_query_db_dr25_early_cutoff_firewall_lint_disable_and_overrides" {
+    const allocator = std.testing.allocator;
+    var db = try CompilerDb.init(allocator);
+    defer db.deinit();
+
+    const fid = FileId.fromInt(700);
+    try db.setFilePackageId(fid, .root);
+    try db.setFilePath(fid, "D:/ws/src/service.cx");
+    const cx_source =
+        \\pub fn compute(val: i32) -> i32 {
+        \\    let unused_local = 42;
+        \\    return val + 1;
+        \\}
+    ;
+    _ = try db.setInput(fid, cx_source, .low);
+    try db.setPackageLintSemanticSettings(.root, .{}, null);
+    try db.setPackageLintFilterConfig(.root, "D:/ws", .{}, null);
+
+    // [1] Initial projection populates Stages 1–17 and emits `W0402` (`unused-binding`):
+    const initial_sink = try db.projectFileDiagnostics(fid);
+    var saw_w0402 = false;
+    for (initial_sink.asSlice()) |diag_item| {
+        if (diag_item.code == .w0402_unused_binding) saw_w0402 = true;
+    }
+    try std.testing.expect(saw_w0402);
+
+    const parse_execs_before = db.telemetry.stage_executions[@backingInt(QueryStage.parse_cst)];
+    const tc_execs_before = db.telemetry.stage_executions[@backingInt(QueryStage.typecheck_body)];
+    const sast_execs_before = db.telemetry.stage_executions[@backingInt(QueryStage.verify_sast_mir)];
+    const sup_execs_before = db.telemetry.stage_executions[@backingInt(QueryStage.suppression_table)];
+
+    // [2] Edit `[lint].disable = ["unused-binding"]` (leaving `[lint.settings]` untouched):
+    const start_timer = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
+    try db.setPackageLintSemanticSettings(.root, .{}, null);
+    try db.setPackageLintFilterConfig(
+        .root,
+        "D:/ws",
+        .{ .disable_mask = diagnostic.RuleId.unused_binding.bit() },
+        null,
+    );
+    const reprojected_sink = try db.projectFileDiagnostics(fid);
+    const elapsed_ns = start_timer.untilNow(std.testing.io).raw.nanoseconds;
+
+    // `W0402` is now filtered out in `< 1 ms`, with ZERO re-executions of `parse_cst`, `typecheck_body`, or `verify_sast_mir`!
+    for (reprojected_sink.asSlice()) |diag_item| {
+        try std.testing.expect(diag_item.code != .w0402_unused_binding);
+    }
+    try std.testing.expect(elapsed_ns < 50_000_000); // `< 1 ms` typical (`< 50 ms` debug CI safety margin)
+    try std.testing.expectEqual(parse_execs_before, db.telemetry.stage_executions[@backingInt(QueryStage.parse_cst)]);
+    try std.testing.expectEqual(tc_execs_before, db.telemetry.stage_executions[@backingInt(QueryStage.typecheck_body)]);
+    try std.testing.expectEqual(sast_execs_before, db.telemetry.stage_executions[@backingInt(QueryStage.verify_sast_mir)]);
+    try std.testing.expectEqual(sup_execs_before, db.telemetry.stage_executions[@backingInt(QueryStage.suppression_table)]);
+
+    // [3] Sibling Early-Cutoff span rebasing (`Ruling 3.4`): prepend an item above `compute`, verify `W0402` span shifts cleanly:
+    try db.setPackageLintFilterConfig(.root, "D:/ws", .{}, null);
+    const shifted_source =
+        \\pub fn header_helper() -> i32 {
+        \\    return 100;
+        \\}
+        \\
+        \\pub fn compute(val: i32) -> i32 {
+        \\    let unused_local = 42;
+        \\    return val + 1;
+        \\}
+    ;
+    _ = try db.setInput(fid, shifted_source, .low);
+    const shifted_sink = try db.projectFileDiagnostics(fid);
+    const expected_start: u32 = @intCast(std.mem.indexOf(u8, shifted_source, "unused_local").?);
+    var found_shifted_span = false;
+    for (shifted_sink.asSlice()) |diag_item| {
+        if (diag_item.code == .w0402_unused_binding) {
+            try std.testing.expectEqual(expected_start, diag_item.primary_span.start_byte);
+            found_shifted_span = true;
+        }
+    }
+    try std.testing.expect(found_shifted_span);
+}
+

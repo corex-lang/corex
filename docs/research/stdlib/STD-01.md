@@ -842,7 +842,7 @@ pub struct Utf8Error {
     pub error_len:   u8?,
 }
 
-@no_alloc @no_panic pub fn validate_utf8(bytes: &[u8], /) -> bool;
+@no_alloc @no_panic pub fn is_valid_utf8(bytes: &[u8], /) -> bool;
 @no_alloc @no_panic pub fn from_utf8(bytes: &[u8], /) -> str!Utf8Error;
 @no_alloc @no_panic pub fn char_width(ch: char, /) -> i8;
 
@@ -2403,5 +2403,5 @@ Every inner loop in `STD-01` is written so `Phase 6` `O(V)` interval filtering +
 1.  **Zero Pre-`main` Static Initializers Gate:** Inspect compiled ELF, Mach-O, PE32+, and `.wasm` binaries via `llvm-readobj --sections` and `wasm-objdump -h` to confirm **zero** `.init_array`, `__mod_init_func`, `.CRT$XCU`, or Wasm `start` sections are emitted across `cx.mem`, `cx.col`, `cx.str`, and `cx.math`.
 2.  **Pointer-Shape ICF Deduplication Gate:** Instantiate `Map[K, V]` across 50 distinct nominal `(u64, *T)` key-value types in a test binary linked with `lld --icf=safe` / `wasm-ld --icf=safe`, and verify via `llvm-nm --size-sort` that `RawTableInner.find_raw`, `find_or_prepare_insert_raw`, `erase_slot_ctrl`, and `rehash_or_grow_raw` each appear **once** in `.text`.
 3.  **Scratch-Arena Exclusivity (`E0328`) & `--sim` Determinism (`Fix-18A`) Gate:** Verify `compile_fail` tests trigger `E0328` on unguarded same-slot scratch rewinds, and run `corex test --sim --seed=0x5EED_CAFE stdlib/cx/` across randomized ASLR runs asserting bit-identical `Map`/`Set` iteration orders and `OOM` fault-injection cleanup.
-4.  **Pentagon Zero-Trap Inner-Loop Gate:** Inspect post-SAST `MIR` (`corex check --sast-strict --emit-mir-post-sast`) across `Arena.alloc_raw`, `RawTableInner.find_raw`, `partition_lomuto_branchless_cyclic`, `partition_point`, `validate_utf8`, `char_width`, `grapheme_class`, `schubfach_to_decimal_f64`, `eisel_lemire_f64`, and `format_u32_jeaiii`, confirming **zero** residual bounds or checked-subtraction traps and `< 2 MB` Pentagon analyzer memory.
+4.  **Pentagon Zero-Trap Inner-Loop Gate:** Inspect post-SAST `MIR` (`corex check --sast-strict --emit-mir-post-sast`) across `Arena.alloc_raw`, `RawTableInner.find_raw`, `partition_lomuto_branchless_cyclic`, `partition_point`, `is_valid_utf8`, `char_width`, `grapheme_class`, `schubfach_to_decimal_f64`, `eisel_lemire_f64`, and `format_u32_jeaiii`, confirming **zero** residual bounds or checked-subtraction traps and `< 2 MB` Pentagon analyzer memory.
 5.  **Four-Tier Differential & `< 10 KB` Freestanding Wasm Gate:** Assert 100% behavioral parity under `corex test --diff-backends` (`Pre-Opt MirVm`, `Post-Opt MirVm`, `-ofmt=c`, and `LLVM`) over the full Unicode `GraphemeBreakTest.txt` conformance corpus (`GB1`–`GB999` including `GB9c` and `GB11`) and 1,000,000 random/subnormal/boundary IEEE-754 float round-trips, while asserting freestanding `wasm32` Profiles A–C stay strictly `< 10,240 bytes`.

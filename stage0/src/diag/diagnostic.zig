@@ -176,283 +176,360 @@ pub const DiagnosticCode = enum(u16) {
     e0015_cache_integrity_mismatch = 14,
     /// Package fetch failure or missing cached artifact under `--offline` / `COREX_HERMETIC=1` (`E0016`).
     e0016_offline_or_fetch_failed = 15,
+    /// Stray standalone `.corex-lint.toml` or `.corexfmt.toml` dotfile (`E0017`).
+    e0017_stray_tool_config_dotfile = 16,
+    /// Forbidden style-fragmenting or severity-remapping key in `corex.toml` (`E0018`).
+    e0018_forbidden_tool_config_key = 17,
+    /// Unknown lint rule code/slug or malformed path glob in `corex.toml` or CLI flags (`E0019`).
+    e0019_invalid_lint_rule_or_glob = 18,
+    /// Out-of-range `[lint.settings]` or `[lsp]` configuration value (`E0020`).
+    e0020_tool_setting_out_of_range = 19,
 
     // E01xx; Lexical Scanning, UTF-8 & Literal Rules:
     /// Invalid UTF-8 byte sequence in source file (`E0101`).
-    e0101_invalid_utf8_sequence = 16,
+    e0101_invalid_utf8_sequence = 20,
     /// Unterminated string or character literal (`E0102`).
-    e0102_unterminated_string_literal = 17,
+    e0102_unterminated_string_literal = 21,
     /// Malformed numeric literal or invalid digit separator (`E0103`).
-    e0103_invalid_numeric_literal = 18,
+    e0103_invalid_numeric_literal = 22,
     /// File token count exceeds `MAX_TOKENS_PER_FILE` (`E0104`).
-    e0104_token_limit_exceeded = 19,
+    e0104_token_limit_exceeded = 23,
     /// Retired `::` path separator (`E0112`).
-    e0112_retired_path_separator = 20,
+    e0112_retired_path_separator = 24,
     /// Retired `&&` logical AND operator (`E0113`).
-    e0113_retired_logical_and = 21,
+    e0113_retired_logical_and = 25,
     /// Unmatched `}` or invalid brace escape in interpolated `f"…"` string (`E0114`).
-    e0114_invalid_brace_escape = 22,
+    e0114_invalid_brace_escape = 26,
     /// Retired `"""` delimiter or non-whitespace before closing `"` on multiline string (`E0115`).
-    e0115_multiline_string_opening = 23,
+    e0115_multiline_string_opening = 27,
     /// Under-indented multiline string content line or forbidden hard `\t` tab (`E0116`).
-    e0116_multiline_string_indent = 24,
+    e0116_multiline_string_indent = 28,
     /// Non-ASCII byte (`> 0x7F`) in `b'…'` or `b"…"` byte literal (`E0117`).
-    e0117_non_ascii_byte_literal = 25,
+    e0117_non_ascii_byte_literal = 29,
     /// Retired block comment (`/* … */`) or 3-character doc prefix (`//!`, `///`) (`E0118`).
-    e0118_block_doc_comment_forbidden = 26,
+    e0118_block_doc_comment_forbidden = 30,
 
     // E02xx; Syntax Parsing, Recovery & Casing:
     /// Unexpected token in grammar production (`E0201`).
-    e0201_unexpected_token = 27,
+    e0201_unexpected_token = 31,
     /// Unclosed block, group, or generic delimiter (`E0202`).
-    e0202_unclosed_delimiter = 28,
+    e0202_unclosed_delimiter = 32,
     /// Parser recursion depth exceeded `MAX_PARSE_DEPTH` (`E0203`).
-    e0203_parse_depth_exceeded = 29,
+    e0203_parse_depth_exceeded = 33,
     /// Invalid pattern binding inside a negated, disjunctive, or non-condition `is` test (`E0214`).
-    e0214_invalid_condition_binding = 30,
+    e0214_invalid_condition_binding = 34,
     /// Condition `:=` binding outside a parenthesized positive `if`/`while` header (`E0215`).
-    e0215_invalid_walrus_position = 31,
+    e0215_invalid_walrus_position = 35,
     /// Retired `if let` or `while let` conditional destructuring syntax (`E0216`).
-    e0216_retired_if_while_let = 32,
+    e0216_retired_if_while_let = 36,
     /// Direct `core` kernel import or path outside `--internal-core` (`E0218`).
-    e0218_direct_core_import_forbidden = 33,
+    e0218_direct_core_import_forbidden = 37,
     /// Retired infix `||` logical OR operator (`E0219`).
-    e0219_retired_logical_or = 34,
+    e0219_retired_logical_or = 38,
     /// Retired prefix `!` negation operator (`E0220`).
-    e0220_retired_bang_prefix = 35,
+    e0220_retired_bang_prefix = 39,
     /// Retired local mutability or parameter mode spelling (`E0221`).
-    e0221_retired_mutability_or_param_mode = 36,
+    e0221_retired_mutability_or_param_mode = 40,
     /// Non-associative chained `A!B!C` result type (`E0222`).
-    e0222_chained_result_type = 37,
+    e0222_chained_result_type = 41,
     /// Retired `=` key-value separator inside `@attribute(…)` (`E0223`).
-    e0223_retired_attribute_eq = 38,
+    e0223_retired_attribute_eq = 42,
     /// Retired `;` member separator in `struct`, `union`, `enum`, or `bit_field` (`E0224`).
-    e0224_retired_semicolon_member_sep = 39,
+    e0224_retired_semicolon_member_sep = 43,
     /// Retired `@noalloc` attribute spelling (`E0225`).
-    e0225_retired_noalloc_attribute = 40,
+    e0225_retired_noalloc_attribute = 44,
     /// Retired `*const T` raw pointer syntax (`E0226`).
-    e0226_retired_const_raw_ptr = 41,
+    e0226_retired_const_raw_ptr = 45,
     /// Retired prefix `*ptr` dereference syntax (`E0227`).
-    e0227_retired_prefix_deref = 42,
+    e0227_retired_prefix_deref = 46,
     /// Invalid `/` positional-only or `*` keyword-only parameter zone separator (`E0228`).
-    e0228_invalid_param_zone_separator = 43,
+    e0228_invalid_param_zone_separator = 47,
     /// Misplaced `/#` module docstring outside top-of-file header (`E0229`).
-    e0229_misplaced_module_doc_comment = 44,
+    e0229_misplaced_module_doc_comment = 48,
     /// Unattached `/|` outer docstring not preceding a documentable declaration (`E0230`).
-    e0230_unattached_doc_comment = 45,
+    e0230_unattached_doc_comment = 49,
     /// Redundant visibility modifier on `impl` block (`E0231`).
-    e0231_visibility_on_impl_block = 46,
+    e0231_visibility_on_impl_block = 50,
     /// Inline `fn` or `subscript` inside `struct`, `union`, `bit_field`, or `enum` body (`E0232`).
-    e0232_inline_method_in_type_decl = 47,
+    e0232_inline_method_in_type_decl = 51,
     /// Invalid single-token `elif`, `elsif`, or `elseif` conditional keyword (`E0233`).
-    e0233_invalid_elif_keyword = 48,
+    e0233_invalid_elif_keyword = 52,
     /// Retired non-binding `let _ = …;` or `var _ = …;` wildcard declaration (`E0234`).
-    e0234_non_binding_wildcard_let_var = 49,
+    e0234_non_binding_wildcard_let_var = 53,
     /// Destructuring assignment where every target leaf is `_` or `..` (`E0235`).
-    e0235_all_wildcard_destructuring_assign = 50,
+    e0235_all_wildcard_destructuring_assign = 54,
     /// Missing `:` separator before type annotation (`E0236`).
-    e0236_missing_colon_before_type = 51,
+    e0236_missing_colon_before_type = 55,
     /// Inline `if cond => expr` missing mandatory `else expr` branch (`E0237`).
-    e0237_inline_if_missing_else = 52,
+    e0237_inline_if_missing_else = 56,
     /// Mixed `=>` and `{ … }` block branches in `if` expression (`E0238`).
-    e0238_mixed_if_arrow_and_block = 53,
+    e0238_mixed_if_arrow_and_block = 57,
     /// Retired standalone layout/linkage attribute or `@[…]`/`@(…)` wrapper (`E0239`).
-    e0239_retired_layout_or_link_attribute = 54,
+    e0239_retired_layout_or_link_attribute = 58,
+    /// Invalid, empty, category-wide, or non-suppressible lint rule selector (`E0240`).
+    e0240_invalid_suppression_selector = 59,
 
     // E03xx; MIR SAST Memory, Ownership, Capabilities & Exclusivity:
     /// Use of deallocated or freed value (`E0301`).
-    e0301_use_after_free = 55,
+    e0301_use_after_free = 60,
     /// Use of moved value after ownership transfer (`E0302`).
-    e0302_use_after_move = 56,
+    e0302_use_after_move = 61,
     /// Read of possibly uninitialized memory or binding (`E0303`).
-    e0303_uninitialized_memory_read = 57,
+    e0303_uninitialized_memory_read = 62,
     /// Unconsumed `@linear` resource or memory leak (`E0304`).
-    e0304_resource_or_memory_leak = 58,
+    e0304_resource_or_memory_leak = 63,
     /// Mutable aliasing or MVS loan exclusivity violation (`E0305`).
-    e0305_exclusivity_violation = 59,
+    e0305_exclusivity_violation = 64,
     /// Value escapes lexical arena or stack region (`E0306`).
-    e0306_region_escape_violation = 60,
+    e0306_region_escape_violation = 65,
     /// Compile-time proven out-of-bounds buffer access (`E0307`).
-    e0307_static_buffer_overflow = 61,
+    e0307_static_buffer_overflow = 66,
     /// Non-NUL-terminated `str` or slice passed to `@null_terminated` C FFI parameter (`E0308`).
-    e0308_unterminated_cstr_ffi = 62,
+    e0308_unterminated_cstr_ffi = 67,
     /// Concurrent mutable aliasing, `@thread_local` capture, or borrow escape across `TaskGroup`/`async` (`E0309`).
-    e0309_concurrent_exclusivity_or_escape = 63,
+    e0309_concurrent_exclusivity_or_escape = 68,
     /// `@owned_by_caller @free_with(fn)` FFI pointer released with mismatched deallocator (`E0310`).
-    e0310_mismatched_ffi_deallocator = 64,
+    e0310_mismatched_ffi_deallocator = 69,
     /// Unchecked dereference or `@non_null` use of `@may_be_null` FFI pointer (`E0311`).
-    e0311_unchecked_nullable_ffi_ptr = 65,
+    e0311_unchecked_nullable_ffi_ptr = 70,
     /// Raw pointer and length passed to `@slice_len` / `@byte_len` FFI without proven capacity (`E0312`).
-    e0312_unproven_ffi_slice_len = 66,
+    e0312_unproven_ffi_slice_len = 71,
     /// Double free or duplicate `@linear` resource consumption (`E0313`).
-    e0313_double_free_or_close = 67,
+    e0313_double_free_or_close = 72,
     /// `FromBytes` / `IntoBytes` wire layout contract violation (`E0315`).
-    e0315_wire_layout_contract_violation = 68,
+    e0315_wire_layout_contract_violation = 73,
     /// Worst-case call stack exceeds `@max_stack` budget (`E0316`).
-    e0316_max_stack_budget_exceeded = 69,
+    e0316_max_stack_budget_exceeded = 74,
     /// Inline `async` state-machine frame subtree exceeds `16 KiB` cap or recurses unboxed (`E0317`).
-    e0317_async_inline_frame_exceeded = 70,
+    e0317_async_inline_frame_exceeded = 75,
     /// `@no_alloc` contract violated by heap allocation (`E0320`).
-    e0320_no_alloc_contract_violation = 71,
+    e0320_no_alloc_contract_violation = 76,
     /// `@no_panic` contract violated by residual trap path (`E0321`).
-    e0321_no_panic_contract_violation = 72,
+    e0321_no_panic_contract_violation = 77,
     /// `@no_block` contract violated by blocking operation (`E0322`).
-    e0322_no_block_contract_violation = 73,
+    e0322_no_block_contract_violation = 78,
     /// Trait `impl` method escalates signature contract (`E0323`).
-    e0323_trait_impl_effect_escalation = 74,
+    e0323_trait_impl_effect_escalation = 79,
     /// Package exceeds authorized capability policy (`E0324`).
-    e0324_package_capability_violation = 75,
+    e0324_package_capability_violation = 80,
     /// Forbidden capability in hermetic `comptime` context (`E0325`).
-    e0325_comptime_sandbox_violation = 76,
+    e0325_comptime_sandbox_violation = 81,
     /// `@embed_bytes` path escapes package sandbox root (`E0326`).
-    e0326_embed_path_escape = 77,
+    e0326_embed_path_escape = 82,
     /// Forbidden linker section or sandbox bypass attribute (`E0327`).
-    e0327_forbidden_sandbox_bypass_attribute = 78,
+    e0327_forbidden_sandbox_bypass_attribute = 83,
     /// Scratch arena rewind aliases caller output arena (`E0328`).
-    e0328_scratch_arena_ping_pong_conflict = 79,
+    e0328_scratch_arena_ping_pong_conflict = 84,
 
     // E04xx; Type System, Inference, Traits, Bounds & Error Semantics:
     /// Ambiguous overload call in explicit overload group (`E0400`).
-    e0400_ambiguous_overload = 80,
+    e0400_ambiguous_overload = 85,
     /// Mismatched types between expected and found expressions (`E0401`).
-    e0401_type_mismatch = 81,
+    e0401_type_mismatch = 86,
     /// Type does not satisfy constrained trait or type group bound (`E0402`).
-    e0402_unsatisfied_trait_bound = 82,
+    e0402_unsatisfied_trait_bound = 87,
     /// Unresolved identifier or symbol in scope (`E0403`).
-    e0403_unresolved_symbol = 83,
+    e0403_unresolved_symbol = 88,
     /// Conflicting concrete types for a Bind-Once Constrained Type Group (`E0404`).
-    e0404_bind_once_group_conflict = 84,
+    e0404_bind_once_group_conflict = 89,
     /// Distinct nominal type mixed with underlying representation without `as` or `~T` (`E0405`).
-    e0405_distinct_type_mixing = 85,
+    e0405_distinct_type_mixing = 90,
     /// Compile-time value or width violates range refinement or bit-field bounds (`E0406`).
-    e0406_range_refinement_violation = 86,
+    e0406_range_refinement_violation = 91,
     /// Contextual `.Variant` syntax cannot be resolved against expected type (`E0407`).
-    e0407_invalid_contextual_variant = 87,
+    e0407_invalid_contextual_variant = 92,
     /// Duplicate symbol definition in the same namespace and lexical scope (`E0408`).
-    e0408_duplicate_definition = 88,
+    e0408_duplicate_definition = 93,
     /// Access to a private item, field, or method outside its defining module (`E0409`).
-    e0409_private_symbol_access = 89,
+    e0409_private_symbol_access = 94,
     /// Postfix `?` operator used outside a fallible `T!E` or `T?` function (`E0410`).
-    e0410_try_outside_fallible_fn = 90,
+    e0410_try_outside_fallible_fn = 95,
     /// Propagated error type cannot be converted via `FromError` or `@from` (`E0411`).
-    e0411_missing_from_error_conversion = 91,
+    e0411_missing_from_error_conversion = 96,
     /// `let … else` guard block does not unconditionally diverge (`never`) (`E0412`).
-    e0412_let_else_not_diverging = 92,
+    e0412_let_else_not_diverging = 97,
     /// Unhandled `T!E` or `@must_use` value in expression statement (`E0413`).
-    e0413_unhandled_must_use_or_result = 93,
+    e0413_unhandled_must_use_or_result = 98,
     /// Forbidden bare `_ = fallible()` discard of a `T!E` without `catch` or `.ok()` (`E0414`).
-    e0414_bare_wildcard_result_discard = 94,
+    e0414_bare_wildcard_result_discard = 99,
     /// Non-exhaustive pattern arms in `match` expression (`E0415`).
-    e0415_non_exhaustive_match = 95,
+    e0415_non_exhaustive_match = 100,
     /// `$` length sentinel used outside indexable `[…]` brackets (`E0416`).
-    e0416_invalid_dollar_length_expr = 96,
+    e0416_invalid_dollar_length_expr = 101,
     /// Irrefutable bare identifier pattern in an `is` test (`E0418`).
-    e0418_irrefutable_is_binding = 97,
+    e0418_irrefutable_is_binding = 102,
     /// Invalid named or default call arguments at a call site (`E0419`).
-    e0419_invalid_call_arguments = 98,
+    e0419_invalid_call_arguments = 103,
     /// Missing active `own` marker at call site on named non-`Copy` binding (`E0420`).
-    e0420_missing_call_site_own = 99,
+    e0420_missing_call_site_own = 104,
     /// Bare by-value parameter `x: T` where `T` is non-`Copy` (`E0421`).
-    e0421_non_copy_value_parameter = 100,
+    e0421_non_copy_value_parameter = 105,
     /// `&out T` parameter contract violation at call site or function exit (`E0422`).
-    e0422_out_param_contract_violation = 101,
+    e0422_out_param_contract_violation = 106,
     /// `bit_field` width mismatch or invalid backed-enum, `bit_field`, or `bool` `as` cast (`E0423`).
-    e0423_invalid_bitfield_or_enum_cast = 102,
+    e0423_invalid_bitfield_or_enum_cast = 107,
     /// Retired `.len` or `.ptr` field access on slice, array, or `str` (`E0424`).
-    e0424_retired_slice_field_access = 103,
+    e0424_retired_slice_field_access = 108,
     /// Invalid `opaque` value usage or direct `*opaque` dereference (`E0425`).
-    e0425_invalid_opaque_type_usage = 104,
+    e0425_invalid_opaque_type_usage = 109,
     /// Non-defaulted generic parameter follows a defaulted generic parameter (`E0426`).
-    e0426_non_trailing_generic_default = 105,
+    e0426_non_trailing_generic_default = 110,
     /// Invalid `@derive(From)` enum layout or Type Group on error side of `T!Group` (`E0427`).
-    e0427_invalid_error_composition = 106,
+    e0427_invalid_error_composition = 111,
     /// Named argument passed to a `/` positional-only parameter (`E0428`).
-    e0428_named_arg_for_positional_only = 107,
+    e0428_named_arg_for_positional_only = 112,
     /// Positional argument passed to a `*` keyword-only parameter (`E0429`).
-    e0429_positional_arg_for_keyword_only = 108,
+    e0429_positional_arg_for_keyword_only = 113,
     /// Non-defaulted parameter follows a defaulted parameter before `*` (`E0430`).
-    e0430_non_default_after_default_param = 109,
+    e0430_non_default_after_default_param = 114,
     /// Invalid `FormatSpec` syntax or incompatible specifier for interpolated type or `@secret` (`E0431`).
-    e0431_invalid_format_specifier = 110,
+    e0431_invalid_format_specifier = 115,
     /// Missing non-defaulted struct field initializer without `..` or `..base` (`E0432`).
-    e0432_missing_struct_field_initializer = 111,
+    e0432_missing_struct_field_initializer = 116,
     /// Inaccessible private, `pub(super)`, or `pub(pkg)` symbol or struct field (`E0433`).
-    e0433_inaccessible_field_or_visibility = 112,
+    e0433_inaccessible_field_or_visibility = 117,
     /// Invalid non-place or immutable target in parallel destructuring assignment (`E0434`).
-    e0434_invalid_parallel_assign_target = 113,
+    e0434_invalid_parallel_assign_target = 118,
     /// Invalid, non-boolean, or undeclared feature predicate in `@cfg(…)` (`E0435`).
-    e0435_invalid_cfg_predicate = 114,
+    e0435_invalid_cfg_predicate = 119,
     /// `@builder_item` invoked outside an active `@builder` trailing block scope (`E0436`).
-    e0436_builder_item_outside_scope = 115,
+    e0436_builder_item_outside_scope = 120,
     /// Invalid labeled `match` `continue :label` target or state payload (`E0437`).
-    e0437_invalid_labeled_match_continue = 116,
+    e0437_invalid_labeled_match_continue = 121,
     /// Postfix `.await` used outside an `async fn`, `async` closure, or `async` block (`E0438`).
-    e0438_await_outside_async_context = 117,
+    e0438_await_outside_async_context = 122,
     /// Pointless `_ = expr;` discard of `unit` or already-used local/parameter (`E0439`).
-    e0439_pointless_unit_or_used_discard = 118,
+    e0439_pointless_unit_or_used_discard = 123,
     /// Invalid or conflicting `@repr`, `@link`, or `@inline` schema arguments (`E0440`).
-    e0440_invalid_repr_or_inline_attribute = 119,
+    e0440_invalid_repr_or_inline_attribute = 124,
     /// Safe `&` / `&mut` / `&out` borrow of misaligned packed struct field (`E0441`).
-    e0441_unaligned_packed_field_borrow = 120,
+    e0441_unaligned_packed_field_borrow = 125,
 
     // E05xx; Comptime Virtual Machine & MIR Lowering:
     /// Compile-time execution exceeded step fuel budget (`E0501`).
-    e0501_comptime_step_limit_exceeded = 121,
+    e0501_comptime_step_limit_exceeded = 126,
     /// Compile-time integer arithmetic overflow (`E0502`).
-    e0502_integer_constant_overflow = 122,
+    e0502_integer_constant_overflow = 127,
     /// Forbidden non-deterministic, FFI, I/O, or raw pointer-to-integer operation in `comptime` (`E0503`).
-    e0503_forbidden_comptime_operation = 123,
+    e0503_forbidden_comptime_operation = 128,
     /// Out-of-bounds array, slice, or virtual allocation access in `comptime` (`E0504`).
-    e0504_comptime_out_of_bounds = 124,
+    e0504_comptime_out_of_bounds = 129,
     /// Read from uninitialized virtual memory bytes in `comptime` (`E0505`).
-    e0505_comptime_uninitialized_read = 125,
+    e0505_comptime_uninitialized_read = 130,
     /// Null, misaligned, or dangling virtual pointer dereference in `comptime` (`E0506`).
-    e0506_comptime_invalid_pointer = 126,
+    e0506_comptime_invalid_pointer = 131,
     /// Division by zero, remainder by zero, or invalid shift count in `comptime` (`E0507`).
-    e0507_comptime_arithmetic_trap = 127,
+    e0507_comptime_arithmetic_trap = 132,
     /// Virtual heap, call depth, loop unroll, or `@embed_bytes` cap exceeded in `comptime` (`E0508`).
-    e0508_comptime_resource_limit_exceeded = 128,
+    e0508_comptime_resource_limit_exceeded = 133,
     /// Cyclic dependency across `const` or `comptime` evaluations (`E0509`).
-    e0509_comptime_evaluation_cycle = 129,
+    e0509_comptime_evaluation_cycle = 134,
     /// Failed `@compile_assert` or reached `@compile_error` intrinsic (`E0510`).
-    e0510_compile_assertion_failed = 130,
+    e0510_compile_assertion_failed = 135,
 
-    // W00xx to W05xx; Subsystem Compiler Warnings:
+    // W00xx to W05xx; Subsystem Warnings & 44 Built-In Lint Rules (`DR-25`):
     /// Deprecated CLI invocation or option (`W0001`).
-    w0001_deprecated_cli_option = 131,
+    w0001_deprecated_cli_option = 136,
+    /// Unfulfilled `@expect(…)` or stale/misplaced suppression directive (`W0002`).
+    w0002_unused_suppression = 137,
+    /// Missing or placeholder suppression rationale under `require_suppression_reason` (`W0003`).
+    w0003_missing_suppression_reason = 138,
+    /// Unconditional `@allow` used where self-cleaning `@expect` fits (`W0004`).
+    w0004_prefer_expect_over_allow = 139,
     /// Redundant character escape sequence in literal (`W0101`).
-    w0101_redundant_escape_sequence = 132,
+    w0101_redundant_escape_sequence = 140,
+    /// Bidirectional override, isolate, or zero-width Trojan Source codepoint (`W0102`).
+    w0102_unicode_trojan_control = 141,
+    /// Mixed-script identifier or UTS #39 confusable identifier collision (`W0103`).
+    w0103_confusable_ident = 142,
+    /// Confusable homoglyph or standalone ASCII impostor in comment, docstring, or literal (`W0104`).
+    w0104_ambiguous_unicode_text = 143,
     /// Interpolated `f"…"` / `f#"…"#` string contains zero `{…}` holes (`W0119`).
-    w0119_useless_format_string = 133,
+    w0119_useless_format_string = 144,
     /// Plain `"…"` passed to `FmtArgs` sink contains `{ident}` matching an in-scope binding (`W0120`).
-    w0120_uninterpolated_fmt_placeholder = 134,
+    w0120_uninterpolated_fmt_placeholder = 145,
+    /// Raw string literal `#"…"#` uses more `#` delimiters than required (`W0121`).
+    w0121_needless_raw_string_hashes = 146,
+    /// Numeric literal with `>= 5` ungrouped digits or irregular `_` grouping (`W0122`).
+    w0122_ungrouped_numeric_literal = 147,
+    /// Hexadecimal literal `0x…` contains lowercase `a`–`f` digits (`W0123`).
+    w0123_non_upper_hex_literal = 148,
     /// Identifier does not follow canonical CoreX casing (`W0201`).
-    w0201_non_canonical_identifier_case = 135,
+    w0201_non_canonical_identifier_case = 149,
     /// Non-idiomatic syntax or redundant expression construct (`W0202`).
-    w0202_non_idiomatic_construct = 136,
+    w0202_non_idiomatic_construct = 150,
+    /// Cryptic single-character variable, parameter, or field identifier (`W0203`).
+    w0203_single_char_ident = 151,
+    /// Binding shadows an outer binding in the same function (`W0204`).
+    w0204_shadowed_binding = 152,
+    /// `bool`-returning function or method lacks predicate prefix (`W0205`).
+    w0205_bool_predicate_naming = 153,
+    /// Zero-parameter accessor uses redundant `get_` prefix (`W0206`).
+    w0206_getter_prefix_noise = 154,
+    /// `as_*` / `to_*` / `into_*` method violates 3-tier receiver/allocation contract (`W0207`).
+    w0207_conversion_prefix_mismatch = 155,
+    /// Explicit local type annotation duplicates literal suffix or constructor type (`W0208`).
+    w0208_redundant_literal_type = 156,
+    /// Explicit `return expr;` at tail of function or closure body (`W0209`).
+    w0209_needless_trailing_return = 157,
+    /// Verbose `x = x op y` or 3-statement temporary swap (`W0210`).
+    w0210_manual_assign_or_swap = 158,
     /// Unused region capability or linear binding (`W0308`).
-    w0308_unused_region_allocation = 137,
+    w0308_unused_region_allocation = 159,
     /// Slice or array bounds not statically proven under `--sast-strict` (`W0314`).
-    w0314_unproven_bounds_access = 138,
+    w0314_unproven_bounds_access = 160,
     /// Panic inside vacated non-`Copy` projection inserts abort guard (`W0329`).
-    w0329_vacated_projection_panic_abort = 139,
+    w0329_vacated_projection_panic_abort = 161,
     /// Unreachable high-risk capability exported by dependency (`W0330`).
-    w0330_ambient_dead_capability_in_dep = 140,
+    w0330_ambient_dead_capability_in_dep = 162,
+    /// Non-seeded entropy, wall clock, or pointer-address hash in `corex test --sim` (`W0332`).
+    w0332_nondeterministic_sim_source = 163,
     /// Redundant `@inline`, `@no_alloc`, `@no_panic`, or `@no_block` on private/generic/`= expr;` fn (`W0333`).
-    w0333_redundant_private_contract = 141,
+    w0333_redundant_private_contract = 164,
+    /// `.clone()` on non-`Copy` binding at provable last use (`W0334`).
+    w0334_redundant_move_clone = 165,
+    /// Repeated string concatenation or growth inside loop without `StringBuilder` (`W0335`).
+    w0335_string_concat_in_loop = 166,
     /// Unreachable pattern arm in `match` expression (`W0401`).
-    w0401_unreachable_pattern_arm = 142,
+    w0401_unreachable_pattern_arm = 167,
     /// Unused local variable binding or function parameter (`W0402`).
-    w0402_unused_binding = 143,
+    w0402_unused_binding = 168,
     /// Reference to symbol marked `@deprecated` (`W0403`).
-    w0403_deprecated_symbol = 144,
+    w0403_deprecated_symbol = 169,
+    /// Unused `use` import item or alias (`W0404`).
+    w0404_unused_import = 170,
+    /// `var` binding or `&mut` parameter never mutated (`W0405`).
+    w0405_unused_mut_binding = 171,
+    /// `pub(pkg)` or `pub(super)` symbol never referenced outside its module (`W0406`).
+    w0406_unused_pkg_visibility = 172,
+    /// Redundant boolean literal comparison or `if cond => true else false` branch (`W0407`).
+    w0407_needless_bool_branch = 173,
+    /// Nested `if a { if b { … } }` without `else` branch (`W0408`).
+    w0408_collapsible_if = 174,
+    /// `match` with single substantive arm and `_ => {}` wildcard (`W0409`).
+    w0409_simplifiable_match = 175,
+    /// Verbose `match` reimplementing `orelse` or postfix `?` (`W0410`).
+    w0410_manual_orelse_or_try = 176,
+    /// Single-use local temporary immediately consumed on the next line (`W0411`).
+    w0411_single_use_temp = 177,
+    /// Redundant `.clone()` on a `Copy` receiver (`W0412`).
+    w0412_clone_on_copy = 178,
+    /// Immutable `&T` parameter where `T: Copy` and `sizeof(T) <= 16` (`W0413`).
+    w0413_trivially_copy_pass_by_ref = 179,
+    /// Identical LHS and RHS operands in comparison, logical, or bitwise operator (`W0414`).
+    w0414_identical_operands = 180,
     /// Function exceeds MIR inlining cost threshold (`W0501`).
-    w0501_inlining_budget_exceeded = 145,
+    w0501_inlining_budget_exceeded = 181,
 
     /// Ergonomic alias for undeclared `@cfg(cfg.feature.<name>)` predicates (`E0435`).
     pub const e0435_unknown_cfg_feature: DiagnosticCode = .e0435_invalid_cfg_predicate;
     /// Ergonomic alias for `.e0502_integer_constant_overflow`.
     pub const e0502_integer_overflow: DiagnosticCode = .e0502_integer_constant_overflow;
+
+    /// Returns the raw integer discriminant (`0..181`) of this `DiagnosticCode`.
+    pub inline fn asInt(self: DiagnosticCode) u16 {
+        return @backingInt(self);
+    }
 
     /// Returns the static `DiagnosticDescriptor` metadata for this `DiagnosticCode` in $O(1)$ time.
     pub inline fn asDescriptor(self: DiagnosticCode) DiagnosticDescriptor {
@@ -469,10 +546,214 @@ pub const DiagnosticCode = enum(u16) {
         return self.asDescriptor().default_severity;
     }
 
+    /// Returns the bijective `RuleId` (`0..43`) if this `DiagnosticCode` is one of the 44 built-in lint rules.
+    pub inline fn asLintRuleId(self: DiagnosticCode) ?RuleId {
+        const mapped = DIAG_CODE_TO_RULE_ID[@backingInt(self)];
+        return if (mapped == 0xFF) null else @enumFromInt(mapped);
+    }
+
     /// Resolves a canonical 5-character code string (e.g., `"E0302"`) to its `DiagnosticCode` in $O(1)$ time.
     pub fn fromCodeStr(code_str: []const u8) ?DiagnosticCode {
         return DIAGNOSTIC_CODE_STR_MAP.get(code_str);
     }
+};
+
+/// Dense 64-bit bitmask over all 44 CoreX v1.0 built-in lint rules (`RuleId` `0..43`).
+pub const RuleMask64 = u64;
+
+/// Strongly typed dense `0..43` rule identifier for the 44 CoreX v1.0 built-in lint rules (`DR-25` §4.2).
+pub const RuleId = enum(u8) {
+    /// Unfulfilled `@expect(…)` or stale/misplaced suppression (`W0002`).
+    unused_suppression = 0,
+    /// Missing or placeholder suppression `reason` (`W0003`).
+    missing_suppression_reason = 1,
+    /// Unconditional `@allow` used where `@expect` fits (`W0004`).
+    prefer_expect_over_allow = 2,
+    /// Redundant character escape sequence (`W0101`).
+    redundant_escape_sequence = 3,
+    /// Bidirectional or zero-width Trojan Source control character (`W0102`).
+    unicode_trojan_control = 4,
+    /// Mixed-script or UTS #39 confusable identifier (`W0103`).
+    confusable_ident = 5,
+    /// Ambiguous Unicode homoglyph or ASCII impostor in text (`W0104`).
+    ambiguous_unicode_text = 6,
+    /// Zero-hole interpolated `f"…"` string (`W0119`).
+    useless_format_string = 7,
+    /// Plain `"…"` string with `{ident}` in `FmtArgs` sink (`W0120`).
+    uninterpolated_fmt_braces = 8,
+    /// Excess `#` delimiters on raw string literal (`W0121`).
+    needless_raw_string_hashes = 9,
+    /// Ungrouped `>= 5`-digit or irregularly grouped numeric literal (`W0122`).
+    ungrouped_numeric_literal = 10,
+    /// Lowercase `a`–`f` digits in `0x…` hexadecimal literal (`W0123`).
+    non_upper_hex_literal = 11,
+    /// Non-canonical CoreX identifier casing (`W0201`).
+    non_canonical_case = 12,
+    /// Non-idiomatic syntax or redundant expression construct (`W0202`).
+    non_idiomatic_syntax = 13,
+    /// Cryptic single-character identifier (`W0203`).
+    single_char_ident = 14,
+    /// Inner binding shadows outer binding in function (`W0204`).
+    shadowed_binding = 15,
+    /// `bool`-returning function/method lacks predicate prefix (`W0205`).
+    bool_predicate_naming = 16,
+    /// Zero-parameter accessor uses redundant `get_` prefix (`W0206`).
+    getter_prefix_noise = 17,
+    /// `as_*` / `to_*` / `into_*` receiver/allocation contract mismatch (`W0207`).
+    conversion_prefix_mismatch = 18,
+    /// Redundant explicit local type duplicating literal suffix/constructor (`W0208`).
+    redundant_literal_type = 19,
+    /// Explicit `return expr;` at tail of body (`W0209`).
+    needless_trailing_return = 20,
+    /// Verbose `x = x op y` or 3-statement swap (`W0210`).
+    manual_assign_or_swap = 21,
+    /// Unused region allocation or linear binding (`W0308`).
+    unused_region_alloc = 22,
+    /// Vacated non-`Copy` projection panic abort guard (`W0329`).
+    vacated_projection_abort = 23,
+    /// Ambient unreachable high-risk dependency capability (`W0330`).
+    ambient_dead_capability = 24,
+    /// Non-deterministic host source in `corex test --sim` (`W0332`).
+    nondeterministic_sim_source = 25,
+    /// Redundant contract attribute on private/generic/`= expr;` fn (`W0333`).
+    redundant_private_contract = 26,
+    /// `.clone()` on non-`Copy` binding at provable last use (`W0334`).
+    redundant_move_clone = 27,
+    /// String concatenation inside loop without `StringBuilder` (`W0335`).
+    string_concat_in_loop = 28,
+    /// Unreachable pattern arm in `match` (`W0401`).
+    unreachable_pattern = 29,
+    /// Unused local variable or parameter (`W0402`).
+    unused_binding = 30,
+    /// Reference to `@deprecated` symbol (`W0403`).
+    deprecated_use = 31,
+    /// Unused `use` import item or alias (`W0404`).
+    unused_import = 32,
+    /// `var` binding or `&mut` parameter never mutated (`W0405`).
+    unused_mut_binding = 33,
+    /// `pub(pkg)` / `pub(super)` item unused outside defining module (`W0406`).
+    unused_pkg_visibility = 34,
+    /// Redundant boolean comparison or `if cond => true else false` (`W0407`).
+    needless_bool_branch = 35,
+    /// Collapsible nested `if` without `else` (`W0408`).
+    collapsible_if = 36,
+    /// Single-arm `match` with `_ => {}` wildcard (`W0409`).
+    simplifiable_match = 37,
+    /// Manual `match` reimplementing `orelse` or `?` (`W0410`).
+    manual_orelse_or_try = 38,
+    /// Single-use local temporary immediately consumed on next line (`W0411`).
+    single_use_temp = 39,
+    /// Redundant `.clone()` on `Copy` type (`W0412`).
+    clone_on_copy = 40,
+    /// Small `<= 16 B` `Copy` parameter passed by `&T` (`W0413`).
+    trivially_copy_pass_by_ref = 41,
+    /// Identical LHS and RHS operands in binary operator (`W0414`).
+    identical_operands = 42,
+    /// Function exceeds MIR inlining instruction budget (`W0501`).
+    inlining_budget_exceeded = 43,
+
+    /// Total count of CoreX v1.0 built-in lint rules (`44`).
+    pub const COUNT: usize = 44;
+
+    /// Returns the dense `0..43` integer index of this `RuleId`.
+    pub inline fn asInt(self: RuleId) u8 {
+        return @intFromEnum(self);
+    }
+
+    /// Returns the single-bit `RuleMask64` (`1 << rule_id`) for this `RuleId`.
+    pub inline fn bit(self: RuleId) RuleMask64 {
+        return @as(RuleMask64, 1) << @intCast(@intFromEnum(self));
+    }
+
+    /// Returns the static `LintRuleMeta` catalog entry for this `RuleId` in $O(1)$ time.
+    pub inline fn asMeta(self: RuleId) LintRuleMeta {
+        return DIAGNOSTIC_LINT_CATALOG[@intFromEnum(self)];
+    }
+
+    /// Returns the corresponding `DiagnosticCode` (`W0xxx`) for this `RuleId`.
+    pub inline fn asDiagCode(self: RuleId) DiagnosticCode {
+        return self.asMeta().diag_code;
+    }
+
+    /// Returns the canonical `kebab-case` rule slug (e.g., `"single-char-ident"`).
+    pub inline fn asSlug(self: RuleId) []const u8 {
+        return self.asMeta().slug;
+    }
+};
+
+/// Informational taxonomy grouping for `corex explain` and `--format json` (`DR-25` §2.1).
+pub const LintCategory = enum(u8) {
+    /// Probable bug, Trojan Source hazard, unreachable code, or simulation nondeterminism (`4` rules).
+    correctness = 0,
+    /// Dubious or confusing code that may mask subtle logic bugs (`11` rules).
+    suspicious = 1,
+    /// Readability, self-documenting naming, and simplified control flow (`14` rules).
+    clarity = 2,
+    /// Canonical CoreX surface conventions and hygiene (`10` rules).
+    style = 3,
+    /// Zero-cost ownership, copy, and allocation performance (`5` rules).
+    perf = 4,
+
+    /// Returns the canonical lowercase category label.
+    pub fn asStr(self: LintCategory) []const u8 {
+        return switch (self) {
+            .correctness => "correctness",
+            .suspicious => "suspicious",
+            .clarity => "clarity",
+            .style => "style",
+            .perf => "perf",
+        };
+    }
+};
+
+/// Compiler pipeline stage that produces candidates for a built-in lint rule (`DR-25` §4.1).
+pub const LintPassStage = enum(u8) {
+    /// Pass 1A lexical / `TokenBuffer` scan (`W0101`–`W0104`, `W0119`, `W0121`–`W0123`).
+    token_buffer = 0,
+    /// Pass 1B `LosslessCstArena` + `AstArena` walk (`W0003`, `W0004`, `W0201`–`W0203`).
+    cst_ast = 1,
+    /// Pass 2 `SymbolResolver` scope/module graph (`W0103`, `W0204`, `W0404`, `W0406`).
+    resolve = 2,
+    /// Pass 3 `TypeSystem` / typed HIR (`W0120`, `W0205`–`W0206`, `W0208`–`W0210`, `W0401`–`W0403`, `W0405`, `W0407`–`W0412`, `W0414`).
+    typecheck = 3,
+    /// Pass 4 `MirSast` dataflow & ownership (`W0207`, `W0308`, `W0329`–`W0335`, `W0413`).
+    mir_sast = 4,
+    /// Pass 5 `MirOpt` inlining cost model (`W0501`).
+    mir_opt = 5,
+    /// Post-pass `FulfillmentTracker` unfulfilled `@expect` / stale directive sweep (`W0002`).
+    post_filter = 6,
+};
+
+/// Canonical metadata record for each of the 44 CoreX v1.0 built-in lint rules (`DR-25` §4.2).
+pub const LintRuleMeta = struct {
+    /// Dense `0..43` rule identifier.
+    rule_id: RuleId,
+    /// Bijective `W0xxx` `DiagnosticCode`.
+    diag_code: DiagnosticCode,
+    /// Canonical `kebab-case` rule slug (`5..40` ASCII bytes).
+    slug: []const u8,
+    /// Informational category (`correctness`, `suspicious`, `clarity`, `style`, `perf`).
+    category: LintCategory,
+    /// Compiler pass stage emitting raw candidates for this rule.
+    stage: LintPassStage,
+    /// Default fix applicability tier (`.machine_applicable`, `.maybe_incorrect`, or `.unspecified`).
+    default_applicability: FixApplicability,
+    /// Whether LSP publishes `DiagnosticTag.Unnecessary` (`1`) for dimmed editor rendering.
+    is_unnecessary_tag: bool,
+};
+
+/// Classification outcome of `lookupLintRuleBySelector` (`0` heap allocations).
+pub const LintSelectorLookup = union(enum) {
+    /// Matched one of the 44 suppressible built-in lint rules.
+    rule: RuleId,
+    /// Matched a forbidden blanket or category name (`*`, `all`, `warnings`, `style`, `clarity`, etc.).
+    forbidden_category_or_wildcard: void,
+    /// Matched an `E0xxx` hard compiler error code (`null` if unassigned `E0xxx`).
+    non_suppressible_error_code: ?DiagnosticCode,
+    /// Matched a non-lint subsystem warning (`W0001` or `W0314`).
+    non_suppressible_subsystem_warning: DiagnosticCode,
+    /// Unrecognized rule code or slug.
+    unknown: void,
 };
 
 /// Static metadata entry in `DIAGNOSTIC_CATALOG` describing a `DiagnosticCode`.
@@ -650,6 +931,35 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .default_severity = .err,
         .title = "package fetch failed or unavailable offline",
         .explanation = "A required package artifact or sparse index entry could not be fetched or was missing from cache under `--offline`.",
+    },
+    .{
+        .code = .e0017_stray_tool_config_dotfile,
+        .code_str = "E0017",
+        .default_severity = .err,
+        .title = "stray standalone tool configuration file",
+        .explanation = "Standalone `.corex-lint.toml` / `.corexfmt.toml` files are forbidden; " ++
+            "configure `[lint]`, `[fmt]`, and `[lsp]` in `corex.toml`.",
+    },
+    .{
+        .code = .e0018_forbidden_tool_config_key,
+        .code_str = "E0018",
+        .default_severity = .err,
+        .title = "forbidden style-fragmenting or severity-remapping key in 'corex.toml'",
+        .explanation = "`[fmt]` forbids style knobs and `[lint]` uses a flat `disable = [\"…\"]` list without per-rule severity maps.",
+    },
+    .{
+        .code = .e0019_invalid_lint_rule_or_glob,
+        .code_str = "E0019",
+        .default_severity = .err,
+        .title = "unknown lint rule identifier or invalid path glob pattern",
+        .explanation = "A rule code/slug or path glob pattern in `corex.toml` or CLI flags is unrecognized or malformed.",
+    },
+    .{
+        .code = .e0020_tool_setting_out_of_range,
+        .code_str = "E0020",
+        .default_severity = .err,
+        .title = "tooling configuration threshold or setting value out of bounds",
+        .explanation = "A `[lint.settings]` or `[lsp]` configuration value falls outside its allowed range or enum domain.",
     },
     .{
         .code = .e0101_invalid_utf8_sequence,
@@ -928,6 +1238,13 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .title = "retired standalone layout/linkage attribute or '@[…]'/'@(…)' wrapper",
         .explanation = "Layout and symbol attributes consolidate into `@repr(…)` and `@link(…)`, " ++
             "and attributes use `@attr` without outer brackets.",
+    },
+    .{
+        .code = .e0240_invalid_suppression_selector,
+        .code_str = "E0240",
+        .default_severity = .err,
+        .title = "invalid, empty, category-wide, or non-suppressible rule selector",
+        .explanation = "`@expect`, `@allow`, and `// corex check:` require explicit `W0xxx` lint codes or `kebab-case` rule slugs.",
     },
     .{
         .code = .e0301_use_after_free,
@@ -1470,11 +1787,54 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .explanation = "A deprecated command-line flag was used; prefer the canonical replacement flag.",
     },
     .{
+        .code = .w0002_unused_suppression,
+        .code_str = "W0002",
+        .default_severity = .warning,
+        .title = "unused lint suppression expectation",
+        .explanation = "An `@expect(…)` or `expect(…)` directive intercepted zero matching lint warnings (or `file-*` appeared mid-file).",
+    },
+    .{
+        .code = .w0003_missing_suppression_reason,
+        .code_str = "W0003",
+        .default_severity = .warning,
+        .title = "missing or placeholder lint suppression reason",
+        .explanation = "Suppression directives require a meaningful `reason: \"…\"` or `-- <reason>` rationale (`>= 4` non-placeholder chars).",
+    },
+    .{
+        .code = .w0004_prefer_expect_over_allow,
+        .code_str = "W0004",
+        .default_severity = .warning,
+        .title = "prefer '@expect' over '@allow' on handwritten items",
+        .explanation = "Use self-cleaning `@expect(…)` instead of `@allow(…)` on " ++
+            "non-`@cfg`, non-`@generated` items so stale suppressions surface.",
+    },
+    .{
         .code = .w0101_redundant_escape_sequence,
         .code_str = "W0101",
         .default_severity = .warning,
         .title = "redundant character escape sequence",
         .explanation = "A string or character literal used an unnecessary backslash escape.",
+    },
+    .{
+        .code = .w0102_unicode_trojan_control,
+        .code_str = "W0102",
+        .default_severity = .warning,
+        .title = "Trojan bidirectional or zero-width Unicode control codepoint",
+        .explanation = "Source contains a UAX #9 bidirectional override/isolate or invisible zero-width spoofing control scalar.",
+    },
+    .{
+        .code = .w0103_confusable_ident,
+        .code_str = "W0103",
+        .default_severity = .warning,
+        .title = "mixed-script confusable identifier or skeleton collision",
+        .explanation = "An identifier mixes confusable cross-script glyphs (`UTS #55`) or collides with an in-scope `UTS #39` skeleton.",
+    },
+    .{
+        .code = .w0104_ambiguous_unicode_text,
+        .code_str = "W0104",
+        .default_severity = .warning,
+        .title = "ambiguous Unicode homoglyph or typographic impostor in text",
+        .explanation = "A literal or comment mixes a non-ASCII homoglyph into a Latin word or uses smart quotes, NBSP, or `U+2212` minus.",
     },
     .{
         .code = .w0119_useless_format_string,
@@ -1492,6 +1852,27 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .explanation = "Plain `\"…\"` does not interpolate `{ident}`; prepend `f` if formatting the in-scope binding was intended.",
     },
     .{
+        .code = .w0121_needless_raw_string_hashes,
+        .code_str = "W0121",
+        .default_severity = .warning,
+        .title = "needless raw string '#' guards or 'r' prefix",
+        .explanation = "A raw or raw-format string uses more `#` delimiter guards than required or needs neither `\"` nor `\\`.",
+    },
+    .{
+        .code = .w0122_ungrouped_numeric_literal,
+        .code_str = "W0122",
+        .default_severity = .warning,
+        .title = "ungrouped or inconsistently grouped numeric literal",
+        .explanation = "Multi-digit integer literals (`>= 5` digits) must group digits consistently with `_` separators.",
+    },
+    .{
+        .code = .w0123_non_upper_hex_literal,
+        .code_str = "W0123",
+        .default_severity = .warning,
+        .title = "non-uppercase hexadecimal literal digits or '0X' prefix",
+        .explanation = "Hexadecimal literals must use a lowercase `0x` prefix and uppercase `A`–`F` digits (keeping type suffixes lowercase).",
+    },
+    .{
         .code = .w0201_non_canonical_identifier_case,
         .code_str = "W0201",
         .default_severity = .warning,
@@ -1503,7 +1884,64 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .code_str = "W0202",
         .default_severity = .warning,
         .title = "non-idiomatic syntax or redundant expression construct",
-        .explanation = "An expression or type annotation uses redundant parentheses, boolean comparisons, or non-canonical surface spelling.",
+        .explanation = "An expression or declaration uses redundant parentheses, `;`, explicit `-> unit`, or non-canonical surface spelling.",
+    },
+    .{
+        .code = .w0203_single_char_ident,
+        .code_str = "W0203",
+        .default_severity = .warning,
+        .title = "cryptic single-character local or parameter identifier",
+        .explanation = "Single-letter bindings outside `{i, j, k, n, x, y, z, w}` and inline single-expression closures obscure intent.",
+    },
+    .{
+        .code = .w0204_shadowed_binding,
+        .code_str = "W0204",
+        .default_severity = .warning,
+        .title = "local binding shadows live outer 'var' or later-read variable",
+        .explanation = "Shadowing a mutable `var`, an outer binding read after the inner block, or an unread same-scope `let` risks confusion.",
+    },
+    .{
+        .code = .w0205_bool_predicate_naming,
+        .code_str = "W0205",
+        .default_severity = .warning,
+        .title = "boolean-returning function lacks predicate naming",
+        .explanation = "Non-mutating `-> bool` functions and methods should read as predicates (`is_`, `has_`, `can_`, `should_`, `contains`, …).",
+    },
+    .{
+        .code = .w0206_getter_prefix_noise,
+        .code_str = "W0206",
+        .default_severity = .warning,
+        .title = "redundant 'get_' prefix on O(1) property accessor",
+        .explanation = "Zero-argument `&self` property accessors omit `get_` (`len()`, `header()`, reserving `get` for keyed/fallible lookups).",
+    },
+    .{
+        .code = .w0207_conversion_prefix_mismatch,
+        .code_str = "W0207",
+        .default_severity = .warning,
+        .title = "'as_' / 'to_' / 'into_' conversion prefix violates ownership or allocation tier",
+        .explanation = "`as_*` must borrow with zero heap allocation, `to_*` must not consume `own self` on `~Copy`, " ++
+            "and `into_*` must take `own self`.",
+    },
+    .{
+        .code = .w0208_redundant_literal_type,
+        .code_str = "W0208",
+        .default_severity = .warning,
+        .title = "redundant explicit type annotation on local binding",
+        .explanation = "A local `let` or `var` repeats `: T` when the initializer already carries an explicit type suffix or nominal constructor.",
+    },
+    .{
+        .code = .w0209_needless_trailing_return,
+        .code_str = "W0209",
+        .default_severity = .warning,
+        .title = "needless trailing 'return' at end of body",
+        .explanation = "Omit trailing `return;` in `unit` bodies and write tail `expr` directly instead of `return expr;`.",
+    },
+    .{
+        .code = .w0210_manual_assign_or_swap,
+        .code_str = "W0210",
+        .default_severity = .warning,
+        .title = "manual compound assignment or temporary swap",
+        .explanation = "Use compound assignment (`x += y;`) instead of `x = x + y;` and parallel destructuring `(a, b) = (b, a);` for swaps.",
     },
     .{
         .code = .w0308_unused_region_allocation,
@@ -1534,12 +1972,34 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .explanation = "Dependency exports dead/unreachable functions carrying `net`, `process`, or `ffi` capabilities.",
     },
     .{
+        .code = .w0332_nondeterministic_sim_source,
+        .code_str = "W0332",
+        .default_severity = .warning,
+        .title = "nondeterministic host clock or entropy source in simulation",
+        .explanation = "Direct host `clock` or `entropy` syscalls bypass `Context.reactor` / `Context.rng` under `corex test --sim`.",
+    },
+    .{
         .code = .w0333_redundant_private_contract,
         .code_str = "W0333",
         .default_severity = .warning,
         .title = "redundant '@inline', '@no_alloc', '@no_panic', or '@no_block' attribute",
         .explanation = "Inlining and effect contracts are inferred automatically on private, generic, " ++
             "and `= expr;` functions; reserve for `pub` boundaries.",
+    },
+    .{
+        .code = .w0334_redundant_move_clone,
+        .code_str = "W0334",
+        .default_severity = .warning,
+        .title = "redundant '.clone()' on owned value before last use",
+        .explanation = "Liveness analysis proved the cloned local `~Copy` binding is never read again; transfer ownership directly without cloning.",
+    },
+    .{
+        .code = .w0335_string_concat_in_loop,
+        .code_str = "W0335",
+        .default_severity = .warning,
+        .title = "repeated string or vector concatenation inside loop",
+        .explanation = "Repeated `+=` or `f\"{s}…\"` re-allocation inside a loop degrades throughput; " ++
+            "pre-size with `with_capacity` or use `Writer`.",
     },
     .{
         .code = .w0401_unreachable_pattern_arm,
@@ -1563,6 +2023,84 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
         .explanation = "A symbol marked `@deprecated` was referenced; migrate to its replacement API or run `corex upgrade`.",
     },
     .{
+        .code = .w0404_unused_import,
+        .code_str = "W0404",
+        .default_severity = .warning,
+        .title = "unused 'use' import specifier",
+        .explanation = "An imported `use` specifier has zero value, type, or trait-method references in active or `@cfg`-gated code.",
+    },
+    .{
+        .code = .w0405_unused_mut_binding,
+        .code_str = "W0405",
+        .default_severity = .warning,
+        .title = "mutable 'var' binding is never mutated",
+        .explanation = "A `var` local variable or value parameter is never reassigned or `&mut`-borrowed; declare immutable `let` instead.",
+    },
+    .{
+        .code = .w0406_unused_pkg_visibility,
+        .code_str = "W0406",
+        .default_severity = .warning,
+        .title = "unused 'pub(pkg)' or 'pub(super)' cross-module visibility",
+        .explanation = "An intra-package `pub(pkg)` or `pub(super)` item has zero callers outside its defining module; narrow its visibility.",
+    },
+    .{
+        .code = .w0407_needless_bool_branch,
+        .code_str = "W0407",
+        .default_severity = .warning,
+        .title = "needless boolean branch or literal boolean equality",
+        .explanation = "Simplify `if c { return true; } else { return false; }`, `x == true`, `x == false`, and `not (a == b)` directly.",
+    },
+    .{
+        .code = .w0408_collapsible_if,
+        .code_str = "W0408",
+        .default_severity = .warning,
+        .title = "collapsible nested 'if' or 'else { if }'",
+        .explanation = "Combine nested `if a { if b { … } }` into `if a and b { … }` and `else { if b { … } }` into `else if b { … }`.",
+    },
+    .{
+        .code = .w0409_simplifiable_match,
+        .code_str = "W0409",
+        .default_severity = .warning,
+        .title = "two-arm 'match' simplifiable to 'if' or 'if is'",
+        .explanation = "Replace two-arm boolean `match` or single-pattern `match` with an empty `_ => {}` arm by `if` / `if x is Pattern`.",
+    },
+    .{
+        .code = .w0410_manual_orelse_or_try,
+        .code_str = "W0410",
+        .default_severity = .warning,
+        .title = "manual 'Option' / 'Result' 'match' reducible to 'orelse' or '?'",
+        .explanation = "Express `.Some(v) => v, .None => d` as `opt orelse d` and `.Ok(v) => v, .Err(e) => return .Err(e)` as `res?`.",
+    },
+    .{
+        .code = .w0411_single_use_temp,
+        .code_str = "W0411",
+        .default_severity = .warning,
+        .title = "single-use temporary variable before return or condition",
+        .explanation = "Inline single-use `let res = expr; return res;` or condition-tested temporaries directly into their consumer.",
+    },
+    .{
+        .code = .w0412_clone_on_copy,
+        .code_str = "W0412",
+        .default_severity = .warning,
+        .title = "unnecessary '.clone()' on 'Copy' type",
+        .explanation = "Calling `.clone()` on a `Copy` value or `&Copy` reference is redundant; copy by value or dereference `.*` directly.",
+    },
+    .{
+        .code = .w0413_trivially_copy_pass_by_ref,
+        .code_str = "W0413",
+        .default_severity = .warning,
+        .title = "small 'Copy' type passed by '&T' reference",
+        .explanation = "Passing register-sized `Copy` types (`<= 8 B` on 64-bit, `<= 4 B` on `wasm32`) by value avoids pointer indirection.",
+    },
+    .{
+        .code = .w0414_identical_operands,
+        .code_str = "W0414",
+        .default_severity = .warning,
+        .title = "identical operands on both sides of operator or branch",
+        .explanation = "Comparing, combining, or branching to identical pure expressions " ++
+            "(`x == x`, `a and a`, `if c => a else a`) indicates a typo.",
+    },
+    .{
         .code = .w0501_inlining_budget_exceeded,
         .code_str = "W0501",
         .default_severity = .warning,
@@ -1571,9 +2109,475 @@ pub const DIAGNOSTIC_CATALOG = [_]DiagnosticDescriptor{
     },
 };
 
+/// Mask with all 44 v1.0 built-in lint rule bits enabled (`(1 << 44) - 1`).
+pub const ALL_RULES_MASK: RuleMask64 = (@as(u64, 1) << RuleId.COUNT) - 1;
+
+/// Canonical 44-rule CoreX v1.0 Built-In Lint Catalog (`DR-25` §2.2 & Post-Critique Ruling 1.2).
+pub const DIAGNOSTIC_LINT_CATALOG = [RuleId.COUNT]LintRuleMeta{
+    .{
+        .rule_id = .unused_suppression,
+        .diag_code = .w0002_unused_suppression,
+        .slug = "unused-suppression",
+        .category = .suspicious,
+        .stage = .post_filter,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = true,
+    },
+    .{
+        .rule_id = .missing_suppression_reason,
+        .diag_code = .w0003_missing_suppression_reason,
+        .slug = "missing-suppression-reason",
+        .category = .clarity,
+        .stage = .cst_ast,
+        .default_applicability = .unspecified,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .prefer_expect_over_allow,
+        .diag_code = .w0004_prefer_expect_over_allow,
+        .slug = "prefer-expect-over-allow",
+        .category = .clarity,
+        .stage = .cst_ast,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .redundant_escape_sequence,
+        .diag_code = .w0101_redundant_escape_sequence,
+        .slug = "redundant-escape-sequence",
+        .category = .style,
+        .stage = .token_buffer,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = true,
+    },
+    .{
+        .rule_id = .unicode_trojan_control,
+        .diag_code = .w0102_unicode_trojan_control,
+        .slug = "unicode-trojan-control",
+        .category = .correctness,
+        .stage = .token_buffer,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .confusable_ident,
+        .diag_code = .w0103_confusable_ident,
+        .slug = "confusable-ident",
+        .category = .suspicious,
+        .stage = .resolve,
+        .default_applicability = .unspecified,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .ambiguous_unicode_text,
+        .diag_code = .w0104_ambiguous_unicode_text,
+        .slug = "ambiguous-unicode-text",
+        .category = .suspicious,
+        .stage = .token_buffer,
+        .default_applicability = .maybe_incorrect,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .useless_format_string,
+        .diag_code = .w0119_useless_format_string,
+        .slug = "useless-format-string",
+        .category = .clarity,
+        .stage = .token_buffer,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .uninterpolated_fmt_braces,
+        .diag_code = .w0120_uninterpolated_fmt_placeholder,
+        .slug = "uninterpolated-fmt-braces",
+        .category = .suspicious,
+        .stage = .typecheck,
+        .default_applicability = .maybe_incorrect,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .needless_raw_string_hashes,
+        .diag_code = .w0121_needless_raw_string_hashes,
+        .slug = "needless-raw-string-hashes",
+        .category = .style,
+        .stage = .token_buffer,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = true,
+    },
+    .{
+        .rule_id = .ungrouped_numeric_literal,
+        .diag_code = .w0122_ungrouped_numeric_literal,
+        .slug = "ungrouped-numeric-literal",
+        .category = .clarity,
+        .stage = .token_buffer,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .non_upper_hex_literal,
+        .diag_code = .w0123_non_upper_hex_literal,
+        .slug = "non-upper-hex-literal",
+        .category = .style,
+        .stage = .token_buffer,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .non_canonical_case,
+        .diag_code = .w0201_non_canonical_identifier_case,
+        .slug = "non-canonical-case",
+        .category = .style,
+        .stage = .cst_ast,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .non_idiomatic_syntax,
+        .diag_code = .w0202_non_idiomatic_construct,
+        .slug = "non-idiomatic-syntax",
+        .category = .style,
+        .stage = .cst_ast,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .single_char_ident,
+        .diag_code = .w0203_single_char_ident,
+        .slug = "single-char-ident",
+        .category = .clarity,
+        .stage = .cst_ast,
+        .default_applicability = .unspecified,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .shadowed_binding,
+        .diag_code = .w0204_shadowed_binding,
+        .slug = "shadowed-binding",
+        .category = .suspicious,
+        .stage = .resolve,
+        .default_applicability = .unspecified,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .bool_predicate_naming,
+        .diag_code = .w0205_bool_predicate_naming,
+        .slug = "bool-predicate-naming",
+        .category = .clarity,
+        .stage = .typecheck,
+        .default_applicability = .unspecified,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .getter_prefix_noise,
+        .diag_code = .w0206_getter_prefix_noise,
+        .slug = "getter-prefix-noise",
+        .category = .style,
+        .stage = .typecheck,
+        .default_applicability = .maybe_incorrect,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .conversion_prefix_mismatch,
+        .diag_code = .w0207_conversion_prefix_mismatch,
+        .slug = "conversion-prefix-mismatch",
+        .category = .suspicious,
+        .stage = .mir_sast,
+        .default_applicability = .maybe_incorrect,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .redundant_literal_type,
+        .diag_code = .w0208_redundant_literal_type,
+        .slug = "redundant-literal-type",
+        .category = .clarity,
+        .stage = .typecheck,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = true,
+    },
+    .{
+        .rule_id = .needless_trailing_return,
+        .diag_code = .w0209_needless_trailing_return,
+        .slug = "needless-trailing-return",
+        .category = .style,
+        .stage = .typecheck,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = true,
+    },
+    .{
+        .rule_id = .manual_assign_or_swap,
+        .diag_code = .w0210_manual_assign_or_swap,
+        .slug = "manual-assign-or-swap",
+        .category = .style,
+        .stage = .typecheck,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .unused_region_alloc,
+        .diag_code = .w0308_unused_region_allocation,
+        .slug = "unused-region-alloc",
+        .category = .suspicious,
+        .stage = .mir_sast,
+        .default_applicability = .unspecified,
+        .is_unnecessary_tag = true,
+    },
+    .{
+        .rule_id = .vacated_projection_abort,
+        .diag_code = .w0329_vacated_projection_panic_abort,
+        .slug = "vacated-projection-abort",
+        .category = .suspicious,
+        .stage = .mir_sast,
+        .default_applicability = .unspecified,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .ambient_dead_capability,
+        .diag_code = .w0330_ambient_dead_capability_in_dep,
+        .slug = "ambient-dead-capability",
+        .category = .suspicious,
+        .stage = .mir_sast,
+        .default_applicability = .unspecified,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .nondeterministic_sim_source,
+        .diag_code = .w0332_nondeterministic_sim_source,
+        .slug = "nondeterministic-sim-source",
+        .category = .correctness,
+        .stage = .mir_sast,
+        .default_applicability = .unspecified,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .redundant_private_contract,
+        .diag_code = .w0333_redundant_private_contract,
+        .slug = "redundant-private-contract",
+        .category = .style,
+        .stage = .mir_sast,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = true,
+    },
+    .{
+        .rule_id = .redundant_move_clone,
+        .diag_code = .w0334_redundant_move_clone,
+        .slug = "redundant-move-clone",
+        .category = .perf,
+        .stage = .mir_sast,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = true,
+    },
+    .{
+        .rule_id = .string_concat_in_loop,
+        .diag_code = .w0335_string_concat_in_loop,
+        .slug = "string-concat-in-loop",
+        .category = .perf,
+        .stage = .mir_sast,
+        .default_applicability = .unspecified,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .unreachable_pattern,
+        .diag_code = .w0401_unreachable_pattern_arm,
+        .slug = "unreachable-pattern",
+        .category = .correctness,
+        .stage = .typecheck,
+        .default_applicability = .maybe_incorrect,
+        .is_unnecessary_tag = true,
+    },
+    .{
+        .rule_id = .unused_binding,
+        .diag_code = .w0402_unused_binding,
+        .slug = "unused-binding",
+        .category = .suspicious,
+        .stage = .typecheck,
+        .default_applicability = .maybe_incorrect,
+        .is_unnecessary_tag = true,
+    },
+    .{
+        .rule_id = .deprecated_use,
+        .diag_code = .w0403_deprecated_symbol,
+        .slug = "deprecated-use",
+        .category = .suspicious,
+        .stage = .typecheck,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .unused_import,
+        .diag_code = .w0404_unused_import,
+        .slug = "unused-import",
+        .category = .style,
+        .stage = .resolve,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = true,
+    },
+    .{
+        .rule_id = .unused_mut_binding,
+        .diag_code = .w0405_unused_mut_binding,
+        .slug = "unused-mut-binding",
+        .category = .clarity,
+        .stage = .typecheck,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = true,
+    },
+    .{
+        .rule_id = .unused_pkg_visibility,
+        .diag_code = .w0406_unused_pkg_visibility,
+        .slug = "unused-pkg-visibility",
+        .category = .clarity,
+        .stage = .resolve,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = true,
+    },
+    .{
+        .rule_id = .needless_bool_branch,
+        .diag_code = .w0407_needless_bool_branch,
+        .slug = "needless-bool-branch",
+        .category = .clarity,
+        .stage = .typecheck,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .collapsible_if,
+        .diag_code = .w0408_collapsible_if,
+        .slug = "collapsible-if",
+        .category = .clarity,
+        .stage = .typecheck,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .simplifiable_match,
+        .diag_code = .w0409_simplifiable_match,
+        .slug = "simplifiable-match",
+        .category = .clarity,
+        .stage = .typecheck,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .manual_orelse_or_try,
+        .diag_code = .w0410_manual_orelse_or_try,
+        .slug = "manual-orelse-or-try",
+        .category = .clarity,
+        .stage = .typecheck,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .single_use_temp,
+        .diag_code = .w0411_single_use_temp,
+        .slug = "single-use-temp",
+        .category = .clarity,
+        .stage = .typecheck,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .clone_on_copy,
+        .diag_code = .w0412_clone_on_copy,
+        .slug = "clone-on-copy",
+        .category = .perf,
+        .stage = .typecheck,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = true,
+    },
+    .{
+        .rule_id = .trivially_copy_pass_by_ref,
+        .diag_code = .w0413_trivially_copy_pass_by_ref,
+        .slug = "trivially-copy-pass-by-ref",
+        .category = .perf,
+        .stage = .mir_sast,
+        .default_applicability = .machine_applicable,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .identical_operands,
+        .diag_code = .w0414_identical_operands,
+        .slug = "identical-operands",
+        .category = .correctness,
+        .stage = .typecheck,
+        .default_applicability = .maybe_incorrect,
+        .is_unnecessary_tag = false,
+    },
+    .{
+        .rule_id = .inlining_budget_exceeded,
+        .diag_code = .w0501_inlining_budget_exceeded,
+        .slug = "inlining-budget-exceeded",
+        .category = .perf,
+        .stage = .mir_opt,
+        .default_applicability = .unspecified,
+        .is_unnecessary_tag = false,
+    },
+};
+
+/// $O(1)$ lookup table mapping `@backingInt(DiagnosticCode)` to `RuleId` (`0xFF` = non-lint code).
+pub const DIAG_CODE_TO_RULE_ID = blk: {
+    var table: [DIAGNOSTIC_CATALOG.len]u8 = @splat(0xFF);
+    for (DIAGNOSTIC_LINT_CATALOG) |meta| {
+        table[@backingInt(meta.diag_code)] = meta.rule_id.asInt();
+    }
+    break :blk table;
+};
+
+/// $O(1)$ lookup table mapping numeric suffix `2..501` of `"W0xxx"` to `RuleId` (`0xFF` = unassigned/non-lint).
+pub const W_NUMBER_TO_RULE_ID = blk: {
+    var table: [600]u8 = @splat(0xFF);
+    for (DIAGNOSTIC_LINT_CATALOG) |meta| {
+        const code_str = meta.diag_code.asCodeStr();
+        const num: usize = (@as(usize, code_str[1] - '0') * 1000) +
+            (@as(usize, code_str[2] - '0') * 100) +
+            (@as(usize, code_str[3] - '0') * 10) +
+            @as(usize, code_str[4] - '0');
+        table[num] = meta.rule_id.asInt();
+    }
+    break :blk table;
+};
+
+/// Open-addressed 64-slot `Wyhash(0)` linear-probing table mapping `kebab-case` slugs to `RuleId` (`0xFF` = empty).
+pub const LINT_SLUG_HASH_TABLE = blk: {
+    @setEvalBranchQuota(20_000);
+    var table: [64]u8 = @splat(0xFF);
+    for (DIAGNOSTIC_LINT_CATALOG, 0..) |meta, rule_idx| {
+        var slot: usize = @intCast(std.hash.Wyhash.hash(0, meta.slug) & 63);
+        while (table[slot] != 0xFF) : (slot = (slot + 1) & 63) {}
+        table[slot] = @intCast(rule_idx);
+    }
+    break :blk table;
+};
+
+/// Forbidden blanket or category-wide selector keywords (`E0240` / `E0019`).
+const FORBIDDEN_SELECTOR_MAP = std.StaticStringMap(void).initComptime(.{
+    .{ "*", {} },
+    .{ "all", {} },
+    .{ "clarity", {} },
+    .{ "correctness", {} },
+    .{ "lints", {} },
+    .{ "perf", {} },
+    .{ "style", {} },
+    .{ "suspicious", {} },
+    .{ "warnings", {} },
+});
+
+/// Legacy pre-`DR-25` shorthand aliases mapped to canonical v1.0 `kebab-case` slugs for typo hints.
+const LEGACY_LINT_ALIAS_SUGGESTIONS = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "deprecated", "deprecated-use" },
+    .{ "idiom", "non-idiomatic-syntax" },
+    .{ "non_canonical_case", "non-canonical-case" },
+    .{ "non_idiomatic", "non-idiomatic-syntax" },
+    .{ "redundant_private_contract", "redundant-private-contract" },
+    .{ "uninterpolated_fmt_placeholder", "uninterpolated-fmt-braces" },
+    .{ "unreachable_pattern", "unreachable-pattern" },
+    .{ "unused", "unused-binding" },
+    .{ "unused_binding", "unused-binding" },
+    .{ "unused_variables", "unused-binding" },
+    .{ "useless_format_string", "useless-format-string" },
+});
+
 /// Static $O(1)$ compile-time map resolving canonical 5-character code strings to `DiagnosticCode`.
 pub const DIAGNOSTIC_CODE_STR_MAP = blk: {
-    @setEvalBranchQuota(20_000);
+    @setEvalBranchQuota(30_000);
     var pairs: [DIAGNOSTIC_CATALOG.len]CodeKvPair = undefined;
     for (DIAGNOSTIC_CATALOG, 0..) |descriptor, i| {
         pairs[i] = .{ descriptor.code_str, descriptor.code };
@@ -1582,12 +2586,52 @@ pub const DIAGNOSTIC_CODE_STR_MAP = blk: {
 };
 
 comptime {
-    std.debug.assert(DIAGNOSTIC_CATALOG.len == 146);
+    @setEvalBranchQuota(50_000);
+    std.debug.assert(DIAGNOSTIC_CATALOG.len == 182);
     std.debug.assert(DIAGNOSTIC_CODE_STR_MAP.keys().len == DIAGNOSTIC_CATALOG.len);
     std.debug.assert(@typeInfo(DiagnosticCode).@"enum".field_names.len == DIAGNOSTIC_CATALOG.len);
+    std.debug.assert(@sizeOf(RuleId) == 1);
+    std.debug.assert(@sizeOf(RuleMask64) == 8);
+    std.debug.assert(DIAGNOSTIC_LINT_CATALOG.len == 44);
     for (DIAGNOSTIC_CATALOG, 0..) |entry, i| {
         std.debug.assert(@backingInt(entry.code) == i);
     }
+
+    // Verify Post-Critique Ruling 1.2 fix-tier and category counts + bijective lookup round-trips:
+    var auto_count: usize = 0;
+    var unsafe_count: usize = 0;
+    var diag_only_count: usize = 0;
+    var cat_counts: [5]usize = @splat(0);
+
+    for (DIAGNOSTIC_LINT_CATALOG, 0..) |meta, idx| {
+        std.debug.assert(meta.rule_id.asInt() == idx);
+        std.debug.assert(meta.diag_code.defaultSeverity() == .warning);
+        std.debug.assert(meta.diag_code.asLintRuleId().? == meta.rule_id);
+        std.debug.assert(meta.slug.len >= 5 and meta.slug.len <= 40);
+        for (meta.slug) |ch| {
+            std.debug.assert((ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or ch == '-');
+        }
+        std.debug.assert(lookupLintRuleBySelector(meta.slug).rule == meta.rule_id);
+        std.debug.assert(lookupLintRuleBySelector(meta.diag_code.asCodeStr()).rule == meta.rule_id);
+
+        switch (meta.default_applicability) {
+            .machine_applicable => auto_count += 1,
+            .maybe_incorrect => unsafe_count += 1,
+            .unspecified => diag_only_count += 1,
+            .has_placeholders => unreachable,
+        }
+        cat_counts[@intFromEnum(meta.category)] += 1;
+    }
+    std.debug.assert(auto_count == 26);
+    std.debug.assert(unsafe_count == 7);
+    std.debug.assert(diag_only_count == 11);
+    std.debug.assert(cat_counts[@intFromEnum(LintCategory.correctness)] == 4);
+    std.debug.assert(cat_counts[@intFromEnum(LintCategory.suspicious)] == 11);
+    std.debug.assert(cat_counts[@intFromEnum(LintCategory.clarity)] == 14);
+    std.debug.assert(cat_counts[@intFromEnum(LintCategory.style)] == 10);
+    std.debug.assert(cat_counts[@intFromEnum(LintCategory.perf)] == 5);
+    std.debug.assert(DiagnosticCode.w0001_deprecated_cli_option.asLintRuleId() == null);
+    std.debug.assert(DiagnosticCode.w0314_unproven_bounds_access.asLintRuleId() == null);
 }
 
 // -------------------------------------- INTERNALS --------------------------------------
@@ -1926,6 +2970,146 @@ pub const TransactionalPatcher = struct {
     }
 };
 
+/// Classifies `text` (`W0xxx` code or `kebab-case` slug) in $O(1)$ time with zero heap allocations.
+pub fn lookupLintRuleBySelector(text: []const u8) LintSelectorLookup {
+    if (text.len == 0) return .unknown;
+    if (FORBIDDEN_SELECTOR_MAP.has(text)) return .forbidden_category_or_wildcard;
+
+    // [1] Fast 5-byte `W0xxx` / `E0xxx` prefix check:
+    if (text.len == 5 and
+        std.ascii.isDigit(text[1]) and
+        std.ascii.isDigit(text[2]) and
+        std.ascii.isDigit(text[3]) and
+        std.ascii.isDigit(text[4]))
+    {
+        const num: usize = (@as(usize, text[1] - '0') * 1000) +
+            (@as(usize, text[2] - '0') * 100) +
+            (@as(usize, text[3] - '0') * 10) +
+            @as(usize, text[4] - '0');
+        if (text[0] == 'W') {
+            if (num < W_NUMBER_TO_RULE_ID.len) {
+                const mapped = W_NUMBER_TO_RULE_ID[num];
+                if (mapped != 0xFF) return .{ .rule = @enumFromInt(mapped) };
+            }
+            if (num == 1) return .{ .non_suppressible_subsystem_warning = .w0001_deprecated_cli_option };
+            if (num == 314) return .{ .non_suppressible_subsystem_warning = .w0314_unproven_bounds_access };
+            return .unknown;
+        }
+        if (text[0] == 'E') {
+            return .{ .non_suppressible_error_code = DiagnosticCode.fromCodeStr(text) };
+        }
+    }
+
+    // [2] Open-addressed 64-slot `Wyhash(0)` probe for `kebab-case` rule slugs:
+    if (text.len <= 48) {
+        var slot: usize = @intCast(std.hash.Wyhash.hash(0, text) & 63);
+        var probes: usize = 0;
+        while (probes < 64) : (probes += 1) {
+            const rule_idx = LINT_SLUG_HASH_TABLE[slot];
+            if (rule_idx == 0xFF) break;
+            if (std.mem.eql(u8, DIAGNOSTIC_LINT_CATALOG[rule_idx].slug, text)) {
+                return .{ .rule = @enumFromInt(rule_idx) };
+            }
+            slot = (slot + 1) & 63;
+        }
+    }
+    return .unknown;
+}
+
+/// Computes bounded Jaro-Winkler similarity in `[0.0, 1.0]` over `<= 64`-byte ASCII strings (`0` heap allocs).
+pub fn jaroWinklerSimilarity(first_text: []const u8, second_text: []const u8) f64 {
+    const len_a = @min(first_text.len, 64);
+    const len_b = @min(second_text.len, 64);
+    if (len_a == 0 and len_b == 0) return 1.0;
+    if (len_a == 0 or len_b == 0) return 0.0;
+    if (std.mem.eql(u8, first_text[0..len_a], second_text[0..len_b])) return 1.0;
+
+    const max_len = @max(len_a, len_b);
+    const match_dist: usize = if (max_len >= 2) (max_len / 2) - 1 else 0;
+
+    var matched_a: u64 = 0;
+    var matched_b: u64 = 0;
+    var match_count: usize = 0;
+
+    var idx_a: usize = 0;
+    while (idx_a < len_a) : (idx_a += 1) {
+        const win_start = idx_a -| match_dist;
+        const win_end = @min(len_b, idx_a + match_dist + 1);
+        var idx_b = win_start;
+        while (idx_b < win_end) : (idx_b += 1) {
+            const bit_b = @as(u64, 1) << @intCast(idx_b);
+            if ((matched_b & bit_b) != 0) continue;
+            if (first_text[idx_a] != second_text[idx_b]) continue;
+            matched_a |= @as(u64, 1) << @intCast(idx_a);
+            matched_b |= bit_b;
+            match_count += 1;
+            break;
+        }
+    }
+    if (match_count == 0) return 0.0;
+
+    var transpositions: usize = 0;
+    var cursor_b: usize = 0;
+    idx_a = 0;
+    while (idx_a < len_a) : (idx_a += 1) {
+        if ((matched_a & (@as(u64, 1) << @intCast(idx_a))) == 0) continue;
+        while (cursor_b < len_b and (matched_b & (@as(u64, 1) << @intCast(cursor_b))) == 0) {
+            cursor_b += 1;
+        }
+        if (cursor_b < len_b and first_text[idx_a] != second_text[cursor_b]) {
+            transpositions += 1;
+        }
+        cursor_b += 1;
+    }
+
+    const matches_f: f64 = @floatFromInt(match_count);
+    const trans_half_f: f64 = @as(f64, @floatFromInt(transpositions)) / 2.0;
+    const jaro = ((matches_f / @as(f64, @floatFromInt(len_a))) +
+        (matches_f / @as(f64, @floatFromInt(len_b))) +
+        ((matches_f - trans_half_f) / matches_f)) / 3.0;
+
+    var prefix_len: usize = 0;
+    const max_prefix = @min(@as(usize, 4), @min(len_a, len_b));
+    while (prefix_len < max_prefix and first_text[prefix_len] == second_text[prefix_len]) {
+        prefix_len += 1;
+    }
+    return jaro + (@as(f64, @floatFromInt(prefix_len)) * 0.1 * (1.0 - jaro));
+}
+
+/// Suggests the closest canonical lint rule slug or `W0xxx` code when Jaro-Winkler `>= 0.80` (`0` heap allocs).
+pub fn suggestClosestLintRule(text: []const u8) ?[]const u8 {
+    if (text.len == 0 or text.len > 64) return null;
+    if (LEGACY_LINT_ALIAS_SUGGESTIONS.get(text)) |legacy_target| return legacy_target;
+
+    // Normalize `_` -> `-` and uppercase -> lowercase on stack for slug typo scoring:
+    var norm_slug_buf: [64]u8 = undefined;
+    var norm_code_buf: [64]u8 = undefined;
+    for (text, 0..) |ch, i| {
+        norm_slug_buf[i] = if (ch == '_') '-' else std.ascii.toLower(ch);
+        norm_code_buf[i] = std.ascii.toUpper(ch);
+    }
+    const norm_slug = norm_slug_buf[0..text.len];
+    const norm_code = norm_code_buf[0..text.len];
+
+    var best_score: f64 = 0.80;
+    var best_match: ?[]const u8 = null;
+
+    for (DIAGNOSTIC_LINT_CATALOG) |meta| {
+        const slug_score = jaroWinklerSimilarity(norm_slug, meta.slug);
+        if (slug_score >= best_score) {
+            best_score = slug_score;
+            best_match = meta.slug;
+        }
+        const code_str = meta.diag_code.asCodeStr();
+        const code_score = jaroWinklerSimilarity(norm_code, code_str);
+        if (code_score > best_score) {
+            best_score = code_score;
+            best_match = code_str;
+        }
+    }
+    return best_match;
+}
+
 test "test_diagnostic_sink_error_cap_and_patcher" {
     var sink = DiagnosticSink.initWithLimit(std.testing.allocator, 2);
     defer sink.deinit();
@@ -1973,7 +3157,18 @@ test "test_diagnostic_sink_error_cap_and_patcher" {
     try std.testing.expectEqual(@as(u32, 1), outcome.applied_count);
     try std.testing.expectEqualStrings("call(&socket);", outcome.patched_source);
 
-    try std.testing.expectEqual(@as(usize, 146), DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 182), DIAGNOSTIC_CATALOG.len);
+    try std.testing.expectEqual(@as(usize, 44), DIAGNOSTIC_LINT_CATALOG.len);
+    try std.testing.expectEqual(RuleId.single_char_ident, lookupLintRuleBySelector("single-char-ident").rule);
+    try std.testing.expectEqual(RuleId.single_char_ident, lookupLintRuleBySelector("W0203").rule);
+    try std.testing.expect(lookupLintRuleBySelector("style") == .forbidden_category_or_wildcard);
+    try std.testing.expect(lookupLintRuleBySelector("*") == .forbidden_category_or_wildcard);
+    try std.testing.expect(lookupLintRuleBySelector("E0302") == .non_suppressible_error_code);
+    try std.testing.expect(lookupLintRuleBySelector("W0001") == .non_suppressible_subsystem_warning);
+    try std.testing.expect(lookupLintRuleBySelector("W0314") == .non_suppressible_subsystem_warning);
+    try std.testing.expectEqualStrings("single-char-ident", suggestClosestLintRule("single_char_ident").?);
+    try std.testing.expectEqualStrings("collapsible-if", suggestClosestLintRule("colapsible-if").?);
+    try std.testing.expectEqualStrings("non-canonical-case", suggestClosestLintRule("non_canonical_case").?);
     try std.testing.expectEqual(
         DiagnosticCode.e0118_block_doc_comment_forbidden,
         DiagnosticCode.fromCodeStr("E0118").?,

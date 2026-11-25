@@ -598,9 +598,9 @@ test "test_lsp_did_change_coalescing_cancellation_and_diagnostics" {
         try std.testing.expect(push_v4_frame != null);
 
         // Verify `W0402` (`tags:[1]`), `W0403` (`tags:[2]`), and `E0313` `relatedInformation` in push payload:
-        try std.testing.expect(std.mem.indexOf(u8, push_v4_frame.?, "\"code\":\"W0402\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, push_v4_frame.?, "\"code\":\"W0402/unused-binding\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, push_v4_frame.?, "\"tags\":[1]") != null);
-        try std.testing.expect(std.mem.indexOf(u8, push_v4_frame.?, "\"code\":\"W0403\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, push_v4_frame.?, "\"code\":\"W0403/deprecated-use\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, push_v4_frame.?, "\"tags\":[2]") != null);
         try std.testing.expect(std.mem.indexOf(u8, push_v4_frame.?, "\"code\":\"E0313\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, push_v4_frame.?, "\"relatedInformation\":[{") != null);
@@ -649,9 +649,9 @@ test "test_lsp_did_change_coalescing_cancellation_and_diagnostics" {
 
         const full_diag = findFrameByIdFragment(first_pull_out.frames, "\"id\":2").?;
         try std.testing.expect(std.mem.indexOf(u8, full_diag, "\"kind\":\"full\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, full_diag, "\"code\":\"W0402\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, full_diag, "\"code\":\"W0402/unused-binding\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, full_diag, "\"tags\":[1]") != null);
-        try std.testing.expect(std.mem.indexOf(u8, full_diag, "\"code\":\"W0403\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, full_diag, "\"code\":\"W0403/deprecated-use\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, full_diag, "\"tags\":[2]") != null);
         try std.testing.expect(std.mem.indexOf(u8, full_diag, "\"relatedInformation\":[{") != null);
 
@@ -1392,9 +1392,9 @@ test "test_lsp_hygienic_rename_code_action_and_range_formatting" {
 
     const code_act_resp = findFrameByIdFragment(outcome.frames, "\"id\":9").?;
     try std.testing.expect(std.mem.indexOf(u8, code_act_resp, "\"kind\":\"quickfix\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, code_act_resp, "\"code\":\"W0202\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code_act_resp, "\"code\":\"W0407/needless-bool-branch\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, code_act_resp, "return flag;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, code_act_resp, "\"code\":\"W0403\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code_act_resp, "\"code\":\"W0403/deprecated-use\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, code_act_resp, "modern_double(delta)") != null);
 
     const range_fmt_resp = findFrameByIdFragment(outcome.frames, "\"id\":10").?;
@@ -1437,8 +1437,8 @@ test "test_lsp_windows_case_uri_watched_eviction_multifile_fix_and_internal_core
         "corex.toml",
         "[package]\nname = \"hardening_pkg\"\nversion = \"0.1.0\"\n",
     );
-    const initial_main_disk = "pub mod helper;\npub fn entry_val() -> i32 {\n    return helper.base_num();\n}\n";
-    const initial_helper_disk = "pub fn base_num() -> i32 {\n    return 10;\n}\n";
+    const initial_main_disk = "pub mod helper;\npub fn entry_val() -> i32 {\n    helper.base_num()\n}\n";
+    const initial_helper_disk = "pub fn base_num() -> i32 {\n    10\n}\n";
     try writeWorkspaceFile(allocator, io, ws_dir, "SrcMixed/main.cx", initial_main_disk);
     try writeWorkspaceFile(allocator, io, ws_dir, "SrcMixed/helper.cx", initial_helper_disk);
     try writeWorkspaceFile(
@@ -1570,7 +1570,7 @@ test "test_lsp_windows_case_uri_watched_eviction_multifile_fix_and_internal_core
         &phase_a_in,
         alt_main_uri,
         1,
-        "pub mod helper;\npub fn entry_val() -> i32 {\n    let delta_v = 1;\n    return helper.base_num() + delta_v;\n}\n",
+        "pub mod helper;\npub fn entry_val() -> i32 {\n    let delta_v = 1;\n    helper.base_num() + delta_v\n}\n",
     );
     try appendDidOpenFrame(allocator, &phase_a_in, helper_uri, 1, initial_helper_disk);
 
@@ -1610,8 +1610,8 @@ test "test_lsp_windows_case_uri_watched_eviction_multifile_fix_and_internal_core
         );
         try writeEscapedJsonString(&chg2_buf.writer, alt_main_uri);
         try chg2_buf.writer.writeAll(
-            ",\"version\":3},\"contentChanges\":[{\"range\":{\"start\":{\"line\":4,\"character\":31}," ++
-                "\"end\":{\"line\":4,\"character\":38}},\"text\":\"delta_v + extra_v\"}]}}",
+            ",\"version\":3},\"contentChanges\":[{\"range\":{\"start\":{\"line\":4,\"character\":24}," ++
+                "\"end\":{\"line\":4,\"character\":31}},\"text\":\"delta_v + extra_v\"}]}}",
         );
         try appendLspFrame(allocator, &phase_a_in, chg2_buf.written());
     }
@@ -1673,7 +1673,7 @@ test "test_lsp_windows_case_uri_watched_eviction_multifile_fix_and_internal_core
         "pub fn entry_val() -> i32 {\n" ++
         "    let delta_v = 100;\n" ++
         "    let extra_v = 22;\n" ++
-        "    return helper.base_num() + delta_v + extra_v;\n" ++
+        "    helper.base_num() + delta_v + extra_v\n" ++
         "}\n";
     const alt_decoded = try lsp_server.decodeFileUriToNormalizedPath(allocator, alt_main_uri);
     defer allocator.free(alt_decoded);
@@ -1752,13 +1752,17 @@ test "test_lsp_windows_case_uri_watched_eviction_multifile_fix_and_internal_core
             .edits = blocked_edits,
         };
 
-        try main_parsed.diagnostics.emit(.{
+        const synthetic_diag: corex.diagnostic.Diagnostic = .{
             .code = .w0202_non_idiomatic_construct,
             .severity = .warning,
             .primary_span = corex.Span.init(mounted_main_fid, 0, 15),
             .message = "synthetic multi-file quickfix probe",
             .suggestions = fixes,
-        });
+        };
+        try main_parsed.diagnostics.emit(synthetic_diag);
+        if (session.db.projected_file_diagnostics.getPtr(mounted_main_fid.asInt())) |proj_sink| {
+            try proj_sink.emit(synthetic_diag);
+        }
     }
 
     // Phase B: `codeAction` (`id: 6`) + pipelined `> 120`-byte `$/cancelRequest` (`BLAKE3` slot) + `shutdown`/`exit`:
@@ -2602,17 +2606,17 @@ test "test_lsp_stdlib_cx_signature_syntax_error_and_recovery_no_cycle" {
 
     const core_root_src =
         "pub fn identity_f64(val: f64) -> f64 {\n" ++
-        "    return val;\n" ++
+        "    val\n" ++
         "}\n";
     const cx_mod_src =
         "pub mod math;\n";
     const math_src =
         "fn helper_step(r1: f64, hfx: f64) -> f64 {\n" ++
         "    let t_val: f64 = 3.0 - r1 * hfx;\n" ++
-        "    return r1 * t_val;\n" ++
+        "    0.0 + r1 * t_val\n" ++
         "}\n" ++
-        "fn ln_f64(x: f64, /) -> f64 {\n" ++
-        "    return helper_step(x, 0.5);\n" ++
+        "pub fn ln_f64(x: f64, /) -> f64 {\n" ++
+        "    helper_step(x, 0.5)\n" ++
         "}\n";
 
     try writeWorkspaceFile(allocator, io, ws_dir, "core/root.cx", core_root_src);
@@ -2651,8 +2655,8 @@ test "test_lsp_stdlib_cx_signature_syntax_error_and_recovery_no_cycle" {
             allocator,
             "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{{" ++
                 "\"textDocument\":{{\"uri\":\"{s}\",\"version\":2}}," ++
-                "\"contentChanges\":[{{\"range\":{{\"start\":{{\"line\":4,\"character\":11}}," ++
-                "\"end\":{{\"line\":4,\"character\":16}}}},\"text\":\"\"}}]}}}}",
+                "\"contentChanges\":[{{\"range\":{{\"start\":{{\"line\":4,\"character\":15}}," ++
+                "\"end\":{{\"line\":4,\"character\":20}}}},\"text\":\"\"}}]}}}}",
             .{math_uri},
         ),
         try std.fmt.allocPrint(
@@ -2671,8 +2675,8 @@ test "test_lsp_stdlib_cx_signature_syntax_error_and_recovery_no_cycle" {
             allocator,
             "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{{" ++
                 "\"textDocument\":{{\"uri\":\"{s}\",\"version\":3}}," ++
-                "\"contentChanges\":[{{\"range\":{{\"start\":{{\"line\":4,\"character\":11}}," ++
-                "\"end\":{{\"line\":4,\"character\":11}}}},\"text\":\": f64\"}}]}}}}",
+                "\"contentChanges\":[{{\"range\":{{\"start\":{{\"line\":4,\"character\":15}}," ++
+                "\"end\":{{\"line\":4,\"character\":15}}}},\"text\":\": f64\"}}]}}}}",
             .{math_uri},
         ),
         try std.fmt.allocPrint(
@@ -2720,4 +2724,848 @@ test "test_lsp_stdlib_cx_signature_syntax_error_and_recovery_no_cycle" {
     try std.testing.expect(
         std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":6").?, "\"line\":1,\"character\":8") != null,
     );
+}
+
+test "test_lsp_dr25_manifest_config_w0xxx_slug_codelens_expect_hover_and_live_reload" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const ws_dir = try createTempWorkspaceDir(allocator, io, "dr25_lsp_ws");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, ws_dir) catch {};
+        allocator.free(ws_dir);
+    }
+
+    const toml_v1 =
+        "[package]\n" ++
+        "name = \"lsp-dr25\"\n" ++
+        "version = \"0.1.0\"\n" ++
+        "edition = \"2026\"\n\n" ++
+        "[lsp]\n" ++
+        "inlay-hints-types = false\n" ++
+        "inlay-hints-parameter-names = \"none\"\n" ++
+        "code-lens-test-bench = true\n" ++
+        "max-completion-items = 20\n";
+    try writeWorkspaceFile(allocator, io, ws_dir, "corex.toml", toml_v1);
+
+    const main_cx =
+        "@expect(unused-binding, reason: \"verified hover target\")\n" ++
+        "pub fn compute_sum(lhs_v: i32, rhs_v: i32) -> i32 {\n" ++
+        "    let kept_unused = 42;\n" ++
+        "    lhs_v + rhs_v\n" ++
+        "}\n" ++
+        "pub fn call_demo() -> i32 {\n" ++
+        "    let live_unused = 99;\n" ++
+        "    let inferred_loc = compute_sum(10, 20);\n" ++
+        "    inferred_loc + 1\n" ++
+        "}\n" ++
+        "test \"adds numbers\" {\n" ++
+        "    let _res = call_demo();\n" ++
+        "}\n";
+    try writeWorkspaceFile(allocator, io, ws_dir, "src/main.cx", main_cx);
+
+    const toml_path = try std.fmt.allocPrint(allocator, "{s}/corex.toml", .{ws_dir});
+    defer allocator.free(toml_path);
+    const toml_uri = try resolvePathToFileUri(allocator, io, toml_path);
+    defer allocator.free(toml_uri);
+    const ws_uri = toml_uri[0 .. toml_uri.len - "/corex.toml".len];
+
+    const main_path = try std.fmt.allocPrint(allocator, "{s}/src/main.cx", .{ws_dir});
+    defer allocator.free(main_path);
+    const main_uri = try resolvePathToFileUri(allocator, io, main_path);
+    defer allocator.free(main_uri);
+
+    var inbound: std.ArrayListUnmanaged(u8) = .empty;
+    defer inbound.deinit(allocator);
+
+    const init_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{" ++
+            "\"rootUri\":\"{s}\",\"capabilities\":{{\"general\":{{\"positionEncodings\":[\"utf-8\"]}}}}}}}}",
+        .{ws_uri},
+    );
+    defer allocator.free(init_req);
+    try appendLspFrame(allocator, &inbound, init_req);
+    try appendDidOpenFrame(allocator, &inbound, main_uri, 1, main_cx);
+
+    // `#2` `hover` on `@expect` (`line 0, character 2`) and `#3` `hover` on `unused-binding` (`line 0, character 10`):
+    const hover_expect_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/hover\",\"params\":{{" ++
+            "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":0,\"character\":2}}}}}}",
+        .{main_uri},
+    );
+    defer allocator.free(hover_expect_req);
+    try appendLspFrame(allocator, &inbound, hover_expect_req);
+
+    const hover_slug_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/hover\",\"params\":{{" ++
+            "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":0,\"character\":10}}}}}}",
+        .{main_uri},
+    );
+    defer allocator.free(hover_slug_req);
+    try appendLspFrame(allocator, &inbound, hover_slug_req);
+
+    // `#4` `codeLens` on `src/main.cx`, `#5` `inlayHint` (disabled via `[lsp]`), `#6` `completion` capped at `20`:
+    const lens_req_1 = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/codeLens\",\"params\":{{" ++
+            "\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+        .{main_uri},
+    );
+    defer allocator.free(lens_req_1);
+    try appendLspFrame(allocator, &inbound, lens_req_1);
+
+    const inlay_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/inlayHint\",\"params\":{{" ++
+            "\"textDocument\":{{\"uri\":\"{s}\"}}," ++
+            "\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":12,\"character\":0}}}}}}}}",
+        .{main_uri},
+    );
+    defer allocator.free(inlay_req);
+    try appendLspFrame(allocator, &inbound, inlay_req);
+
+    const comp_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"textDocument/completion\",\"params\":{{" ++
+            "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":7,\"character\":4}}}}}}",
+        .{main_uri},
+    );
+    defer allocator.free(comp_req);
+    try appendLspFrame(allocator, &inbound, comp_req);
+
+    // `#7` `codeAction` on `live_unused` (`line 6`) offering secondary `Suppress` Quick Fix (`isPreferred: false`):
+    const ca_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/codeAction\",\"params\":{{" ++
+            "\"textDocument\":{{\"uri\":\"{s}\"}}," ++
+            "\"range\":{{\"start\":{{\"line\":6,\"character\":0}},\"end\":{{\"line\":6,\"character\":25}}}}," ++
+            "\"context\":{{\"diagnostics\":[]}}}}}}",
+        .{main_uri},
+    );
+    defer allocator.free(ca_req);
+    try appendLspFrame(allocator, &inbound, ca_req);
+
+    // Live `didOpen` on `corex.toml` with invalid `[fmt]` key (`E0018`), then valid `[lint].disable` + `code-lens = false`:
+    const invalid_toml = toml_v1 ++ "\n[fmt]\nindent-width = 2\n";
+    try appendDidOpenFrame(allocator, &inbound, toml_uri, 1, invalid_toml);
+    // Force push flush via `codeLens` `#8`:
+    const lens_req_2 = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"textDocument/codeLens\",\"params\":{{" ++
+            "\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+        .{main_uri},
+    );
+    defer allocator.free(lens_req_2);
+    try appendLspFrame(allocator, &inbound, lens_req_2);
+
+    const valid_reload_toml =
+        "[package]\n" ++
+        "name = \"lsp-dr25\"\n" ++
+        "version = \"0.1.0\"\n" ++
+        "edition = \"2026\"\n\n" ++
+        "[lint]\n" ++
+        "disable = [\"unused-binding\"]\n\n" ++
+        "[lsp]\n" ++
+        "code-lens-test-bench = false\n";
+    const toml_change = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{{" ++
+            "\"textDocument\":{{\"uri\":\"{s}\",\"version\":2}}," ++
+            "\"contentChanges\":[{{\"text\":",
+        .{toml_uri},
+    );
+    defer allocator.free(toml_change);
+    var change_json: std.Io.Writer.Allocating = .init(allocator);
+    defer change_json.deinit();
+    try change_json.writer.writeAll(toml_change);
+    try std.json.Stringify.encodeJsonString(valid_reload_toml, .{}, &change_json.writer);
+    try change_json.writer.writeAll("}]}}");
+    try appendLspFrame(allocator, &inbound, change_json.written());
+
+    const lens_req_3 = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"textDocument/codeLens\",\"params\":{{" ++
+            "\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+        .{main_uri},
+    );
+    defer allocator.free(lens_req_3);
+    try appendLspFrame(allocator, &inbound, lens_req_3);
+
+    try appendLspFrame(allocator, &inbound, "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"shutdown\",\"params\":null}");
+    try appendLspFrame(allocator, &inbound, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}");
+
+    var outcome = try executeLspTranscript(allocator, io, inbound.items, null, .{});
+    defer outcome.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), outcome.exit_code);
+
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":1").?, "\"codeLensProvider\"") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":2").?, "@expect(rule") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":3").?, "W0402/unused-binding") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":4").?, "▸ Run test") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":5").?, "\"result\":[]") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":6").?, "\"isIncomplete\":true") != null,
+    );
+    const ca_frame = findFrameByIdFragment(outcome.frames, "\"id\":7").?;
+    try std.testing.expect(std.mem.indexOf(u8, ca_frame, "Suppress `unused-binding` with `@expect`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ca_frame, "\"isPreferred\":false") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":9").?, "\"result\":[]") != null,
+    );
+
+    // Verify `E0018` was published on `corex.toml` v1 and cleared (`"diagnostics":[]`) after fixing `corex.toml` v2:
+    var saw_toml_e0018 = false;
+    var saw_main_cleared = false;
+    for (outcome.frames) |frame| {
+        if (std.mem.indexOf(u8, frame, toml_uri) != null and std.mem.indexOf(u8, frame, "E0018") != null) {
+            saw_toml_e0018 = true;
+        }
+        if (std.mem.indexOf(u8, frame, main_uri) != null and
+            std.mem.indexOf(u8, frame, "\"diagnostics\":[]") != null)
+        {
+            saw_main_cleared = true;
+        }
+    }
+    try std.testing.expect(saw_toml_e0018);
+    try std.testing.expect(saw_main_cleared);
+}
+
+test "test_lsp_dr25_suppress_quickfix_roundtrip_single_and_multiline_zero_errors" {
+    const LocalHelper = struct {
+        fn lineCharToByteOffset(src: []const u8, line_target: usize, char_target: usize) usize {
+            var cur_line: usize = 0;
+            var idx: usize = 0;
+            while (idx < src.len and cur_line < line_target) : (idx += 1) {
+                if (src[idx] == '\n') cur_line += 1;
+            }
+            return @min(src.len, idx + char_target);
+        }
+
+        fn extractSuppressTextEdit(
+            alloc: std.mem.Allocator,
+            frame_json: []const u8,
+            uri: []const u8,
+        ) !struct { start_line: usize, start_char: usize, end_line: usize, end_char: usize, new_text: []u8 } {
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, frame_json, .{});
+            defer parsed.deinit();
+            const actions = parsed.value.object.get("result").?.array.items;
+            for (actions) |act_val| {
+                const act_obj = act_val.object;
+                const title_str = act_obj.get("title").?.string;
+                if (!std.mem.startsWith(u8, title_str, "Suppress `")) continue;
+                const edit_obj = act_obj.get("edit").?.object.get("changes").?.object.get(uri).?.array.items[0].object;
+                const range_obj = edit_obj.get("range").?.object;
+                const start_obj = range_obj.get("start").?.object;
+                const end_obj = range_obj.get("end").?.object;
+                return .{
+                    .start_line = @intCast(start_obj.get("line").?.integer),
+                    .start_char = @intCast(start_obj.get("character").?.integer),
+                    .end_line = @intCast(end_obj.get("line").?.integer),
+                    .end_char = @intCast(end_obj.get("character").?.integer),
+                    .new_text = try alloc.dupe(u8, edit_obj.get("newText").?.string),
+                };
+            }
+            return error.MissingSuppressAction;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const ws_dir = try createTempWorkspaceDir(allocator, io, "dr25_lsp_sup_rt");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, ws_dir) catch {};
+        allocator.free(ws_dir);
+    }
+
+    const toml_src =
+        "[package]\n" ++
+        "name = \"lsp-sup-rt\"\n" ++
+        "version = \"0.1.0\"\n" ++
+        "edition = \"2026\"\n";
+    try writeWorkspaceFile(allocator, io, ws_dir, "corex.toml", toml_src);
+
+    // Line 1 has single-line `W0402`; line 4 (interior of multiline `r"..."`) has raw U+202E (`W0102`):
+    const main_cx =
+        "pub fn demo_suppress() -> str {\n" ++
+        "    let unused_single = 42;\n" ++
+        "    let raw_multi = r\"\n" ++
+        "        clean header\n" ++
+        "        bidir \u{202E} payload\n" ++
+        "        \";\n" ++
+        "    raw_multi\n" ++
+        "}\n";
+    try writeWorkspaceFile(allocator, io, ws_dir, "src/main.cx", main_cx);
+
+    const toml_path = try std.fmt.allocPrint(allocator, "{s}/corex.toml", .{ws_dir});
+    defer allocator.free(toml_path);
+    const toml_uri = try resolvePathToFileUri(allocator, io, toml_path);
+    defer allocator.free(toml_uri);
+    const ws_uri = toml_uri[0 .. toml_uri.len - "/corex.toml".len];
+
+    const main_path = try std.fmt.allocPrint(allocator, "{s}/src/main.cx", .{ws_dir});
+    defer allocator.free(main_path);
+    const main_uri = try resolvePathToFileUri(allocator, io, main_path);
+    defer allocator.free(main_uri);
+
+    // [1] Request `textDocument/codeAction` for both single-line (`line 1`) and multiline-interior (`line 4`):
+    var inbound_1: std.ArrayListUnmanaged(u8) = .empty;
+    defer inbound_1.deinit(allocator);
+    const init_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{" ++
+            "\"rootUri\":\"{s}\",\"capabilities\":{{\"general\":{{\"positionEncodings\":[\"utf-8\"]}}}}}}}}",
+        .{ws_uri},
+    );
+    defer allocator.free(init_req);
+    try appendLspFrame(allocator, &inbound_1, init_req);
+    try appendDidOpenFrame(allocator, &inbound_1, main_uri, 1, main_cx);
+
+    const ca_single_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/codeAction\",\"params\":{{" ++
+            "\"textDocument\":{{\"uri\":\"{s}\"}}," ++
+            "\"range\":{{\"start\":{{\"line\":1,\"character\":8}},\"end\":{{\"line\":1,\"character\":21}}}}," ++
+            "\"context\":{{\"diagnostics\":[]}}}}}}",
+        .{main_uri},
+    );
+    defer allocator.free(ca_single_req);
+    try appendLspFrame(allocator, &inbound_1, ca_single_req);
+
+    const ca_multi_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/codeAction\",\"params\":{{" ++
+            "\"textDocument\":{{\"uri\":\"{s}\"}}," ++
+            "\"range\":{{\"start\":{{\"line\":4,\"character\":14}},\"end\":{{\"line\":4,\"character\":17}}}}," ++
+            "\"context\":{{\"diagnostics\":[]}}}}}}",
+        .{main_uri},
+    );
+    defer allocator.free(ca_multi_req);
+    try appendLspFrame(allocator, &inbound_1, ca_multi_req);
+    try appendLspFrame(allocator, &inbound_1, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"shutdown\",\"params\":null}");
+    try appendLspFrame(allocator, &inbound_1, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}");
+
+    var out_1 = try executeLspTranscript(allocator, io, inbound_1.items, null, .{});
+    defer out_1.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), out_1.exit_code);
+
+    const single_edit = try LocalHelper.extractSuppressTextEdit(
+        allocator,
+        findFrameByIdFragment(out_1.frames, "\"id\":2").?,
+        main_uri,
+    );
+    defer allocator.free(single_edit.new_text);
+    const multi_edit = try LocalHelper.extractSuppressTextEdit(
+        allocator,
+        findFrameByIdFragment(out_1.frames, "\"id\":3").?,
+        main_uri,
+    );
+    defer allocator.free(multi_edit.new_text);
+
+    try std.testing.expectEqualStrings(
+        " // corex check: expect(unused-binding) -- explain suppression",
+        single_edit.new_text,
+    );
+    try std.testing.expectEqualStrings(
+        "    @expect(unicode-trojan-control, reason: \"explain suppression\")\n",
+        multi_edit.new_text,
+    );
+
+    // Apply `multi_edit` (line 2) then `single_edit` (line 1) in reverse byte order:
+    const m_start = LocalHelper.lineCharToByteOffset(main_cx, multi_edit.start_line, multi_edit.start_char);
+    const m_end = LocalHelper.lineCharToByteOffset(main_cx, multi_edit.end_line, multi_edit.end_char);
+    const s_start = LocalHelper.lineCharToByteOffset(main_cx, single_edit.start_line, single_edit.start_char);
+    const s_end = LocalHelper.lineCharToByteOffset(main_cx, single_edit.end_line, single_edit.end_char);
+    try std.testing.expect(s_end <= m_start);
+
+    var patched_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer patched_buf.deinit(allocator);
+    try patched_buf.appendSlice(allocator, main_cx[0..s_start]);
+    try patched_buf.appendSlice(allocator, single_edit.new_text);
+    try patched_buf.appendSlice(allocator, main_cx[s_end..m_start]);
+    try patched_buf.appendSlice(allocator, multi_edit.new_text);
+    try patched_buf.appendSlice(allocator, main_cx[m_end..]);
+
+    // [2] Round-trip patched document via `didOpen` + `codeLens` flush and verify `0` `E0240` errors & `0` warnings:
+    var inbound_2: std.ArrayListUnmanaged(u8) = .empty;
+    defer inbound_2.deinit(allocator);
+    try appendLspFrame(allocator, &inbound_2, init_req);
+    try appendDidOpenFrame(allocator, &inbound_2, main_uri, 1, patched_buf.items);
+    const lens_flush = try std.fmt.allocPrint(
+        allocator,
+        "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/codeLens\",\"params\":{{" ++
+            "\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+        .{main_uri},
+    );
+    defer allocator.free(lens_flush);
+    try appendLspFrame(allocator, &inbound_2, lens_flush);
+    try appendLspFrame(allocator, &inbound_2, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"shutdown\",\"params\":null}");
+    try appendLspFrame(allocator, &inbound_2, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}");
+
+    var out_2 = try executeLspTranscript(allocator, io, inbound_2.items, null, .{});
+    defer out_2.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), out_2.exit_code);
+
+    var saw_empty_diags = false;
+    for (out_2.frames) |frame| {
+        if (std.mem.indexOf(u8, frame, main_uri) != null and
+            std.mem.indexOf(u8, frame, "publishDiagnostics") != null)
+        {
+            try std.testing.expect(std.mem.indexOf(u8, frame, "E0240") == null);
+            try std.testing.expect(std.mem.indexOf(u8, frame, "\"diagnostics\":[]") != null);
+            saw_empty_diags = true;
+        }
+    }
+    try std.testing.expect(saw_empty_diags);
+}
+
+test "test_lsp_dr25_end_to_end_tags_is_preferred_stdlib_nav_rename_and_sub_2ms_median" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const PosHelper = struct {
+        const LineChar = struct {
+            line: u32,
+            character: u32,
+        };
+
+        /// Converts a UTF-8 byte offset inside `text` to a zero-based `(line, character)` pair.
+        fn byteOffsetToLineChar(text: []const u8, target_byte: usize) LineChar {
+            var line_idx: u32 = 0;
+            var col_idx: u32 = 0;
+            var idx: usize = 0;
+            while (idx < target_byte and idx < text.len) : (idx += 1) {
+                if (text[idx] == '\n') {
+                    line_idx += 1;
+                    col_idx = 0;
+                } else if (text[idx] != '\r') {
+                    col_idx += 1;
+                }
+            }
+            return .{ .line = line_idx, .character = col_idx };
+        }
+    };
+
+    // [1] & [2] `"code":"W0xxx/slug"`, `Severity.Warning = 2` (never `1`), `DiagnosticTag.Unnecessary` (`1`) /
+    // `Deprecated` (`2`), and `codeAction` `isPreferred: true` (`MachineApplicable`) vs `false` (`MaybeIncorrect`):
+    {
+        const ws_dir = try createTempWorkspaceDir(allocator, io, "dr25_tags_fixes");
+        defer {
+            std.Io.Dir.cwd().deleteTree(io, ws_dir) catch {};
+            allocator.free(ws_dir);
+        }
+
+        try writeWorkspaceFile(
+            allocator,
+            io,
+            ws_dir,
+            "corex.toml",
+            "[package]\nname = \"lsp-dr25-tags\"\nversion = \"0.1.0\"\nedition = \"2026\"\n",
+        );
+
+        const helper_cx = "pub fn active_op(val_in: u32) -> u32 {\n    val_in + 1_u32\n}\n" ++
+            "pub fn unused_op() -> u32 {\n    7_u32\n}\n";
+        try writeWorkspaceFile(allocator, io, ws_dir, "src/helper.cx", helper_cx);
+
+        const main_cx =
+            "mod helper;\n" ++
+            "use helper.{active_op, unused_op};\n" ++
+            "@deprecated(since: \"0.2.0\", reason: \"use active_op\", upgrade: \"active_op($0)\")\n" ++
+            "pub fn legacy_op(val_in: u32) -> u32 {\n" ++
+            "    active_op(val_in)\n" ++
+            "}\n" ++
+            "@expect(single-char-ident, reason: \"stale selector probe\")\n" ++
+            "pub fn verify_lint_surface(seed_val: u32) -> str {\n" ++
+            "    let unused_slot = 0xdead_beef_u32;\n" ++
+            "    let _call_res = legacy_op(seed_val);\n" ++
+            "    \"\u{0421}ache\"\n" ++
+            "}\n";
+        try writeWorkspaceFile(allocator, io, ws_dir, "src/main.cx", main_cx);
+
+        const toml_path = try std.fmt.allocPrint(allocator, "{s}/corex.toml", .{ws_dir});
+        defer allocator.free(toml_path);
+        const toml_uri = try resolvePathToFileUri(allocator, io, toml_path);
+        defer allocator.free(toml_uri);
+        const ws_uri = toml_uri[0 .. toml_uri.len - "/corex.toml".len];
+
+        const main_path = try std.fmt.allocPrint(allocator, "{s}/src/main.cx", .{ws_dir});
+        defer allocator.free(main_path);
+        const main_uri = try resolvePathToFileUri(allocator, io, main_path);
+        defer allocator.free(main_uri);
+
+        var inbound: std.ArrayListUnmanaged(u8) = .empty;
+        defer inbound.deinit(allocator);
+
+        const init_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{" ++
+                "\"rootUri\":\"{s}\",\"capabilities\":{{\"general\":{{\"positionEncodings\":[\"utf-8\"]}}," ++
+                "\"textDocument\":{{\"diagnostic\":{{}}}}}}}}}}",
+            .{ws_uri},
+        );
+        defer allocator.free(init_req);
+        try appendLspFrame(allocator, &inbound, init_req);
+        try appendDidOpenFrame(allocator, &inbound, main_uri, 1, main_cx);
+
+        const pull_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/diagnostic\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+            .{main_uri},
+        );
+        defer allocator.free(pull_req);
+        try appendLspFrame(allocator, &inbound, pull_req);
+
+        const action_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/codeAction\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}}," ++
+                "\"range\":{{\"start\":{{\"line\":0,\"character\":0}},\"end\":{{\"line\":12,\"character\":0}}}}," ++
+                "\"context\":{{\"diagnostics\":[]}}}}}}",
+            .{main_uri},
+        );
+        defer allocator.free(action_req);
+        try appendLspFrame(allocator, &inbound, action_req);
+        try appendLspFrame(allocator, &inbound, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"shutdown\",\"params\":null}");
+        try appendLspFrame(allocator, &inbound, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}");
+
+        var outcome = try executeLspTranscript(allocator, io, inbound.items, null, .{});
+        defer outcome.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0), outcome.exit_code);
+
+        const diag_frame = findFrameByIdFragment(outcome.frames, "\"id\":2").?;
+        try std.testing.expect(std.mem.indexOf(u8, diag_frame, "\"severity\":1") == null);
+        try std.testing.expect(std.mem.indexOf(u8, diag_frame, "\"severity\":2,\"code\":\"W0002/unused-suppression\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, diag_frame, "\"severity\":2,\"code\":\"W0404/unused-import\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, diag_frame, "\"severity\":2,\"code\":\"W0402/unused-binding\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, diag_frame, "\"severity\":2,\"code\":\"W0123/non-upper-hex-literal\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, diag_frame, "\"severity\":2,\"code\":\"W0403/deprecated-use\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, diag_frame, "\"severity\":2,\"code\":\"W0104/ambiguous-unicode-text\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, diag_frame, "\"tags\":[1]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, diag_frame, "\"tags\":[2]") != null);
+
+        const act_frame = findFrameByIdFragment(outcome.frames, "\"id\":3").?;
+        try std.testing.expect(
+            std.mem.indexOf(u8, act_frame, "\"kind\":\"quickfix\",\"isPreferred\":true,\"diagnostics\":[{") != null,
+        );
+        try std.testing.expect(std.mem.indexOf(u8, act_frame, "0xDEAD_BEEF") != null);
+        try std.testing.expect(std.mem.indexOf(u8, act_frame, "active_op(seed_val)") != null);
+        try std.testing.expect(
+            std.mem.indexOf(u8, act_frame, "(unsafe fix)\",\"kind\":\"quickfix\",\"isPreferred\":false") != null,
+        );
+        try std.testing.expect(std.mem.indexOf(u8, act_frame, "_unused_slot") != null);
+    }
+
+    // [3] & [4] Live `stdlib/cx/str.cx` (`is_internal_core = true`) navigation (`hover`, `definition`, `references`,
+    // `prepareRename` + `rename` `F2` on `is_valid_utf8` and `@expect(...)`) + ranged `didChange` break/restore:
+    {
+        const root_uri = try resolvePathToFileUri(allocator, io, "core/root.cx");
+        defer allocator.free(root_uri);
+        const repo_ws_uri = root_uri[0 .. root_uri.len - "/core/root.cx".len];
+
+        const str_uri = try resolvePathToFileUri(allocator, io, "stdlib/cx/str.cx");
+        defer allocator.free(str_uri);
+        const str_bytes = try std.Io.Dir.cwd().readFileAlloc(io, "stdlib/cx/str.cx", allocator, .limited(4 * 1024 * 1024));
+        defer allocator.free(str_bytes);
+
+        const expect_off = std.mem.indexOf(u8, str_bytes, "unused-pkg-visibility").?;
+        const decl_marker = "pub fn is_valid_utf8(";
+        const decl_off = std.mem.indexOf(u8, str_bytes, decl_marker).? + "pub fn ".len;
+        const call_marker = "if not is_valid_utf8(written)";
+        const call_off = std.mem.indexOf(u8, str_bytes, call_marker).? + "if not ".len;
+        const break_stmt = "    (ActiveStrOps {}).is_valid_utf8_fast(bytes)";
+        const break_off = std.mem.indexOfPos(u8, str_bytes, decl_off, break_stmt).?;
+
+        const expect_pos = PosHelper.byteOffsetToLineChar(str_bytes, expect_off);
+        const decl_pos = PosHelper.byteOffsetToLineChar(str_bytes, decl_off);
+        const call_pos = PosHelper.byteOffsetToLineChar(str_bytes, call_off);
+        const break_start = PosHelper.byteOffsetToLineChar(str_bytes, break_off);
+        const break_end = PosHelper.byteOffsetToLineChar(str_bytes, break_off + break_stmt.len);
+
+        var inbound: std.ArrayListUnmanaged(u8) = .empty;
+        defer inbound.deinit(allocator);
+
+        const init_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{" ++
+                "\"rootUri\":\"{s}\",\"capabilities\":{{\"general\":{{\"positionEncodings\":[\"utf-8\"]}}," ++
+                "\"textDocument\":{{\"diagnostic\":{{}}}}}}}}}}",
+            .{repo_ws_uri},
+        );
+        defer allocator.free(init_req);
+        try appendLspFrame(allocator, &inbound, init_req);
+        try appendDidOpenFrame(allocator, &inbound, str_uri, 1, str_bytes);
+
+        const pull_clean_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/diagnostic\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+            .{str_uri},
+        );
+        defer allocator.free(pull_clean_req);
+        try appendLspFrame(allocator, &inbound, pull_clean_req);
+
+        const hover_expect_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/hover\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}}}}}}",
+            .{ str_uri, expect_pos.line, expect_pos.character },
+        );
+        defer allocator.free(hover_expect_req);
+        try appendLspFrame(allocator, &inbound, hover_expect_req);
+
+        const hover_fn_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/hover\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}}}}}}",
+            .{ str_uri, call_pos.line, call_pos.character + 3 },
+        );
+        defer allocator.free(hover_fn_req);
+        try appendLspFrame(allocator, &inbound, hover_fn_req);
+
+        const def_fn_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/definition\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}}}}}}",
+            .{ str_uri, call_pos.line, call_pos.character + 3 },
+        );
+        defer allocator.free(def_fn_req);
+        try appendLspFrame(allocator, &inbound, def_fn_req);
+
+        const refs_fn_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"textDocument/references\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}}," ++
+                "\"context\":{{\"includeDeclaration\":true}}}}}}",
+            .{ str_uri, decl_pos.line, decl_pos.character + 3 },
+        );
+        defer allocator.free(refs_fn_req);
+        try appendLspFrame(allocator, &inbound, refs_fn_req);
+
+        const prep_ren_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/prepareRename\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}}}}}}",
+            .{ str_uri, decl_pos.line, decl_pos.character + 3 },
+        );
+        defer allocator.free(prep_ren_req);
+        try appendLspFrame(allocator, &inbound, prep_ren_req);
+
+        const ren_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"textDocument/rename\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}}," ++
+                "\"newName\":\"is_utf8_well_formed\"}}}}",
+            .{ str_uri, decl_pos.line, decl_pos.character + 3 },
+        );
+        defer allocator.free(ren_req);
+        try appendLspFrame(allocator, &inbound, ren_req);
+
+        const sem_full_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"textDocument/semanticTokens/full\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+            .{str_uri},
+        );
+        defer allocator.free(sem_full_req);
+        try appendLspFrame(allocator, &inbound, sem_full_req);
+
+        // Ranged incremental `didChange` (`v2`) breaking `is_valid_utf8` body, probing LSP under broken syntax/types,
+        // then ranged `didChange` (`v3`) restoring exact clean text:
+        const broken_stmt = "    let broken_probe: bool = 123_u32 + ;";
+        const did_break_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\",\"version\":2}}," ++
+                "\"contentChanges\":[{{\"range\":{{\"start\":{{\"line\":{d},\"character\":{d}}}," ++
+                "\"end\":{{\"line\":{d},\"character\":{d}}}}},\"text\":\"{s}\"}}]}}}}",
+            .{ str_uri, break_start.line, break_start.character, break_end.line, break_end.character, broken_stmt },
+        );
+        defer allocator.free(did_break_req);
+        try appendLspFrame(allocator, &inbound, did_break_req);
+
+        const broken_hover_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"textDocument/hover\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}}}}}}",
+            .{ str_uri, call_pos.line, call_pos.character + 3 },
+        );
+        defer allocator.free(broken_hover_req);
+        try appendLspFrame(allocator, &inbound, broken_hover_req);
+
+        const broken_sem_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"textDocument/semanticTokens/full\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+            .{str_uri},
+        );
+        defer allocator.free(broken_sem_req);
+        try appendLspFrame(allocator, &inbound, broken_sem_req);
+
+        const did_restore_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\",\"version\":3}}," ++
+                "\"contentChanges\":[{{\"range\":{{\"start\":{{\"line\":{d},\"character\":0}}," ++
+                "\"end\":{{\"line\":{d},\"character\":{d}}}}},\"text\":\"{s}\"}}]}}}}",
+            .{ str_uri, break_start.line, break_start.line, broken_stmt.len, break_stmt },
+        );
+        defer allocator.free(did_restore_req);
+        try appendLspFrame(allocator, &inbound, did_restore_req);
+
+        const pull_restored_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"textDocument/diagnostic\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+            .{str_uri},
+        );
+        defer allocator.free(pull_restored_req);
+        try appendLspFrame(allocator, &inbound, pull_restored_req);
+
+        try appendLspFrame(allocator, &inbound, "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"shutdown\",\"params\":null}");
+        try appendLspFrame(allocator, &inbound, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}");
+
+        var outcome = try executeLspTranscript(allocator, io, inbound.items, null, .{ .is_internal_core = true });
+        defer outcome.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0), outcome.exit_code);
+
+        // Zero `-32603` internal errors across the entire broken + restored session:
+        for (outcome.frames) |frame| {
+            try std.testing.expect(std.mem.indexOf(u8, frame, "-32603") == null);
+        }
+
+        const clean_pull = findFrameByIdFragment(outcome.frames, "\"id\":2").?;
+        try std.testing.expect(std.mem.indexOf(u8, clean_pull, "\"items\":[]") != null);
+
+        const hover_expect_resp = findFrameByIdFragment(outcome.frames, "\"id\":3").?;
+        try std.testing.expect(std.mem.indexOf(u8, hover_expect_resp, "\"result\":") != null);
+
+        const hover_fn_resp = findFrameByIdFragment(outcome.frames, "\"id\":4").?;
+        try std.testing.expect(std.mem.indexOf(u8, hover_fn_resp, "is_valid_utf8") != null);
+        try std.testing.expect(std.mem.indexOf(u8, hover_fn_resp, "UTF-8") != null);
+
+        const def_line_str = try std.fmt.allocPrint(allocator, "\"line\":{d}", .{decl_pos.line});
+        defer allocator.free(def_line_str);
+        const call_line_str = try std.fmt.allocPrint(allocator, "\"line\":{d}", .{call_pos.line});
+        defer allocator.free(call_line_str);
+
+        const def_fn_resp = findFrameByIdFragment(outcome.frames, "\"id\":5").?;
+        try std.testing.expect(std.mem.indexOf(u8, def_fn_resp, def_line_str) != null);
+
+        const refs_fn_resp = findFrameByIdFragment(outcome.frames, "\"id\":6").?;
+        try std.testing.expect(std.mem.indexOf(u8, refs_fn_resp, def_line_str) != null);
+        try std.testing.expect(std.mem.indexOf(u8, refs_fn_resp, call_line_str) != null);
+
+        const prep_ren_resp = findFrameByIdFragment(outcome.frames, "\"id\":7").?;
+        try std.testing.expect(std.mem.indexOf(u8, prep_ren_resp, "\"placeholder\":\"is_valid_utf8\"") != null);
+
+        const ren_resp = findFrameByIdFragment(outcome.frames, "\"id\":8").?;
+        try std.testing.expect(std.mem.indexOf(u8, ren_resp, "\"newText\":\"is_utf8_well_formed\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, ren_resp, def_line_str) != null);
+        try std.testing.expect(std.mem.indexOf(u8, ren_resp, call_line_str) != null);
+
+        const restored_pull = findFrameByIdFragment(outcome.frames, "\"id\":12").?;
+        try std.testing.expect(std.mem.indexOf(u8, restored_pull, "\"items\":[]") != null);
+    }
+
+    // [5] `< 2 ms` (`< 2,000,000 ns` median over 31 iterations) incremental `[lint].disable` & single-keystroke
+    // `setInputWithEdit` + `projectFileDiagnostics` re-projection latency (using `smp_allocator` to avoid
+    // global `std.testing.allocator` debug stack-trace mutex contention across parallel test threads):
+    {
+        var db = try corex.CompilerDb.init(std.heap.smp_allocator);
+        defer db.deinit();
+
+        const fid = corex.FileId.fromInt(990);
+        try db.setFilePackageId(fid, .root);
+        try db.setFilePath(fid, "D:/ws/src/hot_loop.cx");
+        const clean_src =
+            "pub fn helper_add(lhs: u32, rhs: u32) -> u32 {\n" ++
+            "    lhs + rhs\n" ++
+            "}\n\n" ++
+            "pub fn hot_mask(word_in: u32) -> u32 {\n" ++
+            "    let mask_val = 0xDEAD_BEEF_u32;\n" ++
+            "    helper_add(word_in, mask_val)\n" ++
+            "}\n";
+        const dirty_src =
+            "pub fn helper_add(lhs: u32, rhs: u32) -> u32 {\n" ++
+            "    lhs + rhs\n" ++
+            "}\n\n" ++
+            "pub fn hot_mask(word_in: u32) -> u32 {\n" ++
+            "    let mask_val = 0xDEAD_BEEf_u32;\n" ++
+            "    helper_add(word_in, mask_val)\n" ++
+            "}\n";
+        const edit_off: u32 = @intCast(std.mem.indexOf(u8, clean_src, "F_u32").?);
+
+        _ = try db.setInput(fid, dirty_src, .low);
+        try db.setPackageLintSemanticSettings(.root, .{}, null);
+        try db.setPackageLintFilterConfig(.root, "D:/ws", .{}, null);
+        const seed_sink = try db.projectFileDiagnostics(fid);
+        try std.testing.expectEqual(@as(usize, 1), seed_sink.countDiagnostics());
+
+        const disabled_mask = corex.RuleId.non_upper_hex_literal.bit();
+
+        // Warmup (`4` rounds) + `31` timed rounds for `corex.toml` `[lint].disable` re-projection:
+        const tc_stage_idx = @backingInt(corex.query_db.QueryStage.typecheck_body);
+        const typecheck_before = db.telemetry.stage_executions[tc_stage_idx];
+        var toml_samples: [31]u64 = undefined;
+        var round_i: usize = 0;
+        while (round_i < 4 + toml_samples.len) : (round_i += 1) {
+            const is_disabled = (round_i % 2) == 0;
+            const t_start = std.Io.Clock.Timestamp.now(io, .awake);
+            try db.setPackageLintFilterConfig(
+                .root,
+                "D:/ws",
+                if (is_disabled) .{ .disable_mask = disabled_mask } else .{},
+                null,
+            );
+            const sink = try db.projectFileDiagnostics(fid);
+            const elapsed_ns: u64 = @intCast(@max(0, t_start.untilNow(io).raw.nanoseconds));
+            try std.testing.expectEqual(@as(usize, if (is_disabled) 0 else 1), sink.countDiagnostics());
+            if (round_i >= 4) toml_samples[round_i - 4] = elapsed_ns;
+        }
+        // Early-Cutoff firewall invariant: `0` upstream `typecheck_body` executions across all 35 toggles!
+        try std.testing.expectEqual(typecheck_before, db.telemetry.stage_executions[tc_stage_idx]);
+        std.mem.sort(u64, &toml_samples, {}, std.sort.asc(u64));
+        const max_toml_median_ns: u64 = if (builtin.mode == .debug) 10_000_000 else 2_000_000;
+        try std.testing.expect(toml_samples[toml_samples.len / 2] < max_toml_median_ns);
+
+        // Reset filter to all-enabled, then time `31` single-keystroke `setInputWithEdit` + `projectFileDiagnostics`:
+        try db.setPackageLintFilterConfig(.root, "D:/ws", .{}, null);
+        _ = try db.setInput(fid, clean_src, .low);
+        _ = try db.projectFileDiagnostics(fid);
+
+        var edit_samples: [31]u64 = undefined;
+        var key_i: usize = 0;
+        while (key_i < 4 + edit_samples.len) : (key_i += 1) {
+            const is_lower = (key_i % 2) == 0;
+            const next_src = if (is_lower) dirty_src else clean_src;
+            const t_start = std.Io.Clock.Timestamp.now(io, .awake);
+            _ = try db.setInputWithEdit(
+                fid,
+                next_src,
+                .low,
+                .{ .start_byte = edit_off, .old_end_byte = edit_off + 1, .new_end_byte = edit_off + 1 },
+            );
+            const sink = try db.projectFileDiagnostics(fid);
+            const elapsed_ns: u64 = @intCast(@max(0, t_start.untilNow(io).raw.nanoseconds));
+            try std.testing.expectEqual(@as(usize, if (is_lower) 1 else 0), sink.countDiagnostics());
+            if (key_i >= 4) edit_samples[key_i - 4] = elapsed_ns;
+        }
+        std.mem.sort(u64, &edit_samples, {}, std.sort.asc(u64));
+        const max_edit_median_ns: u64 = if (builtin.mode == .debug) 15_000_000 else 2_000_000;
+        try std.testing.expect(edit_samples[edit_samples.len / 2] < max_edit_median_ns);
+    }
 }

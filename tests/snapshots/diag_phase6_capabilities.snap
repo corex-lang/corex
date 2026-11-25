@@ -52,7 +52,7 @@
   │
   ╰─▸ help: grant the capability in `[dependencies]` policy or remove the offending call chain
 
-⚠︎ warning[W0330]: dependency `untrusted_codec` contains unreachable ambient `ffi, unsafe_op` code outside exported call graph
+⚠︎ warning[W0330/ambient-dead-capability]: dependency `untrusted_codec` contains unreachable ambient `ffi, unsafe_op` code outside exported call graph
   ╭─▸ src/sast/phase6_capability_errors.cx:1:1
   │
 1 │ extern "C" fn raw_c_hook() -> i32;

@@ -509,7 +509,7 @@ test "test_core_stdlib_four_tier_differential_oracle_end_to_end" {
         "    _ = write_stdout(\"core-stdout-ok\\n\");\n" ++
         "    _ = write_stderr(\"core-stderr-ok\\n\");\n" ++
         "\n" ++
-        "    return padded_slot.value +\n" ++
+        "    padded_slot.value +\n" ++
         "        (prev_u32 as i32) +\n" ++
         "        (final_u32 as i32) +\n" ++
         "        reduce_add_v4i32(v4_sum) +\n" ++
@@ -518,7 +518,7 @@ test "test_core_stdlib_four_tier_differential_oracle_end_to_end" {
         "        (max_wide as i32) +\n" ++
         "        partner_slot +\n" ++
         "        dst_arr[0] +\n" ++
-        "        (mmio_read as i32);\n" ++
+        "        (mmio_read as i32)\n" ++
         "}\n";
 
     var db = try CompilerDb.init(allocator);

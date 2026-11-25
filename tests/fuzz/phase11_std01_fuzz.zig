@@ -5,7 +5,7 @@
 //! - Container state-machine equivalence (`Vec`, `SmallVec`, `Deque`, `SlotMap`, `Map`, `Set`)
 //!   against flat reference models across randomized push/pop/insert/remove/rehash transitions,
 //! - Sorting equivalence (`cx.col.sort_unstable` `ipnsort` vs `cx.col.sort` `Powersort`),
-//! - `validate_utf8` Keiser–Lemire SIMD vs scalar `validate_utf8_detailed` oracle across mutated
+//! - `is_valid_utf8` Keiser–Lemire SIMD vs scalar `validate_utf8_detailed` oracle across mutated
 //!   boundary buffers (`0..128` bytes, split multi-byte tails, overlongs, surrogates),
 //! - `String` 24-byte SSO <-> heap <-> `Arena` growth, slicing, and mutation invariants,
 //! - `format_int` <-> `parse_int` across radices `2..=36` and `format_float` <-> `parse_float`
@@ -346,7 +346,7 @@ test "test_phase11_std01_fuzz_utf8_simd_vs_scalar_string_sso_and_numeric_roundtr
         "pub fn main() -> i32 {\n" ++
         "    var rng: u64 = 0x7F8A_9123_4455_6677_u64;\n" ++
         "\n" ++
-        "    // [1] `validate_utf8` Keiser–Lemire SIMD vs independent scalar oracle across 300 mutated buffers:\n" ++
+        "    // [1] `is_valid_utf8` Keiser–Lemire SIMD vs independent scalar oracle across 300 mutated buffers:\n" ++
         "    var raw_buf: [u8; 96] = [0_u8; 96];\n" ++
         "    var case_i: usize = 0_usize;\n" ++
         "    while case_i < 300_usize {\n" ++
@@ -382,7 +382,7 @@ test "test_phase11_std01_fuzz_utf8_simd_vs_scalar_string_sso_and_numeric_roundtr
         "            raw_buf[mut_idx] = raw_buf[mut_idx] ^ ((next_rng(&mut rng) & 0xFF_u64) as u8);\n" ++
         "        }\n" ++
         "        let slice_view: &[u8] = raw_buf[0..len];\n" ++
-        "        let sut_valid: bool = str.validate_utf8(slice_view);\n" ++
+        "        let sut_valid: bool = str.is_valid_utf8(slice_view);\n" ++
         "        let ref_valid: bool = scalar_utf8_oracle(slice_view);\n" ++
         "        if sut_valid != ref_valid { return 1; }\n" ++
         "        if (str.from_utf8(slice_view) is .Ok(_)) != ref_valid { return 2; }\n" ++

@@ -19,6 +19,7 @@ const symbol_resolver = @import("symbol_resolver.zig");
 const mir_sast = @import("mir_sast.zig");
 const mir_vm = @import("mir_vm.zig");
 const diagnostic = @import("diag/diagnostic.zig");
+const lint_filter = @import("lint_filter.zig");
 const pkg_conflict_seam = @import("pkg_conflict_seam.zig");
 
 const FileId = mem_foundation.FileId;
@@ -49,6 +50,16 @@ pub const TransactionalPatcher = diagnostic.TransactionalPatcher;
 pub const EffectCapabilityMask = mir_sast.EffectCapabilityMask;
 /// Re-exported `@cfg` evaluation environment (`symbol_resolver.CfgEnv`).
 pub const CfgEnv = symbol_resolver.CfgEnv;
+/// Re-exported dense `0..43` lint rule identifier (`diagnostic.RuleId`).
+pub const RuleId = diagnostic.RuleId;
+/// Re-exported 64-bit lint rule bitmask (`diagnostic.RuleMask64`).
+pub const RuleMask64 = diagnostic.RuleMask64;
+/// Re-exported semantic `[lint.settings]` configuration (`lint_filter.LintSettings`).
+pub const LintSettings = lint_filter.LintSettings;
+/// Re-exported 128-bit `[lint.settings]` content digest (`lint_filter.SemanticSettingsDigest`).
+pub const SemanticSettingsDigest = lint_filter.SemanticSettingsDigest;
+/// Re-exported CLI `--only` / `--disable` filter (`lint_filter.CliLintFilter`).
+pub const CliLintFilter = lint_filter.CliLintFilter;
 
 /// Compatibility-series tier used by Bounded-MVS (`DR-11` §3.1).
 pub const SeriesTier = enum(u8) {
@@ -675,6 +686,254 @@ pub const WorkspacePackageMeta = struct {
     publish: ?PublishPolicy = null,
 };
 
+/// Single non-backtracking 64-state bit-parallel Thompson NFA compiled from one brace-expanded glob branch.
+pub const SubNfa64 = struct {
+    /// Number of byte-consuming states (`0 .. num_states - 1`; accept state is `num_states <= 63`).
+    num_states: u8 = 0,
+    /// Bitmask `(1 << num_states) - 1` of byte-consuming state indices.
+    valid_state_mask: u64 = 0,
+    /// Precomputed epsilon closure of state `0`.
+    initial_mask: u64 = 0,
+    /// Single-bit mask `1 << num_states` representing the accepting state.
+    accept_bit: u64 = 0,
+    /// States `s` that stay in `s` on a matching byte (`*` and `**`).
+    self_loop_mask: u64 = 0,
+    /// States `s` that advance to `s + 1` on a matching byte (literals, `?`, `[…]`, `/` in `**/`).
+    advance_mask: u64 = 0,
+    /// Per-state 256-bit ASCII/UTF-8 byte class (`len == num_states`).
+    char_classes: []const [4]u64 = &.{},
+    /// Precomputed transitive epsilon closure for every state `0 .. num_states` (`len == num_states + 1`).
+    eps_closure: []const u64 = &.{},
+
+    /// Returns `true` if `state_idx` accepts `byte` in $O(1)$ time.
+    pub inline fn stateMatchesByte(self: SubNfa64, state_idx: u6, byte: u8) bool {
+        const word = self.char_classes[state_idx][byte >> 6];
+        return (word & (@as(u64, 1) << @intCast(byte & 63))) != 0;
+    }
+
+    /// Evaluates whether `rel_path` matches this NFA in $O(|\text{path}|)$ time with zero allocations.
+    pub fn matchesNormalizedPath(self: SubNfa64, rel_path: []const u8) bool {
+        var active = self.initial_mask;
+        for (rel_path) |raw_byte| {
+            if (active == 0) return false;
+            const norm_byte: u8 = if (raw_byte == '\\') '/' else raw_byte;
+            var matched: u64 = 0;
+            var iter_active = active & self.valid_state_mask;
+            while (iter_active != 0) {
+                const state_idx: u6 = @intCast(@ctz(iter_active));
+                iter_active &= iter_active - 1;
+                if (self.stateMatchesByte(state_idx, norm_byte)) {
+                    matched |= (@as(u64, 1) << state_idx);
+                }
+            }
+            const raw_next = (matched & self.self_loop_mask) | ((matched & self.advance_mask) << 1);
+            var next_active: u64 = 0;
+            var iter_next = raw_next;
+            while (iter_next != 0) {
+                const next_idx: u6 = @intCast(@ctz(iter_next));
+                iter_next &= iter_next - 1;
+                next_active |= self.eps_closure[next_idx];
+            }
+            active = next_active;
+        }
+        return (active & self.accept_bit) != 0;
+    }
+};
+
+/// Deterministic non-backtracking path-glob matcher supporting up to 16 `{a,b}` 64-state Thompson NFAs.
+pub const CompiledGlob64 = struct {
+    /// Original interned glob pattern text for deterministic matrix fingerprinting.
+    pattern_id: StringId = .empty,
+    /// Compiled brace-expanded sub-automata (`1..=16`).
+    sub_nfas: []const SubNfa64 = &.{},
+
+    /// Returns `true` if `raw_rel_path` matches any brace-expanded NFA in $O(|\text{path}|)$ time (`0` allocs).
+    pub fn matchesPath(self: CompiledGlob64, raw_rel_path: []const u8) bool {
+        var path_view = raw_rel_path;
+        while (std.mem.startsWith(u8, path_view, "./") or std.mem.startsWith(u8, path_view, ".\\")) {
+            path_view = path_view[2..];
+        }
+        for (self.sub_nfas) |sub| {
+            if (sub.matchesNormalizedPath(path_view)) return true;
+        }
+        return false;
+    }
+};
+
+/// Per-glob lint disable override parsed from `[[lint.overrides]]` or `[[workspace.lint.overrides]]`.
+pub const LintOverride = struct {
+    /// Non-empty inclusion globs matched against workspace/package-relative POSIX paths.
+    files: []const CompiledGlob64 = &.{},
+    /// Optional exclusion globs carving paths out of `files`.
+    exclude_files: []const CompiledGlob64 = &.{},
+    /// Additional lint rules disabled on matching files.
+    disable_mask: RuleMask64 = 0,
+};
+
+/// Validated `[lint]` or `[workspace.lint]` configuration (`DR-25` §3.1, `ADR-25B`).
+pub const LintConfig = struct {
+    /// When `true` (default), workspace members inherit `[workspace.lint]` before applying local overrides.
+    inherit: bool = true,
+    /// `true` if `inherit` was explicitly written in TOML.
+    has_explicit_inherit: bool = false,
+    /// Package-wide disabled rule bitmask (`0` = all 44 rules enabled).
+    disable_mask: RuleMask64 = 0,
+    /// Paths excluded from lint emission completely.
+    exclude: []const CompiledGlob64 = &.{},
+    /// Bounded semantic thresholds hashed separately at `QueryStage.lint_semantic_settings`.
+    settings: LintSettings = .{},
+    /// Bitmask of `[lint.settings]` keys explicitly set in this table (`bits 0..5`).
+    explicit_settings_mask: u8 = 0,
+    /// Ordered `[[lint.overrides]]` blocks accumulating path-scoped `disable_mask` bits.
+    overrides: []const LintOverride = &.{},
+
+    /// Returns `true` if `rel_path` matches any pattern in `self.exclude`.
+    pub fn isFileExcluded(self: LintConfig, rel_path: []const u8) bool {
+        for (self.exclude) |glob_item| {
+            if (glob_item.matchesPath(rel_path)) return true;
+        }
+        return false;
+    }
+
+    /// Resolves the effective `RuleMask64` of disabled rules for `rel_path` + `cli_filter` (`DR-25` §3.1).
+    pub fn resolveFileDisabledMask(
+        self: LintConfig,
+        rel_path: []const u8,
+        cli_filter: CliLintFilter,
+    ) RuleMask64 {
+        if (self.isFileExcluded(rel_path)) return diagnostic.ALL_RULES_MASK;
+        var disabled = self.disable_mask;
+        for (self.overrides) |override_entry| {
+            var is_included = false;
+            for (override_entry.files) |inc_glob| {
+                if (inc_glob.matchesPath(rel_path)) {
+                    is_included = true;
+                    break;
+                }
+            }
+            if (!is_included) continue;
+            var is_excluded = false;
+            for (override_entry.exclude_files) |exc_glob| {
+                if (exc_glob.matchesPath(rel_path)) {
+                    is_excluded = true;
+                    break;
+                }
+            }
+            if (!is_excluded) {
+                disabled |= override_entry.disable_mask;
+            }
+        }
+        return cli_filter.applyToDisabledMask(disabled);
+    }
+
+    /// Computes a 64-bit `Wyhash` digest over `disable_mask`, `exclude`, and `overrides` (excluding `settings`).
+    pub fn computeDisabledMatrixFingerprint(
+        self: LintConfig,
+        interner: *const StringInterner,
+    ) u64 {
+        var hasher = std.hash.Wyhash.init(0xA5A5_5A5A_C3C3_3C3C);
+        const mask_le = std.mem.nativeToLittle(u64, self.disable_mask);
+        hasher.update(std.mem.asBytes(&mask_le));
+
+        const excl_len_le = std.mem.nativeToLittle(u32, @intCast(self.exclude.len));
+        hasher.update(std.mem.asBytes(&excl_len_le));
+        for (self.exclude) |glob_item| {
+            const pat_str = interner.get(glob_item.pattern_id);
+            const pat_len_le = std.mem.nativeToLittle(u32, @intCast(pat_str.len));
+            hasher.update(std.mem.asBytes(&pat_len_le));
+            hasher.update(pat_str);
+        }
+
+        const ov_len_le = std.mem.nativeToLittle(u32, @intCast(self.overrides.len));
+        hasher.update(std.mem.asBytes(&ov_len_le));
+        for (self.overrides) |ov_item| {
+            const ov_mask_le = std.mem.nativeToLittle(u64, ov_item.disable_mask);
+            hasher.update(std.mem.asBytes(&ov_mask_le));
+            const files_len_le = std.mem.nativeToLittle(u32, @intCast(ov_item.files.len));
+            hasher.update(std.mem.asBytes(&files_len_le));
+            for (ov_item.files) |inc_glob| {
+                const pat_str = interner.get(inc_glob.pattern_id);
+                const pat_len_le = std.mem.nativeToLittle(u32, @intCast(pat_str.len));
+                hasher.update(std.mem.asBytes(&pat_len_le));
+                hasher.update(pat_str);
+            }
+            const ex_files_len_le = std.mem.nativeToLittle(u32, @intCast(ov_item.exclude_files.len));
+            hasher.update(std.mem.asBytes(&ex_files_len_le));
+            for (ov_item.exclude_files) |exc_glob| {
+                const pat_str = interner.get(exc_glob.pattern_id);
+                const pat_len_le = std.mem.nativeToLittle(u32, @intCast(pat_str.len));
+                hasher.update(std.mem.asBytes(&pat_len_le));
+                hasher.update(pat_str);
+            }
+        }
+        return hasher.final();
+    }
+};
+
+/// Validated `[fmt]` or `[workspace.fmt]` guardrails (`DR-25` §3.1; style knobs rejected with `E0018`).
+pub const FmtConfig = struct {
+    /// When `true` (default), workspace members inherit `[workspace.fmt]`.
+    inherit: bool = true,
+    /// `true` if `inherit` was explicitly written in TOML.
+    has_explicit_inherit: bool = false,
+    /// Paths skipped by `corex fmt` directory traversal.
+    exclude: []const CompiledGlob64 = &.{},
+    /// When `false` (default), `@generated` / `DO NOT EDIT` files are skipped by `corex fmt`.
+    check_generated: bool = false,
+    /// `true` if `check-generated` was explicitly written in TOML.
+    has_explicit_check_generated: bool = false,
+
+    /// Returns `true` if `rel_path` matches any pattern in `self.exclude`.
+    pub fn isFileExcluded(self: FmtConfig, rel_path: []const u8) bool {
+        for (self.exclude) |glob_item| {
+            if (glob_item.matchesPath(rel_path)) return true;
+        }
+        return false;
+    }
+};
+
+/// Parameter-name inlay hint verbosity mode in `[lsp].inlay-hints-parameter-names` (`DR-25` §3.1).
+pub const LspParamHintsMode = enum(u8) {
+    /// Disable parameter-name inlay hints (`"none"`).
+    none = 0,
+    /// Show parameter-name inlay hints unless the argument identifier matches (`"non-matching"`, default).
+    non_matching = 1,
+    /// Show parameter-name inlay hints on every positional argument (`"all"`).
+    all = 2,
+};
+
+/// Effect/capability inlay hint verbosity mode in `[lsp].inlay-hints-effects` (`DR-25` §3.1).
+pub const LspEffectsHintsMode = enum(u8) {
+    /// Disable effect/capability inlay hints (`"none"`).
+    none = 0,
+    /// Show effect hints only on contract boundaries (`"contracts-only"`, default).
+    contracts_only = 1,
+    /// Show inferred effect hints on all functions (`"all"`).
+    all = 2,
+};
+
+/// Validated `[lsp]` or `[workspace.lsp]` presentation settings (`DR-25` §3.1, Ruling 2).
+pub const LspConfig = struct {
+    /// When `true` (default), workspace members inherit `[workspace.lsp]`.
+    inherit: bool = true,
+    /// `true` if `inherit` was explicitly written in TOML.
+    has_explicit_inherit: bool = false,
+    /// Enables inferred `: Type` inlay hints on `let` / `var` bindings (`inlay-hints-types`).
+    inlay_hints_types: bool = true,
+    /// Parameter-name inlay hint verbosity (`inlay-hints-parameter-names`).
+    inlay_hints_parameter_names: LspParamHintsMode = .non_matching,
+    /// Enables implicit MVS projection inlay hints (`inlay-hints-mvs-modes`).
+    inlay_hints_mvs_modes: bool = true,
+    /// Effect/capability inlay hint verbosity (`inlay-hints-effects`).
+    inlay_hints_effects: LspEffectsHintsMode = .contracts_only,
+    /// Enables `▸ Run test` / `▸ Run bench` CodeLens items (`code-lens-test-bench`).
+    code_lens_test_bench: bool = true,
+    /// Maximum completion candidates returned per `textDocument/completion` response (`16..=256`, default `64`).
+    max_completion_items: u16 = 64,
+    /// Bitmask of `[lsp]` keys explicitly set in this table (`bits 0..5`).
+    explicit_fields_mask: u8 = 0,
+};
+
 /// Monorepo `[workspace]` configuration parsed from a root `corex.toml`.
 pub const WorkspaceConfig = struct {
     /// Member directory patterns (`members = ["crates/*", "tools/cli"]`).
@@ -693,6 +952,12 @@ pub const WorkspaceConfig = struct {
     excludes: []const ExcludeRule = &.{},
     /// Optional `[workspace.patch.*]` overrides.
     patches: []const PatchSpec = &.{},
+    /// Shared `[workspace.lint]` policy inherited when member `lint.inherit == true`.
+    lint: LintConfig = .{},
+    /// Shared `[workspace.fmt]` policy inherited when member `fmt.inherit == true`.
+    fmt: FmtConfig = .{},
+    /// Shared `[workspace.lsp]` policy inherited when member `lsp.inherit == true`.
+    lsp: LspConfig = .{},
 };
 
 /// Complete validated representation of a `corex.toml` manifest or `.cx` script frontmatter.
@@ -717,6 +982,12 @@ pub const Manifest = struct {
     patches: []const PatchSpec = &.{},
     /// Effective `[security]` capability policy.
     security: SecurityPolicy = .{},
+    /// Effective `[lint]` configuration (excluded from `root_manifest_blake3` per `DR-25` §3.1).
+    lint: LintConfig = .{},
+    /// Effective `[fmt]` configuration (excluded from `root_manifest_blake3` per `DR-25` §3.1).
+    fmt: FmtConfig = .{},
+    /// Effective `[lsp]` configuration (excluded from `root_manifest_blake3` per `DR-25` §3.1).
+    lsp: LspConfig = .{},
     /// Optional `[workspace]` table.
     workspace: ?WorkspaceConfig = null,
     /// Cloned `24B` `TomlSpanAnchor` array indexed by `anchor_id`.
@@ -865,6 +1136,29 @@ pub const MAX_VERSION_COMPARATORS: usize = 8;
 pub const LOCKFILE_VERSION: u32 = 1;
 /// Default CoreX language edition when `[package].edition` is omitted.
 pub const DEFAULT_COREX_EDITION = "2026";
+/// Maximum `{a,b}` brace expansion branches permitted in a single glob string (`E0019`).
+pub const MAX_GLOB_BRACE_EXPANSIONS: usize = 16;
+/// Maximum total NFA states (`0..63`) permitted in a single `SubNfa64` glob branch (`E0019`).
+pub const MAX_GLOB_STATES: usize = 64;
+/// Inclusive lower bound for `[lsp].max-completion-items` (`E0020`).
+pub const LSP_MAX_COMPLETION_ITEMS_MIN: u16 = 16;
+/// Inclusive upper bound for `[lsp].max-completion-items` (`E0020`).
+pub const LSP_MAX_COMPLETION_ITEMS_MAX: u16 = 256;
+
+/// CoreX-specific standalone tool configuration dotfiles rejected with `E0017` (`DR-25` §3.1, Ruling 2).
+pub const FORBIDDEN_STRAY_TOOL_DOTFILES = [_][]const u8{
+    ".corex-fmt.toml",
+    ".corex-lint.toml",
+    ".corex-lsp.toml",
+    ".corexfmt.toml",
+    ".corexlint.toml",
+    "corex-fmt.toml",
+    "corex-lint.toml",
+    "corex-lsp.toml",
+    "corexfmt.toml",
+    "corexlint.toml",
+};
+
 /// Domain header hashed at the front of `computeNormalizedManifestBlake3`.
 const MANIFEST_NORM_DOMAIN = "corex-manifest-norm-v1\x00";
 
@@ -3887,6 +4181,1359 @@ fn emitManifestFieldErr(sink: ?*DiagnosticSink, span: Span, message: []const u8)
     }
 }
 
+// --------------- Tooling Configuration & Globs ----------------
+
+/// Emits a manifest tooling diagnostic (`E0017`–`E0020`) with an optional `help:` footer note.
+fn emitToolConfigDiag(
+    sink: ?*DiagnosticSink,
+    code: DiagnosticCode,
+    span: Span,
+    message: []const u8,
+    help_note_opt: ?[]const u8,
+) !void {
+    if (sink) |diag_sink| {
+        if (help_note_opt) |help_note| {
+            const notes = try diag_sink.arena.dupe([]const u8, &.{help_note});
+            try diag_sink.emit(.{
+                .code = code,
+                .severity = .err,
+                .primary_span = span,
+                .message = message,
+                .notes = notes,
+            });
+        } else {
+            try diag_sink.emit(.{
+                .code = code,
+                .severity = .err,
+                .primary_span = span,
+                .message = message,
+            });
+        }
+    }
+}
+
+/// Sets or clears `byte` inside a 256-bit `[4]u64` character-class bitset.
+inline fn setByteClassBit(bits: *[4]u64, byte: u8, is_set: bool) void {
+    const word_idx = byte >> 6;
+    const mask = @as(u64, 1) << @intCast(byte & 63);
+    if (is_set) {
+        bits[word_idx] |= mask;
+    } else {
+        bits[word_idx] &= ~mask;
+    }
+}
+
+/// Expands `{a,b}` alternations up to `MAX_GLOB_BRACE_EXPANSIONS` (`16`), returning `null` on syntax/cap error.
+fn expandGlobBraceBranches(
+    arena: *BumpArena,
+    raw_pattern: []const u8,
+    err_reason_out: *[]const u8,
+) !?[]const []const u8 {
+    var queue_buf: [MAX_GLOB_BRACE_EXPANSIONS][]const u8 = undefined;
+    queue_buf[0] = raw_pattern;
+    var queue_len: usize = 1;
+
+    outer: while (true) {
+        var target_idx: ?usize = null;
+        var open_pos: usize = 0;
+        var close_pos: usize = 0;
+
+        for (queue_buf[0..queue_len], 0..) |candidate, q_idx| {
+            var scan_i: usize = 0;
+            var in_brackets = false;
+            var found_open: ?usize = null;
+            var brace_depth: u32 = 0;
+            var comma_at_top = false;
+
+            while (scan_i < candidate.len) : (scan_i += 1) {
+                const ch_byte = candidate[scan_i];
+                if (in_brackets) {
+                    if (ch_byte == ']') in_brackets = false;
+                    continue;
+                }
+                if (ch_byte == '[') {
+                    in_brackets = true;
+                    if (scan_i + 1 < candidate.len and
+                        (candidate[scan_i + 1] == '!' or candidate[scan_i + 1] == '^'))
+                    {
+                        scan_i += 1;
+                    }
+                    if (scan_i + 1 < candidate.len and candidate[scan_i + 1] == ']') {
+                        scan_i += 1;
+                    }
+                    continue;
+                }
+                if (ch_byte == '{') {
+                    if (brace_depth == 0) found_open = scan_i;
+                    brace_depth += 1;
+                } else if (ch_byte == '}') {
+                    if (brace_depth == 0) {
+                        err_reason_out.* = "unmatched closing `}` in path glob pattern";
+                        return null;
+                    }
+                    brace_depth -= 1;
+                    if (brace_depth == 0 and target_idx == null) {
+                        if (!comma_at_top) {
+                            err_reason_out.* = "brace alternation `{…}` in path glob requires at least two comma-separated branches";
+                            return null;
+                        }
+                        target_idx = q_idx;
+                        open_pos = found_open.?;
+                        close_pos = scan_i;
+                        break;
+                    }
+                } else if (ch_byte == ',' and brace_depth == 1) {
+                    comma_at_top = true;
+                }
+            }
+
+            if (in_brackets) {
+                err_reason_out.* = "unclosed `[…]` character class in path glob pattern";
+                return null;
+            }
+            if (brace_depth != 0) {
+                err_reason_out.* = "unclosed `{…}` brace alternation in path glob pattern";
+                return null;
+            }
+            if (target_idx != null) break;
+        }
+
+        const expand_q_idx = target_idx orelse break :outer;
+        const source_pat = queue_buf[expand_q_idx];
+        const prefix = source_pat[0..open_pos];
+        const inner = source_pat[open_pos + 1 .. close_pos];
+        const suffix = source_pat[close_pos + 1 ..];
+
+        var parts_buf: [MAX_GLOB_BRACE_EXPANSIONS][]const u8 = undefined;
+        var parts_len: usize = 0;
+        var part_start: usize = 0;
+        var inner_depth: u32 = 0;
+        var inner_brackets = false;
+        var inner_i: usize = 0;
+        while (inner_i <= inner.len) : (inner_i += 1) {
+            if (inner_i == inner.len or (inner[inner_i] == ',' and inner_depth == 0 and !inner_brackets)) {
+                const branch_part = inner[part_start..inner_i];
+                if (branch_part.len == 0) {
+                    err_reason_out.* = "empty alternative inside `{…}` path glob pattern is forbidden";
+                    return null;
+                }
+                if (parts_len >= MAX_GLOB_BRACE_EXPANSIONS) {
+                    err_reason_out.* = "path glob `{…}` alternation exceeds maximum `16` expansions";
+                    return null;
+                }
+                parts_buf[parts_len] = branch_part;
+                parts_len += 1;
+                part_start = inner_i + 1;
+                continue;
+            }
+            const inner_ch = inner[inner_i];
+            if (inner_brackets) {
+                if (inner_ch == ']') inner_brackets = false;
+            } else if (inner_ch == '[') {
+                inner_brackets = true;
+            } else if (inner_ch == '{') {
+                inner_depth += 1;
+            } else if (inner_ch == '}') {
+                inner_depth -|= 1;
+            }
+        }
+
+        if ((queue_len - 1) + parts_len > MAX_GLOB_BRACE_EXPANSIONS) {
+            err_reason_out.* = "path glob `{…}` alternation exceeds maximum `16` expansions";
+            return null;
+        }
+
+        var next_queue: [MAX_GLOB_BRACE_EXPANSIONS][]const u8 = undefined;
+        var next_len: usize = 0;
+        for (queue_buf[0..expand_q_idx]) |prior| {
+            next_queue[next_len] = prior;
+            next_len += 1;
+        }
+        for (parts_buf[0..parts_len]) |branch_mid| {
+            next_queue[next_len] = try std.fmt.allocPrint(
+                arena.asAllocator(),
+                "{s}{s}{s}",
+                .{ prefix, branch_mid, suffix },
+            );
+            next_len += 1;
+        }
+        for (queue_buf[expand_q_idx + 1 .. queue_len]) |rest_item| {
+            next_queue[next_len] = rest_item;
+            next_len += 1;
+        }
+        queue_buf = next_queue;
+        queue_len = next_len;
+    }
+
+    return try arena.dupe([]const u8, queue_buf[0..queue_len]);
+}
+
+/// Compiles one brace-expanded glob `branch` into a 64-state `SubNfa64` (`null` on invalid syntax or `> 64` states).
+fn compileSingleSubNfa64(
+    arena: *BumpArena,
+    raw_branch: []const u8,
+    err_reason_out: *[]const u8,
+) !?SubNfa64 {
+    var branch = raw_branch;
+    while (std.mem.startsWith(u8, branch, "./")) {
+        branch = branch[2..];
+    }
+    if (branch.len == 0) {
+        err_reason_out.* = "path glob pattern cannot be empty";
+        return null;
+    }
+    if (branch[0] == '/' or (branch.len >= 2 and std.ascii.isAlphabetic(branch[0]) and branch[1] == ':')) {
+        err_reason_out.* = "path glob must be a jailed relative path without leading `/` or drive prefix";
+        return null;
+    }
+    if (std.mem.indexOfScalar(u8, branch, '\\') != null) {
+        err_reason_out.* = "path glob must use portable forward-slash `/` separators instead of `\\`";
+        return null;
+    }
+    if (branch[branch.len - 1] == '/' or std.mem.indexOf(u8, branch, "//") != null) {
+        err_reason_out.* = "path glob cannot end with `/` or contain empty `//` segments (use `dir/**`)";
+        return null;
+    }
+
+    var seg_iter = std.mem.splitScalar(u8, branch, '/');
+    while (seg_iter.next()) |seg| {
+        if (std.mem.eql(u8, seg, "..") or std.mem.eql(u8, seg, ".")) {
+            err_reason_out.* = "path traversal segment `..` or `.` is forbidden in `corex.toml` globs";
+            return null;
+        }
+    }
+
+    var classes_buf: [MAX_GLOB_STATES][4]u64 = undefined;
+    var direct_eps: [MAX_GLOB_STATES]u64 = @splat(0);
+    var self_loop_mask: u64 = 0;
+    var advance_mask: u64 = 0;
+    var state_count: usize = 0;
+
+    const all_bytes_class: [4]u64 = @splat(std.math.maxInt(u64));
+    var non_slash_class: [4]u64 = all_bytes_class;
+    setByteClassBit(&non_slash_class, '/', false);
+    var slash_only_class: [4]u64 = @splat(0);
+    setByteClassBit(&slash_only_class, '/', true);
+
+    var cursor: usize = 0;
+    while (cursor < branch.len) {
+        // [1] Leading `**/` (`0+` directory prefixes):
+        if (cursor == 0 and std.mem.startsWith(u8, branch, "**/")) {
+            if (state_count + 2 >= MAX_GLOB_STATES) {
+                err_reason_out.* = "path glob exceeds maximum `64`-state NFA complexity cap";
+                return null;
+            }
+            const s_any = state_count;
+            const s_slash = state_count + 1;
+            classes_buf[s_any] = all_bytes_class;
+            self_loop_mask |= (@as(u64, 1) << @intCast(s_any));
+            direct_eps[s_any] |= (@as(u64, 1) << @intCast(s_slash)) | (@as(u64, 1) << @intCast(state_count + 2));
+
+            classes_buf[s_slash] = slash_only_class;
+            advance_mask |= (@as(u64, 1) << @intCast(s_slash));
+            state_count += 2;
+            cursor += 3;
+            continue;
+        }
+
+        // [2] Interior `/**/` (`0+` intermediate directory segments):
+        if (std.mem.startsWith(u8, branch[cursor..], "/**/")) {
+            if (state_count + 3 >= MAX_GLOB_STATES) {
+                err_reason_out.* = "path glob exceeds maximum `64`-state NFA complexity cap";
+                return null;
+            }
+            const s_lead_slash = state_count;
+            const s_any = state_count + 1;
+            const s_tail_slash = state_count + 2;
+            classes_buf[s_lead_slash] = slash_only_class;
+            advance_mask |= (@as(u64, 1) << @intCast(s_lead_slash));
+
+            classes_buf[s_any] = all_bytes_class;
+            self_loop_mask |= (@as(u64, 1) << @intCast(s_any));
+            direct_eps[s_any] |= (@as(u64, 1) << @intCast(s_tail_slash)) | (@as(u64, 1) << @intCast(state_count + 3));
+
+            classes_buf[s_tail_slash] = slash_only_class;
+            advance_mask |= (@as(u64, 1) << @intCast(s_tail_slash));
+            state_count += 3;
+            cursor += 4;
+            continue;
+        }
+
+        // [3] Trailing `/**` (everything beneath directory):
+        if (cursor + 3 == branch.len and std.mem.eql(u8, branch[cursor..], "/**")) {
+            if (state_count + 2 >= MAX_GLOB_STATES) {
+                err_reason_out.* = "path glob exceeds maximum `64`-state NFA complexity cap";
+                return null;
+            }
+            const s_slash = state_count;
+            const s_any = state_count + 1;
+            classes_buf[s_slash] = slash_only_class;
+            advance_mask |= (@as(u64, 1) << @intCast(s_slash));
+
+            classes_buf[s_any] = all_bytes_class;
+            self_loop_mask |= (@as(u64, 1) << @intCast(s_any));
+            direct_eps[s_any] |= (@as(u64, 1) << @intCast(state_count + 2));
+            state_count += 2;
+            cursor += 3;
+            continue;
+        }
+
+        // [4] Standalone or general `**` vs single `*`:
+        if (branch[cursor] == '*') {
+            var star_end = cursor + 1;
+            while (star_end < branch.len and branch[star_end] == '*') : (star_end += 1) {}
+            if (state_count + 1 >= MAX_GLOB_STATES) {
+                err_reason_out.* = "path glob exceeds maximum `64`-state NFA complexity cap";
+                return null;
+            }
+            const is_double = (star_end - cursor) >= 2;
+            classes_buf[state_count] = if (is_double) all_bytes_class else non_slash_class;
+            self_loop_mask |= (@as(u64, 1) << @intCast(state_count));
+            direct_eps[state_count] |= (@as(u64, 1) << @intCast(state_count + 1));
+            state_count += 1;
+            cursor = star_end;
+            continue;
+        }
+
+        // [5] Single `?` (`1` non-`/` byte):
+        if (branch[cursor] == '?') {
+            if (state_count + 1 >= MAX_GLOB_STATES) {
+                err_reason_out.* = "path glob exceeds maximum `64`-state NFA complexity cap";
+                return null;
+            }
+            classes_buf[state_count] = non_slash_class;
+            advance_mask |= (@as(u64, 1) << @intCast(state_count));
+            state_count += 1;
+            cursor += 1;
+            continue;
+        }
+
+        // [6] Character class `[abc]` / `[a-z]` / `[!a-z]` / `[^a-z]` (never matches `/`):
+        if (branch[cursor] == '[') {
+            if (state_count + 1 >= MAX_GLOB_STATES) {
+                err_reason_out.* = "path glob exceeds maximum `64`-state NFA complexity cap";
+                return null;
+            }
+            var cls_i = cursor + 1;
+            var is_negated = false;
+            if (cls_i < branch.len and (branch[cls_i] == '!' or branch[cls_i] == '^')) {
+                is_negated = true;
+                cls_i += 1;
+            }
+            var cls_bits: [4]u64 = @splat(0);
+            var has_any_cls_item = false;
+            while (cls_i < branch.len) {
+                if (branch[cls_i] == ']' and has_any_cls_item) break;
+                const lo_ch = branch[cls_i];
+                has_any_cls_item = true;
+                if (cls_i + 2 < branch.len and branch[cls_i + 1] == '-' and branch[cls_i + 2] != ']') {
+                    const hi_ch = branch[cls_i + 2];
+                    if (lo_ch > hi_ch) {
+                        err_reason_out.* = "inverted `[z-a]` character range in path glob pattern";
+                        return null;
+                    }
+                    var range_ch: u16 = lo_ch;
+                    while (range_ch <= hi_ch) : (range_ch += 1) {
+                        setByteClassBit(&cls_bits, @intCast(range_ch), true);
+                    }
+                    cls_i += 3;
+                } else {
+                    setByteClassBit(&cls_bits, lo_ch, true);
+                    cls_i += 1;
+                }
+            }
+            if (!has_any_cls_item or cls_i >= branch.len or branch[cls_i] != ']') {
+                err_reason_out.* = "unclosed or empty `[…]` character class in path glob pattern";
+                return null;
+            }
+            if (is_negated) {
+                for (&cls_bits) |*word| word.* = ~word.*;
+            }
+            setByteClassBit(&cls_bits, '/', false);
+            if ((cls_bits[0] | cls_bits[1] | cls_bits[2] | cls_bits[3]) == 0) {
+                err_reason_out.* = "character class `[…]` in path glob matches zero valid non-`/` characters";
+                return null;
+            }
+            classes_buf[state_count] = cls_bits;
+            advance_mask |= (@as(u64, 1) << @intCast(state_count));
+            state_count += 1;
+            cursor = cls_i + 1;
+            continue;
+        }
+
+        // [7] Exact literal byte:
+        if (state_count + 1 >= MAX_GLOB_STATES) {
+            err_reason_out.* = "path glob exceeds maximum `64`-state NFA complexity cap";
+            return null;
+        }
+        var lit_bits: [4]u64 = @splat(0);
+        setByteClassBit(&lit_bits, branch[cursor], true);
+        classes_buf[state_count] = lit_bits;
+        advance_mask |= (@as(u64, 1) << @intCast(state_count));
+        state_count += 1;
+        cursor += 1;
+    }
+
+    const total_nfa_states = state_count + 1;
+    const eps_closure = try arena.allocSlice(u64, total_nfa_states);
+    var s_idx: usize = 0;
+    while (s_idx < total_nfa_states) : (s_idx += 1) {
+        eps_closure[s_idx] = (@as(u64, 1) << @intCast(s_idx)) | direct_eps[s_idx];
+    }
+
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var st_i: usize = 0;
+        while (st_i < total_nfa_states) : (st_i += 1) {
+            var expanded = eps_closure[st_i];
+            var iter_bits = expanded;
+            while (iter_bits != 0) {
+                const target_bit: u6 = @intCast(@ctz(iter_bits));
+                iter_bits &= iter_bits - 1;
+                if (target_bit < total_nfa_states) {
+                    expanded |= eps_closure[target_bit];
+                }
+            }
+            if (expanded != eps_closure[st_i]) {
+                eps_closure[st_i] = expanded;
+                changed = true;
+            }
+        }
+    }
+
+    const valid_mask: u64 = if (state_count == 0) 0 else (@as(u64, 1) << @intCast(state_count)) - 1;
+    return .{
+        .num_states = @intCast(state_count),
+        .valid_state_mask = valid_mask,
+        .initial_mask = eps_closure[0],
+        .accept_bit = @as(u64, 1) << @intCast(state_count),
+        .self_loop_mask = self_loop_mask,
+        .advance_mask = advance_mask,
+        .char_classes = try arena.dupe([4]u64, classes_buf[0..state_count]),
+        .eps_closure = eps_closure,
+    };
+}
+
+/// Compiles `raw_pattern` into a `CompiledGlob64` (`E0019` on malformed globs, `..`, `> 16` braces, or `> 64` states).
+fn compileGlob64Impl(
+    arena: *BumpArena,
+    interner: *StringInterner,
+    raw_pattern: []const u8,
+    span: Span,
+    sink: ?*DiagnosticSink,
+) !?CompiledGlob64 {
+    if (raw_pattern.len == 0) {
+        try emitToolConfigDiag(sink, .e0019_invalid_lint_rule_or_glob, span, "path glob pattern cannot be empty", null);
+        return null;
+    }
+    var err_reason: []const u8 = "invalid path glob pattern";
+    const branches = (try expandGlobBraceBranches(arena, raw_pattern, &err_reason)) orelse {
+        try emitToolConfigDiag(sink, .e0019_invalid_lint_rule_or_glob, span, err_reason, null);
+        return null;
+    };
+
+    const sub_nfas = try arena.allocSlice(SubNfa64, branches.len);
+    for (branches, 0..) |branch, i| {
+        sub_nfas[i] = (try compileSingleSubNfa64(arena, branch, &err_reason)) orelse {
+            try emitToolConfigDiag(sink, .e0019_invalid_lint_rule_or_glob, span, err_reason, null);
+            return null;
+        };
+    }
+
+    return .{
+        .pattern_id = try interner.intern(raw_pattern),
+        .sub_nfas = sub_nfas,
+    };
+}
+
+/// Parses an array of TOML glob strings into `[]const CompiledGlob64` (`E0013` if non-array; `E0019` on bad glob).
+fn parseGlobArray(
+    arena: *BumpArena,
+    interner: *StringInterner,
+    val: TomlDomValue,
+    val_span: Span,
+    field_label: []const u8,
+    require_non_empty: bool,
+    sink: ?*DiagnosticSink,
+) !?[]const CompiledGlob64 {
+    if (val != .array_val) {
+        if (sink) |diag_sink| {
+            const msg = try std.fmt.allocPrint(
+                diag_sink.arena.asAllocator(),
+                "`{s}` must be an array of path glob strings",
+                .{field_label},
+            );
+            try emitManifestFieldErr(sink, val_span, msg);
+        }
+        return null;
+    }
+    if (require_non_empty and val.array_val.len == 0) {
+        if (sink) |diag_sink| {
+            const msg = try std.fmt.allocPrint(
+                diag_sink.arena.asAllocator(),
+                "`{s}` must contain at least one path glob string",
+                .{field_label},
+            );
+            try emitToolConfigDiag(sink, .e0019_invalid_lint_rule_or_glob, val_span, msg, null);
+        }
+        return null;
+    }
+
+    var globs: std.ArrayList(CompiledGlob64) = .empty;
+    defer globs.deinit(arena.backing_allocator);
+    for (val.array_val) |elem| {
+        if (elem.val != .str_val) {
+            try emitToolConfigDiag(
+                sink,
+                .e0019_invalid_lint_rule_or_glob,
+                elem.span,
+                "path glob element must be a string",
+                null,
+            );
+            continue;
+        }
+        if (try compileGlob64Impl(arena, interner, elem.val.str_val, elem.span, sink)) |compiled| {
+            try globs.append(arena.backing_allocator, compiled);
+        }
+    }
+    return try arena.dupe(CompiledGlob64, globs.items);
+}
+
+/// Parses a `disable = ["…"]` rule selector array into `RuleMask64` (`E0019` + Jaro-Winkler help on unknown rules).
+fn parseLintDisableMask(
+    val: TomlDomValue,
+    val_span: Span,
+    field_label: []const u8,
+    sink: ?*DiagnosticSink,
+) !RuleMask64 {
+    if (val != .array_val) {
+        if (sink) |diag_sink| {
+            const msg = try std.fmt.allocPrint(
+                diag_sink.arena.asAllocator(),
+                "`{s}` must be an array of lint rule slugs or `W0xxx` codes",
+                .{field_label},
+            );
+            try emitManifestFieldErr(sink, val_span, msg);
+        }
+        return 0;
+    }
+
+    var mask: RuleMask64 = 0;
+    for (val.array_val) |elem| {
+        if (elem.val != .str_val) {
+            try emitToolConfigDiag(
+                sink,
+                .e0019_invalid_lint_rule_or_glob,
+                elem.span,
+                "lint rule selector in `disable` must be a string",
+                null,
+            );
+            continue;
+        }
+        const raw_sel = elem.val.str_val;
+        switch (diagnostic.lookupLintRuleBySelector(raw_sel)) {
+            .rule => |rule_id| {
+                mask |= rule_id.bit();
+            },
+            .forbidden_category_or_wildcard => {
+                if (sink) |diag_sink| {
+                    const msg = try std.fmt.allocPrint(
+                        diag_sink.arena.asAllocator(),
+                        "category or wildcard `{s}` cannot be disabled as a group in `corex.toml`; list explicit rule slugs or `W0xxx` codes",
+                        .{raw_sel},
+                    );
+                    try emitToolConfigDiag(sink, .e0019_invalid_lint_rule_or_glob, elem.span, msg, null);
+                }
+            },
+            .non_suppressible_error_code => {
+                if (sink) |diag_sink| {
+                    const msg = try std.fmt.allocPrint(
+                        diag_sink.arena.asAllocator(),
+                        "compiler error `{s}` cannot be disabled; `[lint].disable` only accepts `W0xxx` lint rules",
+                        .{raw_sel},
+                    );
+                    try emitToolConfigDiag(sink, .e0019_invalid_lint_rule_or_glob, elem.span, msg, null);
+                }
+            },
+            .non_suppressible_subsystem_warning => {
+                if (sink) |diag_sink| {
+                    const msg = try std.fmt.allocPrint(
+                        diag_sink.arena.asAllocator(),
+                        "subsystem warning `{s}` is not a configurable lint rule",
+                        .{raw_sel},
+                    );
+                    try emitToolConfigDiag(sink, .e0019_invalid_lint_rule_or_glob, elem.span, msg, null);
+                }
+            },
+            .unknown => {
+                if (sink) |diag_sink| {
+                    const msg = try std.fmt.allocPrint(
+                        diag_sink.arena.asAllocator(),
+                        "unknown lint rule `{s}` in `disable`",
+                        .{raw_sel},
+                    );
+                    const help_note = if (diagnostic.suggestClosestLintRule(raw_sel)) |closest|
+                        try std.fmt.allocPrint(diag_sink.arena.asAllocator(), "help: did you mean `{s}`?", .{closest})
+                    else
+                        null;
+                    try emitToolConfigDiag(sink, .e0019_invalid_lint_rule_or_glob, elem.span, msg, help_note);
+                }
+            },
+        }
+    }
+    return mask;
+}
+
+/// Extracts an integer scalar from `TomlDomValue` (`int_val` or `uint_val`), returning `null` if non-integer.
+fn extractTomlSignedOrUnsignedInt(val: TomlDomValue) ?i128 {
+    return switch (val) {
+        .int_val => |iv| iv,
+        .uint_val => |uv| @as(i128, uv),
+        else => null,
+    };
+}
+
+/// Validates that `ident` is a valid non-empty ASCII CoreX identifier (`[A-Za-z_][A-Za-z0-9_]*`).
+fn isValidAllowedIdentEntry(ident: []const u8) bool {
+    if (ident.len == 0 or ident.len > MAX_PKG_NAME_BYTES) return false;
+    const first_ch = ident[0];
+    if (!std.ascii.isAlphabetic(first_ch) and first_ch != '_') return false;
+    for (ident[1..]) |ch_byte| {
+        if (!std.ascii.isAlphanumeric(ch_byte) and ch_byte != '_') return false;
+    }
+    return true;
+}
+
+/// Parses and validates `[lint.settings]` or `[workspace.lint.settings]` (`E0020` on out-of-range values).
+fn parseLintSettingsSection(
+    arena: *BumpArena,
+    interner: *StringInterner,
+    settings_tbl: *const TomlDomTable,
+    explicit_mask_out: *u8,
+    sink: ?*DiagnosticSink,
+) !LintSettings {
+    var settings: LintSettings = .{};
+    for (settings_tbl.entries.items) |kv| {
+        if (std.mem.eql(u8, kv.key, "min-grouped-int-digits")) {
+            explicit_mask_out.* |= (1 << 0);
+            const raw_int = extractTomlSignedOrUnsignedInt(kv.val) orelse {
+                try emitToolConfigDiag(
+                    sink,
+                    .e0020_tool_setting_out_of_range,
+                    kv.val_span,
+                    "`[lint.settings].min-grouped-int-digits` must be an integer in `4..=12`",
+                    null,
+                );
+                continue;
+            };
+            if (raw_int < lint_filter.MIN_GROUPED_INT_DIGITS_MIN or raw_int > lint_filter.MIN_GROUPED_INT_DIGITS_MAX) {
+                try emitToolConfigDiag(
+                    sink,
+                    .e0020_tool_setting_out_of_range,
+                    kv.val_span,
+                    "`[lint.settings].min-grouped-int-digits` is out of range (expected `4..=12`)",
+                    null,
+                );
+                continue;
+            }
+            settings.min_grouped_int_digits = @intCast(raw_int);
+        } else if (std.mem.eql(u8, kv.key, "min-grouped-hex-digits")) {
+            explicit_mask_out.* |= (1 << 1);
+            const raw_hex = extractTomlSignedOrUnsignedInt(kv.val) orelse {
+                try emitToolConfigDiag(
+                    sink,
+                    .e0020_tool_setting_out_of_range,
+                    kv.val_span,
+                    "`[lint.settings].min-grouped-hex-digits` must be an integer in `4..=16`",
+                    null,
+                );
+                continue;
+            };
+            if (raw_hex < lint_filter.MIN_GROUPED_HEX_DIGITS_MIN or raw_hex > lint_filter.MIN_GROUPED_HEX_DIGITS_MAX) {
+                try emitToolConfigDiag(
+                    sink,
+                    .e0020_tool_setting_out_of_range,
+                    kv.val_span,
+                    "`[lint.settings].min-grouped-hex-digits` is out of range (expected `4..=16`)",
+                    null,
+                );
+                continue;
+            }
+            settings.min_grouped_hex_digits = @intCast(raw_hex);
+        } else if (std.mem.eql(u8, kv.key, "trivial-copy-max-bytes")) {
+            explicit_mask_out.* |= (1 << 2);
+            const raw_copy = extractTomlSignedOrUnsignedInt(kv.val) orelse {
+                try emitToolConfigDiag(
+                    sink,
+                    .e0020_tool_setting_out_of_range,
+                    kv.val_span,
+                    "`[lint.settings].trivial-copy-max-bytes` must be an integer in `4..=16`",
+                    null,
+                );
+                continue;
+            };
+            if (raw_copy < lint_filter.TRIVIAL_COPY_MAX_BYTES_MIN or raw_copy > lint_filter.TRIVIAL_COPY_MAX_BYTES_MAX) {
+                try emitToolConfigDiag(
+                    sink,
+                    .e0020_tool_setting_out_of_range,
+                    kv.val_span,
+                    "`[lint.settings].trivial-copy-max-bytes` is out of range (expected `4..=16`)",
+                    null,
+                );
+                continue;
+            }
+            settings.trivial_copy_max_bytes = @intCast(raw_copy);
+        } else if (std.mem.eql(u8, kv.key, "require-suppression-reason")) {
+            explicit_mask_out.* |= (1 << 3);
+            if (kv.val != .bool_val) {
+                try emitToolConfigDiag(
+                    sink,
+                    .e0020_tool_setting_out_of_range,
+                    kv.val_span,
+                    "`[lint.settings].require-suppression-reason` must be a boolean (`true` or `false`)",
+                    null,
+                );
+                continue;
+            }
+            settings.require_suppression_reason = kv.val.bool_val;
+        } else if (std.mem.eql(u8, kv.key, "allowed-ident-names")) {
+            explicit_mask_out.* |= (1 << 4);
+            if (kv.val != .array_val) {
+                try emitToolConfigDiag(
+                    sink,
+                    .e0020_tool_setting_out_of_range,
+                    kv.val_span,
+                    "`[lint.settings].allowed-ident-names` must be an array of `<= 64` identifier strings",
+                    null,
+                );
+                continue;
+            }
+            if (kv.val.array_val.len > lint_filter.MAX_ALLOWED_IDENT_NAMES) {
+                try emitToolConfigDiag(
+                    sink,
+                    .e0020_tool_setting_out_of_range,
+                    kv.val_span,
+                    "`[lint.settings].allowed-ident-names` exceeds maximum `64` entries",
+                    null,
+                );
+                continue;
+            }
+            var raw_ids: std.ArrayList(StringId) = .empty;
+            defer raw_ids.deinit(arena.backing_allocator);
+            for (kv.val.array_val) |elem| {
+                if (elem.val != .str_val or !isValidAllowedIdentEntry(elem.val.str_val)) {
+                    try emitToolConfigDiag(
+                        sink,
+                        .e0020_tool_setting_out_of_range,
+                        elem.span,
+                        "`[lint.settings].allowed-ident-names` entries must be non-empty ASCII identifiers",
+                        null,
+                    );
+                    continue;
+                }
+                try raw_ids.append(arena.backing_allocator, try interner.intern(elem.val.str_val));
+            }
+            settings.allowed_ident_names = try sortAndDedupStringIds(arena, interner, raw_ids.items);
+        } else if (std.mem.eql(u8, kv.key, "allowed-confusables")) {
+            explicit_mask_out.* |= (1 << 5);
+            if (kv.val != .array_val) {
+                try emitToolConfigDiag(
+                    sink,
+                    .e0020_tool_setting_out_of_range,
+                    kv.val_span,
+                    "`[lint.settings].allowed-confusables` must be an array of `<= 64` single non-ASCII characters",
+                    null,
+                );
+                continue;
+            }
+            if (kv.val.array_val.len > lint_filter.MAX_ALLOWED_CONFUSABLES) {
+                try emitToolConfigDiag(
+                    sink,
+                    .e0020_tool_setting_out_of_range,
+                    kv.val_span,
+                    "`[lint.settings].allowed-confusables` exceeds maximum `64` entries",
+                    null,
+                );
+                continue;
+            }
+            var cps: std.ArrayList(u21) = .empty;
+            defer cps.deinit(arena.backing_allocator);
+            for (kv.val.array_val) |elem| {
+                if (elem.val != .str_val) {
+                    try emitToolConfigDiag(
+                        sink,
+                        .e0020_tool_setting_out_of_range,
+                        elem.span,
+                        "`[lint.settings].allowed-confusables` entry must be a single non-ASCII Unicode character string",
+                        null,
+                    );
+                    continue;
+                }
+                const str_s = elem.val.str_val;
+                var utf8_ok = false;
+                var decoded_cp: u21 = 0;
+                if (str_s.len >= 2 and std.unicode.utf8ValidateSlice(str_s)) {
+                    const cp_len = std.unicode.utf8ByteSequenceLength(str_s[0]) catch 0;
+                    if (cp_len == str_s.len) {
+                        decoded_cp = std.unicode.utf8Decode(str_s) catch 0;
+                        if (decoded_cp >= 0x80) utf8_ok = true;
+                    }
+                }
+                if (!utf8_ok) {
+                    try emitToolConfigDiag(
+                        sink,
+                        .e0020_tool_setting_out_of_range,
+                        elem.span,
+                        "`[lint.settings].allowed-confusables` entry must be a single non-ASCII scalar (`>= U+0080`)",
+                        null,
+                    );
+                    continue;
+                }
+                try cps.append(arena.backing_allocator, decoded_cp);
+            }
+            std.mem.sort(u21, cps.items, {}, std.sort.asc(u21));
+            var dedup_len: usize = 0;
+            for (cps.items) |cp_val| {
+                if (dedup_len == 0 or cps.items[dedup_len - 1] != cp_val) {
+                    cps.items[dedup_len] = cp_val;
+                    dedup_len += 1;
+                }
+            }
+            settings.allowed_confusables = try arena.dupe(u21, cps.items[0..dedup_len]);
+        } else {
+            try emitManifestFieldErr(sink, kv.key_span, "unknown key in `[lint.settings]` table");
+        }
+    }
+    return settings;
+}
+
+/// Returns `true` if `key` is a forbidden severity-remapping or per-rule toggle key in `[lint]` (`E0018`).
+fn isForbiddenLintSeverityOrToggleKey(key: []const u8) bool {
+    if (std.mem.eql(u8, key, "rules") or
+        std.mem.eql(u8, key, "categories") or
+        std.mem.eql(u8, key, "levels") or
+        std.mem.eql(u8, key, "enable") or
+        std.mem.eql(u8, key, "select") or
+        std.mem.eql(u8, key, "extend-select") or
+        std.mem.eql(u8, key, "allow") or
+        std.mem.eql(u8, key, "warn") or
+        std.mem.eql(u8, key, "deny") or
+        std.mem.eql(u8, key, "forbid") or
+        std.mem.eql(u8, key, "severity") or
+        std.mem.eql(u8, key, "level"))
+    {
+        return true;
+    }
+    return switch (diagnostic.lookupLintRuleBySelector(key)) {
+        .rule, .forbidden_category_or_wildcard => true,
+        else => false,
+    };
+}
+
+/// Parses and validates `[lint]` or `[workspace.lint]` (`E0018`, `E0019`, `E0020`).
+fn parseLintSection(
+    arena: *BumpArena,
+    interner: *StringInterner,
+    lint_tbl: *const TomlDomTable,
+    is_workspace_table: bool,
+    sink: ?*DiagnosticSink,
+) !LintConfig {
+    var cfg: LintConfig = .{};
+    var overrides_list: std.ArrayList(LintOverride) = .empty;
+    defer overrides_list.deinit(arena.backing_allocator);
+
+    for (lint_tbl.entries.items) |kv| {
+        if (std.mem.eql(u8, kv.key, "inherit")) {
+            if (is_workspace_table) {
+                try emitManifestFieldErr(sink, kv.key_span, "`inherit` is only valid on package `[lint]`, not `[workspace.lint]`");
+                continue;
+            }
+            if (kv.val != .bool_val) {
+                try emitManifestFieldErr(sink, kv.val_span, "`[lint].inherit` must be a boolean");
+                continue;
+            }
+            cfg.inherit = kv.val.bool_val;
+            cfg.has_explicit_inherit = true;
+        } else if (std.mem.eql(u8, kv.key, "disable")) {
+            cfg.disable_mask |= try parseLintDisableMask(kv.val, kv.val_span, "[lint].disable", sink);
+        } else if (std.mem.eql(u8, kv.key, "exclude")) {
+            if (try parseGlobArray(arena, interner, kv.val, kv.val_span, "[lint].exclude", false, sink)) |globs| {
+                cfg.exclude = globs;
+            }
+        } else if (std.mem.eql(u8, kv.key, "settings")) {
+            if (kv.val != .table_val) {
+                try emitManifestFieldErr(sink, kv.val_span, "`[lint.settings]` must be a table");
+                continue;
+            }
+            cfg.settings = try parseLintSettingsSection(
+                arena,
+                interner,
+                kv.val.table_val,
+                &cfg.explicit_settings_mask,
+                sink,
+            );
+        } else if (std.mem.eql(u8, kv.key, "overrides")) {
+            if (kv.val != .array_val) {
+                try emitManifestFieldErr(sink, kv.val_span, "`[[lint.overrides]]` must be an array of tables");
+                continue;
+            }
+            for (kv.val.array_val) |ov_elem| {
+                if (ov_elem.val != .table_val) {
+                    try emitManifestFieldErr(sink, ov_elem.span, "`[[lint.overrides]]` element must be a table");
+                    continue;
+                }
+                var ov_entry: LintOverride = .{};
+                var has_files_key = false;
+                var has_disable_key = false;
+                for (ov_elem.val.table_val.entries.items) |okv| {
+                    if (std.mem.eql(u8, okv.key, "files")) {
+                        has_files_key = true;
+                        if (try parseGlobArray(
+                            arena,
+                            interner,
+                            okv.val,
+                            okv.val_span,
+                            "[[lint.overrides]].files",
+                            true,
+                            sink,
+                        )) |inc_globs| {
+                            ov_entry.files = inc_globs;
+                        }
+                    } else if (std.mem.eql(u8, okv.key, "exclude_files")) {
+                        if (try parseGlobArray(
+                            arena,
+                            interner,
+                            okv.val,
+                            okv.val_span,
+                            "[[lint.overrides]].exclude_files",
+                            false,
+                            sink,
+                        )) |exc_globs| {
+                            ov_entry.exclude_files = exc_globs;
+                        }
+                    } else if (std.mem.eql(u8, okv.key, "disable")) {
+                        has_disable_key = true;
+                        ov_entry.disable_mask |= try parseLintDisableMask(
+                            okv.val,
+                            okv.val_span,
+                            "[[lint.overrides]].disable",
+                            sink,
+                        );
+                    } else if (isForbiddenLintSeverityOrToggleKey(okv.key)) {
+                        if (sink) |diag_sink| {
+                            const msg = try std.fmt.allocPrint(
+                                diag_sink.arena.asAllocator(),
+                                "`[[lint.overrides]]` uses a strict `disable`-only model; `{s}` is forbidden (`DR-25`)",
+                                .{okv.key},
+                            );
+                            try emitToolConfigDiag(
+                                sink,
+                                .e0018_forbidden_tool_config_key,
+                                okv.key_span,
+                                msg,
+                                "help: list suppressed rules in `disable = [\"…\"]`",
+                            );
+                        }
+                    } else {
+                        try emitManifestFieldErr(sink, okv.key_span, "unknown key in `[[lint.overrides]]` table");
+                    }
+                }
+                if (!has_files_key) {
+                    try emitToolConfigDiag(
+                        sink,
+                        .e0019_invalid_lint_rule_or_glob,
+                        ov_elem.span,
+                        "`[[lint.overrides]]` entry requires a non-empty `files = [\"…\"]` glob array",
+                        null,
+                    );
+                }
+                if (!has_disable_key) {
+                    try emitManifestFieldErr(sink, ov_elem.span, "`[[lint.overrides]]` entry requires `disable = […]`");
+                }
+                if (ov_entry.files.len > 0) {
+                    try overrides_list.append(arena.backing_allocator, ov_entry);
+                }
+            }
+        } else if (isForbiddenLintSeverityOrToggleKey(kv.key) or kv.val == .bool_val or kv.val == .str_val) {
+            if (sink) |diag_sink| {
+                const msg = try std.fmt.allocPrint(
+                    diag_sink.arena.asAllocator(),
+                    "`[lint]` uses a strict `disable`-only model (`E0xxx` = error, `W0xxx` = warning); `{s}` is forbidden (`DR-25`)",
+                    .{kv.key},
+                );
+                try emitToolConfigDiag(
+                    sink,
+                    .e0018_forbidden_tool_config_key,
+                    kv.key_span,
+                    msg,
+                    "help: remove per-rule toggles/severities and list suppressed rules in `disable = [\"…\"]`",
+                );
+            }
+        } else {
+            try emitManifestFieldErr(sink, kv.key_span, "unknown key in `[lint]` table");
+        }
+    }
+
+    cfg.overrides = try arena.dupe(LintOverride, overrides_list.items);
+    return cfg;
+}
+
+/// Parses and validates `[fmt]` or `[workspace.fmt]`, rejecting all style-fragmenting knobs with `E0018`.
+fn parseFmtSection(
+    arena: *BumpArena,
+    interner: *StringInterner,
+    fmt_tbl: *const TomlDomTable,
+    is_workspace_table: bool,
+    sink: ?*DiagnosticSink,
+) !FmtConfig {
+    var cfg: FmtConfig = .{};
+    for (fmt_tbl.entries.items) |kv| {
+        if (std.mem.eql(u8, kv.key, "inherit")) {
+            if (is_workspace_table) {
+                try emitManifestFieldErr(sink, kv.key_span, "`inherit` is only valid on package `[fmt]`, not `[workspace.fmt]`");
+                continue;
+            }
+            if (kv.val != .bool_val) {
+                try emitManifestFieldErr(sink, kv.val_span, "`[fmt].inherit` must be a boolean");
+                continue;
+            }
+            cfg.inherit = kv.val.bool_val;
+            cfg.has_explicit_inherit = true;
+        } else if (std.mem.eql(u8, kv.key, "exclude")) {
+            if (try parseGlobArray(arena, interner, kv.val, kv.val_span, "[fmt].exclude", false, sink)) |globs| {
+                cfg.exclude = globs;
+            }
+        } else if (std.mem.eql(u8, kv.key, "check-generated")) {
+            if (kv.val != .bool_val) {
+                try emitManifestFieldErr(sink, kv.val_span, "`[fmt].check-generated` must be a boolean");
+                continue;
+            }
+            cfg.check_generated = kv.val.bool_val;
+            cfg.has_explicit_check_generated = true;
+        } else {
+            if (sink) |diag_sink| {
+                const msg = try std.fmt.allocPrint(
+                    diag_sink.arena.asAllocator(),
+                    "style-configuration key `[fmt].{s}` is forbidden; `corex fmt` enforces a single zero-knob canonical style (`DR-25`)",
+                    .{kv.key},
+                );
+                try emitToolConfigDiag(
+                    sink,
+                    .e0018_forbidden_tool_config_key,
+                    kv.key_span,
+                    msg,
+                    "help: `[fmt]` only permits `inherit`, `exclude`, and `check-generated`",
+                );
+            }
+        }
+    }
+    return cfg;
+}
+
+/// Parses and validates `[lsp]` or `[workspace.lsp]` (`E0020` on out-of-range/invalid enum values).
+fn parseLspSection(
+    lsp_tbl: *const TomlDomTable,
+    is_workspace_table: bool,
+    sink: ?*DiagnosticSink,
+) !LspConfig {
+    var cfg: LspConfig = .{};
+    for (lsp_tbl.entries.items) |kv| {
+        if (std.mem.eql(u8, kv.key, "inherit")) {
+            if (is_workspace_table) {
+                try emitManifestFieldErr(sink, kv.key_span, "`inherit` is only valid on package `[lsp]`, not `[workspace.lsp]`");
+                continue;
+            }
+            if (kv.val != .bool_val) {
+                try emitManifestFieldErr(sink, kv.val_span, "`[lsp].inherit` must be a boolean");
+                continue;
+            }
+            cfg.inherit = kv.val.bool_val;
+            cfg.has_explicit_inherit = true;
+        } else if (std.mem.eql(u8, kv.key, "inlay-hints-types")) {
+            cfg.explicit_fields_mask |= (1 << 0);
+            if (kv.val != .bool_val) {
+                try emitToolConfigDiag(
+                    sink,
+                    .e0020_tool_setting_out_of_range,
+                    kv.val_span,
+                    "`[lsp].inlay-hints-types` must be a boolean (`true` or `false`)",
+                    null,
+                );
+                continue;
+            }
+            cfg.inlay_hints_types = kv.val.bool_val;
+        } else if (std.mem.eql(u8, kv.key, "inlay-hints-parameter-names")) {
+            cfg.explicit_fields_mask |= (1 << 1);
+            if (kv.val != .str_val) {
+                try emitToolConfigDiag(
+                    sink,
+                    .e0020_tool_setting_out_of_range,
+                    kv.val_span,
+                    "`[lsp].inlay-hints-parameter-names` must be `\"none\"`, `\"non-matching\"`, or `\"all\"`",
+                    null,
+                );
+                continue;
+            }
+            if (std.mem.eql(u8, kv.val.str_val, "none")) {
+                cfg.inlay_hints_parameter_names = .none;
+            } else if (std.mem.eql(u8, kv.val.str_val, "non-matching")) {
+                cfg.inlay_hints_parameter_names = .non_matching;
+            } else if (std.mem.eql(u8, kv.val.str_val, "all")) {
+                cfg.inlay_hints_parameter_names = .all;
+            } else {
+                try emitToolConfigDiag(
+                    sink,
+                    .e0020_tool_setting_out_of_range,
+                    kv.val_span,
+                    "invalid `[lsp].inlay-hints-parameter-names` mode (expected `\"none\"`, `\"non-matching\"`, or `\"all\"`)",
+                    null,
+                );
+            }
+        } else if (std.mem.eql(u8, kv.key, "inlay-hints-mvs-modes")) {
+            cfg.explicit_fields_mask |= (1 << 2);
+            if (kv.val != .bool_val) {
+                try emitToolConfigDiag(
+                    sink,
+                    .e0020_tool_setting_out_of_range,
+                    kv.val_span,
+                    "`[lsp].inlay-hints-mvs-modes` must be a boolean (`true` or `false`)",
+                    null,
+                );
+                continue;
+            }
+            cfg.inlay_hints_mvs_modes = kv.val.bool_val;
+        } else if (std.mem.eql(u8, kv.key, "inlay-hints-effects")) {
+            cfg.explicit_fields_mask |= (1 << 3);
+            if (kv.val != .str_val) {
+                try emitToolConfigDiag(
+                    sink,
+                    .e0020_tool_setting_out_of_range,
+                    kv.val_span,
+                    "`[lsp].inlay-hints-effects` must be `\"none\"`, `\"contracts-only\"`, or `\"all\"`",
+                    null,
+                );
+                continue;
+            }
+            if (std.mem.eql(u8, kv.val.str_val, "none")) {
+                cfg.inlay_hints_effects = .none;
+            } else if (std.mem.eql(u8, kv.val.str_val, "contracts-only")) {
+                cfg.inlay_hints_effects = .contracts_only;
+            } else if (std.mem.eql(u8, kv.val.str_val, "all")) {
+                cfg.inlay_hints_effects = .all;
+            } else {
+                try emitToolConfigDiag(
+                    sink,
+                    .e0020_tool_setting_out_of_range,
+                    kv.val_span,
+                    "invalid `[lsp].inlay-hints-effects` mode (expected `\"none\"`, `\"contracts-only\"`, or `\"all\"`)",
+                    null,
+                );
+            }
+        } else if (std.mem.eql(u8, kv.key, "code-lens-test-bench")) {
+            cfg.explicit_fields_mask |= (1 << 4);
+            if (kv.val != .bool_val) {
+                try emitToolConfigDiag(
+                    sink,
+                    .e0020_tool_setting_out_of_range,
+                    kv.val_span,
+                    "`[lsp].code-lens-test-bench` must be a boolean (`true` or `false`)",
+                    null,
+                );
+                continue;
+            }
+            cfg.code_lens_test_bench = kv.val.bool_val;
+        } else if (std.mem.eql(u8, kv.key, "max-completion-items")) {
+            cfg.explicit_fields_mask |= (1 << 5);
+            const raw_max = extractTomlSignedOrUnsignedInt(kv.val) orelse {
+                try emitToolConfigDiag(
+                    sink,
+                    .e0020_tool_setting_out_of_range,
+                    kv.val_span,
+                    "`[lsp].max-completion-items` must be an integer in `16..=256`",
+                    null,
+                );
+                continue;
+            };
+            if (raw_max < LSP_MAX_COMPLETION_ITEMS_MIN or raw_max > LSP_MAX_COMPLETION_ITEMS_MAX) {
+                try emitToolConfigDiag(
+                    sink,
+                    .e0020_tool_setting_out_of_range,
+                    kv.val_span,
+                    "`[lsp].max-completion-items` is out of range (expected `16..=256`)",
+                    null,
+                );
+                continue;
+            }
+            cfg.max_completion_items = @intCast(raw_max);
+        } else {
+            try emitManifestFieldErr(sink, kv.key_span, "unknown key in `[lsp]` table");
+        }
+    }
+    return cfg;
+}
+
+/// Merges `member_lint` over `ws_lint` when `member_lint.inherit` is `true` (`DR-25` §3.1).
+fn resolveEffectivePackageLintConfigImpl(
+    arena: *BumpArena,
+    member_lint: LintConfig,
+    ws_lint: LintConfig,
+) !LintConfig {
+    if (!member_lint.inherit) return member_lint;
+
+    var merged_exclude: []const CompiledGlob64 = member_lint.exclude;
+    if (ws_lint.exclude.len > 0) {
+        if (member_lint.exclude.len == 0) {
+            merged_exclude = ws_lint.exclude;
+        } else {
+            const combined = try arena.allocSlice(CompiledGlob64, ws_lint.exclude.len + member_lint.exclude.len);
+            @memcpy(combined[0..ws_lint.exclude.len], ws_lint.exclude);
+            @memcpy(combined[ws_lint.exclude.len..], member_lint.exclude);
+            merged_exclude = combined;
+        }
+    }
+
+    var merged_overrides: []const LintOverride = member_lint.overrides;
+    if (ws_lint.overrides.len > 0) {
+        if (member_lint.overrides.len == 0) {
+            merged_overrides = ws_lint.overrides;
+        } else {
+            const combined_ov = try arena.allocSlice(LintOverride, ws_lint.overrides.len + member_lint.overrides.len);
+            @memcpy(combined_ov[0..ws_lint.overrides.len], ws_lint.overrides);
+            @memcpy(combined_ov[ws_lint.overrides.len..], member_lint.overrides);
+            merged_overrides = combined_ov;
+        }
+    }
+
+    var eff_settings = ws_lint.settings;
+    if ((member_lint.explicit_settings_mask & (1 << 0)) != 0) {
+        eff_settings.min_grouped_int_digits = member_lint.settings.min_grouped_int_digits;
+    }
+    if ((member_lint.explicit_settings_mask & (1 << 1)) != 0) {
+        eff_settings.min_grouped_hex_digits = member_lint.settings.min_grouped_hex_digits;
+    }
+    if ((member_lint.explicit_settings_mask & (1 << 2)) != 0) {
+        eff_settings.trivial_copy_max_bytes = member_lint.settings.trivial_copy_max_bytes;
+    }
+    if ((member_lint.explicit_settings_mask & (1 << 3)) != 0) {
+        eff_settings.require_suppression_reason = member_lint.settings.require_suppression_reason;
+    }
+    if ((member_lint.explicit_settings_mask & (1 << 4)) != 0) {
+        eff_settings.allowed_ident_names = member_lint.settings.allowed_ident_names;
+    }
+    if ((member_lint.explicit_settings_mask & (1 << 5)) != 0) {
+        eff_settings.allowed_confusables = member_lint.settings.allowed_confusables;
+    }
+
+    return .{
+        .inherit = true,
+        .has_explicit_inherit = member_lint.has_explicit_inherit,
+        .disable_mask = ws_lint.disable_mask | member_lint.disable_mask,
+        .exclude = merged_exclude,
+        .settings = eff_settings,
+        .explicit_settings_mask = ws_lint.explicit_settings_mask | member_lint.explicit_settings_mask,
+        .overrides = merged_overrides,
+    };
+}
+
+/// Merges `member_fmt` over `ws_fmt` when `member_fmt.inherit` is `true` (`DR-25` §3.1).
+fn resolveEffectivePackageFmtConfigImpl(
+    arena: *BumpArena,
+    member_fmt: FmtConfig,
+    ws_fmt: FmtConfig,
+) !FmtConfig {
+    if (!member_fmt.inherit) return member_fmt;
+
+    var merged_exclude: []const CompiledGlob64 = member_fmt.exclude;
+    if (ws_fmt.exclude.len > 0) {
+        if (member_fmt.exclude.len == 0) {
+            merged_exclude = ws_fmt.exclude;
+        } else {
+            const combined = try arena.allocSlice(CompiledGlob64, ws_fmt.exclude.len + member_fmt.exclude.len);
+            @memcpy(combined[0..ws_fmt.exclude.len], ws_fmt.exclude);
+            @memcpy(combined[ws_fmt.exclude.len..], member_fmt.exclude);
+            merged_exclude = combined;
+        }
+    }
+
+    return .{
+        .inherit = true,
+        .has_explicit_inherit = member_fmt.has_explicit_inherit,
+        .exclude = merged_exclude,
+        .check_generated = if (member_fmt.has_explicit_check_generated)
+            member_fmt.check_generated
+        else
+            ws_fmt.check_generated,
+        .has_explicit_check_generated = member_fmt.has_explicit_check_generated or ws_fmt.has_explicit_check_generated,
+    };
+}
+
+/// Merges `member_lsp` over `ws_lsp` when `member_lsp.inherit` is `true` (`DR-25` §3.1).
+fn resolveEffectivePackageLspConfigImpl(member_lsp: LspConfig, ws_lsp: LspConfig) LspConfig {
+    if (!member_lsp.inherit) return member_lsp;
+    var eff = ws_lsp;
+    eff.inherit = true;
+    eff.has_explicit_inherit = member_lsp.has_explicit_inherit;
+    if ((member_lsp.explicit_fields_mask & (1 << 0)) != 0) eff.inlay_hints_types = member_lsp.inlay_hints_types;
+    if ((member_lsp.explicit_fields_mask & (1 << 1)) != 0) {
+        eff.inlay_hints_parameter_names = member_lsp.inlay_hints_parameter_names;
+    }
+    if ((member_lsp.explicit_fields_mask & (1 << 2)) != 0) eff.inlay_hints_mvs_modes = member_lsp.inlay_hints_mvs_modes;
+    if ((member_lsp.explicit_fields_mask & (1 << 3)) != 0) eff.inlay_hints_effects = member_lsp.inlay_hints_effects;
+    if ((member_lsp.explicit_fields_mask & (1 << 4)) != 0) {
+        eff.code_lens_test_bench = member_lsp.code_lens_test_bench;
+    }
+    if ((member_lsp.explicit_fields_mask & (1 << 5)) != 0) {
+        eff.max_completion_items = member_lsp.max_completion_items;
+    }
+    eff.explicit_fields_mask = ws_lsp.explicit_fields_mask | member_lsp.explicit_fields_mask;
+    return eff;
+}
+
+/// Probes `dir_path` for forbidden standalone CoreX tool dotfiles, emitting `E0017` when present.
+fn checkStrayToolConfigDotfilesImpl(
+    io: std.Io,
+    dir_path: []const u8,
+    fallback_file_id: FileId,
+    sink: ?*DiagnosticSink,
+) !bool {
+    const trimmed_dir = std.mem.trimEnd(u8, dir_path, "/\\");
+    var path_buf: [1024]u8 = undefined;
+    var found_any = false;
+
+    for (FORBIDDEN_STRAY_TOOL_DOTFILES) |dotfile_name| {
+        const probe_path = if (trimmed_dir.len == 0 or std.mem.eql(u8, trimmed_dir, "."))
+            dotfile_name
+        else
+            std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ trimmed_dir, dotfile_name }) catch continue;
+
+        if (std.Io.Dir.cwd().statFile(io, probe_path, .{})) |_| {
+            found_any = true;
+            if (sink) |diag_sink| {
+                const msg = try std.fmt.allocPrint(
+                    diag_sink.arena.asAllocator(),
+                    "standalone tool configuration file `{s}` is forbidden (`DR-25`); " ++
+                        "consolidate `[lint]`, `[fmt]`, and `[lsp]` inside `corex.toml`",
+                    .{dotfile_name},
+                );
+                const help_note = try std.fmt.allocPrint(
+                    diag_sink.arena.asAllocator(),
+                    "help: move settings into `corex.toml` and delete `{s}`",
+                    .{dotfile_name},
+                );
+                try emitToolConfigDiag(
+                    sink,
+                    .e0017_stray_tool_config_dotfile,
+                    Span.init(fallback_file_id, 0, 0),
+                    msg,
+                    help_note,
+                );
+            }
+        } else |_| {}
+    }
+    return found_any;
+}
+
 /// Parses `[security]` (including `[security.dev]` and `[security.package.<name>]`).
 fn parseSecuritySection(
     arena: *BumpArena,
@@ -4869,6 +6516,44 @@ fn lowerDomToManifest(
             continue;
         }
 
+        if (std.mem.eql(u8, key, "lint")) {
+            if (top_kv.val != .table_val) {
+                try emitManifestFieldErr(sink, top_kv.val_span, "`[lint]` must be a table");
+                continue;
+            }
+            manifest.lint = try parseLintSection(arena, interner, top_kv.val.table_val, false, sink);
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "lints")) {
+            try emitToolConfigDiag(
+                sink,
+                .e0018_forbidden_tool_config_key,
+                top_kv.key_span,
+                "Cargo-style `[lints]` severity table is forbidden in `corex.toml`; use `[lint]` with `disable = [\"…\"]` (`DR-25`)",
+                "help: replace `[lints]` with `[lint]`",
+            );
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "fmt")) {
+            if (top_kv.val != .table_val) {
+                try emitManifestFieldErr(sink, top_kv.val_span, "`[fmt]` must be a table");
+                continue;
+            }
+            manifest.fmt = try parseFmtSection(arena, interner, top_kv.val.table_val, false, sink);
+            continue;
+        }
+
+        if (std.mem.eql(u8, key, "lsp")) {
+            if (top_kv.val != .table_val) {
+                try emitManifestFieldErr(sink, top_kv.val_span, "`[lsp]` must be a table");
+                continue;
+            }
+            manifest.lsp = try parseLspSection(top_kv.val.table_val, false, sink);
+            continue;
+        }
+
         if (std.mem.eql(u8, key, "workspace")) {
             if (is_script) {
                 try emitManifestFieldErr(sink, top_kv.key_span, "`[workspace]` is forbidden in single-file `.cx` script frontmatter");
@@ -4900,6 +6585,20 @@ fn lowerDomToManifest(
                     try parsePatchRootSection(arena, interner, doc, wkv.val.table_val, &ws_patch, sink);
                 } else if (std.mem.eql(u8, wkv.key, "package") and wkv.val == .table_val) {
                     ws_cfg.package = try parseWorkspacePackageSection(arena, interner, wkv.val.table_val, true, sink);
+                } else if (std.mem.eql(u8, wkv.key, "lint") and wkv.val == .table_val) {
+                    ws_cfg.lint = try parseLintSection(arena, interner, wkv.val.table_val, true, sink);
+                } else if (std.mem.eql(u8, wkv.key, "lints")) {
+                    try emitToolConfigDiag(
+                        sink,
+                        .e0018_forbidden_tool_config_key,
+                        wkv.key_span,
+                        "Cargo-style `[workspace.lints]` severity table is forbidden; use `[workspace.lint]` (`DR-25`)",
+                        "help: replace `[workspace.lints]` with `[workspace.lint]`",
+                    );
+                } else if (std.mem.eql(u8, wkv.key, "fmt") and wkv.val == .table_val) {
+                    ws_cfg.fmt = try parseFmtSection(arena, interner, wkv.val.table_val, true, sink);
+                } else if (std.mem.eql(u8, wkv.key, "lsp") and wkv.val == .table_val) {
+                    ws_cfg.lsp = try parseLspSection(wkv.val.table_val, true, sink);
                 } else {
                     try emitManifestFieldErr(sink, wkv.key_span, "unknown key in `[workspace]` table");
                 }
@@ -5028,6 +6727,13 @@ fn lowerDomToManifest(
     }
     manifest.excludes = excludes_list.items;
     manifest.patches = patches_list.items;
+    if (manifest.package != null) {
+        if (manifest.workspace) |ws_self| {
+            manifest.lint = try resolveEffectivePackageLintConfig(arena, manifest.lint, ws_self.lint);
+            manifest.fmt = try resolveEffectivePackageFmtConfig(arena, manifest.fmt, ws_self.fmt);
+            manifest.lsp = resolveEffectivePackageLspConfig(manifest.lsp, ws_self.lsp);
+        }
+    }
     manifest.root_manifest_blake3 = computeNormalizedManifestBlake3(&manifest, interner);
     return manifest;
 }
@@ -5146,6 +6852,52 @@ fn isValidSnakeAlias(alias: []const u8) bool {
 }
 
 // ------------------------------------- PUBLIC API --------------------------------------
+
+// --------------- Tooling Configuration & Globs ----------------
+
+/// Compiles `raw_pattern` into a non-backtracking 64-state `CompiledGlob64` (`E0019` on error).
+pub fn compileGlob64(
+    arena: *BumpArena,
+    interner: *StringInterner,
+    raw_pattern: []const u8,
+    span: Span,
+    sink: ?*DiagnosticSink,
+) !?CompiledGlob64 {
+    return compileGlob64Impl(arena, interner, raw_pattern, span, sink);
+}
+
+/// Merges `member_lint` over `ws_lint` when `member_lint.inherit` is `true` (`DR-25` §3.1).
+pub fn resolveEffectivePackageLintConfig(
+    arena: *BumpArena,
+    member_lint: LintConfig,
+    ws_lint: LintConfig,
+) !LintConfig {
+    return resolveEffectivePackageLintConfigImpl(arena, member_lint, ws_lint);
+}
+
+/// Merges `member_fmt` over `ws_fmt` when `member_fmt.inherit` is `true` (`DR-25` §3.1).
+pub fn resolveEffectivePackageFmtConfig(
+    arena: *BumpArena,
+    member_fmt: FmtConfig,
+    ws_fmt: FmtConfig,
+) !FmtConfig {
+    return resolveEffectivePackageFmtConfigImpl(arena, member_fmt, ws_fmt);
+}
+
+/// Merges `member_lsp` over `ws_lsp` when `member_lsp.inherit` is `true` (`DR-25` §3.1).
+pub fn resolveEffectivePackageLspConfig(member_lsp: LspConfig, ws_lsp: LspConfig) LspConfig {
+    return resolveEffectivePackageLspConfigImpl(member_lsp, ws_lsp);
+}
+
+/// Probes `dir_path` for forbidden standalone CoreX tool dotfiles, emitting `E0017` when present.
+pub fn checkStrayToolConfigDotfiles(
+    io: std.Io,
+    dir_path: []const u8,
+    fallback_file_id: FileId,
+    sink: ?*DiagnosticSink,
+) !bool {
+    return checkStrayToolConfigDotfilesImpl(io, dir_path, fallback_file_id, sink);
+}
 
 // --------------- Package Naming & Target `@cfg` ---------------
 
@@ -6064,6 +7816,7 @@ pub fn loadWorkspaceManifestBundle(
     const root_dir_raw = std.fs.path.dirname(root_manifest_path) orelse ".";
     const owned_root_dir = try arena.dupe(u8, root_dir_raw);
     const owned_root_path = try arena.dupe(u8, root_manifest_path);
+    _ = try checkStrayToolConfigDotfiles(io, owned_root_dir, root_file_id, sink);
 
     var member_list: std.ArrayList(WorkspaceMember) = .empty;
     if (parsed_root.manifest.package != null) {
@@ -6134,6 +7887,7 @@ pub fn loadWorkspaceManifestBundle(
 
             const mem_dir = try std.fmt.allocPrint(arena.asAllocator(), "{s}/{s}", .{ owned_root_dir, rel_d });
             const mem_toml = try std.fmt.allocPrint(arena.asAllocator(), "{s}/corex.toml", .{mem_dir});
+            _ = try checkStrayToolConfigDotfiles(io, mem_dir, FileId.fromInt(next_fid), sink);
             const mem_bytes = std.Io.Dir.cwd().readFileAlloc(
                 io,
                 mem_toml,
@@ -6187,6 +7941,20 @@ pub fn loadWorkspaceManifestBundle(
                 parsed_mem.manifest.dependencies,
                 ws_cfg.dependencies,
                 sink,
+            );
+            parsed_mem.manifest.lint = try resolveEffectivePackageLintConfig(
+                &arena,
+                parsed_mem.manifest.lint,
+                ws_cfg.lint,
+            );
+            parsed_mem.manifest.fmt = try resolveEffectivePackageFmtConfig(
+                &arena,
+                parsed_mem.manifest.fmt,
+                ws_cfg.fmt,
+            );
+            parsed_mem.manifest.lsp = resolveEffectivePackageLspConfig(
+                parsed_mem.manifest.lsp,
+                ws_cfg.lsp,
             );
             parsed_mem.manifest.root_manifest_blake3 = computeNormalizedManifestBlake3(&parsed_mem.manifest, interner);
 
@@ -6877,3 +8645,237 @@ comptime {
     std.debug.assert(@sizeOf(TomlCstNode) == 16 and @alignOf(TomlCstNode) == 4);
     std.debug.assert(@sizeOf(TomlSpanAnchor) == 24 and @alignOf(TomlSpanAnchor) == 4);
 }
+
+// ---------------------------------------- TESTS ----------------------------------------
+
+test "test_pkg_manifest_dr25_tooling_schema_compiled_glob64_and_lockfile_firewall" {
+    const allocator = std.testing.allocator;
+    var arena = BumpArena.init(allocator);
+    defer arena.deinit();
+    var interner = try StringInterner.init(allocator);
+    defer interner.deinit();
+    var sink = DiagnosticSink.init(allocator);
+    defer sink.deinit();
+    const cfg_env: CfgEnv = .{};
+
+    const bare_toml =
+        \\[package]
+        \\name = "telemetry-gateway"
+        \\version = "1.2.0"
+        \\corex = "1.0"
+    ;
+    var parsed_bare = try parseManifest(allocator, &arena, &interner, FileId.fromInt(1), bare_toml, &cfg_env, &sink);
+    defer parsed_bare.doc.deinit(allocator);
+
+    const full_toml =
+        \\[package]
+        \\name = "telemetry-gateway"
+        \\version = "1.2.0"
+        \\corex = "1.0"
+        \\
+        \\[lint]
+        \\inherit = true
+        \\disable = ["W0501", "needless-trailing-return"]
+        \\exclude = ["src/generated/**/*.cx"]
+        \\
+        \\[lint.settings]
+        \\min-grouped-int-digits     = 6
+        \\min-grouped-hex-digits     = 8
+        \\trivial-copy-max-bytes     = 16
+        \\require-suppression-reason = false
+        \\allowed-ident-names        = ["id", "db", "io", "rx", "tx"]
+        \\allowed-confusables        = ["α", "β"]
+        \\
+        \\[[lint.overrides]]
+        \\files = ["tests/**/*.cx", "**/pb/*.cx", "src/legacy_{v1,v2}/**"]
+        \\exclude_files = ["tests/security_strict/**/*.cx"]
+        \\disable = ["unused-pkg-visibility", "single-char-ident"]
+        \\
+        \\[fmt]
+        \\exclude = ["tests/fixtures/malformed/**/*.cx"]
+        \\check-generated = true
+        \\
+        \\[lsp]
+        \\inlay-hints-types           = false
+        \\inlay-hints-parameter-names = "all"
+        \\inlay-hints-mvs-modes       = false
+        \\inlay-hints-effects         = "none"
+        \\code-lens-test-bench        = false
+        \\max-completion-items        = 128
+    ;
+    var parsed_full = try parseManifest(allocator, &arena, &interner, FileId.fromInt(2), full_toml, &cfg_env, &sink);
+    defer parsed_full.doc.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), sink.countDiagnostics());
+    // Lockfile hash firewall: editing `[lint]`, `[fmt]`, or `[lsp]` must NEVER alter `root_manifest_blake3`!
+    try std.testing.expectEqualSlices(
+        u8,
+        &parsed_bare.manifest.root_manifest_blake3,
+        &parsed_full.manifest.root_manifest_blake3,
+    );
+
+    const lint_cfg = parsed_full.manifest.lint;
+    try std.testing.expectEqual(@as(u8, 6), lint_cfg.settings.min_grouped_int_digits);
+    try std.testing.expectEqual(@as(u8, 8), lint_cfg.settings.min_grouped_hex_digits);
+    try std.testing.expectEqual(@as(?u8, 16), lint_cfg.settings.trivial_copy_max_bytes);
+    try std.testing.expect(!lint_cfg.settings.require_suppression_reason);
+    try std.testing.expectEqual(@as(usize, 5), lint_cfg.settings.allowed_ident_names.len);
+    try std.testing.expectEqual(@as(usize, 2), lint_cfg.settings.allowed_confusables.len);
+    try std.testing.expect(lint_cfg.isFileExcluded("src/generated/v1/api.cx"));
+    try std.testing.expect(!lint_cfg.isFileExcluded("src/net/http.cx"));
+
+    const mask_src = lint_cfg.resolveFileDisabledMask("src/net/http.cx", .{});
+    try std.testing.expect((mask_src & RuleId.inlining_budget_exceeded.bit()) != 0);
+    try std.testing.expect((mask_src & RuleId.needless_trailing_return.bit()) != 0);
+    try std.testing.expect((mask_src & RuleId.single_char_ident.bit()) == 0);
+
+    const mask_test = lint_cfg.resolveFileDisabledMask("tests/unit/auth_test.cx", .{});
+    try std.testing.expect((mask_test & RuleId.single_char_ident.bit()) != 0);
+    try std.testing.expect((mask_test & RuleId.unused_pkg_visibility.bit()) != 0);
+
+    const mask_pb = lint_cfg.resolveFileDisabledMask("crates/rpc/pb/wire.cx", .{});
+    try std.testing.expect((mask_pb & RuleId.single_char_ident.bit()) != 0);
+
+    const mask_legacy = lint_cfg.resolveFileDisabledMask("src/legacy_v2/old.cx", .{});
+    try std.testing.expect((mask_legacy & RuleId.single_char_ident.bit()) != 0);
+
+    const mask_strict = lint_cfg.resolveFileDisabledMask("tests/security_strict/audit.cx", .{});
+    try std.testing.expect((mask_strict & RuleId.single_char_ident.bit()) == 0);
+
+    try std.testing.expect(parsed_full.manifest.fmt.check_generated);
+    try std.testing.expect(parsed_full.manifest.fmt.isFileExcluded("tests/fixtures/malformed/bad.cx"));
+    try std.testing.expect(!parsed_full.manifest.lsp.inlay_hints_types);
+    try std.testing.expectEqual(LspParamHintsMode.all, parsed_full.manifest.lsp.inlay_hints_parameter_names);
+    try std.testing.expect(!parsed_full.manifest.lsp.inlay_hints_mvs_modes);
+    try std.testing.expectEqual(LspEffectsHintsMode.none, parsed_full.manifest.lsp.inlay_hints_effects);
+    try std.testing.expect(!parsed_full.manifest.lsp.code_lens_test_bench);
+    try std.testing.expectEqual(@as(u16, 128), parsed_full.manifest.lsp.max_completion_items);
+}
+
+test "test_pkg_manifest_dr25_script_frontmatter_workspace_inheritance_and_e0018_e0020" {
+    const allocator = std.testing.allocator;
+    var arena = BumpArena.init(allocator);
+    defer arena.deinit();
+    var interner = try StringInterner.init(allocator);
+    defer interner.deinit();
+    const cfg_env: CfgEnv = .{};
+
+    // [1] Script frontmatter supports `[lint]`, `[fmt]`, and `[lsp]`:
+    {
+        var script_sink = DiagnosticSink.init(allocator);
+        defer script_sink.deinit();
+        const script_src =
+            \\---
+            \\[lint]
+            \\disable = ["single-char-ident"]
+            \\[fmt]
+            \\check-generated = true
+            \\[lsp]
+            \\max-completion-items = 32
+            \\---
+            \\pub fn main() {}
+        ;
+        const extracted = (try extractScriptFrontmatter(&arena, FileId.fromInt(3), script_src, &script_sink)).?;
+        var parsed_script = try parseScriptFrontmatterManifest(
+            allocator,
+            &arena,
+            &interner,
+            FileId.fromInt(3),
+            script_src,
+            extracted,
+            &cfg_env,
+            &script_sink,
+        );
+        defer parsed_script.doc.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), script_sink.countDiagnostics());
+        try std.testing.expect((parsed_script.manifest.lint.disable_mask & RuleId.single_char_ident.bit()) != 0);
+        try std.testing.expect(parsed_script.manifest.fmt.check_generated);
+        try std.testing.expectEqual(@as(u16, 32), parsed_script.manifest.lsp.max_completion_items);
+    }
+
+    // [2] Workspace inheritance (`inherit = true` merges vs `inherit = false` isolates):
+    {
+        var ws_sink = DiagnosticSink.init(allocator);
+        defer ws_sink.deinit();
+        const ws_toml =
+            \\[package]
+            \\name = "root-pkg"
+            \\version = "0.1.0"
+            \\[lint]
+            \\disable = ["unused-binding"]
+            \\[lint.settings]
+            \\min-grouped-int-digits = 7
+            \\[workspace]
+            \\members = []
+            \\[workspace.lint]
+            \\disable = ["deprecated-use"]
+            \\[workspace.lint.settings]
+            \\min-grouped-int-digits = 6
+            \\min-grouped-hex-digits = 10
+            \\[workspace.lsp]
+            \\max-completion-items = 200
+        ;
+        var parsed_ws = try parseManifest(allocator, &arena, &interner, FileId.fromInt(4), ws_toml, &cfg_env, &ws_sink);
+        defer parsed_ws.doc.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), ws_sink.countDiagnostics());
+        const eff_lint = parsed_ws.manifest.lint;
+        try std.testing.expect((eff_lint.disable_mask & RuleId.unused_binding.bit()) != 0);
+        try std.testing.expect((eff_lint.disable_mask & RuleId.deprecated_use.bit()) != 0);
+        try std.testing.expectEqual(@as(u8, 7), eff_lint.settings.min_grouped_int_digits);
+        try std.testing.expectEqual(@as(u8, 10), eff_lint.settings.min_grouped_hex_digits);
+        try std.testing.expectEqual(@as(u16, 200), parsed_ws.manifest.lsp.max_completion_items);
+
+        const isolated = try resolveEffectivePackageLintConfig(
+            &arena,
+            .{ .inherit = false, .disable_mask = RuleId.single_char_ident.bit() },
+            parsed_ws.manifest.workspace.?.lint,
+        );
+        try std.testing.expectEqual(RuleId.single_char_ident.bit(), isolated.disable_mask);
+    }
+
+    // [3] E0018, E0019 (Jaro-Winkler suggestion + bad globs), and E0020 out-of-range checks:
+    {
+        var err_sink = DiagnosticSink.init(allocator);
+        defer err_sink.deinit();
+        const bad_toml =
+            \\[package]
+            \\name = "bad-cfg"
+            \\version = "0.1.0"
+            \\[lint]
+            \\disable = ["unused-bindng", "correctness", "E0403"]
+            \\exclude = ["../escape/*.cx", "/abs/*.cx", "{a,b"]
+            \\allow = ["W0402"]
+            \\[lint.settings]
+            \\min-grouped-int-digits = 2
+            \\trivial-copy-max-bytes = 64
+            \\allowed-confusables = ["ab"]
+            \\[fmt]
+            \\indent-width = 2
+            \\[lsp]
+            \\max-completion-items = 999
+            \\inlay-hints-parameter-names = "verbose"
+        ;
+        var parsed_bad = try parseManifest(allocator, &arena, &interner, FileId.fromInt(5), bad_toml, &cfg_env, &err_sink);
+        defer parsed_bad.doc.deinit(allocator);
+
+        var count_e0018: usize = 0;
+        var count_e0019: usize = 0;
+        var count_e0020: usize = 0;
+        var saw_did_you_mean = false;
+        for (err_sink.asSlice()) |diag_item| {
+            if (diag_item.code == .e0018_forbidden_tool_config_key) count_e0018 += 1;
+            if (diag_item.code == .e0019_invalid_lint_rule_or_glob) {
+                count_e0019 += 1;
+                for (diag_item.notes) |note_str| {
+                    if (std.mem.indexOf(u8, note_str, "unused-binding") != null) saw_did_you_mean = true;
+                }
+            }
+            if (diag_item.code == .e0020_tool_setting_out_of_range) count_e0020 += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2), count_e0018);
+        try std.testing.expectEqual(@as(usize, 6), count_e0019);
+        try std.testing.expectEqual(@as(usize, 5), count_e0020);
+        try std.testing.expect(saw_did_you_mean);
+    }
+}
+

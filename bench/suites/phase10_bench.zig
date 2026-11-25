@@ -530,7 +530,7 @@ fn writeSynthetic400LocModule(
             "pub fn func_00(seed_val: i32) -> i32 {{\n" ++
             "    let pair = SamplePair {{ x_metric: seed_val, y_metric: {d} }};\n" ++
             "    let sum_val = pair.x_metric +% pair.y_metric;\n" ++
-            "    return sum_val ^ 3;\n" ++
+            "    sum_val ^ 3\n" ++
             "}}\n",
         .{ mod_ordinal, @as(usize, (mod_ordinal % 97) + 1) },
     );
@@ -552,7 +552,7 @@ fn writeSynthetic400LocModule(
                 "    }}\n" ++
                 "    let folded_val = acc_val ^ {d};\n" ++
                 "    let prev_val = func_00(folded_val);\n" ++
-                "    return prev_val +% 1;\n" ++
+                "    prev_val +% 1\n" ++
                 "}}\n",
             .{ fn_idx, fn_idx, fn_idx + 11 },
         );
@@ -615,7 +615,7 @@ fn writeSynthetic400LocRootModule(
                 "        total_val = total_val -% summary.flags;\n" ++
                 "    }}\n" ++
                 "    let mixed_val = total_val ^ 5;\n" ++
-                "    return mixed_val;\n" ++
+                "    mixed_val +% 1\n" ++
                 "}}\n",
             .{ fn_idx, target_mod, fn_idx, target_mod, fn_idx + 1 },
         );

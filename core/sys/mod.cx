@@ -30,25 +30,25 @@ pub const STDERR_FD: i32 = 2;
 /| Writes raw UTF-8 `text` to standard output (`fd = 1`) and returns the byte count written.
 @inline @no_alloc
 pub fn write_stdout(text: str) -> isize {
-    return @sys_write(STDOUT_FD, text);
+    @sys_write(STDOUT_FD, text)
 }
 
 /| Writes raw `bytes` slice to standard output (`fd = 1`) and returns the byte count written.
 @inline @no_alloc
 pub fn write_stdout_bytes(bytes: &[u8]) -> isize {
-    return @sys_write(STDOUT_FD, bytes);
+    @sys_write(STDOUT_FD, bytes)
 }
 
 /| Writes raw UTF-8 `text` to standard error (`fd = 2`) and returns the byte count written.
 @inline @no_alloc
 pub fn write_stderr(text: str) -> isize {
-    return @sys_write(STDERR_FD, text);
+    @sys_write(STDERR_FD, text)
 }
 
 /| Writes raw `bytes` slice to standard error (`fd = 2`) and returns the byte count written.
 @inline @no_alloc
 pub fn write_stderr_bytes(bytes: &[u8]) -> isize {
-    return @sys_write(STDERR_FD, bytes);
+    @sys_write(STDERR_FD, bytes)
 }
 
 /| Immediately terminates the current process with `status_code` (`@sys_exit`).

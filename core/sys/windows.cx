@@ -45,13 +45,13 @@ pub extern "C" fn win32_exit_process(exit_code: u32) -> never;
 /| Safe wrapper writing `text` to standard output in binary mode (`fd = 1`).
 @inline @no_alloc
 pub fn write_stdout(text: str) -> isize {
-    return @sys_write(STDOUT_FD, text);
+    @sys_write(STDOUT_FD, text)
 }
 
 /| Safe wrapper writing `text` to standard error in binary mode (`fd = 2`).
 @inline @no_alloc
 pub fn write_stderr(text: str) -> isize {
-    return @sys_write(STDERR_FD, text);
+    @sys_write(STDERR_FD, text)
 }
 
 /| Safe wrapper terminating the process with `status_code`.

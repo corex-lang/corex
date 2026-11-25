@@ -5556,6 +5556,78 @@ const MirLowerer = struct {
         return false;
     }
 
+    /// Returns `true` if `place_id` projects through an `unsafe` raw pointer (`*const T` / `*mut T`).
+    fn isPlaceBehindRawPtr(self: *const MirLowerer, place_id: PlaceId) bool {
+        const place = self.body.places.items[place_id.asInt()];
+        if (place.base >= self.body.locals.items.len) return false;
+        var cur_ty = self.pool.unwrapUnderlyingType(self.body.locals.items[place.base].type_id);
+        var active_downcast: ?u32 = null;
+        var active_soa_field_ty: ?TypeId = null;
+
+        for (self.body.getPlaceProjections(place_id)) |proj| {
+            if (active_soa_field_ty) |soa_field_ty| {
+                active_soa_field_ty = null;
+                if (proj.kind == .index) {
+                    cur_ty = soa_field_ty;
+                    continue;
+                } else if (proj.kind == .slice_len) {
+                    cur_ty = .usize_ty;
+                    continue;
+                }
+                return false;
+            }
+            if (cur_ty.isError()) return false;
+            const ty_node = self.pool.getNode(cur_ty);
+            switch (proj.kind) {
+                .deref => {
+                    active_downcast = null;
+                    if (ty_node.tag == .raw_ptr_ty) return true;
+                    if (ty_node.tag == .ref_ty or ty_node.tag == .mut_ref_ty) {
+                        cur_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(ty_node.lhs));
+                    } else {
+                        return false;
+                    }
+                },
+                .downcast => active_downcast = proj.payload,
+                .field => {
+                    if (active_downcast) |tag_ord| {
+                        active_downcast = null;
+                        cur_ty = self.pool.unwrapUnderlyingType(self.resolveVariantPayloadType(cur_ty, tag_ord));
+                        if (proj.payload > 0) {
+                            cur_ty = self.pool.unwrapUnderlyingType(
+                                self.resolveAggregateMemberType(cur_ty, proj.payload),
+                            );
+                        }
+                    } else {
+                        cur_ty = self.pool.unwrapUnderlyingType(
+                            self.resolveAggregateMemberType(cur_ty, proj.payload),
+                        );
+                    }
+                },
+                .index => {
+                    active_downcast = null;
+                    if (ty_node.tag == .raw_ptr_ty) return true;
+                    if (cur_ty == .str_ty) {
+                        cur_ty = .u8_ty;
+                    } else {
+                        cur_ty = self.pool.unwrapUnderlyingType(TypeId.fromInt(ty_node.lhs));
+                    }
+                },
+                .soa_elem => {
+                    active_downcast = null;
+                    active_soa_field_ty = self.pool.unwrapUnderlyingType(
+                        self.resolveAggregateMemberType(TypeId.fromInt(ty_node.lhs), proj.payload),
+                    );
+                },
+                .slice_len => {
+                    active_downcast = null;
+                    cur_ty = .usize_ty;
+                },
+            }
+        }
+        return false;
+    }
+
     /// Loads `place_id` as an RValue wrapped in a scoped `ghost_access_let` bracket, optionally moving non-`Copy` places.
     fn loadPlaceValue(
         self: *MirLowerer,
@@ -5573,8 +5645,8 @@ const MirLowerer = struct {
         try self.emitGhostEnd(open_tok, tok);
 
         if (is_move_allowed and !val_ty.isError() and
-            !self.pool.getFlags(val_ty).is_copy and
-            !self.isPlaceBehindSharedRef(place_id))
+            type_system.classifyOwnershipTier(self.pool, self.sym_table, val_ty) != .copy_tier and
+            !self.isPlaceBehindRawPtr(place_id))
         {
             _ = try self.ssa.emitInst(self.cur_bb, .{
                 .op = .ghost_storage_move,
@@ -5859,9 +5931,10 @@ const MirLowerer = struct {
                 return self.ssa.readVariable(lid.asInt(), self.cur_bb);
             },
             .hir_global_ref => {
-                if (self.resolveExternStaticGlobalRef(node) != null or self.isConstSymGlobalRef(node)) {
+                const is_const_sym = self.isConstSymGlobalRef(node);
+                if (self.resolveExternStaticGlobalRef(node) != null or is_const_sym) {
                     const ext_place = try self.lowerPlace(expr_hir);
-                    return self.loadPlaceValue(ext_place, node.type_id, tok, true);
+                    return self.loadPlaceValue(ext_place, node.type_id, tok, !is_const_sym);
                 }
                 return self.ssa.emitInst(self.cur_bb, .{
                     .op = .fn_addr,
@@ -6513,8 +6586,18 @@ const MirLowerer = struct {
                     return self.ssa.readVariable(sc_var.asInt(), join_bb);
                 }
 
-                const lhs_val = try self.lowerRValue(lhs_hir);
-                const rhs_val = try self.lowerRValue(rhs_hir);
+                const is_cmp_op = switch (bin_op) {
+                    .eq, .ne, .lt, .le, .gt, .ge => true,
+                    else => false,
+                };
+                const lhs_val = if (is_cmp_op)
+                    try self.lowerBorrowedValue(lhs_hir)
+                else
+                    try self.lowerRValue(lhs_hir);
+                const rhs_val = if (is_cmp_op)
+                    try self.lowerBorrowedValue(rhs_hir)
+                else
+                    try self.lowerRValue(rhs_hir);
                 const operand_ty = self.hir_store.getNode(lhs_hir).type_id;
                 const mir_bin = if (node.flags.is_dollar_sub)
                     BinOpKind.usub_checked

@@ -111,6 +111,87 @@ Canonical dogfooding backlog for **CoreX** (`.cx`) surface syntax proposals, erg
     -   `stdlib/cx/str.cx:3661-3744` (`Display` / `Debug` / `Hash` forwarding shared across `String | CowStr`),
     -   Upcoming `Phase 11.3` `stdlib/cx/serde.cx` (`Serialize` & `Deserialize` across `14` primitive scalar types, saving `25+` repeated `impl` blocks).
 
+### `SW-004` – Compact, De-Noised Hover Contract & Capability Footer (`<sub>` Styling & Dropping `(verified)`)
+
+-   **Category:** `Docstring & IDE UX` (User-Requested Polish)
+-   **Problem & Friction:**
+    -   Function hover tooltips (`stage0/src/lsp_server.zig:7110-7208`) append a two-line `DR-17` contract, capability, and stack footer (`✓ @no_alloc (verified) · ✓ @no_panic (verified) · ✓ @no_block · caps: none (pure)` / `stack: 16 B own · 16 B max`) rendered at full body font size, competing visually with the signature and `/|` docstring while repeating `(verified)` on every annotated contract.
+-   **Candidate CoreX Design(s):**
+    -   Drop the noisy `(verified)` parentheticals from `corex lsp` CommonMark output (`✓ @no_alloc · ✓ @no_panic · ✓ @no_block · caps: pure`), and style the trailing contract footer inside `../vscode-ext-corex/src/extension.ts` (`toVsDoc` with `supportHtml = true`) using safe `<sub>…</sub>` paired with theme-adaptive semi-transparent hex (`#00000099` in Light themes, `#ffffffa6` in Dark themes via `window.activeColorTheme.kind`, and un-dimmed in High Contrast themes) so `corex lsp` remains 100% pure CommonMark while blending naturally into every light and dark theme.
+-   **Compiler & Tooling Impact:**
+    -   **`TokenKind` Delta:** `0`.
+    -   **`corex lsp` & `vscode-ext-corex`:** Cleaner `appendFnHoverContractBullets` formatting in `lsp_server.zig` paired with `MarkdownString.supportHtml = true` footer wrapping (and optional `corex.hover.contracts` verbosity toggle) in `vscode-ext-corex`.
+-   **Real Call-Site Evidence:**
+    -   Affects every `fn` and method hover across `100%` of `.cx` files in `core/`, `stdlib/cx/`, `compiler/`, and user workspaces.
+
+### `SW-005` – Civil Calendar, Timezone & Zero-Allocation Date/Time Formatting in `cx.time`
+
+-   **Category:** `Stdlib Ergonomics` (User-Requested)
+-   **Problem & Friction:**
+    -   `STD-02` (`Phase 11.2a` `stdlib/cx/time.cx`) specifies monotonic `Instant`, `Duration`, and raw UTC epoch `SystemTime` required to self-host `compiler/*.cx`, but does not yet include civil calendar types (`Date`, `Time`, `DateTime`, `UtcOffset`) or human-readable ISO-8601 / RFC 3339 / pattern formatting and parsing (`Display`, `f"{dt}"`).
+-   **Candidate CoreX Design(s):**
+    -   Extend `cx.time` (either alongside `Phase 11.2a` if compact and `libc`-free, or in an early `0.x` `cx.time` wave) with Hinnant civil-from-days `Date` / `Time` / `DateTime` / `UtcOffset` value types (`Copy`, zero heap allocation), RFC 3339 / ISO-8601 `parse` & `Display` formatting, and `FmtSpec` integration (`f"{now:%Y-%m-%d %H:%M:%S}"` or canonical specifiers).
+-   **Compiler & Tooling Impact:**
+    -   **`TokenKind` Delta:** `0` (pure `stdlib/cx/time.cx` types and traits; unused calendar helpers tree-shake to `0` bytes).
+-   **Real Call-Site Evidence:**
+    -   Directly usable in `corex lsp` trace/log timestamps, `corex test` / `corex bench` run reports, `pkg_cache` / `corex publish` metadata, and everyday application logging.
+
+### `SW-006` – Statement-Terminated Braced Control Flow (`if` / `match` / `loop`) Before Next-Line `(expr)`
+
+-   **Category:** `Syntax Refinement`
+-   **Problem & Friction:**
+    -   When a statement-position `if cond { @panic(…); }` or `match` block (without `else`, returning `unit`) is followed on the next line by a parenthesized tail expression such as `(raw_word & 0xFFFF_u32) as u16` or `(ActiveStrOps {}).is_valid_utf8_fast(bytes)`, Pratt postfix continuation treats `(` on the next line as a call on the preceding `if` expression (`if cond { … }(expr)`), requiring an explicit `;` after `}` or unwrapping the outer parentheses.
+-   **Candidate CoreX Design(s):**
+    -   Following Rust's statement-block rule, terminate braced control-flow expressions (`if`, `match`, `for`, `while`, `loop`, `{ … }`) at `}` in statement position when their type is `unit` (or when separated by a line break before `(` / `[`), rather than parsing next-line `(…)` as a postfix call on the block:
+
+        ```cx
+        // Before (requires `;` after `}` or dropping outer parens on tail):
+        if idx >= buf.len() {
+            panic("out of bounds");
+        };
+        (buf[idx] as u32 & 0x7F_u32) as u16
+
+        // After (braced statement terminates cleanly at `}`):
+        if idx >= buf.len() {
+            panic("out of bounds");
+        }
+        (buf[idx] as u32 & 0x7F_u32) as u16
+        ```
+
+-   **Compiler & Tooling Impact:**
+    -   **`TokenKind` Delta:** `0` (`Parser.parseStmt` / Pratt postfix loop lookahead check on braced statements).
+    -   **`corex fmt` & `corex check` (`W0209`):** Eliminates postfix-call hazards when `W0209` (`needless-trailing-return`) strips `return ` before parenthesized tail expressions `(a & b) as u16`.
+-   **Real Call-Site Evidence:**
+    -   Hit across `stdlib/cx/str.cx:735, 916, 1119, 1301, 4603`, `stdlib/cx/math.cx` bit-extraction tails, and `docs/COMPARISONS.md:259-263` (`12+` sites).
+
+### `SW-007` – Safe Borrow-Propagating `match` Ergonomics on `&Enum` & `@repr(C)` Tagged Unions
+
+-   **Category:** `Syntax Refinement`
+-   **Problem & Friction:**
+    -   Matching on a shared or mutable reference to a non-`Copy` enum (`self: &CowStr` where `CowStr` holds `Owned(String)`) currently lacks safe `&payload` / `&mut payload` variant projection across `@repr(C)` tagged enums, forcing manual `unsafe` pointer-offset helpers (`CowStr.as_owned_ref(&self) -> *String` in `stdlib/cx/str.cx:3054-3062`) to borrow the inner `String` without moving it.
+-   **Candidate CoreX Design(s):**
+    -   Support explicit `&binding` / `&mut binding` pattern bindings (or Rust-RFC-2005-style borrow propagation when matching `&Enum` / `&mut Enum`), projecting a lifetime-checked `&T` / `&mut T` directly to the variant payload across both native and `@repr(C)` tagged enums:
+
+        ```cx
+        // Before (requires unsafe pointer offset helper in stdlib/cx/str.cx:3054-3062 & 3728-3732):
+        match self.* {
+            .Borrowed(slice) => .Borrowed(slice),
+            .Owned(_) => .Owned(unsafe { self.as_owned_ref().*.clone() }),
+        }
+
+        // After (100% safe MVS borrow projection):
+        match self {
+            .Borrowed(slice) => .Borrowed(slice.*),
+            .Owned(&owned_str) => .Owned(owned_str.clone()),
+        }
+        ```
+
+-   **Compiler & Tooling Impact:**
+    -   **`TokenKind` Delta:** `0` (uses existing `&` / `&mut` in `Pattern` + `MIR` variant-field `.place_addr` projection).
+    -   **`MIR` SAST:** Propagates the scrutinee's loan provenance directly onto `&owned_str` (`Pass 2` NLL + `Pass 3` region escape).
+-   **Real Call-Site Evidence:**
+    -   `stdlib/cx/str.cx:3054-3062, 3728-3732` (`CowStr`), plus upcoming `Phase 11.2a`–`11.3` recursive/owned ADTs (`cx.io`, `cx.serde.JsonValue`, `cx.serde.TomlValue`, and `compiler/*.cx` AST/HIR enums).
+
 ---
 
 ## 3. Decided & Rejected Ledger

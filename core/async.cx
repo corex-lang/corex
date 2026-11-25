@@ -123,19 +123,19 @@ impl[T] Poll[T] {
     /| Returns `true` if `self` is `.Ready(_)`.
     @no_alloc @no_panic
     pub fn is_ready(&self) -> bool {
-        return match self {
+        match self {
             .Ready(_) => true,
             .Pending => false,
-        };
+        }
     }
 
     /| Returns `true` if `self` is `.Pending`.
     @no_alloc @no_panic
     pub fn is_pending(&self) -> bool {
-        return match self {
+        match self {
             .Ready(_) => false,
             .Pending => true,
-        };
+        }
     }
 }
 
@@ -143,19 +143,19 @@ impl Waker {
     /| Returns a no-op `Waker` suitable for single-threaded synchronous `block_on` polling.
     @inline @no_alloc @no_panic
     pub fn noop() -> Waker {
-        return Waker {
+        Waker {
             data: @default_init[*mut opaque](),
             wake_fn: .None,
-        };
+        }
     }
 
     /| Returns `true` when `self` carries no wakeup callback.
     @inline @no_alloc @no_panic
     pub fn is_noop(&self) -> bool {
-        return match self.wake_fn {
+        match self.wake_fn {
             .Some(_) => false,
             .None => true,
-        };
+        }
     }
 
     /| Invokes the underlying wakeup callback if present.
@@ -173,7 +173,7 @@ impl CancelToken {
     /| Returns an inert `CancelToken` that never signals cancellation.
     @inline @no_alloc @no_panic
     pub fn none() -> CancelToken {
-        return CancelToken { flag_ptr: @default_init[*u64]() };
+        CancelToken { flag_ptr: @default_init[*u64]() }
     }
 
     /| Returns `true` if cooperative cancellation has been requested on the associated `CancelSource`.
@@ -182,9 +182,9 @@ impl CancelToken {
         if self.flag_ptr == @default_init[*u64]() {
             return false;
         }
-        return unsafe {
+        unsafe {
             @atomic_load(self.flag_ptr, 2_u8) != 0_u64
-        };
+        }
     }
 }
 
@@ -192,13 +192,13 @@ impl CancelSource {
     /| Constructs a fresh uncanceled `CancelSource`.
     @inline @no_alloc @no_panic
     pub fn new() -> CancelSource {
-        return CancelSource { flag: 0_u64 };
+        CancelSource { flag: 0_u64 }
     }
 
     /| Borrows a `Copy` `CancelToken` observing `self` (`with context.cancel_token = src.as_token()`).
     @inline @no_alloc @no_panic
     pub fn as_token(&self) -> CancelToken {
-        return CancelToken { flag_ptr: &raw self.flag };
+        CancelToken { flag_ptr: &raw self.flag }
     }
 
     /| Signals cooperative cancellation to all holders of tokens derived from `self`.
@@ -212,9 +212,9 @@ impl CancelSource {
     /| Returns `true` if `cancel()` has been invoked on `self`.
     @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn is_canceled(&self) -> bool {
-        return unsafe {
+        unsafe {
             @atomic_load(&raw self.flag, 2_u8) != 0_u64
-        };
+        }
     }
 }
 
@@ -222,12 +222,12 @@ impl TaskHeader {
     /| Constructs a zero-initialized `TaskHeader`.
     @inline @no_alloc @no_panic
     pub fn empty() -> TaskHeader {
-        return TaskHeader {
+        TaskHeader {
             poll_fn: 0,
             drop_fn: 0,
             parent_or_waker: 0,
             state_and_flags: 0_u64,
-        };
+        }
     }
 }
 
@@ -239,10 +239,10 @@ pub async fn yield_now() {
 
 /| Drives `fut` to completion on the current OS thread using `context.reactor` (blocking the caller thread).
 pub fn block_on[T](fut: own Future[T]) -> T {
-    return block_on(own fut);
+    block_on(own fut)
 }
 
 /| Enters a structured concurrency nursery that joins or cancels all spawned child tasks before returning.
 pub async fn task_group[R](scope_fn: |&mut TaskGroup[never]| -> R) -> R {
-    return task_group(scope_fn).await;
+    task_group(scope_fn).await
 }
