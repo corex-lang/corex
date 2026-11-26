@@ -100,15 +100,10 @@ static void _cx_rt_trap(uint32_t trap_reason) {
     const char *trace_path = getenv("COREX_ORACLE_TRACE_FILE");
     if (trace_path != NULL && trace_path[0] != '\0') {
         _cx_rt_trace_append("TRAP:1\n");
-        (void)fflush(stdout);
-        (void)fflush(stderr);
-        _exit(101);
     }
-#if defined(__GNUC__) || defined(__clang__)
-    __builtin_trap();
-#else
-    abort();
-#endif
+    (void)fflush(stdout);
+    (void)fflush(stderr);
+    _exit(101);
 }
 
 static intptr_t _cx_rt_sys_write(int32_t fd_num, const uint8_t *buf_ptr, size_t buf_len) {

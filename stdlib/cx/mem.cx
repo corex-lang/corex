@@ -659,9 +659,8 @@ fn arena_resize_in_place(
     if not slab.is_null() {
         let slab_base = slab as usize;
         let ptr_addr = ptr as usize;
-        if ptr_addr >= slab_base and ptr_addr +% old_layout.size == slab_base +% (
-            arena.used_offset as usize
-        ) {
+        if ptr_addr >= slab_base
+            and ptr_addr +% old_layout.size == slab_base +% (arena.used_offset as usize) {
             let rel_off: usize = ptr_addr -% slab_base;
             let slab_cap = unsafe {
                 slab.*.cap
@@ -764,9 +763,9 @@ fn is_valid_utf8_bytes(bytes: &[u8], /) -> bool {
             }
             i += 2_usize;
         } else if b0 < 0xF0_u8 {
-            if i +% 2_usize >= n or (bytes[i +% 1_usize] & 0xC0_u8) != 0x80_u8 or (
-                bytes[i +% 2_usize] & 0xC0_u8
-            ) != 0x80_u8 {
+            if i +% 2_usize >= n
+                or (bytes[i +% 1_usize] & 0xC0_u8) != 0x80_u8
+                or (bytes[i +% 2_usize] & 0xC0_u8) != 0x80_u8 {
                 return false;
             }
             let b1: u8 = bytes[i +% 1_usize];
@@ -775,9 +774,10 @@ fn is_valid_utf8_bytes(bytes: &[u8], /) -> bool {
             }
             i += 3_usize;
         } else if b0 <= 0xF4_u8 {
-            if i +% 3_usize >= n or (bytes[i +% 1_usize] & 0xC0_u8) != 0x80_u8 or (
-                bytes[i +% 2_usize] & 0xC0_u8
-            ) != 0x80_u8 or (bytes[i +% 3_usize] & 0xC0_u8) != 0x80_u8 {
+            if i +% 3_usize >= n
+                or (bytes[i +% 1_usize] & 0xC0_u8) != 0x80_u8
+                or (bytes[i +% 2_usize] & 0xC0_u8) != 0x80_u8
+                or (bytes[i +% 3_usize] & 0xC0_u8) != 0x80_u8 {
                 return false;
             }
             let b1: u8 = bytes[i +% 1_usize];
@@ -1997,9 +1997,8 @@ impl Span16 {
     /| Projects `self` onto `buf`, returning `.None` if `off + len > buf.len()`.
     @std_cap_boundary(clears: [may_panic]) @inline @no_alloc @no_panic
     pub fn slice(self, buf: &[u8], /) -> &[u8]? {
-        if (end_idx := (self.off as usize) +% (self.len as usize)) <= buf.len() and (
-            self.off as usize
-        ) <= end_idx {
+        if (end_idx := (self.off as usize) +% (self.len as usize)) <= buf.len()
+            and (self.off as usize) <= end_idx {
             return .Some(buf[(self.off as usize)..end_idx]);
         }
         .None

@@ -1,0 +1,3297 @@
+/# Cross-Platform WTF-8 Paths, 24-Byte SSO PathBuf, and Lexical Normalization (cx.path)
+/#
+/# Implements zero-allocation borrowed `Path` slices, 24-byte Little-Endian SSO `PathBuf`
+/# containers (`<= 23` inline bytes and `0x7F` `PathBuf?` niche), flavor-parameterized POSIX
+/# and Windows `\\?\`/UNC/drive-letter component iterators, lexical normalization, and lossless
+/# `[u16; 512]` stack WTF-8 <-> UTF-16LE transcoding (`STD-02` §1.2, §2.2, §3.2).
+/#
+/# Performs zero OS syscalls across all operations (`EffectCapabilityMask == PURE` on views,
+/# component iteration, and `WTF-8` codecs) and stays below `cx.io` and `cx.fs` in the `STD-02` DAG.
+
+use cx.col.Vec;
+use cx.mem.{AllocError, AllocatorHandle, Arena, Layout};
+use cx.str.{String, is_valid_utf8};
+
+// ---------------------------------------- TYPES ----------------------------------------
+// ----------------- Path Flavors & Components ------------------
+/| Owned dynamic byte vector alias used for `O(1)` `PathBuf.into_bytes` ownership transfer.
+type ByteVec = Vec[u8];
+
+/| Lexical path syntax flavor (`Posix` `/` vs. `Windows` drive/UNC/`\\?\` semantics).
+@derive(Copy, Equatable, Clone, Debug)
+pub(pkg) enum PathFlavor: u8 {
+    /| POSIX and WASI forward-slash (`/`) path semantics (`0`).
+    Posix = 0,
+    /| Windows drive, UNC, `\\.\` device, and `\\?\` verbatim path semantics (`1`).
+    Windows = 1,
+}
+
+/| Windows volume, UNC share, device-namespace, or verbatim `\\?\` prefix (`STD-02` §2.2).
+@derive(Copy, Clone, Debug)
+pub enum PathPrefix {
+    /| Literal extended-length label (`\\?\label`).
+    Verbatim(&[u8]),
+    /| Extended-length UNC share (`\\?\UNC\server\share`).
+    VerbatimUnc {
+        /| UNC host or server component bytes.
+        server: &[u8],
+        /| UNC share name bytes.
+        share: &[u8],
+    },
+    /| Extended-length drive prefix (`\\?\C:`, normalized to uppercase ASCII `A..=Z`).
+    VerbatimDisk(u8),
+    /| Win32 device namespace prefix (`\\.\PIPE` or `\\.\COM1`).
+    DeviceNs(&[u8]),
+    /| Standard UNC network share (`\\server\share`).
+    Unc {
+        /| UNC host or server component bytes.
+        server: &[u8],
+        /| UNC share name bytes.
+        share: &[u8],
+    },
+    /| Standard DOS drive letter (`C:`, normalized to uppercase ASCII `A..=Z`).
+    Disk(u8),
+}
+
+/| Parsed lexical component yielded by `ComponentsIter` (`STD-02` §2.2).
+@derive(Copy, Clone, Debug)
+pub enum Component {
+    /| Leading Windows drive, UNC, device, or verbatim prefix.
+    Prefix(PathPrefix),
+    /| Root directory separator (`/` on POSIX, `\` or implicit UNC/verbatim root on Windows).
+    RootDir,
+    /| Leading current-directory segment (`.`).
+    CurDir,
+    /| Parent-directory segment (`..`).
+    ParentDir,
+    /| Normal non-empty path segment bytes.
+    Normal(&[u8]),
+}
+
+/| Error indicating a candidate `base` path was not a component-wise prefix (`1 B`).
+@repr(C) @derive(Copy, Equatable, Clone, Debug)
+pub struct StripPrefixError {
+    /| Non-zero tag byte preserving the `0` niche for `StripPrefixError?` (`1 B`).
+    _tag: u8 = 1,
+}
+
+// ----------------- Borrowed Path & Iterators ------------------
+/| Borrowed OS path slice (`16 B` on 64-bit, `8 B` on `wasm32`; UTF-8 on POSIX/WASI, WTF-8 on Windows).
+@repr(C) @derive(Copy)
+pub struct Path {
+    /| Underlying unvalidated POSIX/WASI or WTF-8 path bytes.
+    bytes: &[u8],
+}
+
+/| Double-ended zero-allocation iterator over the lexical `Component`s of a `Path`.
+@repr(C) @derive(Copy)
+pub struct ComponentsIter {
+    /| Original underlying path slice.
+    raw: &[u8],
+    /| Parsed leading Windows `PathPrefix`, or `.None` when absent / `Posix`.
+    prefix: PathPrefix?,
+    /| Byte end offset of `prefix` inside `raw` (`0` when `prefix` is `.None`).
+    prefix_len: usize,
+    /| Byte end offset of `prefix` plus any physical root or leading `.` token.
+    start_dir_end: usize,
+    /| Start byte index of unconsumed body components inside `raw`.
+    front_idx: usize,
+    /| Exclusive end byte index of unconsumed body components inside `raw`.
+    back_idx: usize,
+    /| Active lexical path flavor (`Posix` or `Windows`).
+    flavor: PathFlavor,
+    /| `true` when `prefix` is a Windows `\\?\` verbatim prefix disabling `/` and `.`/`..` interpretation.
+    is_verbatim: bool,
+    /| `true` while `prefix` has not yet been consumed from either end.
+    has_prefix_left: bool,
+    /| Unconsumed start-directory state (`0 = None`, `1 = RootDir`, `2 = CurDir`).
+    start_dir_left: u8,
+}
+
+/| Zero-allocation iterator walking `self`, `self.parent()`, … up to the root or empty path.
+@repr(C) @derive(Copy)
+pub struct AncestorsIter {
+    /| Next ancestor `Path` to yield, or `.None` after exhausting the root/empty ancestor.
+    next_path: Path?,
+}
+
+/| Precomputed slice splice descriptor shared by `Path.join`, `Path.join_in`, and `PathBuf.push`.
+@derive(Copy)
+struct JoinPlan {
+    /| Retained prefix slice from the base path.
+    head: &[u8],
+    /| Inserted separator byte when `has_sep` is `true`.
+    sep: u8,
+    /| `true` when a single separator byte must be inserted between `head` and `tail`.
+    has_sep: bool,
+    /| Appended suffix slice from the child path.
+    tail: &[u8],
+}
+
+// -------------------- 24-Byte SSO PathBuf ---------------------
+/| 24-byte `AutoDrop` owned path with 23-byte Little-Endian SSO (`sizeof(PathBuf) == sizeof(PathBuf?) == 24 B`).
+@repr(C, align: 8)
+pub struct PathBuf {
+    /| Inline `[0..23]` path bytes + length in `raw_bytes[23]` (`0..=23`), or overlaid `HeapRepr` (`raw_bytes[23] >= 0x80`).
+    raw_bytes: [u8; 24],
+}
+
+/| Non-inline 24-byte `PathBuf` overlay on 64-bit targets (`flagged_cap` places bit 31 at `raw_bytes[23]` on LE).
+@cfg(target.ptr_width == 64) @repr(C, align: 8) @derive(Copy)
+struct HeapRepr64 {
+    /| Non-null path byte buffer pointer (`Bytes 0..7`).
+    ptr: *mut u8,
+    /| Full 64-bit LSB-tagged `AllocatorHandle` (`Bytes 8..15`).
+    alloc: AllocatorHandle,
+    /| Initialized path byte length (`Bytes 16..19`).
+    len: u32,
+    /| `cap | 0x8000_0000` (`Bytes 20..23`, ensuring `raw_bytes[23] >= 0x80`).
+    flagged_cap: u32,
+}
+
+/| Non-inline 24-byte `PathBuf` overlay on 32-bit (`wasm32`) targets preserving identical byte offsets `16..23`.
+@cfg(target.ptr_width == 32) @repr(C, align: 8) @derive(Copy)
+struct HeapRepr32 {
+    /| Non-null path byte buffer pointer (`Bytes 0..3`).
+    ptr: *mut u8,
+    /| High-half pointer padding (`Bytes 4..7`).
+    _pad0: u32,
+    /| 32-bit LSB-tagged `AllocatorHandle` (`Bytes 8..11`).
+    alloc: AllocatorHandle,
+    /| High-half handle padding (`Bytes 12..15`).
+    _pad1: u32,
+    /| Initialized path byte length (`Bytes 16..19`).
+    len: u32,
+    /| `cap | 0x8000_0000` (`Bytes 20..23`, ensuring `raw_bytes[23] >= 0x80`).
+    flagged_cap: u32,
+}
+
+/| Active 24-byte `PathBuf` heap/arena/rodata overlay (`HeapRepr64` on 64-bit targets).
+@cfg(target.ptr_width == 64)
+type HeapRepr = HeapRepr64;
+
+/| Active 24-byte `PathBuf` heap/arena/rodata overlay (`HeapRepr32` on `wasm32` targets).
+@cfg(target.ptr_width == 32)
+type HeapRepr = HeapRepr32;
+
+/| Zero-sized 64-bit `HeapRepr` packer (`target.ptr_width == 64`).
+@cfg(target.ptr_width == 64) @derive(Copy)
+struct PtrWidthOps64 {}
+
+/| Zero-sized 32-bit `HeapRepr` packer (`target.ptr_width == 32`).
+@cfg(target.ptr_width == 32) @derive(Copy)
+struct PtrWidthOps32 {}
+
+/| Active pointer-width `HeapRepr` packer (`PtrWidthOps64` on 64-bit targets).
+@cfg(target.ptr_width == 64)
+type ActivePtrOps = PtrWidthOps64;
+
+/| Active pointer-width `HeapRepr` packer (`PtrWidthOps32` on `wasm32` targets).
+@cfg(target.ptr_width == 32)
+type ActivePtrOps = PtrWidthOps32;
+
+// ------------------- WTF-8 & Verbatim Types -------------------
+/| Validation or capacity error returned when transcoding WTF-8 path bytes into UTF-16LE (`STD-02` §3.2).
+@expect(unused-pkg-visibility, reason: "used by cx.fs, cx.env, and cx.process in Phase 11.2a")
+@derive(Copy, Equatable, Clone, Debug)
+pub(pkg) enum Wtf8Error: u8 {
+    /| Input contained an interior `0x00` NUL byte forbidden in OS C/Win32 path strings (`1`).
+    InteriorNulByte = 1,
+    /| Input contained overlong, truncated, out-of-range, or 6-byte CESU-8 paired surrogate sequences (`2`).
+    InvalidWtf8 = 2,
+    /| Destination `&mut [u16]` slice lacked room for the transcoded UTF-16 code units (`3`).
+    BufferTooSmall = 3,
+}
+
+/| Win32 extended-length `\\?\` / NT `\??\` prefix promotion policy (`STD-02` §2.2, §3.2).
+@expect(unused-pkg-visibility, reason: "used by cx.fs, cx.env, and cx.process in Phase 11.2a")
+@derive(Copy, Equatable, Clone, Debug)
+pub(pkg) enum VerbatimMode: u8 {
+    /| Promotes paths `>= 248` `WCHAR`s, DOS reserved stems, or trailing spaces/dots to `\\?\` (`0`).
+    AutoPromote = 0,
+    /| Unconditionally emits `\\?\C:\…` or `\\?\UNC\server\share\…` (`1`).
+    Always = 1,
+    /| Emits `\??\C:\…` or `\??\UNC\server\share\…` for `NtCreateFile` (`2`).
+    NtNamespace = 2,
+}
+
+// --------------------------------------- CONSTS ----------------------------------------
+// ------------------ Platform Path Separators ------------------
+/| Active target lexical `PathFlavor` (`.Windows` on Windows targets).
+@cfg(target.os == "windows")
+const ACTIVE_FLAVOR: PathFlavor = PathFlavor.Windows;
+
+/| Active target lexical `PathFlavor` (`.Posix` on Unix and WASI targets).
+@cfg(not (target.os == "windows"))
+const ACTIVE_FLAVOR: PathFlavor = PathFlavor.Posix;
+
+/| Primary platform path component separator (`'\\'` on Windows, `'/'` on POSIX/WASI).
+@cfg(target.os == "windows")
+pub const MAIN_SEPARATOR: char = '\\';
+
+/| Primary platform path component separator (`'/'` on POSIX/WASI, `'\\'` on Windows).
+@cfg(not (target.os == "windows"))
+pub const MAIN_SEPARATOR: char = '/';
+
+/| Primary platform path separator byte (`b'\\'` on Windows, `b'/'` on POSIX/WASI).
+@cfg(target.os == "windows")
+pub const MAIN_SEPARATOR_BYTE: u8 = b'\\';
+
+/| Primary platform path separator byte (`b'/'` on POSIX/WASI, `b'\\'` on Windows).
+@cfg(not (target.os == "windows"))
+pub const MAIN_SEPARATOR_BYTE: u8 = b'/';
+
+/| Primary platform path separator string (`"\\"` on Windows, `"/"` on POSIX/WASI).
+@cfg(target.os == "windows")
+pub const MAIN_SEPARATOR_STR: str = "\\";
+
+/| Primary platform path separator string (`"/"` on POSIX/WASI, `"\\"` on Windows).
+@cfg(not (target.os == "windows"))
+pub const MAIN_SEPARATOR_STR: str = "/";
+
+/| Environment `PATH` search-list delimiter byte (`b';'` on Windows, `b':'` on POSIX/WASI).
+@cfg(target.os == "windows")
+pub const PATH_LIST_SEPARATOR: u8 = b';';
+
+/| Environment `PATH` search-list delimiter byte (`b':'` on POSIX/WASI, `b';'` on Windows).
+@cfg(not (target.os == "windows"))
+pub const PATH_LIST_SEPARATOR: u8 = b':';
+
+// ------------------ SSO & Transcoding Limits ------------------
+/| Stack `WCHAR` buffer capacity (`512` `u16`s = `1 KiB`) for zero-heap Win32 WTF-8 transcoding.
+pub(super) const STACK_WCHAR_CAP: usize = 512;
+
+/| Bit 7 marker in `PathBuf.raw_bytes[23]` identifying non-inline `HeapRepr`.
+const PATH_HEAP_FLAG_U8: u8 = 0x80_u8;
+
+/| Bit 31 marker in `HeapRepr.flagged_cap` setting `raw_bytes[23] >= 0x80` on Little-Endian targets.
+const PATH_HEAP_FLAG_U32: u32 = 0x8000_0000_u32;
+
+/| 31-bit capacity mask on `HeapRepr.flagged_cap` (`<= 2 GiB - 1`).
+const PATH_CAP_MASK_U32: u32 = 0x7FFF_FFFF_u32;
+
+/| Maximum inline SSO byte capacity (`23` bytes).
+const PATH_INLINE_CAP: usize = 23;
+
+/| Win32 `CreateDirectoryW` / `MAX_PATH` promotion threshold (`248` UTF-16 `WCHAR`s).
+const WIN32_VERBATIM_THRESHOLD: usize = 248;
+
+/| Inline stack segment-span ceiling before spilling lexical normalization state to `Vec`.
+const INLINE_NORM_SEG_CAP: usize = 64;
+
+/| Sentinel start offset marking a preserved leading `..` segment during lexical normalization.
+const PARENT_SEG_SENTINEL: usize = usize.MAX;
+
+/| UTF-8 encoding of `U+FFFD` (`REPLACEMENT CHARACTER`) used in lossy display and conversion.
+const UTF8_REPLACEMENT_BYTES: [u8; 3] = [0xEF_u8, 0xBF_u8, 0xBD_u8];
+
+/| Uppercase hexadecimal nibble lookup table used in `Debug` byte escaping.
+const HEX_UPPER_DIGITS: [u8; 16] = [
+    b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7',
+    b'8', b'9', b'A', b'B', b'C', b'D', b'E', b'F',
+];
+
+// -------------------------------------- INTERNALS --------------------------------------
+// ------------------- Pointer & Byte Helpers -------------------
+/| Returns non-null sentinel byte pointer `1` for zero-capacity `HeapRepr` instances.
+fn dangling_u8_ptr() -> *mut u8 {
+    1_usize as *mut u8
+}
+
+@cfg(target.ptr_width == 64)
+impl PtrWidthOps64 {
+    /| Packs `(ptr, alloc, len, flagged_cap)` into the 24-byte 64-bit `HeapRepr64` overlay.
+    fn pack_heap(
+        self,
+        ptr: *mut u8,
+        alloc: AllocatorHandle,
+        len: u32,
+        flagged_cap: u32,
+        /,
+    ) -> HeapRepr {
+        _ = self;
+        HeapRepr64 {
+            ptr,
+            alloc,
+            len,
+            flagged_cap,
+        }
+    }
+}
+
+@cfg(target.ptr_width == 32)
+impl PtrWidthOps32 {
+    /| Packs `(ptr, alloc, len, flagged_cap)` into the 24-byte `wasm32` `HeapRepr32` overlay (`_pad0 = 0, _pad1 = 0`).
+    fn pack_heap(
+        self,
+        ptr: *mut u8,
+        alloc: AllocatorHandle,
+        len: u32,
+        flagged_cap: u32,
+        /,
+    ) -> HeapRepr {
+        _ = self;
+        HeapRepr32 {
+            ptr,
+            _pad0: 0_u32,
+            alloc,
+            _pad1: 0_u32,
+            len,
+            flagged_cap,
+        }
+    }
+}
+
+/| Bounds-checked byte read returning `slice[idx]` when `idx < slice.len()`, or `0` out of bounds.
+@std_cap_boundary(clears: [unsafe_op])
+fn byte_at(slice: &[u8], idx: usize, /) -> u8 {
+    if idx < slice.len() {
+        return unsafe {
+            slice.as_ptr().add(idx).read()
+        };
+    }
+    0_u8
+}
+
+/| Bounds-checked sub-slice projection returning `slice[start..end_idx]` when valid, or `b""[0..0]`.
+@std_cap_boundary(clears: [unsafe_op])
+fn subslice_u8(slice: &[u8], start: usize, end_idx: usize, /) -> &[u8] {
+    let total: usize = slice.len();
+    if start <= end_idx and end_idx <= total {
+        return unsafe {
+            @slice_from_raw_parts(slice.as_ptr().add(start), end_idx -% start)
+        };
+    }
+    unsafe {
+        @slice_from_raw_parts(1_usize as *u8, 0_usize)
+    }
+}
+
+/| Canonical zero-length immutable byte slice (`&[u8]`) with static provenance.
+@std_cap_boundary(clears: [unsafe_op])
+fn empty_u8_slice() -> &[u8] {
+    unsafe {
+        @slice_from_raw_parts(1_usize as *u8, 0_usize)
+    }
+}
+
+/| Bounds-checked `u16` read returning `slice[idx]` when `idx < slice.len()`, or `0` out of bounds.
+@std_cap_boundary(clears: [unsafe_op])
+fn u16_at(slice: &[u16], idx: usize, /) -> u16 {
+    if idx < slice.len() {
+        return unsafe {
+            slice.as_ptr().add(idx).read()
+        };
+    }
+    0_u16
+}
+
+/| Bounds-checked `u16` write storing `val` at `slice[idx]` when `idx < slice.len()`.
+@std_cap_boundary(clears: [unsafe_op])
+fn write_u16_at(slice: &mut [u16], idx: usize, val: u16, /) {
+    if idx < slice.len() {
+        unsafe {
+            slice.as_mut_ptr().add(idx).write(val);
+        }
+    }
+}
+
+/| Bounds-checked `u16` sub-slice projection returning `slice[start..end_idx]` when valid, or empty `&[u16]`.
+@std_cap_boundary(clears: [unsafe_op])
+fn subslice_u16(slice: &[u16], start: usize, end_idx: usize, /) -> &[u16] {
+    let total: usize = slice.len();
+    if start <= end_idx and end_idx <= total {
+        return unsafe {
+            @slice_from_raw_parts(slice.as_ptr().add(start), end_idx -% start)
+        };
+    }
+    unsafe {
+        @slice_from_raw_parts(2_usize as *u16, 0_usize)
+    }
+}
+
+/| Returns `true` if `byte_val` is an ASCII letter (`A..=Z` or `a..=z`).
+fn is_ascii_alpha(byte_val: u8, /) -> bool {
+    let lower: u8 = byte_val | 0x20_u8;
+    lower >= b'a' and lower <= b'z'
+}
+
+/| Converts an ASCII letter `byte_val` to uppercase (`a..=z` -> `A..=Z`).
+fn ascii_to_upper(byte_val: u8, /) -> u8 {
+    if byte_val >= b'a' and byte_val <= b'z' => byte_val & ~0x20_u8 else byte_val
+}
+
+/| Returns `true` if `byte_val` is either `/` or `\` under non-verbatim Windows rules.
+fn is_win_sep_byte(byte_val: u8, /) -> bool {
+    byte_val == b'/' or byte_val == b'\\'
+}
+
+/| Returns `true` if `byte_val` separates components under `(flavor, is_verbatim)`.
+fn is_sep_for_flavor(byte_val: u8, flavor: PathFlavor, is_verbatim: bool, /) -> bool {
+    match flavor {
+        .Posix => byte_val == b'/',
+        .Windows => if is_verbatim => byte_val == b'\\' else is_win_sep_byte(byte_val),
+    }
+}
+
+/| Returns the canonical output separator byte for `flavor` (`b'/'` or `b'\\'`).
+fn main_sep_for_flavor(flavor: PathFlavor, /) -> u8 {
+    match flavor {
+        .Posix => b'/',
+        .Windows => b'\\',
+    }
+}
+
+/| Returns `true` if `lhs` and `rhs` contain identical byte sequences.
+@std_cap_boundary(clears: [unsafe_op])
+fn is_bytes_equal(lhs: &[u8], rhs: &[u8], /) -> bool {
+    let n: usize = lhs.len();
+    if n != rhs.len() {
+        return false;
+    }
+    let lhs_ptr: *u8 = lhs.as_ptr();
+    let rhs_ptr: *u8 = rhs.as_ptr();
+    var i: usize = 0;
+    while i < n {
+        if unsafe {
+            lhs_ptr.add(i).read()
+        }
+            != unsafe {
+                rhs_ptr.add(i).read()
+            } {
+            return false;
+        }
+        i = i +% 1;
+    }
+    true
+}
+
+/| Orders `lhs` and `rhs` lexicographically by unsigned byte value.
+@std_cap_boundary(clears: [unsafe_op])
+fn cmp_bytes(lhs: &[u8], rhs: &[u8], /) -> Ordering {
+    let lhs_len: usize = lhs.len();
+    let rhs_len: usize = rhs.len();
+    let common: usize = if lhs_len < rhs_len => lhs_len else rhs_len;
+    let lhs_ptr: *u8 = lhs.as_ptr();
+    let rhs_ptr: *u8 = rhs.as_ptr();
+    var i: usize = 0;
+    while i < common {
+        let lb: u8 = unsafe {
+            lhs_ptr.add(i).read()
+        };
+        let rb: u8 = unsafe {
+            rhs_ptr.add(i).read()
+        };
+        if lb < rb {
+            return .Less;
+        } else if lb > rb {
+            return .Greater;
+        }
+        i = i +% 1;
+    }
+    if lhs_len < rhs_len {
+        return .Less;
+    } else if lhs_len > rhs_len {
+        return .Greater;
+    }
+    .Equal
+}
+
+/| Validates optional `opt_bytes` as UTF-8 and borrows it as `str?` (`0` allocations).
+@std_cap_boundary(clears: [unsafe_op])
+fn bytes_opt_to_str(opt_bytes: &[u8]?, /) -> str? {
+    if opt_bytes is .Some(slice) and is_valid_utf8(slice) {
+        return .Some(
+            unsafe {
+                @str_from_utf8_unchecked(slice)
+            },
+        );
+    }
+    .None
+}
+
+/| Appends `chunk` into `target` `PathBuf`, growing inline SSO to `HeapRepr` when `> 23` bytes.
+@std_cap_boundary(clears: [unsafe_op])
+fn path_buf_try_push_bytes(target: &mut PathBuf, chunk: &[u8], /) -> unit!AllocError {
+    let add_len: usize = chunk.len();
+    if add_len == 0 {
+        return .Ok(());
+    }
+    let cur_len: usize = target.len();
+    if add_len > (PATH_CAP_MASK_U32 as usize) -| cur_len {
+        return .Err(.OutOfMemory);
+    }
+    let new_len: usize = cur_len +% add_len;
+
+    if target.is_inline_repr() and new_len <= PATH_INLINE_CAP {
+        if cur_len < target.raw_bytes.len() {
+            unsafe {
+                @memcpy(
+                    (&raw mut target.raw_bytes[0]).add(cur_len) as *mut opaque,
+                    chunk.as_ptr() as *opaque,
+                    add_len,
+                );
+            }
+        }
+        target.raw_bytes[23] = new_len as u8;
+        return .Ok(());
+    }
+
+    target.reserve_non_inline(new_len)?;
+    var heap_cur: HeapRepr = unsafe {
+        @ptr_read(&raw target.raw_bytes as *HeapRepr)
+    };
+    unsafe {
+        @memcpy(heap_cur.ptr.add(cur_len) as *mut opaque, chunk.as_ptr() as *opaque, add_len);
+        heap_cur.len = new_len as u32;
+        @ptr_write(&raw mut target.raw_bytes as *mut HeapRepr, heap_cur);
+    }
+    .Ok(())
+}
+
+/| Constructs an owned `PathBuf` copying `src_bytes` (`0` heap allocs when `<= 23` bytes).
+fn path_buf_from_slice(src_bytes: &[u8], /) -> PathBuf {
+    var out = PathBuf { raw_bytes: [0_u8; 24] };
+    path_buf_try_push_bytes(&mut out, src_bytes) catch {
+        panic("PathBuf.from out of memory");
+    };
+    out
+}
+
+/| Truncates `target` `PathBuf` raw byte length to `new_len` (`<= target.len()`).
+@std_cap_boundary(clears: [unsafe_op])
+fn path_buf_truncate_raw(target: &mut PathBuf, new_len: usize, /) {
+    if new_len >= target.len() {
+        return;
+    }
+    if target.is_inline_repr() {
+        target.raw_bytes[23] = new_len as u8;
+    } else {
+        var heap_cur: HeapRepr = unsafe {
+            @ptr_read(&raw target.raw_bytes as *HeapRepr)
+        };
+        heap_cur.len = new_len as u32;
+        unsafe {
+            @ptr_write(&raw mut target.raw_bytes as *mut HeapRepr, heap_cur);
+        }
+    }
+}
+
+// ----------------- Prefix & Component Parsing -----------------
+/| Returns `true` when `pref` carries an implicit root (`Unc`, `DeviceNs`, and all `Verbatim*` prefixes).
+fn has_implicit_root_prefix(pref: PathPrefix, /) -> bool {
+    not (pref is .Disk(_))
+}
+
+/| Parses a leading Windows `PathPrefix` from `raw`, returning `(prefix, prefix_byte_len, is_verbatim)`.
+@expect(unused-pkg-visibility, reason: "used by cross-OS tests and cx.fs in Phase 11.2a")
+pub(pkg) fn parse_prefix_win32(raw: &[u8], /) -> (PathPrefix, usize, bool)? {
+    let total: usize = raw.len();
+
+    // [1] Verbatim `\\?\` prefixes (exact backslashes `b"\\\\?\\"`):
+    if total >= 4
+        and byte_at(raw, 0) == b'\\'
+        and byte_at(raw, 1) == b'\\'
+        and byte_at(
+            raw,
+            2,
+        )
+            == b'?'
+        and byte_at(raw, 3) == b'\\' {
+        if total >= 6
+            and is_ascii_alpha(byte_at(raw, 4))
+            and byte_at(raw, 5) == b':'
+            and (total == 6 or byte_at(raw, 6) == b'\\') {
+            return .Some((.VerbatimDisk(ascii_to_upper(byte_at(raw, 4))), 6_usize, true));
+        }
+        if total >= 8
+            and (byte_at(raw, 4) | 0x20_u8) == b'u'
+            and (byte_at(raw, 5) | 0x20_u8) == b'n'
+            and (byte_at(raw, 6) | 0x20_u8) == b'c'
+            and byte_at(raw, 7) == b'\\' {
+            var srv_end: usize = 8;
+            while srv_end < total and byte_at(raw, srv_end) != b'\\' {
+                srv_end = srv_end +% 1;
+            }
+            let server: &[u8] = subslice_u8(raw, 8, srv_end);
+            if srv_end < total {
+                let shr_start: usize = srv_end +% 1;
+                var shr_end: usize = shr_start;
+                while shr_end < total and byte_at(raw, shr_end) != b'\\' {
+                    shr_end = shr_end +% 1;
+                }
+                let share: &[u8] = subslice_u8(raw, shr_start, shr_end);
+                return .Some((.VerbatimUnc { server, share }, shr_end, true));
+            }
+            return .Some((.VerbatimUnc { server, share: empty_u8_slice() }, srv_end, true));
+        }
+        var lbl_end: usize = 4;
+        while lbl_end < total and byte_at(raw, lbl_end) != b'\\' {
+            lbl_end = lbl_end +% 1;
+        }
+        return .Some((.Verbatim(subslice_u8(raw, 4, lbl_end)), lbl_end, true));
+    }
+
+    // [2] Two-separator prefixes (`\\.\` device namespace and `\\server\share` UNC):
+    if total >= 2 and is_win_sep_byte(byte_at(raw, 0)) and is_win_sep_byte(byte_at(raw, 1)) {
+        if total >= 4 and byte_at(raw, 2) == b'.' and is_win_sep_byte(byte_at(raw, 3)) {
+            var dev_end: usize = 4;
+            while dev_end < total and not is_win_sep_byte(byte_at(raw, dev_end)) {
+                dev_end = dev_end +% 1;
+            }
+            return .Some((.DeviceNs(subslice_u8(raw, 4, dev_end)), dev_end, false));
+        }
+        if total >= 3 and not is_win_sep_byte(byte_at(raw, 2)) and byte_at(raw, 2) != b'?' {
+            var srv_end: usize = 2;
+            while srv_end < total and not is_win_sep_byte(byte_at(raw, srv_end)) {
+                srv_end = srv_end +% 1;
+            }
+            if srv_end < total -% 1
+                and is_win_sep_byte(
+                    byte_at(raw, srv_end),
+                )
+                and not is_win_sep_byte(byte_at(raw, srv_end +% 1)) {
+                let shr_start: usize = srv_end +% 1;
+                var shr_end: usize = shr_start;
+                while shr_end < total and not is_win_sep_byte(byte_at(raw, shr_end)) {
+                    shr_end = shr_end +% 1;
+                }
+                return .Some(
+                    (
+                        .Unc {
+                            server: subslice_u8(raw, 2, srv_end),
+                            share: subslice_u8(raw, shr_start, shr_end),
+                        },
+                        shr_end,
+                        false,
+                    ),
+                );
+            }
+        }
+        return .None;
+    }
+
+    // [3] Standard DOS drive prefix (`C:`):
+    if total >= 2 and is_ascii_alpha(byte_at(raw, 0)) and byte_at(raw, 1) == b':' {
+        return .Some((.Disk(ascii_to_upper(byte_at(raw, 0))), 2_usize, false));
+    }
+    .None
+}
+
+/| Parses a leading `PathPrefix` under `flavor` (always `.None` on `.Posix`).
+fn parse_prefix_for_flavor(raw: &[u8], flavor: PathFlavor, /) -> (PathPrefix, usize, bool)? {
+    match flavor {
+        .Posix => .None,
+        .Windows => parse_prefix_win32(raw),
+    }
+}
+
+/| Skips leading separators and elided non-verbatim `.` segments in `raw[idx..end_idx]`.
+fn trim_body_front(
+    raw: &[u8],
+    var idx: usize,
+    end_idx: usize,
+    flavor: PathFlavor,
+    is_verbatim: bool,
+    /,
+) -> usize {
+    let raw_len: usize = raw.len();
+    let limit: usize = if end_idx <= raw_len => end_idx else raw_len;
+    while idx < limit {
+        while idx < limit and is_sep_for_flavor(byte_at(raw, idx), flavor, is_verbatim) {
+            idx = idx +% 1;
+        }
+        if not is_verbatim
+            and idx < limit
+            and byte_at(raw, idx) == b'.'
+            and (
+                idx +% 1 == limit
+                    or (
+                        idx +% 1 < limit
+                            and is_sep_for_flavor(byte_at(raw, idx +% 1), flavor, false)
+                    )
+            ) {
+            idx = idx +% 1;
+        } else {
+            break;
+        }
+    }
+    idx
+}
+
+/| Skips trailing separators and elided non-verbatim `.` segments in `raw[start_idx..end_idx]`.
+fn trim_body_back(
+    raw: &[u8],
+    start_idx: usize,
+    var end_idx: usize,
+    flavor: PathFlavor,
+    is_verbatim: bool,
+    /,
+) -> usize {
+    if end_idx > raw.len() {
+        end_idx = raw.len();
+    }
+    while end_idx > start_idx {
+        while end_idx > start_idx
+            and is_sep_for_flavor(
+                byte_at(raw, end_idx -% 1),
+                flavor,
+                is_verbatim,
+            ) {
+            end_idx = end_idx -% 1;
+        }
+        if not is_verbatim
+            and end_idx > start_idx
+            and byte_at(raw, end_idx -% 1) == b'.'
+            and (
+                end_idx -% 1 == start_idx
+                    or (
+                        end_idx >= 2
+                            and is_sep_for_flavor(byte_at(raw, end_idx -% 2), flavor, false)
+                    )
+            ) {
+            end_idx = end_idx -% 1;
+        } else {
+            break;
+        }
+    }
+    end_idx
+}
+
+/| Classifies a non-empty body segment `seg` as `.ParentDir` (`..`) or `.Normal(seg)`.
+fn classify_body_segment(seg: &[u8], is_verbatim: bool, /) -> Component {
+    if not is_verbatim and seg.len() == 2 and byte_at(seg, 0) == b'.' and byte_at(seg, 1) == b'.' {
+        return .ParentDir;
+    }
+    .Normal(seg)
+}
+
+/| Computes the `(slice_start, slice_end)` byte offsets of the unconsumed sub-path in `iter`.
+fn iter_unconsumed_bounds(iter: ComponentsIter, /) -> (usize, usize) {
+    let slice_start: usize = if iter.has_prefix_left {
+        0_usize
+    } else if iter.start_dir_left != 0_u8 {
+        iter.prefix_len
+    } else if iter.front_idx < iter.back_idx {
+        iter.front_idx
+    } else {
+        return (0_usize, 0_usize);
+    };
+
+    let slice_end: usize = if iter.front_idx < iter.back_idx => iter.back_idx
+        else if iter.start_dir_left != 0_u8 => iter.start_dir_end
+        else iter.prefix_len;
+
+    if slice_start >= slice_end or slice_end > iter.raw.len() {
+        return (0_usize, 0_usize);
+    }
+    return (slice_start, slice_end);
+}
+
+/| Constructs a `ComponentsIter` over `path` parameterized by `flavor`.
+@expect(unused-pkg-visibility, reason: "used by cross-OS tests and cx.fs in Phase 11.2a")
+pub(pkg) fn components_with_flavor(path: Path, flavor: PathFlavor, /) -> ComponentsIter {
+    let raw: &[u8] = path.bytes;
+    let total: usize = raw.len();
+    var prefix: PathPrefix? = .None;
+    var prefix_len: usize = 0;
+    var is_verbatim = false;
+    var has_implicit_root = false;
+
+    if parse_prefix_for_flavor(raw, flavor) is .Some((parsed_pref, parsed_len, parsed_verb)) {
+        prefix = .Some(parsed_pref);
+        prefix_len = parsed_len;
+        is_verbatim = parsed_verb;
+        has_implicit_root = has_implicit_root_prefix(parsed_pref);
+    }
+
+    let has_physical_root: bool = prefix_len < total
+        and is_sep_for_flavor(
+            byte_at(raw, prefix_len),
+            flavor,
+            is_verbatim,
+        );
+    var start_dir_left: u8 = 0;
+    var start_dir_end: usize = prefix_len;
+
+    if has_implicit_root or has_physical_root {
+        start_dir_left = 1_u8;
+        if has_physical_root {
+            start_dir_end = prefix_len +% 1;
+        }
+    } else if not is_verbatim
+        and prefix_len < total
+        and byte_at(raw, prefix_len) == b'.'
+        and (
+            prefix_len +% 1 == total
+                or (
+                    prefix_len +% 1 < total
+                        and is_sep_for_flavor(
+                            byte_at(raw, prefix_len +% 1),
+                            flavor,
+                            false,
+                        )
+                )
+        ) {
+        start_dir_left = 2_u8;
+        start_dir_end = prefix_len +% 1;
+    }
+
+    let front_idx: usize = trim_body_front(raw, start_dir_end, total, flavor, is_verbatim);
+    let back_idx: usize = trim_body_back(raw, front_idx, total, flavor, is_verbatim);
+
+    ComponentsIter {
+        raw,
+        prefix,
+        prefix_len,
+        start_dir_end,
+        front_idx,
+        back_idx,
+        flavor,
+        is_verbatim,
+        has_prefix_left: prefix is .Some(_),
+        start_dir_left,
+    }
+}
+
+/| Returns `true` if `path` has a root directory under `flavor`.
+@expect(unused-pkg-visibility, reason: "used by cross-OS tests and cx.fs in Phase 11.2a")
+pub(pkg) fn has_root_with_flavor(path: Path, flavor: PathFlavor, /) -> bool {
+    let raw: &[u8] = path.bytes;
+    if parse_prefix_for_flavor(raw, flavor) is .Some((pref, pref_len, is_verb)) {
+        if has_implicit_root_prefix(pref) {
+            return true;
+        }
+        return pref_len < raw.len() and is_sep_for_flavor(byte_at(raw, pref_len), flavor, is_verb);
+    }
+    raw.len() > 0 and is_sep_for_flavor(byte_at(raw, 0), flavor, false)
+}
+
+/| Returns `true` if `path` is fully qualified (`has_root` on POSIX; `has_root` + `prefix` on Windows).
+@expect(unused-pkg-visibility, reason: "used by cross-OS tests and cx.fs in Phase 11.2a")
+pub(pkg) fn is_absolute_with_flavor(path: Path, flavor: PathFlavor, /) -> bool {
+    match flavor {
+        .Posix => has_root_with_flavor(path, .Posix),
+        .Windows => has_root_with_flavor(path, .Windows)
+            and parse_prefix_win32(path.bytes) is .Some(
+                _,
+            ),
+    }
+}
+
+/| Returns the parent directory of `path` under `flavor`, or `.None` at root/prefix/empty boundaries.
+@expect(unused-pkg-visibility, reason: "used by cross-OS tests and cx.fs in Phase 11.2a")
+pub(pkg) fn parent_with_flavor(path: Path, flavor: PathFlavor, /) -> Path? {
+    var comps: ComponentsIter = components_with_flavor(path, flavor);
+    match comps.next_back() {
+        .Some(.Normal(_)) | .Some(.CurDir) | .Some(.ParentDir) => {
+            let (start_off, end_off) = iter_unconsumed_bounds(comps);
+            return .Some(Path { bytes: subslice_u8(path.bytes, start_off, end_off) });
+        },
+        _ => return .None,
+    }
+}
+
+/| Returns the final normal component bytes of `path` under `flavor`, or `.None`.
+@expect(unused-pkg-visibility, reason: "used by cross-OS tests and cx.fs in Phase 11.2a")
+pub(pkg) fn file_name_with_flavor(path: Path, flavor: PathFlavor, /) -> &[u8]? {
+    let comps: ComponentsIter = components_with_flavor(path, flavor);
+    if comps.front_idx < comps.back_idx {
+        var seg_start: usize = comps.back_idx;
+        while seg_start > comps.front_idx
+            and not is_sep_for_flavor(
+                byte_at(path.bytes, seg_start -% 1),
+                flavor,
+                comps.is_verbatim,
+            ) {
+            seg_start = seg_start -% 1;
+        }
+        let seg: &[u8] = subslice_u8(path.bytes, seg_start, comps.back_idx);
+        if classify_body_segment(seg, comps.is_verbatim) is .Normal(_) {
+            return .Some(seg);
+        }
+    }
+    .None
+}
+
+/| Splits `file_name` around its last non-leading `.` into `(stem, extension?)`.
+fn split_stem_and_ext(name: &[u8], /) -> (&[u8], &[u8]?) {
+    let total: usize = name.len();
+    var idx: usize = total;
+    while idx > 0 {
+        idx = idx -% 1;
+        if byte_at(name, idx) == b'.' {
+            if idx == 0 {
+                return (name, .None);
+            }
+            return (subslice_u8(name, 0, idx), .Some(subslice_u8(name, idx +% 1, total)));
+        }
+    }
+    return (name, .None);
+}
+
+/| Orders two `PathPrefix` values canonically (`Verbatim < VerbatimUnc < VerbatimDisk < DeviceNs < Unc < Disk`).
+fn cmp_path_prefix(lhs: PathPrefix, rhs: PathPrefix, /) -> Ordering {
+    let lhs_rank: u8 = match lhs {
+        .Verbatim(_) => 0_u8,
+        .VerbatimUnc { .. } => 1_u8,
+        .VerbatimDisk(_) => 2_u8,
+        .DeviceNs(_) => 3_u8,
+        .Unc { .. } => 4_u8,
+        .Disk(_) => 5_u8,
+    };
+    let rhs_rank: u8 = match rhs {
+        .Verbatim(_) => 0_u8,
+        .VerbatimUnc { .. } => 1_u8,
+        .VerbatimDisk(_) => 2_u8,
+        .DeviceNs(_) => 3_u8,
+        .Unc { .. } => 4_u8,
+        .Disk(_) => 5_u8,
+    };
+    if lhs_rank < rhs_rank {
+        return .Less;
+    } else if lhs_rank > rhs_rank {
+        return .Greater;
+    }
+    match lhs {
+        .Verbatim(l_lbl) => if rhs is .Verbatim(r_lbl) => cmp_bytes(l_lbl, r_lbl) else .Equal,
+        .VerbatimUnc { server: l_srv, share: l_shr } => {
+            if (rhs is .VerbatimUnc { server: r_srv, share: r_shr }) {
+                cmp_bytes(l_srv, r_srv).then(cmp_bytes(l_shr, r_shr))
+            } else {
+                .Equal
+            }
+        },
+        .VerbatimDisk(l_drv) => if rhs is .VerbatimDisk(r_drv) {
+            if l_drv < r_drv => .Less
+                else if l_drv > r_drv => .Greater
+                else .Equal
+        } else {
+            .Equal
+        },
+        .DeviceNs(l_dev) => if rhs is .DeviceNs(r_dev) => cmp_bytes(l_dev, r_dev) else .Equal,
+        .Unc { server: l_srv, share: l_shr } => {
+            if (rhs is .Unc { server: r_srv, share: r_shr }) {
+                cmp_bytes(l_srv, r_srv).then(cmp_bytes(l_shr, r_shr))
+            } else {
+                .Equal
+            }
+        },
+        .Disk(l_drv) => if rhs is .Disk(r_drv) {
+            if l_drv < r_drv => .Less
+                else if l_drv > r_drv => .Greater
+                else .Equal
+        } else {
+            .Equal
+        },
+    }
+}
+
+/| Orders two `Component` values canonically (`Prefix < RootDir < CurDir < ParentDir < Normal`).
+fn cmp_component(lhs: Component, rhs: Component, /) -> Ordering {
+    let lhs_rank: u8 = match lhs {
+        .Prefix(_) => 0_u8,
+        .RootDir => 1_u8,
+        .CurDir => 2_u8,
+        .ParentDir => 3_u8,
+        .Normal(_) => 4_u8,
+    };
+    let rhs_rank: u8 = match rhs {
+        .Prefix(_) => 0_u8,
+        .RootDir => 1_u8,
+        .CurDir => 2_u8,
+        .ParentDir => 3_u8,
+        .Normal(_) => 4_u8,
+    };
+    if lhs_rank < rhs_rank {
+        return .Less;
+    } else if lhs_rank > rhs_rank {
+        return .Greater;
+    }
+    match lhs {
+        .Prefix(l_pref) => if rhs is .Prefix(r_pref) => cmp_path_prefix(l_pref, r_pref) else .Equal,
+        .Normal(l_seg) => if rhs is .Normal(r_seg) => cmp_bytes(l_seg, r_seg) else .Equal,
+        _ => .Equal,
+    }
+}
+
+/| Returns `true` when `lhs` and `rhs` components compare equal.
+fn are_components_eq(lhs: Component, rhs: Component, /) -> bool {
+    cmp_component(lhs, rhs) == .Equal
+}
+
+/| Compares `lhs` and `rhs` for normalized component-wise equality under `flavor`.
+@expect(unused-pkg-visibility, reason: "used by cross-OS tests and cx.fs in Phase 11.2a")
+pub(pkg) fn are_paths_eq_with_flavor(lhs: Path, rhs: Path, flavor: PathFlavor, /) -> bool {
+    if is_bytes_equal(lhs.bytes, rhs.bytes) {
+        return true;
+    }
+    var lhs_it: ComponentsIter = components_with_flavor(lhs, flavor);
+    var rhs_it: ComponentsIter = components_with_flavor(rhs, flavor);
+    while true {
+        let lhs_next: Component? = lhs_it.next();
+        let rhs_next: Component? = rhs_it.next();
+        match lhs_next {
+            .Some(l_comp) => if rhs_next is .Some(r_comp) {
+                if not are_components_eq(l_comp, r_comp) {
+                    return false;
+                }
+            } else {
+                return false;
+            },
+            .None => return rhs_next is .None,
+        }
+    }
+    false
+}
+
+/| Orders `lhs` and `rhs` lexicographically by component stream under `flavor`.
+@expect(unused-pkg-visibility, reason: "used by cross-OS tests and cx.fs in Phase 11.2a")
+pub(pkg) fn paths_cmp_with_flavor(lhs: Path, rhs: Path, flavor: PathFlavor, /) -> Ordering {
+    var lhs_it: ComponentsIter = components_with_flavor(lhs, flavor);
+    var rhs_it: ComponentsIter = components_with_flavor(rhs, flavor);
+    while true {
+        let lhs_next: Component? = lhs_it.next();
+        let rhs_next: Component? = rhs_it.next();
+        match lhs_next {
+            .Some(l_comp) => if rhs_next is .Some(r_comp) {
+                let ord: Ordering = cmp_component(l_comp, r_comp);
+                if ord != .Equal {
+                    return ord;
+                }
+            } else {
+                return .Greater;
+            },
+            .None => return if rhs_next is .Some(_) => .Less else .Equal,
+        }
+    }
+    .Equal
+}
+
+/| Returns `true` if `base` is a component-wise prefix of `path` under `flavor`.
+@expect(unused-pkg-visibility, reason: "used by cross-OS tests and cx.fs in Phase 11.2a")
+pub(pkg) fn starts_with_with_flavor(path: Path, base: Path, flavor: PathFlavor, /) -> bool {
+    var self_it: ComponentsIter = components_with_flavor(path, flavor);
+    var base_it: ComponentsIter = components_with_flavor(base, flavor);
+    while base_it.next() is .Some(base_comp) {
+        if self_it.next() is .Some(self_comp) {
+            if not are_components_eq(self_comp, base_comp) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/| Returns `true` if `child` is a component-wise suffix of `path` under `flavor`.
+@expect(unused-pkg-visibility, reason: "used by cross-OS tests and cx.fs in Phase 11.2a")
+pub(pkg) fn ends_with_with_flavor(path: Path, child: Path, flavor: PathFlavor, /) -> bool {
+    var self_it: ComponentsIter = components_with_flavor(path, flavor);
+    var child_it: ComponentsIter = components_with_flavor(child, flavor);
+    while child_it.next_back() is .Some(child_comp) {
+        if self_it.next_back() is .Some(self_comp) {
+            if not are_components_eq(self_comp, child_comp) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/| Strips component-wise `base` from `path` under `flavor`, returning `.Some(rest)` or `.None`.
+@expect(unused-pkg-visibility, reason: "used by cross-OS tests and cx.fs in Phase 11.2a")
+pub(pkg) fn strip_prefix_with_flavor(path: Path, base: Path, flavor: PathFlavor, /) -> Path? {
+    var self_it: ComponentsIter = components_with_flavor(path, flavor);
+    var base_it: ComponentsIter = components_with_flavor(base, flavor);
+    while base_it.next() is .Some(base_comp) {
+        if self_it.next() is .Some(self_comp) {
+            if not are_components_eq(self_comp, base_comp) {
+                return .None;
+            }
+        } else {
+            return .None;
+        }
+    }
+    let (start_off, end_off) = iter_unconsumed_bounds(self_it);
+    .Some(Path { bytes: subslice_u8(path.bytes, start_off, end_off) })
+}
+
+// ---------------- Join & Lexical Normalization ----------------
+/| Computes the exact `JoinPlan` splicing `base` and `child` under `flavor` (handling Win32 drive/root-relative rules).
+fn plan_join_with_flavor(base: &[u8], child: &[u8], flavor: PathFlavor, /) -> JoinPlan {
+    let sep_byte: u8 = main_sep_for_flavor(flavor);
+    if child.is_empty() {
+        return JoinPlan {
+            head: base,
+            sep: sep_byte,
+            has_sep: false,
+            tail: empty_u8_slice(),
+        };
+    }
+    if base.is_empty() {
+        return JoinPlan {
+            head: empty_u8_slice(),
+            sep: sep_byte,
+            has_sep: false,
+            tail: child,
+        };
+    }
+
+    if flavor == .Posix {
+        if byte_at(child, 0) == b'/' {
+            return JoinPlan {
+                head: empty_u8_slice(),
+                sep: b'/',
+                has_sep: false,
+                tail: child,
+            };
+        }
+        let need_sep: bool = byte_at(base, base.len() -% 1) != b'/';
+        return JoinPlan {
+            head: base,
+            sep: b'/',
+            has_sep: need_sep,
+            tail: child,
+        };
+    }
+
+    let child_path = Path { bytes: child };
+    if is_absolute_with_flavor(child_path, .Windows) {
+        return JoinPlan {
+            head: empty_u8_slice(),
+            sep: b'\\',
+            has_sep: false,
+            tail: child,
+        };
+    }
+
+    let base_pref_opt: (PathPrefix, usize, bool)? = parse_prefix_win32(base);
+    let child_pref_opt: (PathPrefix, usize, bool)? = parse_prefix_win32(child);
+
+    // Windows root-relative `\foo` preserves any leading drive/UNC prefix on `base`:
+    if child_pref_opt is .None and has_root_with_flavor(child_path, .Windows) {
+        if base_pref_opt is .Some((_, base_pref_len, _)) {
+            let need_verbatim_bslash: bool = byte_at(child, 0) == b'/';
+            return JoinPlan {
+                head: subslice_u8(base, 0, base_pref_len),
+                sep: b'\\',
+                has_sep: need_verbatim_bslash,
+                tail: if need_verbatim_bslash => subslice_u8(child, 1, child.len()) else child,
+            };
+        }
+        return JoinPlan {
+            head: empty_u8_slice(),
+            sep: b'\\',
+            has_sep: false,
+            tail: child,
+        };
+    }
+
+    // Windows drive-relative `C:foo` appends onto matching drive `C:…` or replaces mismatched drives:
+    if child_pref_opt is .Some((.Disk(child_drv), child_pref_len, _)) {
+        var matching_drive = false;
+        var base_is_bare_disk = false;
+        var base_is_verbatim = false;
+        if base_pref_opt is .Some((base_pref, base_pref_len, is_verb)) {
+            base_is_verbatim = is_verb;
+            if base_pref is .Disk(base_drv) and base_drv == child_drv {
+                matching_drive = true;
+                base_is_bare_disk = base.len() == base_pref_len;
+            } else if base_pref is .VerbatimDisk(base_vdrv) and base_vdrv == child_drv {
+                matching_drive = true;
+            }
+        }
+        if not matching_drive {
+            return JoinPlan {
+                head: empty_u8_slice(),
+                sep: b'\\',
+                has_sep: false,
+                tail: child,
+            };
+        }
+        let rem_tail: &[u8] = subslice_u8(child, child_pref_len, child.len());
+        if rem_tail.is_empty() {
+            return JoinPlan {
+                head: base,
+                sep: b'\\',
+                has_sep: false,
+                tail: empty_u8_slice(),
+            };
+        }
+        let last_b: u8 = byte_at(base, base.len() -% 1);
+        let need_sep: bool = not base_is_bare_disk
+            and not is_sep_for_flavor(
+                last_b,
+                .Windows,
+                base_is_verbatim,
+            );
+        return JoinPlan {
+            head: base,
+            sep: b'\\',
+            has_sep: need_sep,
+            tail: rem_tail,
+        };
+    }
+
+    // Ordinary relative `child`:
+    var is_base_bare_disk = false;
+    var is_base_verbatim = false;
+    if base_pref_opt is .Some((base_pref, base_pref_len, is_verb)) {
+        is_base_verbatim = is_verb;
+        if base_pref is .Disk(_) and base.len() == base_pref_len {
+            is_base_bare_disk = true;
+        }
+    }
+    let last_byte: u8 = byte_at(base, base.len() -% 1);
+    let need_sep: bool = not is_base_bare_disk
+        and not is_sep_for_flavor(
+            last_byte,
+            .Windows,
+            is_base_verbatim,
+        );
+    JoinPlan {
+        head: base,
+        sep: b'\\',
+        has_sep: need_sep,
+        tail: child,
+    }
+}
+
+/| Appends `child` onto `buf` using explicit `flavor` semantics.
+@expect(unused-pkg-visibility, reason: "used by cross-OS tests and cx.fs in Phase 11.2a")
+pub(pkg) fn push_with_flavor(buf: &mut PathBuf, child: Path, flavor: PathFlavor, /) {
+    let plan: JoinPlan = plan_join_with_flavor(buf.as_bytes(), child.bytes, flavor);
+    if plan.head.is_empty() and not plan.has_sep {
+        buf.clear();
+        path_buf_try_push_bytes(buf, plan.tail) catch {
+            panic("PathBuf.push out of memory");
+        };
+        return;
+    }
+    let head_len: usize = plan.head.len();
+    path_buf_truncate_raw(buf, head_len);
+    let extra: usize = (if plan.has_sep => 1_usize else 0_usize) +% plan.tail.len();
+    if extra == 0 {
+        return;
+    }
+    buf.reserve(extra);
+    if plan.has_sep {
+        let sep_arr: [u8; 1] = [plan.sep];
+        path_buf_try_push_bytes(buf, &sep_arr) catch {
+            panic("PathBuf.push out of memory");
+        };
+    }
+    path_buf_try_push_bytes(buf, plan.tail) catch {
+        panic("PathBuf.push out of memory");
+    };
+}
+
+/| Pops the last component from `buf` under explicit `flavor` semantics.
+@expect(unused-pkg-visibility, reason: "used by cross-OS tests and cx.fs in Phase 11.2a")
+pub(pkg) fn pop_with_flavor(buf: &mut PathBuf, flavor: PathFlavor, /) -> bool {
+    if parent_with_flavor(buf.as_path(), flavor) is .Some(par) {
+        path_buf_truncate_raw(buf, par.len());
+        return true;
+    }
+    false
+}
+
+/| Joins `base` and `child` into an owned `PathBuf` under explicit `flavor` semantics.
+@expect(unused-pkg-visibility, reason: "used by cross-OS tests and cx.fs in Phase 11.2a")
+pub(pkg) fn join_with_flavor(base: Path, child: Path, flavor: PathFlavor, /) -> PathBuf {
+    let plan: JoinPlan = plan_join_with_flavor(base.bytes, child.bytes, flavor);
+    let total_len: usize = plan.head.len()
+        +% (if plan.has_sep => 1_usize else 0_usize)
+        +% plan.tail.len();
+    var out = PathBuf.with_capacity(total_len);
+    path_buf_try_push_bytes(&mut out, plan.head) catch {
+        panic("Path.join out of memory");
+    };
+    if plan.has_sep {
+        let sep_arr: [u8; 1] = [plan.sep];
+        path_buf_try_push_bytes(&mut out, &sep_arr) catch {
+            panic("Path.join out of memory");
+        };
+    }
+    path_buf_try_push_bytes(&mut out, plan.tail) catch {
+        panic("Path.join out of memory");
+    };
+    out
+}
+
+/| Joins `base` and `child` directly inside `arena` under explicit `flavor` semantics.
+@expect(unused-pkg-visibility, reason: "used by cross-OS tests and cx.fs in Phase 11.2a")
+@std_cap_boundary(clears: [unsafe_op])
+pub(pkg) fn join_in_with_flavor(
+    arena: &mut Arena,
+    base: Path,
+    child: Path,
+    flavor: PathFlavor,
+    /,
+) -> Path {
+    let plan: JoinPlan = plan_join_with_flavor(base.bytes, child.bytes, flavor);
+    let head_len: usize = plan.head.len();
+    let sep_len: usize = if plan.has_sep => 1_usize else 0_usize;
+    let tail_len: usize = plan.tail.len();
+    let total_len: usize = head_len +% sep_len +% tail_len;
+    if total_len == 0 {
+        return Path { bytes: empty_u8_slice() };
+    }
+    let dst_ptr: *mut u8 = arena.as_handle().alloc(Layout { size: total_len, alignment: 1 }) catch {
+        panic("Path.join_in out of memory");
+    };
+    if head_len > 0 {
+        unsafe {
+            @memcpy(dst_ptr as *mut opaque, plan.head.as_ptr() as *opaque, head_len);
+        }
+    }
+    if plan.has_sep {
+        unsafe {
+            dst_ptr.add(head_len).write(plan.sep);
+        }
+    }
+    if tail_len > 0 {
+        unsafe {
+            @memcpy(
+                dst_ptr.add(head_len +% sep_len) as *mut opaque,
+                plan.tail.as_ptr() as *opaque,
+                tail_len,
+            );
+        }
+    }
+    Path {
+        bytes: unsafe {
+            @slice_from_raw_parts(dst_ptr as *u8, total_len)
+        },
+    }
+}
+
+/| Writes the canonical serialized bytes of `pref` into `out` `PathBuf`.
+fn push_normalized_prefix(out: &mut PathBuf, pref: PathPrefix, /) {
+    match pref {
+        .Verbatim(lbl) => {
+            path_buf_try_push_bytes(out, b"\\\\?\\") catch {
+                panic("Path.normalize_lexical out of memory");
+            };
+            path_buf_try_push_bytes(out, lbl) catch {
+                panic("Path.normalize_lexical out of memory");
+            };
+        },
+        .VerbatimUnc { server, share } => {
+            path_buf_try_push_bytes(out, b"\\\\?\\UNC\\") catch {
+                panic("Path.normalize_lexical out of memory");
+            };
+            path_buf_try_push_bytes(out, server) catch {
+                panic("Path.normalize_lexical out of memory");
+            };
+            path_buf_try_push_bytes(out, b"\\") catch {
+                panic("Path.normalize_lexical out of memory");
+            };
+            path_buf_try_push_bytes(out, share) catch {
+                panic("Path.normalize_lexical out of memory");
+            };
+        },
+        .VerbatimDisk(drv) => {
+            let disk_buf: [u8; 6] = [b'\\', b'\\', b'?', b'\\', drv, b':'];
+            path_buf_try_push_bytes(out, &disk_buf) catch {
+                panic("Path.normalize_lexical out of memory");
+            };
+        },
+        .DeviceNs(dev) => {
+            path_buf_try_push_bytes(out, b"\\\\.\\") catch {
+                panic("Path.normalize_lexical out of memory");
+            };
+            path_buf_try_push_bytes(out, dev) catch {
+                panic("Path.normalize_lexical out of memory");
+            };
+        },
+        .Unc { server, share } => {
+            path_buf_try_push_bytes(out, b"\\\\") catch {
+                panic("Path.normalize_lexical out of memory");
+            };
+            path_buf_try_push_bytes(out, server) catch {
+                panic("Path.normalize_lexical out of memory");
+            };
+            path_buf_try_push_bytes(out, b"\\") catch {
+                panic("Path.normalize_lexical out of memory");
+            };
+            path_buf_try_push_bytes(out, share) catch {
+                panic("Path.normalize_lexical out of memory");
+            };
+        },
+        .Disk(drv) => {
+            let drv_buf: [u8; 2] = [drv, b':'];
+            path_buf_try_push_bytes(out, &drv_buf) catch {
+                panic("Path.normalize_lexical out of memory");
+            };
+        },
+    }
+}
+
+/| Reads segment `(offset, len)` at `idx` from `(inline_segs, overflow_segs)`.
+@std_cap_boundary(clears: [unsafe_op])
+fn read_norm_seg(
+    inline_segs: &[(usize, usize); INLINE_NORM_SEG_CAP],
+    overflow_segs: &Vec[(usize, usize)],
+    idx: usize,
+    /,
+) -> (usize, usize) {
+    if idx < INLINE_NORM_SEG_CAP {
+        return unsafe {
+            (&raw inline_segs[0]).add(idx).read()
+        };
+    }
+    let ov_idx: usize = idx -% INLINE_NORM_SEG_CAP;
+    let ov_slice: &[(usize, usize)] = overflow_segs.as_slice();
+    if ov_idx < ov_slice.len() {
+        return unsafe {
+            ov_slice.as_ptr().add(ov_idx).read()
+        };
+    }
+    return (0_usize, 0_usize);
+}
+
+/| Writes segment `(seg_off, seg_len)` at `idx` into `inline_segs` (`idx < INLINE_NORM_SEG_CAP`).
+@std_cap_boundary(clears: [unsafe_op])
+fn write_inline_norm_seg(
+    inline_segs: &mut [(usize, usize); INLINE_NORM_SEG_CAP],
+    idx: usize,
+    entry: (usize, usize),
+    /,
+) {
+    if idx < INLINE_NORM_SEG_CAP {
+        unsafe {
+            (&raw mut inline_segs[0]).add(idx).write(entry);
+        }
+    }
+}
+
+/| Purely lexical `.` / `..` and separator normalization under `flavor` (never alters `\\?\` verbatim bodies).
+@expect(unused-pkg-visibility, reason: "used by cross-OS tests and cx.fs in Phase 11.2a")
+pub(pkg) fn normalize_lexical_with_flavor(path: Path, flavor: PathFlavor, /) -> PathBuf {
+    let raw: &[u8] = path.bytes;
+    if raw.is_empty() {
+        return PathBuf.new();
+    }
+    if flavor == .Windows and parse_prefix_win32(raw) is .Some((_, _, is_verb)) and is_verb {
+        return path_buf_from_slice(raw);
+    }
+
+    var prefix_opt: PathPrefix? = .None;
+    var has_root = false;
+    var inline_segs: [(usize, usize); INLINE_NORM_SEG_CAP] = [(0_usize, 0_usize); INLINE_NORM_SEG_CAP];
+    var overflow_segs = Vec[(usize, usize)].new();
+    var seg_count: usize = 0;
+
+    let raw_base_addr = raw.as_ptr() as usize;
+    var comps: ComponentsIter = components_with_flavor(path, flavor);
+    while comps.next() is .Some(comp) {
+        match comp {
+            .Prefix(pref) => {
+                prefix_opt = .Some(pref);
+            },
+            .RootDir => {
+                has_root = true;
+            },
+            .CurDir => {},
+            .ParentDir => {
+                if seg_count > 0 {
+                    let top_idx: usize = seg_count -% 1;
+                    let (top_off, _) = read_norm_seg(&inline_segs, &overflow_segs, top_idx);
+                    if top_off != PARENT_SEG_SENTINEL {
+                        seg_count = top_idx;
+                        if seg_count >= INLINE_NORM_SEG_CAP {
+                            _ = overflow_segs.pop();
+                        }
+                    } else if not has_root {
+                        if seg_count < INLINE_NORM_SEG_CAP {
+                            write_inline_norm_seg(
+                                &mut inline_segs,
+                                seg_count,
+                                (PARENT_SEG_SENTINEL, 2_usize),
+                            );
+                        } else {
+                            overflow_segs.push((PARENT_SEG_SENTINEL, 2_usize));
+                        }
+                        seg_count = seg_count +% 1;
+                    }
+                } else if not has_root {
+                    write_inline_norm_seg(&mut inline_segs, 0, (PARENT_SEG_SENTINEL, 2_usize));
+                    seg_count = 1_usize;
+                }
+            },
+            .Normal(seg_bytes) => {
+                let seg_off: usize = (seg_bytes.as_ptr() as usize) -% raw_base_addr;
+                let seg_len: usize = seg_bytes.len();
+                if seg_count < INLINE_NORM_SEG_CAP {
+                    write_inline_norm_seg(&mut inline_segs, seg_count, (seg_off, seg_len));
+                } else {
+                    overflow_segs.push((seg_off, seg_len));
+                }
+                seg_count = seg_count +% 1;
+            },
+        }
+    }
+
+    let sep_byte: u8 = main_sep_for_flavor(flavor);
+    let sep_slice: [u8; 1] = [sep_byte];
+    var out = PathBuf.new();
+    if prefix_opt is .Some(pref) {
+        push_normalized_prefix(&mut out, pref);
+    }
+
+    // Emit root separator when `has_root` and either no implicit-root prefix or body segments follow:
+    let pref_is_unc_or_dev: bool = if prefix_opt is .Some(pref) => has_implicit_root_prefix(pref)
+        else false;
+    if has_root and (not pref_is_unc_or_dev or seg_count > 0) {
+        path_buf_try_push_bytes(&mut out, &sep_slice) catch {
+            panic("Path.normalize_lexical out of memory");
+        };
+    }
+
+    var idx: usize = 0;
+    while idx < seg_count {
+        if idx > 0 {
+            path_buf_try_push_bytes(&mut out, &sep_slice) catch {
+                panic("Path.normalize_lexical out of memory");
+            };
+        }
+        let (seg_off, seg_len) = read_norm_seg(&inline_segs, &overflow_segs, idx);
+        if seg_off == PARENT_SEG_SENTINEL {
+            path_buf_try_push_bytes(&mut out, b"..") catch {
+                panic("Path.normalize_lexical out of memory");
+            };
+        } else {
+            let seg_view: &[u8] = subslice_u8(raw, seg_off, seg_off +% seg_len);
+            path_buf_try_push_bytes(&mut out, seg_view) catch {
+                panic("Path.normalize_lexical out of memory");
+            };
+        }
+        idx = idx +% 1;
+    }
+
+    if out.is_empty() {
+        path_buf_try_push_bytes(&mut out, b".") catch {
+            panic("Path.normalize_lexical out of memory");
+        };
+    }
+    out
+}
+
+/| Purely lexical normalization writing its result directly into `arena` (`0` escape ties to `path`).
+@expect(unused-pkg-visibility, reason: "used by cross-OS tests and cx.fs in Phase 11.2a")
+@std_cap_boundary(clears: [unsafe_op])
+pub(pkg) fn normalize_lexical_in_with_flavor(
+    arena: &mut Arena,
+    path: Path,
+    flavor: PathFlavor,
+    /,
+) -> Path {
+    let norm_buf: PathBuf = normalize_lexical_with_flavor(path, flavor);
+    let norm_bytes: &[u8] = norm_buf.as_bytes();
+    let n: usize = norm_bytes.len();
+    if n == 0 {
+        return Path { bytes: empty_u8_slice() };
+    }
+    let dst_ptr: *mut u8 = arena.as_handle().alloc(Layout { size: n, alignment: 1 }) catch {
+        panic("Path.normalize_lexical_in out of memory");
+    };
+    unsafe {
+        @memcpy(dst_ptr as *mut opaque, norm_bytes.as_ptr() as *opaque, n);
+        return Path { bytes: @slice_from_raw_parts(dst_ptr as *u8, n) };
+    }
+}
+
+// ------------------ DOS Device & Lossy UTF-8 ------------------
+/| Returns `true` if WTF-8 component `comp` has a DOS reserved stem (`CON`, `PRN`, `AUX`, `NUL`, `COM0..³`, `LPT0..³`, `CONIN$`, `CONOUT$`).
+fn is_dos_reserved_bytes(comp: &[u8], /) -> bool {
+    let total: usize = comp.len();
+    if total == 0 {
+        return false;
+    }
+    if total == 1 and byte_at(comp, 0) == b'.' {
+        return false;
+    }
+    if total == 2 and byte_at(comp, 0) == b'.' and byte_at(comp, 1) == b'.' {
+        return false;
+    }
+
+    var stem_end: usize = 0;
+    while stem_end < total {
+        let ch_b: u8 = byte_at(comp, stem_end);
+        if ch_b == b'.' or ch_b == b':' {
+            break;
+        }
+        stem_end = stem_end +% 1;
+    }
+    while stem_end > 0 and byte_at(comp, stem_end -% 1) == b' ' {
+        stem_end = stem_end -% 1;
+    }
+    if stem_end < 3 {
+        return false;
+    }
+
+    let c0: u8 = ascii_to_upper(byte_at(comp, 0));
+    let c1: u8 = ascii_to_upper(byte_at(comp, 1));
+    let c2: u8 = ascii_to_upper(byte_at(comp, 2));
+    if stem_end == 3 {
+        return (c0 == b'C' and c1 == b'O' and c2 == b'N')
+            or (c0 == b'P' and c1 == b'R' and c2 == b'N')
+            or (c0 == b'A' and c1 == b'U' and c2 == b'X')
+            or (c0 == b'N' and c1 == b'U' and c2 == b'L');
+    }
+    if stem_end == 4 {
+        let is_com_or_lpt: bool = (c0 == b'C' and c1 == b'O' and c2 == b'M')
+            or (c0 == b'L' and c1 == b'P' and c2 == b'T');
+        let d_byte: u8 = byte_at(comp, 3);
+        return is_com_or_lpt and d_byte >= b'0' and d_byte <= b'9';
+    }
+    if stem_end == 5 {
+        // UTF-8 Latin-1 superscripts `¹` (`0xC2 0xB9`), `²` (`0xC2 0xB2`), `³` (`0xC2 0xB3`):
+        let is_com_or_lpt: bool = (c0 == b'C' and c1 == b'O' and c2 == b'M')
+            or (c0 == b'L' and c1 == b'P' and c2 == b'T');
+        let b3: u8 = byte_at(comp, 3);
+        let b4: u8 = byte_at(comp, 4);
+        return is_com_or_lpt and b3 == 0xC2_u8 and (b4 == 0xB9_u8 or b4 == 0xB2_u8 or b4 == 0xB3_u8);
+    }
+    if stem_end == 6 {
+        return c0 == b'C'
+            and c1 == b'O'
+            and c2 == b'N'
+            and ascii_to_upper(
+                byte_at(comp, 3),
+            )
+                == b'I'
+            and ascii_to_upper(byte_at(comp, 4)) == b'N'
+            and byte_at(comp, 5) == b'$';
+    }
+    if stem_end == 7 {
+        return c0 == b'C'
+            and c1 == b'O'
+            and c2 == b'N'
+            and ascii_to_upper(
+                byte_at(comp, 3),
+            )
+                == b'O'
+            and ascii_to_upper(byte_at(comp, 4)) == b'U'
+            and ascii_to_upper(
+                byte_at(comp, 5),
+            )
+                == b'T'
+            and byte_at(comp, 6) == b'$';
+    }
+    false
+}
+
+/| Inspects the leading byte sequence at `bytes[pos..]` and returns `(valid_utf8_len, invalid_skip_len)`.
+fn next_utf8_or_wtf8_chunk(bytes: &[u8], pos: usize, /) -> (usize, usize) {
+    let len: usize = bytes.len();
+    if pos >= len {
+        return (0_usize, 0_usize);
+    }
+    let b0: u8 = byte_at(bytes, pos);
+    if b0 < 0x80_u8 {
+        var run_end: usize = pos +% 1;
+        while run_end < len and byte_at(bytes, run_end) < 0x80_u8 {
+            run_end = run_end +% 1;
+        }
+        return (run_end -% pos, 0_usize);
+    }
+    if b0 >= 0xC2_u8 and b0 <= 0xDF_u8 {
+        if pos < len -% 1 and (byte_at(bytes, pos +% 1) & 0xC0_u8) == 0x80_u8 {
+            return (2_usize, 0_usize);
+        }
+        return (0_usize, 1_usize);
+    }
+    if b0 >= 0xE0_u8 and b0 <= 0xEF_u8 {
+        if pos >= len -% 1 {
+            return (0_usize, 1_usize);
+        }
+        let b1: u8 = byte_at(bytes, pos +% 1);
+        // Unpaired WTF-8 surrogate `0xED 0xA0..=0xBF 0x80..=0xBF` maps to single `U+FFFD`:
+        if b0 == 0xED_u8 and b1 >= 0xA0_u8 and b1 <= 0xBF_u8 {
+            if len >= 3 and pos <= len -% 3 and (byte_at(bytes, pos +% 2) & 0xC0_u8) == 0x80_u8 {
+                return (0_usize, 3_usize);
+            }
+            return (0_usize, 1_usize);
+        }
+        let b1_ok: bool = if b0 == 0xE0_u8 => b1 >= 0xA0_u8 and b1 <= 0xBF_u8
+            else if b0 == 0xED_u8 => b1 >= 0x80_u8 and b1 <= 0x9F_u8
+            else (b1 & 0xC0_u8) == 0x80_u8;
+        if not b1_ok {
+            return (0_usize, 1_usize);
+        }
+        if len >= 3 and pos <= len -% 3 and (byte_at(bytes, pos +% 2) & 0xC0_u8) == 0x80_u8 {
+            return (3_usize, 0_usize);
+        }
+        return (0_usize, 2_usize);
+    }
+    if b0 >= 0xF0_u8 and b0 <= 0xF4_u8 {
+        if pos >= len -% 1 {
+            return (0_usize, 1_usize);
+        }
+        let b1: u8 = byte_at(bytes, pos +% 1);
+        let b1_ok: bool = if b0 == 0xF0_u8 => b1 >= 0x90_u8 and b1 <= 0xBF_u8
+            else if b0 == 0xF4_u8 => b1 >= 0x80_u8 and b1 <= 0x8F_u8
+            else (b1 & 0xC0_u8) == 0x80_u8;
+        if not b1_ok {
+            return (0_usize, 1_usize);
+        }
+        if len < 3 or pos > len -% 3 or (byte_at(bytes, pos +% 2) & 0xC0_u8) != 0x80_u8 {
+            return (0_usize, 2_usize);
+        }
+        if len >= 4 and pos <= len -% 4 and (byte_at(bytes, pos +% 3) & 0xC0_u8) == 0x80_u8 {
+            return (4_usize, 0_usize);
+        }
+        return (0_usize, 3_usize);
+    }
+    return (0_usize, 1_usize);
+}
+
+/| Converts `bytes` to valid UTF-8 in `arena` (replacing non-UTF-8 / unpaired WTF-8 sequences with `U+FFFD` and optionally mapping `\` -> `/`).
+@std_cap_boundary(clears: [unsafe_op])
+fn lossy_utf8_in_arena(arena: &mut Arena, bytes: &[u8], slash_backslash: bool, /) -> str {
+    let src_len: usize = bytes.len();
+    if src_len == 0 {
+        return "";
+    }
+    if is_valid_utf8(bytes) {
+        let fast_ptr: *mut u8 = arena.as_handle().alloc(Layout { size: src_len, alignment: 1 }) catch {
+            panic("Path.to_str_lossy_in out of memory");
+        };
+        if not slash_backslash {
+            unsafe {
+                @memcpy(fast_ptr as *mut opaque, bytes.as_ptr() as *opaque, src_len);
+            }
+        } else {
+            var idx: usize = 0;
+            while idx < src_len {
+                let raw_b: u8 = byte_at(bytes, idx);
+                unsafe {
+                    fast_ptr.add(idx).write(if raw_b == b'\\' => b'/' else raw_b);
+                }
+                idx = idx +% 1;
+            }
+        }
+        return unsafe {
+            @str_from_utf8_unchecked(@slice_from_raw_parts(fast_ptr as *u8, src_len))
+        };
+    }
+
+    // [1] Exact output UTF-8 length pass:
+    var out_len: usize = 0;
+    var scan_pos: usize = 0;
+    while scan_pos < src_len {
+        let (valid_n, skip_n) = next_utf8_or_wtf8_chunk(bytes, scan_pos);
+        if valid_n > 0 {
+            out_len = out_len +% valid_n;
+            scan_pos = scan_pos +% valid_n;
+        } else {
+            out_len = out_len +% 3_usize;
+            scan_pos = scan_pos +% skip_n;
+        }
+    }
+
+    // [2] Single-pass write into `arena`:
+    let dst_ptr: *mut u8 = arena.as_handle().alloc(Layout { size: out_len, alignment: 1 }) catch {
+        panic("Path.to_str_lossy_in out of memory");
+    };
+    var write_pos: usize = 0;
+    var read_pos: usize = 0;
+    while read_pos < src_len {
+        let (valid_n, skip_n) = next_utf8_or_wtf8_chunk(bytes, read_pos);
+        if valid_n > 0 {
+            var k: usize = 0;
+            while k < valid_n {
+                let raw_b: u8 = byte_at(bytes, read_pos +% k);
+                unsafe {
+                    dst_ptr
+                        .add(write_pos +% k)
+                        .write(
+                            if slash_backslash and raw_b == b'\\' => b'/' else raw_b,
+                        );
+                }
+                k = k +% 1;
+            }
+            write_pos = write_pos +% valid_n;
+            read_pos = read_pos +% valid_n;
+        } else {
+            unsafe {
+                dst_ptr.add(write_pos).write(0xEF_u8);
+                dst_ptr.add(write_pos +% 1).write(0xBF_u8);
+                dst_ptr.add(write_pos +% 2).write(0xBD_u8);
+            }
+            write_pos = write_pos +% 3_usize;
+            read_pos = read_pos +% skip_n;
+        }
+    }
+    unsafe {
+        @str_from_utf8_unchecked(@slice_from_raw_parts(dst_ptr as *u8, out_len))
+    }
+}
+
+/| Converts `path` lossily to UTF-8 in `arena`, replacing Windows `\` separators with `/` when `flavor == .Windows`.
+@expect(unused-pkg-visibility, reason: "used by cross-OS tests and cx.fs in Phase 11.2a")
+pub(pkg) fn to_slash_lossy_with_flavor_in(
+    path: Path,
+    arena: &mut Arena,
+    flavor: PathFlavor,
+    /,
+) -> str {
+    let is_win_non_verbatim: bool = if flavor == .Windows {
+        if parse_prefix_win32(path.bytes) is .Some((_, _, is_verb)) => not is_verb else true
+    } else {
+        false
+    };
+    lossy_utf8_in_arena(arena, path.bytes, is_win_non_verbatim)
+}
+
+// ------------------ WTF-8 <-> UTF-16LE Codec ------------------
+/| Transcodes well-formed WTF-8 `wtf8` into UTF-16 code units in `out_u16`, rejecting interior NULs and 6-byte CESU-8 pairs.
+pub(super) fn encode_wtf8_to_wtf16(wtf8: &[u8], out_u16: &mut [u16], /) -> usize!Wtf8Error {
+    let src_len: usize = wtf8.len();
+    let dst_cap: usize = out_u16.len();
+    var i: usize = 0;
+    var out_idx: usize = 0;
+    var prev_was_high_surrogate = false;
+
+    while i < src_len {
+        let b0: u8 = byte_at(wtf8, i);
+        if b0 == 0_u8 {
+            return .Err(.InteriorNulByte);
+        }
+        if b0 < 0x80_u8 {
+            if out_idx >= dst_cap {
+                return .Err(.BufferTooSmall);
+            }
+            write_u16_at(out_u16, out_idx, b0 as u16);
+            out_idx = out_idx +% 1;
+            prev_was_high_surrogate = false;
+            i = i +% 1;
+        } else if (b0 & 0xE0_u8) == 0xC0_u8 {
+            if src_len -| i < 2_usize {
+                return .Err(.InvalidWtf8);
+            }
+            let b1: u8 = byte_at(wtf8, i +% 1);
+            if (b1 & 0xC0_u8) != 0x80_u8 {
+                return .Err(.InvalidWtf8);
+            }
+            let cp16: u16 = (((b0 & 0x1F_u8) as u16) << 6_u16) | ((b1 & 0x3F_u8) as u16);
+            if cp16 < 0x80_u16 {
+                return .Err(.InvalidWtf8);
+            }
+            if out_idx >= dst_cap {
+                return .Err(.BufferTooSmall);
+            }
+            write_u16_at(out_u16, out_idx, cp16);
+            out_idx = out_idx +% 1;
+            prev_was_high_surrogate = false;
+            i = i +% 2;
+        } else if (b0 & 0xF0_u8) == 0xE0_u8 {
+            if src_len -| i < 3_usize {
+                return .Err(.InvalidWtf8);
+            }
+            let b1: u8 = byte_at(wtf8, i +% 1);
+            let b2: u8 = byte_at(wtf8, i +% 2);
+            if (b1 & 0xC0_u8) != 0x80_u8 or (b2 & 0xC0_u8) != 0x80_u8 {
+                return .Err(.InvalidWtf8);
+            }
+            let cp16: u16 = (((b0 & 0x0F_u8) as u16) << 12_u16)
+                | (((b1 & 0x3F_u8) as u16) << 6_u16)
+                | ((b2 & 0x3F_u8) as u16);
+            if cp16 < 0x800_u16 {
+                return .Err(.InvalidWtf8);
+            }
+            let is_high: bool = cp16 >= 0xD800_u16 and cp16 <= 0xDBFF_u16;
+            let is_low: bool = cp16 >= 0xDC00_u16 and cp16 <= 0xDFFF_u16;
+            if is_low and prev_was_high_surrogate {
+                return .Err(.InvalidWtf8);
+            }
+            if out_idx >= dst_cap {
+                return .Err(.BufferTooSmall);
+            }
+            write_u16_at(out_u16, out_idx, cp16);
+            out_idx = out_idx +% 1;
+            prev_was_high_surrogate = is_high;
+            i = i +% 3;
+        } else if (b0 & 0xF8_u8) == 0xF0_u8 {
+            if src_len -| i < 4_usize {
+                return .Err(.InvalidWtf8);
+            }
+            let b1: u8 = byte_at(wtf8, i +% 1);
+            let b2: u8 = byte_at(wtf8, i +% 2);
+            let b3: u8 = byte_at(wtf8, i +% 3);
+            if (b1 & 0xC0_u8) != 0x80_u8 or (b2 & 0xC0_u8) != 0x80_u8 or (b3 & 0xC0_u8) != 0x80_u8 {
+                return .Err(.InvalidWtf8);
+            }
+            let cp32: u32 = (((b0 & 0x07_u8) as u32) << 18_u32)
+                | (((b1 & 0x3F_u8) as u32) << 12_u32)
+                | (((b2 & 0x3F_u8) as u32) << 6_u32)
+                | ((b3 & 0x3F_u8) as u32);
+            if cp32 < 0x1_0000_u32 or cp32 > 0x10_FFFF_u32 {
+                return .Err(.InvalidWtf8);
+            }
+            if dst_cap -| out_idx < 2_usize {
+                return .Err(.BufferTooSmall);
+            }
+            let adj: u32 = cp32 -% 0x1_0000_u32;
+            write_u16_at(out_u16, out_idx, (0xD800_u32 | (adj >> 10_u32)) as u16);
+            write_u16_at(out_u16, out_idx +% 1, (0xDC00_u32 | (adj & 0x3FF_u32)) as u16);
+            out_idx = out_idx +% 2;
+            prev_was_high_surrogate = false;
+            i = i +% 4;
+        } else {
+            return .Err(.InvalidWtf8);
+        }
+    }
+    .Ok(out_idx)
+}
+
+/| Computes the exact WTF-8 byte length required to transcode `wtf16` losslessly.
+pub(super) fn wtf8_len_for_wtf16(wtf16: &[u16], /) -> usize {
+    let total: usize = wtf16.len();
+    var i: usize = 0;
+    var byte_len: usize = 0;
+    while i < total {
+        let unit0: u16 = u16_at(wtf16, i);
+        if unit0 >= 0xD800_u16 and unit0 <= 0xDBFF_u16 and total -| i >= 2_usize {
+            let unit1: u16 = u16_at(wtf16, i +% 1);
+            if unit1 >= 0xDC00_u16 and unit1 <= 0xDFFF_u16 {
+                byte_len = byte_len +% 4;
+                i = i +% 2;
+                continue;
+            }
+        }
+        if unit0 <= 0x7F_u16 {
+            byte_len = byte_len +% 1;
+        } else if unit0 <= 0x7FF_u16 {
+            byte_len = byte_len +% 2;
+        } else {
+            byte_len = byte_len +% 3;
+        }
+        i = i +% 1;
+    }
+    byte_len
+}
+
+/| Transcodes `wtf16` (including unpaired UTF-16 surrogates) into canonical WTF-8 inside `out_wtf8`, returning bytes written.
+@std_cap_boundary(clears: [unsafe_op])
+pub(super) fn decode_wtf16_to_wtf8(wtf16: &[u16], out_wtf8: &mut [u8], /) -> usize {
+    let total: usize = wtf16.len();
+    let cap: usize = out_wtf8.len();
+    let dst_ptr: *mut u8 = out_wtf8.as_mut_ptr();
+    var i: usize = 0;
+    var out_idx: usize = 0;
+
+    while i < total {
+        let unit0: u16 = u16_at(wtf16, i);
+        if unit0 >= 0xD800_u16 and unit0 <= 0xDBFF_u16 and total -| i >= 2_usize {
+            let unit1: u16 = u16_at(wtf16, i +% 1);
+            if unit1 >= 0xDC00_u16 and unit1 <= 0xDFFF_u16 {
+                if cap -| out_idx < 4_usize {
+                    break;
+                }
+                let cp32: u32 = 0x1_0000_u32
+                    +% ((((unit0 as u32) -% 0xD800_u32) << 10_u32) | ((unit1 as u32) -% 0xDC00_u32));
+                unsafe {
+                    dst_ptr.add(out_idx).write((0xF0_u32 | (cp32 >> 18_u32)) as u8);
+                    dst_ptr
+                        .add(out_idx +% 1)
+                        .write((0x80_u32 | ((cp32 >> 12_u32) & 0x3F_u32)) as u8);
+                    dst_ptr.add(out_idx +% 2).write((0x80_u32 | ((cp32 >> 6_u32) & 0x3F_u32)) as u8);
+                    dst_ptr.add(out_idx +% 3).write((0x80_u32 | (cp32 & 0x3F_u32)) as u8);
+                }
+                out_idx = out_idx +% 4;
+                i = i +% 2;
+                continue;
+            }
+        }
+        if unit0 <= 0x7F_u16 {
+            if out_idx >= cap {
+                break;
+            }
+            unsafe {
+                dst_ptr.add(out_idx).write(unit0 as u8);
+            }
+            out_idx = out_idx +% 1;
+        } else if unit0 <= 0x7FF_u16 {
+            if cap -| out_idx < 2_usize {
+                break;
+            }
+            unsafe {
+                dst_ptr.add(out_idx).write((0xC0_u16 | (unit0 >> 6_u16)) as u8);
+                dst_ptr.add(out_idx +% 1).write((0x80_u16 | (unit0 & 0x3F_u16)) as u8);
+            }
+            out_idx = out_idx +% 2;
+        } else {
+            if cap -| out_idx < 3_usize {
+                break;
+            }
+            unsafe {
+                dst_ptr.add(out_idx).write((0xE0_u16 | (unit0 >> 12_u16)) as u8);
+                dst_ptr.add(out_idx +% 1).write((0x80_u16 | ((unit0 >> 6_u16) & 0x3F_u16)) as u8);
+                dst_ptr.add(out_idx +% 2).write((0x80_u16 | (unit0 & 0x3F_u16)) as u8);
+            }
+            out_idx = out_idx +% 3;
+        }
+        i = i +% 1;
+    }
+    out_idx
+}
+
+/| Decodes UTF-16/WTF-16 `wtf16` directly into an owned 24-byte SSO `PathBuf` (`0` heap allocs when `<= 23` WTF-8 bytes).
+@std_cap_boundary(clears: [unsafe_op])
+pub(super) fn decode_wtf16_to_path_buf(wtf16: &[u16], /) -> PathBuf {
+    let needed: usize = wtf8_len_for_wtf16(wtf16);
+    if needed == 0 {
+        return PathBuf.new();
+    }
+    if needed <= PATH_INLINE_CAP {
+        var inline_out = PathBuf.new();
+        let dst_inline: &mut [u8] = unsafe {
+            @slice_from_raw_parts_mut(&raw mut inline_out.raw_bytes[0], PATH_INLINE_CAP)
+        };
+        let written: usize = decode_wtf16_to_wtf8(wtf16, dst_inline);
+        inline_out.raw_bytes[23] = written as u8;
+        return inline_out;
+    }
+    var heap_out = PathBuf.with_capacity(needed);
+    var heap_cur: HeapRepr = unsafe {
+        @ptr_read(&raw heap_out.raw_bytes as *HeapRepr)
+    };
+    let dst_slice: &mut [u8] = unsafe {
+        @slice_from_raw_parts_mut(heap_cur.ptr, needed)
+    };
+    let written: usize = decode_wtf16_to_wtf8(wtf16, dst_slice);
+    heap_cur.len = written as u32;
+    unsafe {
+        @ptr_write(&raw mut heap_out.raw_bytes as *mut HeapRepr, heap_cur);
+    }
+    heap_out
+}
+
+/| Decodes UTF-16/WTF-16 `wtf16` directly into `arena`, returning a borrowed `Path`.
+@std_cap_boundary(clears: [unsafe_op])
+pub(super) fn decode_wtf16_in_arena(arena: &mut Arena, wtf16: &[u16], /) -> Path {
+    let needed: usize = wtf8_len_for_wtf16(wtf16);
+    if needed == 0 {
+        return Path { bytes: empty_u8_slice() };
+    }
+    let dst_ptr: *mut u8 = arena.as_handle().alloc(Layout { size: needed, alignment: 1 }) catch {
+        panic("decode_wtf16_in_arena out of memory");
+    };
+    let dst_mut: &mut [u8] = unsafe {
+        @slice_from_raw_parts_mut(dst_ptr, needed)
+    };
+    let written: usize = decode_wtf16_to_wtf8(wtf16, dst_mut);
+    Path {
+        bytes: unsafe {
+            @slice_from_raw_parts(dst_ptr as *u8, written)
+        },
+    }
+}
+
+/| Converts UTF-16 ASCII letter `code_unit` to uppercase (`a..=z` -> `A..=Z`).
+fn u16_ascii_upper(code_unit: u16, /) -> u16 {
+    if code_unit >= 0x0061_u16 and code_unit <= 0x007A_u16 => code_unit & ~0x0020_u16 else code_unit
+}
+
+/| Returns `true` if UTF-16 path segment `comp` matches a DOS reserved device stem (including `COM¹..³` and `LPT¹..³`).
+@expect(unused-pkg-visibility, reason: "used by cx.fs, cx.env, and cx.process in Phase 11.2a")
+pub(pkg) fn is_dos_reserved_wtf16(comp: &[u16], /) -> bool {
+    let total: usize = comp.len();
+    if total == 0 {
+        return false;
+    }
+    if total == 1 and u16_at(comp, 0) == 0x002E_u16 {
+        return false;
+    }
+    if total == 2 and u16_at(comp, 0) == 0x002E_u16 and u16_at(comp, 1) == 0x002E_u16 {
+        return false;
+    }
+
+    var stem_end: usize = 0;
+    while stem_end < total {
+        let ch16: u16 = u16_at(comp, stem_end);
+        if ch16 == 0x002E_u16 or ch16 == 0x003A_u16 {
+            break;
+        }
+        stem_end = stem_end +% 1;
+    }
+    while stem_end > 0 and u16_at(comp, stem_end -% 1) == 0x0020_u16 {
+        stem_end = stem_end -% 1;
+    }
+    if stem_end < 3 {
+        return false;
+    }
+
+    let u0: u16 = u16_ascii_upper(u16_at(comp, 0));
+    let u1: u16 = u16_ascii_upper(u16_at(comp, 1));
+    let u2: u16 = u16_ascii_upper(u16_at(comp, 2));
+
+    if stem_end == 3 {
+        return (u0 == 0x0043_u16 and u1 == 0x004F_u16 and u2 == 0x004E_u16)
+            or (u0 == 0x0050_u16 and u1 == 0x0052_u16 and u2 == 0x004E_u16)
+            or (u0 == 0x0041_u16 and u1 == 0x0055_u16 and u2 == 0x0058_u16)
+            or (u0 == 0x004E_u16 and u1 == 0x0055_u16 and u2 == 0x004C_u16);
+    }
+    if stem_end == 4 {
+        let is_com_or_lpt: bool = (u0 == 0x0043_u16 and u1 == 0x004F_u16 and u2 == 0x004D_u16)
+            or (u0 == 0x004C_u16 and u1 == 0x0050_u16 and u2 == 0x0054_u16);
+        let dig: u16 = u16_at(comp, 3);
+        let is_digit_or_sup: bool = (dig >= 0x0030_u16 and dig <= 0x0039_u16)
+            or dig == 0x00B9_u16
+            or dig == 0x00B2_u16
+            or dig == 0x00B3_u16;
+        return is_com_or_lpt and is_digit_or_sup;
+    }
+    if stem_end == 6 {
+        let u3: u16 = u16_ascii_upper(u16_at(comp, 3));
+        let u4: u16 = u16_ascii_upper(u16_at(comp, 4));
+        return u0 == 0x0043_u16
+            and u1 == 0x004F_u16
+            and u2 == 0x004E_u16
+            and u3 == 0x0049_u16
+            and u4 == 0x004E_u16
+            and u16_at(
+                comp,
+                5,
+            )
+                == 0x0024_u16;
+    }
+    if stem_end == 7 {
+        let u3: u16 = u16_ascii_upper(u16_at(comp, 3));
+        let u4: u16 = u16_ascii_upper(u16_at(comp, 4));
+        let u5: u16 = u16_ascii_upper(u16_at(comp, 5));
+        return u0 == 0x0043_u16
+            and u1 == 0x004F_u16
+            and u2 == 0x004E_u16
+            and u3 == 0x004F_u16
+            and u4 == 0x0055_u16
+            and u5 == 0x0054_u16
+            and u16_at(
+                comp,
+                6,
+            )
+                == 0x0024_u16;
+    }
+    false
+}
+
+/| Returns `true` if Win32 UTF-16 `wpath` requires `\\?\` extended-length promotion (`>= 248` `WCHAR`s, DOS stem, or trailing space/dot).
+@expect(unused-pkg-visibility, reason: "used by cx.fs, cx.env, and cx.process in Phase 11.2a")
+pub(pkg) fn should_promote_verbatim_win32(wpath: &[u16], /) -> bool {
+    let total: usize = wpath.len();
+    if total >= 4
+        and u16_at(wpath, 0) == 0x005C_u16
+        and (u16_at(wpath, 1) == 0x005C_u16 or u16_at(wpath, 1) == 0x003F_u16)
+        and (u16_at(wpath, 2) == 0x003F_u16 or u16_at(wpath, 2) == 0x002E_u16)
+        and u16_at(
+            wpath,
+            3,
+        )
+            == 0x005C_u16 {
+        return false;
+    }
+    if total >= WIN32_VERBATIM_THRESHOLD {
+        return true;
+    }
+
+    var start_idx: usize = 0;
+    let lead_upper: u16 = u16_ascii_upper(u16_at(wpath, 0));
+    if total >= 2
+        and lead_upper >= 0x0041_u16
+        and lead_upper <= 0x005A_u16
+        and u16_at(
+            wpath,
+            1,
+        )
+            == 0x003A_u16 {
+        start_idx = 2_usize;
+    }
+
+    var seg_start: usize = start_idx;
+    var idx: usize = start_idx;
+    while idx <= total {
+        let cur_u16: u16 = u16_at(wpath, idx);
+        let is_delim: bool = if idx == total => true
+            else cur_u16 == 0x005C_u16 or cur_u16 == 0x002F_u16;
+        if is_delim {
+            if idx > seg_start {
+                let comp: &[u16] = subslice_u16(wpath, seg_start, idx);
+                let is_dot: bool = (comp.len() == 1 and u16_at(comp, 0) == 0x002E_u16)
+                    or (
+                        comp.len() == 2
+                            and u16_at(comp, 0) == 0x002E_u16
+                            and u16_at(comp, 1) == 0x002E_u16
+                    );
+                if not is_dot {
+                    let last_ch: u16 = u16_at(comp, comp.len() -% 1);
+                    if last_ch == 0x0020_u16
+                        or last_ch == 0x002E_u16
+                        or is_dos_reserved_wtf16(
+                            comp,
+                        ) {
+                        return true;
+                    }
+                }
+            }
+            seg_start = idx +% 1;
+        }
+        idx = idx +% 1;
+    }
+    false
+}
+
+// ------------------------------------- PUBLIC API --------------------------------------
+// --------------------- Borrowed Path API ----------------------
+/| Returns `true` if `byte_val` is a valid path component separator on the active target OS.
+@inline @no_alloc @no_panic
+pub fn is_separator(byte_val: u8, /) -> bool {
+    is_sep_for_flavor(byte_val, ACTIVE_FLAVOR, false)
+}
+
+impl Path {
+    /| Wraps `source` (`str`, `&[u8]`, or `Path`) in a zero-allocation `Path` view.
+    @no_alloc @no_panic
+    pub fn new[S: str | &[u8] | Path](source: S, /) -> Path {
+        Path { bytes: source.as_bytes() }
+    }
+
+    /| Wraps raw OS / WTF-8 `bytes` in a zero-allocation `Path` view.
+    @no_alloc @no_panic
+    pub fn from_bytes(bytes: &[u8], /) -> Path = Path { bytes };
+
+    /| Borrows the underlying OS / WTF-8 byte slice `&[u8]`.
+    @no_alloc @no_panic
+    pub fn as_os_bytes(self) -> &[u8] = self.bytes;
+
+    /| Borrows the underlying byte slice `&[u8]` (enabling `[P: str | Path]` slice projections).
+    @no_alloc @no_panic
+    pub fn as_bytes(self) -> &[u8] = self.bytes;
+
+    /| Borrows `self` as `str` when valid UTF-8 (`0` allocations), or returns `.None` on unpaired WTF-8 / raw bytes.
+    @std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
+    pub fn to_str(self) -> str? {
+        if is_valid_utf8(self.bytes) {
+            return .Some(
+                unsafe {
+                    @str_from_utf8_unchecked(self.bytes)
+                },
+            );
+        }
+        .None
+    }
+
+    /| Converts `self` into an `arena`-allocated UTF-8 `str`, replacing unpaired WTF-8 / invalid bytes with `U+FFFD`.
+    pub fn to_str_lossy_in(self, arena: &mut Arena, /) -> str {
+        lossy_utf8_in_arena(arena, self.bytes, false)
+    }
+
+    /| Converts `self` into an `arena`-allocated UTF-8 `str` with platform separators normalized to `'/'`.
+    pub fn to_slash_lossy_in(self, arena: &mut Arena, /) -> str {
+        to_slash_lossy_with_flavor_in(self, arena, ACTIVE_FLAVOR)
+    }
+
+    /| Returns the byte length of `self`.
+    @no_alloc @no_panic
+    pub fn len(self) -> usize = self.bytes.len();
+
+    /| Returns `true` if `self` has byte length `0`.
+    @no_alloc @no_panic
+    pub fn is_empty(self) -> bool = self.bytes.is_empty();
+
+    /| Returns `true` if `self` is fully qualified without consulting the current working directory or drive.
+    @no_alloc @no_panic
+    pub fn is_absolute(self) -> bool {
+        is_absolute_with_flavor(self, ACTIVE_FLAVOR)
+    }
+
+    /| Returns `true` if `self` is not fully qualified (`not self.is_absolute()`).
+    @no_alloc @no_panic
+    pub fn is_relative(self) -> bool = not self.is_absolute();
+
+    /| Returns `true` if `self` has an explicit or implicit root directory.
+    @no_alloc @no_panic
+    pub fn has_root(self) -> bool {
+        has_root_with_flavor(self, ACTIVE_FLAVOR)
+    }
+
+    /| Returns the leading Windows `PathPrefix`, or `.None` on POSIX/WASI or unprefixed Windows paths.
+    @no_alloc @no_panic
+    pub fn prefix(self) -> PathPrefix? {
+        if parse_prefix_for_flavor(self.bytes, ACTIVE_FLAVOR) is .Some((pref, _, _)) {
+            return .Some(pref);
+        }
+        .None
+    }
+
+    /| Returns `self` without its final component, or `.None` when `self` terminates at a root, prefix, or empty path.
+    @no_alloc @no_panic
+    pub fn parent(self) -> Path? {
+        parent_with_flavor(self, ACTIVE_FLAVOR)
+    }
+
+    /| Returns an iterator yielding `self`, `self.parent()`, … up to the root or empty path.
+    @no_alloc @no_panic
+    pub fn ancestors(self) -> AncestorsIter = AncestorsIter { next_path: .Some(self) };
+
+    /| Returns the final normal component of `self` as `&[u8]`, or `.None` if `self` ends in `..`, `.`, or root.
+    @no_alloc @no_panic
+    pub fn file_name(self) -> &[u8]? {
+        file_name_with_flavor(self, ACTIVE_FLAVOR)
+    }
+
+    /| Returns `self.file_name()` as `str` when valid UTF-8, or `.None`.
+    @no_alloc @no_panic
+    pub fn file_name_str(self) -> str? {
+        bytes_opt_to_str(self.file_name())
+    }
+
+    /| Returns `self.file_name()` stripped of its final `.ext` suffix, or `.None` when `file_name()` is `.None`.
+    @no_alloc @no_panic
+    pub fn file_stem(self) -> &[u8]? {
+        if self.file_name() is .Some(name) {
+            let (stem, _) = split_stem_and_ext(name);
+            return .Some(stem);
+        }
+        .None
+    }
+
+    /| Returns `self.file_stem()` as `str` when valid UTF-8, or `.None`.
+    @no_alloc @no_panic
+    pub fn file_stem_str(self) -> str? {
+        bytes_opt_to_str(self.file_stem())
+    }
+
+    /| Returns the extension bytes after the final non-leading `.` of `self.file_name()`, or `.None`.
+    @no_alloc @no_panic
+    pub fn extension(self) -> &[u8]? {
+        if self.file_name() is .Some(name) {
+            let (_, ext_opt) = split_stem_and_ext(name);
+            return ext_opt;
+        }
+        .None
+    }
+
+    /| Returns `self.extension()` as `str` when valid UTF-8, or `.None`.
+    @no_alloc @no_panic
+    pub fn extension_str(self) -> str? {
+        bytes_opt_to_str(self.extension())
+    }
+
+    /| Returns `true` if `base` matches a component-wise prefix of `self`.
+    @no_alloc @no_panic
+    pub fn starts_with[P: str | Path](self, base: P, /) -> bool {
+        starts_with_with_flavor(self, Path { bytes: base.as_bytes() }, ACTIVE_FLAVOR)
+    }
+
+    /| Returns `true` if `child` matches a component-wise suffix of `self`.
+    @no_alloc @no_panic
+    pub fn ends_with[P: str | Path](self, child: P, /) -> bool {
+        ends_with_with_flavor(self, Path { bytes: child.as_bytes() }, ACTIVE_FLAVOR)
+    }
+
+    /| Strips component-wise prefix `base` from `self`, returning `.Some(remaining)` or `.None`.
+    @no_alloc @no_panic
+    pub fn strip_prefix[P: str | Path](self, base: P, /) -> Path? {
+        strip_prefix_with_flavor(self, Path { bytes: base.as_bytes() }, ACTIVE_FLAVOR)
+    }
+
+    /| Returns a double-ended zero-allocation iterator over `self`'s lexical `Component`s.
+    @no_alloc @no_panic
+    pub fn components(self) -> ComponentsIter {
+        components_with_flavor(self, ACTIVE_FLAVOR)
+    }
+
+    /| Joins `self` with `child` into an owned 24-byte SSO `PathBuf` (`0` heap allocs when result `<= 23` bytes).
+    pub fn join[P: str | Path](self, child: P, /) -> PathBuf {
+        join_with_flavor(self, Path { bytes: child.as_bytes() }, ACTIVE_FLAVOR)
+    }
+
+    /| Joins `self` with `child` directly inside `arena`, returning an `arena`-backed `Path`.
+    pub fn join_in[P: str | Path](self, arena: &mut Arena, child: P, /) -> Path {
+        join_in_with_flavor(arena, self, Path { bytes: child.as_bytes() }, ACTIVE_FLAVOR)
+    }
+
+    /| Returns a new `PathBuf` with `self.file_name()` replaced by `name`.
+    pub fn with_file_name[S: str | Path](self, name: S, /) -> PathBuf {
+        var out: PathBuf = self.to_path_buf();
+        if self.file_name() != .None {
+            _ = out.pop();
+        }
+        push_with_flavor(&mut out, Path { bytes: name.as_bytes() }, ACTIVE_FLAVOR);
+        out
+    }
+
+    /| Returns a new `PathBuf` with `self.extension()` replaced by `ext` (or stripped when `ext` is `""`).
+    pub fn with_extension(self, ext: str, /) -> PathBuf {
+        var out: PathBuf = self.to_path_buf();
+        _ = out.set_extension(ext);
+        out
+    }
+
+    /| Purely lexical `.` / `..` and separator normalization (`EffectCapabilityMask == PURE` aside from `PathBuf` growth).
+    pub fn normalize_lexical(self) -> PathBuf {
+        normalize_lexical_with_flavor(self, ACTIVE_FLAVOR)
+    }
+
+    /| Purely lexical `.` / `..` and separator normalization allocated inside `arena`.
+    pub fn normalize_lexical_in(self, arena: &mut Arena, /) -> Path {
+        normalize_lexical_in_with_flavor(arena, self, ACTIVE_FLAVOR)
+    }
+
+    /| Returns `true` if any non-verbatim normal component of `self` carries a Windows DOS reserved stem (`CON`, `NUL`, `COM1..³`, etc.).
+    @no_alloc @no_panic
+    pub fn has_dos_reserved_stem(self) -> bool {
+        if parse_prefix_win32(self.bytes) is .Some((_, _, is_verb)) and is_verb {
+            return false;
+        }
+        var comps: ComponentsIter = components_with_flavor(self, .Windows);
+        while comps.next() is .Some(comp) {
+            if comp is .Normal(seg) and is_dos_reserved_bytes(seg) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /| Copies `self` into an owned 24-byte SSO `PathBuf` (`0` heap allocs when `self.len() <= 23`).
+    pub fn to_path_buf(self) -> PathBuf = path_buf_from_slice(self.bytes);
+
+    /| Copies `self` into a `PathBuf` backed by `arena` (`0`-instruction drop on scope exit).
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn to_path_buf_in(self, arena: &mut Arena, /) -> PathBuf {
+        let init_len: usize = self.bytes.len();
+        if init_len > (PATH_CAP_MASK_U32 as usize) {
+            panic(f"Path.to_path_buf_in length {init_len=} exceeds 2 GiB PathBuf max");
+        }
+        let handle: AllocatorHandle = arena.as_handle();
+        let init_cap: usize = if init_len > 0 => init_len else 64_usize;
+        let raw_buf: *mut u8 = handle.alloc(Layout { size: init_cap, alignment: 1 }) catch {
+            panic(f"Path.to_path_buf_in({init_cap=}) out of memory");
+        };
+        if init_len > 0 {
+            unsafe {
+                @memcpy(raw_buf as *mut opaque, self.bytes.as_ptr() as *opaque, init_len);
+            }
+        }
+        var out = PathBuf { raw_bytes: [0_u8; 24] };
+        unsafe {
+            @ptr_write(
+                &raw mut out.raw_bytes as *mut HeapRepr,
+                (ActivePtrOps {}).pack_heap(
+                    raw_buf,
+                    handle,
+                    init_len as u32,
+                    PATH_HEAP_FLAG_U32 | (init_cap as u32),
+                ),
+            );
+        }
+        out
+    }
+}
+
+// ----------------- Owned 24-Byte PathBuf API ------------------
+impl PathBuf {
+    /| Maximum inline path byte capacity before spilling to `HeapRepr` (`23` bytes).
+    pub const INLINE_CAP: usize = 23;
+
+    /| Constructs an empty inline `PathBuf` (`[0_u8; 24]`; `0` allocations).
+    @inline @no_alloc @no_panic
+    pub fn new() -> PathBuf {
+        PathBuf { raw_bytes: [0_u8; 24] }
+    }
+
+    /| Constructs an owned `PathBuf` copying `source` (`0` heap allocs when `<= 23` bytes).
+    pub fn from[S: str | &[u8] | Path](source: S, /) -> PathBuf = path_buf_from_slice(
+        source.as_bytes(),
+    );
+
+    /| Transfers ownership of `text` (`String`) into `PathBuf` in `O(1)` without copying heap/arena/static storage.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn from_string(text: own String, /) -> PathBuf {
+        if text.is_inline() {
+            return path_buf_from_slice(text.as_bytes());
+        }
+        if text.capacity() == 0 and not text.is_empty() {
+            let static_bytes: &[u8] = text.as_bytes();
+            var static_out = PathBuf { raw_bytes: [0_u8; 24] };
+            unsafe {
+                @ptr_write(
+                    &raw mut static_out.raw_bytes as *mut HeapRepr,
+                    (ActivePtrOps {}).pack_heap(
+                        static_bytes.as_ptr() as *mut u8,
+                        AllocatorHandle { raw_tagged_ptr: 2_usize },
+                        static_bytes.len() as u32,
+                        PATH_HEAP_FLAG_U32,
+                    ),
+                );
+            }
+            return static_out;
+        }
+        let (ptr, len, cap, alloc) = (own text).into_bytes().into_raw_parts();
+        if cap == 0 {
+            if not alloc.is_arena_or_static() {
+                return PathBuf.new();
+            }
+            var arena_empty = PathBuf { raw_bytes: [0_u8; 24] };
+            unsafe {
+                @ptr_write(
+                    &raw mut arena_empty.raw_bytes as *mut HeapRepr,
+                    (ActivePtrOps {}).pack_heap(
+                        dangling_u8_ptr(),
+                        alloc,
+                        0_u32,
+                        PATH_HEAP_FLAG_U32,
+                    ),
+                );
+            }
+            return arena_empty;
+        }
+        if cap > (PATH_CAP_MASK_U32 as usize) {
+            let copied = path_buf_from_slice(
+                unsafe {
+                    @slice_from_raw_parts(ptr as *u8, len)
+                },
+            );
+            if not alloc.is_arena_or_static() {
+                alloc.dealloc(ptr, Layout { size: cap, alignment: 1 });
+            }
+            return copied;
+        }
+        var out = PathBuf { raw_bytes: [0_u8; 24] };
+        unsafe {
+            @ptr_write(
+                &raw mut out.raw_bytes as *mut HeapRepr,
+                (ActivePtrOps {}).pack_heap(
+                    ptr,
+                    alloc,
+                    len as u32,
+                    PATH_HEAP_FLAG_U32 | (cap as u32),
+                ),
+            );
+        }
+        out
+    }
+
+    /| Constructs a `PathBuf` immediately in `HeapRepr` mode backed by `arena` (`cap = 64` bytes by default).
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn in_arena(arena: &mut Arena, /, *, cap: usize = 64) -> PathBuf {
+        if cap > (PATH_CAP_MASK_U32 as usize) {
+            panic(f"PathBuf.in_arena({cap=}) exceeds 2 GiB PathBuf max");
+        }
+        let handle: AllocatorHandle = arena.as_handle();
+        let init_ptr: *mut u8 = if cap == 0 {
+            dangling_u8_ptr()
+        } else {
+            handle.alloc(Layout { size: cap, alignment: 1 }) catch {
+                panic(f"PathBuf.in_arena({cap=}) out of memory");
+            }
+        };
+        var out = PathBuf { raw_bytes: [0_u8; 24] };
+        unsafe {
+            @ptr_write(
+                &raw mut out.raw_bytes as *mut HeapRepr,
+                (ActivePtrOps {}).pack_heap(
+                    init_ptr,
+                    handle,
+                    0_u32,
+                    PATH_HEAP_FLAG_U32 | (cap as u32),
+                ),
+            );
+        }
+        out
+    }
+
+    /| Pre-allocates at least `cap` path bytes (staying inline when `cap <= 23`), panicking on `AllocError`.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn with_capacity(cap: usize, /) -> PathBuf {
+        if cap <= PATH_INLINE_CAP {
+            return PathBuf.new();
+        }
+        if cap > (PATH_CAP_MASK_U32 as usize) {
+            panic(f"PathBuf.with_capacity({cap=}) exceeds 2 GiB PathBuf max");
+        }
+        let target_alloc: AllocatorHandle = context.allocator;
+        let ptr: *mut u8 = target_alloc.alloc(Layout { size: cap, alignment: 1 }) catch {
+            panic(f"PathBuf.with_capacity({cap=}) out of memory");
+        };
+        var out = PathBuf { raw_bytes: [0_u8; 24] };
+        unsafe {
+            @ptr_write(
+                &raw mut out.raw_bytes as *mut HeapRepr,
+                (ActivePtrOps {}).pack_heap(
+                    ptr,
+                    target_alloc,
+                    0_u32,
+                    PATH_HEAP_FLAG_U32 | (cap as u32),
+                ),
+            );
+        }
+        out
+    }
+
+    /| Returns `true` when `self` currently stores its path bytes inline (`raw_bytes[23] < 0x80`).
+    fn is_inline_repr(&self) -> bool {
+        (self.raw_bytes[23] & PATH_HEAP_FLAG_U8) == 0_u8
+    }
+
+    /| Ensures non-inline `HeapRepr` with mutable capacity `>= required_len`, preserving `arena` handles.
+    @std_cap_boundary(clears: [unsafe_op])
+    fn reserve_non_inline(&mut self, required_len: usize, /) -> unit!AllocError {
+        if required_len > (PATH_CAP_MASK_U32 as usize) {
+            return .Err(.OutOfMemory);
+        }
+        if self.is_inline_repr() {
+            let cur_len = self.raw_bytes[23] as usize;
+            var next_cap: usize = 32;
+            if next_cap < required_len {
+                next_cap = required_len;
+            }
+            let target_alloc: AllocatorHandle = context.allocator;
+            let new_ptr: *mut u8 = target_alloc.alloc(Layout { size: next_cap, alignment: 1 })?;
+            if cur_len > 0 {
+                unsafe {
+                    @memcpy(new_ptr as *mut opaque, &raw self.raw_bytes[0] as *opaque, cur_len);
+                }
+            }
+            unsafe {
+                @ptr_write(
+                    &raw mut self.raw_bytes as *mut HeapRepr,
+                    (ActivePtrOps {}).pack_heap(
+                        new_ptr,
+                        target_alloc,
+                        cur_len as u32,
+                        PATH_HEAP_FLAG_U32 | (next_cap as u32),
+                    ),
+                );
+            }
+            return .Ok(());
+        }
+
+        let heap: HeapRepr = unsafe {
+            @ptr_read(&raw self.raw_bytes as *HeapRepr)
+        };
+        let old_cap = (heap.flagged_cap & PATH_CAP_MASK_U32) as usize;
+        let is_rodata: bool = heap.alloc.raw_tagged_ptr == 2_usize;
+        if not is_rodata and old_cap >= required_len {
+            return .Ok(());
+        }
+
+        let grown: usize = if old_cap < 64 {
+            if old_cap == 0 => 32 else old_cap << 1_usize
+        } else {
+            old_cap +% (old_cap >> 1_usize)
+        };
+        let unclamped: usize = if grown < required_len => required_len else grown;
+        let next_cap: usize = if unclamped > (PATH_CAP_MASK_U32 as usize) => PATH_CAP_MASK_U32 as usize
+            else unclamped;
+
+        let target_alloc: AllocatorHandle = if is_rodata => context.allocator else heap.alloc;
+        let new_ptr: *mut u8 = if is_rodata or old_cap == 0 {
+            let fresh: *mut u8 = target_alloc.alloc(Layout { size: next_cap, alignment: 1 })?;
+            if heap.len > 0_u32 {
+                unsafe {
+                    @memcpy(fresh as *mut opaque, heap.ptr as *opaque, heap.len as usize);
+                }
+            }
+            fresh
+        } else {
+            target_alloc.realloc(heap.ptr, Layout { size: old_cap, alignment: 1 }, next_cap)?
+        };
+
+        unsafe {
+            @ptr_write(
+                &raw mut self.raw_bytes as *mut HeapRepr,
+                (ActivePtrOps {}).pack_heap(
+                    new_ptr,
+                    target_alloc,
+                    heap.len,
+                    PATH_HEAP_FLAG_U32 | (next_cap as u32),
+                ),
+            );
+        }
+        .Ok(())
+    }
+
+    /| Borrows `self` as a zero-allocation `Path` view.
+    @inline @no_alloc @no_panic
+    pub fn as_path(&self) -> Path {
+        Path { bytes: self.as_bytes() }
+    }
+
+    /| Borrows `self` as raw OS / WTF-8 bytes `&[u8]`.
+    @inline @no_alloc @no_panic
+    pub fn as_os_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+
+    /| Borrows `self` as a contiguous byte slice `&[u8]`.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
+    pub fn as_bytes(&self) -> &[u8] {
+        let tag_byte: u8 = self.raw_bytes[23];
+        if (tag_byte & PATH_HEAP_FLAG_U8) == 0_u8 {
+            return unsafe {
+                @slice_from_raw_parts(&raw self.raw_bytes[0], tag_byte as usize)
+            };
+        }
+        let heap: HeapRepr = unsafe {
+            @ptr_read(&raw self.raw_bytes as *HeapRepr)
+        };
+        unsafe {
+            @slice_from_raw_parts(heap.ptr as *u8, heap.len as usize)
+        }
+    }
+
+    /| Borrows `self` as `str` when valid UTF-8 (`0` allocations), or returns `.None`.
+    @inline @no_alloc @no_panic
+    pub fn to_str(&self) -> str? {
+        self.as_path().to_str()
+    }
+
+    /| Returns the initialized path byte length of `self`.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
+    pub fn len(&self) -> usize {
+        let tag_byte: u8 = self.raw_bytes[23];
+        if (tag_byte & PATH_HEAP_FLAG_U8) == 0_u8 {
+            return tag_byte as usize;
+        }
+        let heap: HeapRepr = unsafe {
+            @ptr_read(&raw self.raw_bytes as *HeapRepr)
+        };
+        heap.len as usize
+    }
+
+    /| Returns the byte capacity of `self` (`23` when inline, `0` for `.rodata`, or heap/arena capacity).
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
+    pub fn capacity(&self) -> usize {
+        if self.is_inline_repr() {
+            return PATH_INLINE_CAP;
+        }
+        let heap: HeapRepr = unsafe {
+            @ptr_read(&raw self.raw_bytes as *HeapRepr)
+        };
+        (heap.flagged_cap & PATH_CAP_MASK_U32) as usize
+    }
+
+    /| Returns `true` if `self` has byte length `0`.
+    @inline @no_alloc @no_panic
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /| Reserves capacity for at least `additional` more path bytes, panicking on `AllocError`.
+    pub fn reserve(&mut self, additional: usize, /) {
+        if additional == 0 {
+            return;
+        }
+        let cur_len: usize = self.len();
+        if additional > (PATH_CAP_MASK_U32 as usize) -| cur_len {
+            panic(f"PathBuf.reserve({additional=}) capacity overflow");
+        }
+        let needed: usize = cur_len +% additional;
+        if self.is_inline_repr() and needed <= PATH_INLINE_CAP {
+            return;
+        }
+        self.reserve_non_inline(needed) catch {
+            panic(f"PathBuf.reserve({additional=}) out of memory");
+        };
+    }
+
+    /| Appends `child` to `self` honoring Windows drive-relative, root-relative, and absolute replacement rules.
+    pub fn push[P: str | Path](&mut self, child: P, /) {
+        push_with_flavor(self, Path { bytes: child.as_bytes() }, ACTIVE_FLAVOR);
+    }
+
+    /| Truncates `self` to `self.as_path().parent()`, returning `true` if truncated or `false` at root/empty.
+    @no_alloc @no_panic
+    pub fn pop(&mut self) -> bool {
+        pop_with_flavor(self, ACTIVE_FLAVOR)
+    }
+
+    /| Replaces `self.as_path().file_name()` with `name` (or appends `name` when `file_name()` is `.None`).
+    pub fn set_file_name[S: str | Path](&mut self, name: S, /) {
+        if self.as_path().file_name() != .None {
+            _ = self.pop();
+        }
+        push_with_flavor(self, Path { bytes: name.as_bytes() }, ACTIVE_FLAVOR);
+    }
+
+    /| Replaces `self`'s extension with `ext` (removing the extension when `ext == ""`), returning `false` if no `file_stem`.
+    pub fn set_extension(&mut self, ext: str, /) -> bool {
+        let stem_end: usize = {
+            let cur_path: Path = self.as_path();
+            let file_name_bytes: &[u8] = cur_path.file_name() orelse return false;
+            let stem_bytes: &[u8] = cur_path.file_stem() orelse return false;
+
+            let raw: &[u8] = self.as_bytes();
+            var is_verb = false;
+            var prefix_len: usize = 0;
+            if parse_prefix_for_flavor(raw, ACTIVE_FLAVOR) is .Some((_, p_len, verb)) {
+                prefix_len = p_len;
+                is_verb = verb;
+            }
+            let name_end: usize = trim_body_back(raw, prefix_len, raw.len(), ACTIVE_FLAVOR, is_verb);
+            (name_end -% file_name_bytes.len()) +% stem_bytes.len()
+        };
+        path_buf_truncate_raw(self, stem_end);
+
+        if not ext.is_empty() {
+            let ext_bytes: &[u8] = ext.as_bytes();
+            var idx: usize = 0;
+            while idx < ext_bytes.len() {
+                assert(
+                    not is_sep_for_flavor(byte_at(ext_bytes, idx), ACTIVE_FLAVOR, false),
+                    "PathBuf.set_extension: extension cannot contain path separators",
+                );
+                idx = idx +% 1;
+            }
+            self.reserve(1_usize +% ext_bytes.len());
+            path_buf_try_push_bytes(self, b".") catch {
+                panic("PathBuf.set_extension out of memory");
+            };
+            path_buf_try_push_bytes(self, ext_bytes) catch {
+                panic("PathBuf.set_extension out of memory");
+            };
+        }
+        true
+    }
+
+    /| Resets `self` to empty (`""`) while retaining any allocated heap/arena capacity.
+    @std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
+    pub fn clear(&mut self) {
+        if self.is_inline_repr() {
+            self.raw_bytes[23] = 0_u8;
+        } else {
+            var heap_cur: HeapRepr = unsafe {
+                @ptr_read(&raw self.raw_bytes as *HeapRepr)
+            };
+            heap_cur.len = 0_u32;
+            unsafe {
+                @ptr_write(&raw mut self.raw_bytes as *mut HeapRepr, heap_cur);
+            }
+        }
+    }
+
+    /| Consumes `self` into `Vec[u8]` (`O(1)` zero-copy ownership transfer when heap/arena-backed).
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn into_bytes(own self) -> Vec[u8] {
+        if self.is_inline_repr() {
+            let inline_len = self.raw_bytes[23] as usize;
+            if inline_len == 0 {
+                @forget(own self);
+                return ByteVec.new();
+            }
+            let view: &[u8] = unsafe {
+                @slice_from_raw_parts(&raw self.raw_bytes[0], inline_len)
+            };
+            let copied: Vec[u8] = ByteVec.from_slice(view);
+            @forget(own self);
+            return copied;
+        }
+        let heap: HeapRepr = unsafe {
+            @ptr_read(&raw self.raw_bytes as *HeapRepr)
+        };
+        if heap.alloc.raw_tagged_ptr == 2_usize {
+            let view: &[u8] = unsafe {
+                @slice_from_raw_parts(heap.ptr as *u8, heap.len as usize)
+            };
+            @forget(own self);
+            return ByteVec.from_slice(view);
+        }
+        let cap = (heap.flagged_cap & PATH_CAP_MASK_U32) as usize;
+        @forget(own self);
+        unsafe {
+            ByteVec.from_raw_parts(heap.ptr, heap.len as usize, cap, heap.alloc)
+        }
+    }
+
+    /| Validates `self` as UTF-8 and transfers ownership into `String` in `O(1)`, or returns `.Err(own self)` intact.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn into_string(own self) -> String!PathBuf {
+        let view_bytes: &[u8] = self.as_bytes();
+        if not is_valid_utf8(view_bytes) {
+            return .Err(own self);
+        }
+        if self.is_inline_repr() {
+            let valid_str: str = unsafe {
+                @str_from_utf8_unchecked(view_bytes)
+            };
+            let inline_str = String.from_str(valid_str);
+            @forget(own self);
+            return .Ok(own inline_str);
+        }
+        let heap: HeapRepr = unsafe {
+            @ptr_read(&raw self.raw_bytes as *HeapRepr)
+        };
+        if heap.alloc.raw_tagged_ptr == 2_usize {
+            let ro_str: str = unsafe {
+                @str_from_utf8_unchecked(
+                    @slice_from_raw_parts(heap.ptr as *u8, heap.len as usize),
+                )
+            };
+            let out_ro = String.from_str(ro_str);
+            @forget(own self);
+            return .Ok(own out_ro);
+        }
+        let raw_vec: Vec[u8] = (own self).into_bytes();
+        match String.from_utf8(own raw_vec) {
+            .Ok(valid_out) => .Ok(own valid_out),
+            .Err(_) => .Ok(String.new()),
+        }
+    }
+}
+
+// ------------------ Path Iterators & Traits -------------------
+impl ComponentsIter {
+    /| Advances from the front and returns the next `Component`, or `.None` when exhausted.
+    @no_alloc @no_panic
+    pub fn next(&mut self) -> Component? {
+        if self.has_prefix_left {
+            self.has_prefix_left = false;
+            if self.prefix is .Some(pref) {
+                return .Some(.Prefix(pref));
+            }
+        }
+        if self.start_dir_left != 0_u8 {
+            let kind: u8 = self.start_dir_left;
+            self.start_dir_left = 0_u8;
+            return if kind == 1_u8 => .Some(.RootDir) else .Some(.CurDir);
+        }
+        if self.front_idx < self.back_idx {
+            var seg_end: usize = self.front_idx;
+            while seg_end < self.back_idx
+                and not is_sep_for_flavor(
+                    byte_at(self.raw, seg_end),
+                    self.flavor,
+                    self.is_verbatim,
+                ) {
+                seg_end = seg_end +% 1;
+            }
+            let seg: &[u8] = subslice_u8(self.raw, self.front_idx, seg_end);
+            self.front_idx = trim_body_front(
+                self.raw,
+                seg_end,
+                self.back_idx,
+                self.flavor,
+                self.is_verbatim,
+            );
+            return .Some(classify_body_segment(seg, self.is_verbatim));
+        }
+        .None
+    }
+
+    /| Advances from the back and returns the final remaining `Component`, or `.None` when exhausted.
+    @no_alloc @no_panic
+    pub fn next_back(&mut self) -> Component? {
+        if self.front_idx < self.back_idx {
+            var seg_start: usize = self.back_idx;
+            while seg_start > self.front_idx
+                and not is_sep_for_flavor(
+                    byte_at(self.raw, seg_start -% 1),
+                    self.flavor,
+                    self.is_verbatim,
+                ) {
+                seg_start = seg_start -% 1;
+            }
+            let seg: &[u8] = subslice_u8(self.raw, seg_start, self.back_idx);
+            self.back_idx = trim_body_back(
+                self.raw,
+                self.front_idx,
+                seg_start,
+                self.flavor,
+                self.is_verbatim,
+            );
+            return .Some(classify_body_segment(seg, self.is_verbatim));
+        }
+        if self.start_dir_left != 0_u8 {
+            let kind: u8 = self.start_dir_left;
+            self.start_dir_left = 0_u8;
+            return if kind == 1_u8 => .Some(.RootDir) else .Some(.CurDir);
+        }
+        if self.has_prefix_left {
+            self.has_prefix_left = false;
+            if self.prefix is .Some(pref) {
+                return .Some(.Prefix(pref));
+            }
+        }
+        .None
+    }
+
+    /| Returns the unconsumed sub-slice of the underlying path as a zero-allocation `Path`.
+    @no_alloc @no_panic
+    pub fn as_path(&self) -> Path {
+        let (start_off, end_off) = iter_unconsumed_bounds(self.*);
+        Path { bytes: subslice_u8(self.*.raw, start_off, end_off) }
+    }
+}
+
+impl AncestorsIter {
+    /| Yields the current ancestor `Path` and steps to its `parent()`, or returns `.None`.
+    @no_alloc @no_panic
+    pub fn next(&mut self) -> Path? {
+        if self.next_path is .Some(cur) {
+            self.next_path = cur.parent();
+            return .Some(cur);
+        }
+        .None
+    }
+}
+
+impl Display for StripPrefixError {
+    /| Formats `StripPrefixError` as a concise human-readable diagnostic message.
+    @no_alloc
+    pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        _ = self;
+        out.write_padded(b"prefix not found", spec)
+    }
+}
+
+impl Equatable for PathPrefix {
+    /| Compares two `PathPrefix` values for structural equality.
+    @no_alloc @no_panic
+    pub fn eq(&self, other: &Self, /) -> bool {
+        cmp_path_prefix(self.*, other.*) == .Equal
+    }
+}
+
+impl Equatable for Component {
+    /| Compares two `Component` values for structural equality.
+    @no_alloc @no_panic
+    pub fn eq(&self, other: &Self, /) -> bool {
+        are_components_eq(self.*, other.*)
+    }
+}
+
+impl TrivialDrop for Path {}
+
+impl Equatable for Path {
+    /| Compares two `Path` views component-by-component under active platform rules.
+    @no_alloc @no_panic
+    pub fn eq(&self, other: &Self, /) -> bool {
+        are_paths_eq_with_flavor(self.*, other.*, ACTIVE_FLAVOR)
+    }
+}
+
+impl Comparable for Path {
+    /| Orders two `Path` views lexicographically by normalized component sequence.
+    @no_alloc @no_panic
+    pub fn cmp(&self, other: &Self, /) -> Ordering {
+        paths_cmp_with_flavor(self.*, other.*, ACTIVE_FLAVOR)
+    }
+}
+
+impl Hash for Path {
+    /| Hashes `self`'s normalized `Component` stream so equal `Path` and `PathBuf` keys hash identically.
+    @no_alloc @no_panic
+    pub fn hash[H: Hasher](&self, state: &mut H, /) {
+        var comps: ComponentsIter = self.*.components();
+        while comps.next() is .Some(comp) {
+            match comp {
+                .Prefix(pref) => {
+                    state.write(&[1_u8]);
+                    match pref {
+                        .Verbatim(lbl) => {
+                            state.write(&[0_u8]);
+                            state.write(lbl);
+                        },
+                        .VerbatimUnc { server, share } => {
+                            state.write(&[1_u8]);
+                            state.write(server);
+                            state.write(&[0xFE_u8]);
+                            state.write(share);
+                        },
+                        .VerbatimDisk(drv) => {
+                            state.write(&[2_u8, drv]);
+                        },
+                        .DeviceNs(dev) => {
+                            state.write(&[3_u8]);
+                            state.write(dev);
+                        },
+                        .Unc { server, share } => {
+                            state.write(&[4_u8]);
+                            state.write(server);
+                            state.write(&[0xFE_u8]);
+                            state.write(share);
+                        },
+                        .Disk(drv) => {
+                            state.write(&[5_u8, drv]);
+                        },
+                    }
+                    state.write(&[0xFF_u8]);
+                },
+                .RootDir => state.write(&[2_u8]),
+                .CurDir => state.write(&[3_u8]),
+                .ParentDir => state.write(&[4_u8]),
+                .Normal(seg) => {
+                    state.write(&[5_u8]);
+                    state.write(seg);
+                    state.write(&[0xFF_u8]);
+                },
+            }
+        }
+        state.write(&[0_u8]);
+    }
+}
+
+impl Display for Path {
+    /| Streams `self` into `out` (fast-pathing valid UTF-8 and replacing unpaired WTF-8 / invalid bytes with `U+FFFD`).
+    @no_alloc
+    pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        let raw: &[u8] = self.*.bytes;
+        if is_valid_utf8(raw) {
+            return out.write_padded(raw, spec);
+        }
+        var pos: usize = 0;
+        let len: usize = raw.len();
+        while pos < len {
+            let (valid_n, skip_n) = next_utf8_or_wtf8_chunk(raw, pos);
+            if valid_n > 0 {
+                out.write_bytes(subslice_u8(raw, pos, pos +% valid_n))?;
+                pos = pos +% valid_n;
+            } else {
+                out.write_bytes(&UTF8_REPLACEMENT_BYTES)?;
+                pos = pos +% skip_n;
+            }
+        }
+        .Ok(())
+    }
+}
+
+impl Debug for Path {
+    /| Formats `self` as a quoted debug path literal, escaping controls, quotes, backslashes, and non-UTF-8 bytes as `\xHH`.
+    @std_cap_boundary(clears: [unsafe_op]) @no_alloc
+    pub fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        _ = spec;
+        out.write_bytes(b"\"")?;
+        let raw: &[u8] = self.*.bytes;
+        let len: usize = raw.len();
+        var pos: usize = 0;
+        while pos < len {
+            let byte_val: u8 = byte_at(raw, pos);
+            if byte_val == b'"' {
+                out.write_bytes(b"\\\"")?;
+                pos = pos +% 1;
+            } else if byte_val == b'\\' {
+                out.write_bytes(b"\\\\")?;
+                pos = pos +% 1;
+            } else if byte_val == b'\n' {
+                out.write_bytes(b"\\n")?;
+                pos = pos +% 1;
+            } else if byte_val == b'\r' {
+                out.write_bytes(b"\\r")?;
+                pos = pos +% 1;
+            } else if byte_val == b'\t' {
+                out.write_bytes(b"\\t")?;
+                pos = pos +% 1;
+            } else if byte_val >= 0x20_u8 and byte_val < 0x7F_u8 {
+                let ascii_arr: [u8; 1] = [byte_val];
+                out.write_bytes(&ascii_arr)?;
+                pos = pos +% 1;
+            } else {
+                let (valid_n, _) = next_utf8_or_wtf8_chunk(raw, pos);
+                if valid_n > 0 {
+                    out.write_bytes(subslice_u8(raw, pos, pos +% valid_n))?;
+                    pos = pos +% valid_n;
+                } else {
+                    let esc_hex: [u8; 4] = [
+                        b'\\',
+                        b'x',
+                        byte_at(&HEX_UPPER_DIGITS, (byte_val >> 4_u8) as usize),
+                        byte_at(&HEX_UPPER_DIGITS, (byte_val & 0x0F_u8) as usize),
+                    ];
+                    out.write_bytes(&esc_hex)?;
+                    pos = pos +% 1;
+                }
+            }
+        }
+        out.write_bytes(b"\"")
+    }
+}
+
+impl AutoDrop for PathBuf {
+    /| Frees general-heap `PathBuf` buffers (`0` ops when inline SSO, `StaticRoData`, or `BumpArenaNoFree`).
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
+    pub fn drop(&mut self) {
+        if (self.raw_bytes[23] & PATH_HEAP_FLAG_U8) != 0_u8 {
+            let heap: HeapRepr = unsafe {
+                @ptr_read(&raw self.raw_bytes as *HeapRepr)
+            };
+            let cap = (heap.flagged_cap & PATH_CAP_MASK_U32) as usize;
+            if cap != 0 and not heap.alloc.is_arena_or_static() {
+                heap.alloc.dealloc(heap.ptr, Layout { size: cap, alignment: 1 });
+            }
+            self.raw_bytes[23] = 0_u8;
+        }
+    }
+}
+
+impl Default for PathBuf {
+    /| Returns an empty inline `PathBuf`.
+    @inline @no_alloc @no_panic
+    pub fn default() -> PathBuf {
+        PathBuf.new()
+    }
+}
+
+impl Clone for PathBuf {
+    /| Clones `self` (`0` heap allocs when `len() <= 23` or `StaticRoData`).
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn clone(&self) -> PathBuf {
+        if self.is_inline_repr() {
+            return PathBuf { raw_bytes: self.raw_bytes };
+        }
+        let heap: HeapRepr = unsafe {
+            @ptr_read(&raw self.raw_bytes as *HeapRepr)
+        };
+        if heap.alloc.raw_tagged_ptr == 2_usize {
+            return PathBuf { raw_bytes: self.raw_bytes };
+        }
+        path_buf_from_slice(self.as_bytes())
+    }
+}
+
+impl Equatable for PathBuf {
+    /| Compares two `PathBuf` values component-by-component via `as_path()`.
+    @inline @no_alloc @no_panic
+    pub fn eq(&self, other: &Self, /) -> bool {
+        self.as_path() == other.as_path()
+    }
+}
+
+impl Comparable for PathBuf {
+    /| Orders two `PathBuf` values component-by-component via `as_path()`.
+    @inline @no_alloc @no_panic
+    pub fn cmp(&self, other: &Self, /) -> Ordering {
+        self.as_path().cmp(&other.as_path())
+    }
+}
+
+impl Hash for PathBuf {
+    /| Hashes `self.as_path()` so `PathBuf` and `Path` keys produce identical hashes.
+    @no_alloc @no_panic
+    pub fn hash[H: Hasher](&self, state: &mut H, /) {
+        self.as_path().hash(state);
+    }
+}
+
+impl Display for PathBuf {
+    /| Streams `self.as_path()` into `out` honoring `spec`.
+    @inline @no_alloc
+    pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        self.as_path().fmt(out, spec)
+    }
+}
+
+impl Debug for PathBuf {
+    /| Formats `self.as_path()` as an escaped debug path literal.
+    @inline @no_alloc
+    pub fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        self.as_path().fmt_debug(out, spec)
+    }
+}

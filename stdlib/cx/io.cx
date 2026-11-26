@@ -1,0 +1,4767 @@
+/# Zero-Copy Streaming I/O, Scatter-Gather Slices, and Standard Streams (cx.io)
+/#
+/# Provides register-sized 8-byte `IoError`, zero-memset `OutBuf`, ABI-exact `IoSlice` and `IoSliceMut`,
+/# vtable-erased `Reader` / `Writer` / `Seek` handles, non-generic `BufReader` (`48 B`) and `@linear BufWriter`
+/# (`32 B`), stream adapters, and reactor-routed locked buffered `stdin` / `stdout` / `stderr` (`STD-02`).
+/#
+/# Every `IoError` packs into a single non-zero `u64` (`bit[0] == 0`, `swifterror`-ready with zero heap
+/# allocations), and standard streams initialize lazily from zeroed `.tbss`/`.bss` memory with zero pre-`main` code.
+
+use core.async.{
+    IoSubmission,
+    SIM_OP_STDIO_RW,
+    SIM_UNHANDLED_SENTINEL,
+};
+use core.sys;
+use cx.col.Vec;
+use cx.fs.{
+    file_sentinel_flush,
+    file_sentinel_read_out,
+    file_sentinel_read_vectored,
+    file_sentinel_seek,
+    file_sentinel_write,
+    file_sentinel_write_vectored,
+};
+use cx.mem.{Arena, Layout, System};
+use cx.str.{String, is_valid_utf8};
+
+// ---------------------------------------- TYPES ----------------------------------------
+// ------------------ IoError & Error Domains -------------------
+/| Origin subsystem of an `IoError` raw status code (`STD-02` §1.2, §2.1).
+@derive(Copy, Equatable, Hash, Clone, Debug)
+pub enum ErrDomain {
+    /| Synthetic library error without an underlying OS status code (`0`).
+    Generic,
+    /| POSIX `errno` (`libc` / kernel `1..`, `1`).
+    PosixErrno,
+    /| Windows Win32 `GetLastError` `DWORD` (`2`).
+    Win32Error,
+    /| Windows Native `NTSTATUS` code (`3`).
+    NtStatus,
+    /| WebAssembly WASI Preview 1 `__wasi_errno_t` (`4`).
+    WasiErrno,
+    /| Deterministic `--sim` `SimReactor` injected fault code (`5`).
+    SimFault,
+}
+
+/| Normalized cross-platform I/O and filesystem failure classification (`sizeof(IoErrorKind?) == 1 B`).
+@derive(Copy, Equatable, Hash, Clone, Debug)
+pub enum IoErrorKind {
+    /| Target file, directory, or executable does not exist.
+    NotFound,
+    /| Caller lacks permission or sandbox capability for the requested operation.
+    PermissionDenied,
+    /| Exclusive target already exists (`EEXIST` / `ERROR_ALREADY_EXISTS`).
+    AlreadyExists,
+    /| Non-blocking descriptor cannot complete immediately (`EAGAIN` / `WSAEWOULDBLOCK`).
+    WouldBlock,
+    /| System call was interrupted by signal delivery (`EINTR`).
+    Interrupted,
+    /| Operation exceeded its configured deadline (`ETIMEDOUT` / `WAIT_TIMEOUT`).
+    TimedOut,
+    /| Stream ended before satisfying the requested exact byte count.
+    UnexpectedEof,
+    /| Underlying sink accepted `0` bytes from a non-empty write buffer.
+    WriteZero,
+    /| Peer closed the read end of a pipe or stream (`EPIPE` / `ERROR_BROKEN_PIPE`).
+    BrokenPipe,
+    /| Caller supplied an invalid argument, offset, or configuration (`EINVAL`).
+    InvalidInput,
+    /| Stream bytes violated expected encoding or structural invariants (e.g., invalid UTF-8).
+    InvalidData,
+    /| Non-recursive directory removal targeted a non-empty directory (`ENOTEMPTY`).
+    DirectoryNotEmpty,
+    /| File operation targeted a directory inode (`EISDIR`).
+    IsADirectory,
+    /| Directory traversal or open targeted a non-directory inode (`ENOTDIR`).
+    NotADirectory,
+    /| Atomic rename or hardlink spanned distinct filesystem mounts (`EXDEV`).
+    CrossesDevices,
+    /| Symlink chain looped or violated `RESOLVE_BENEATH` / `O_NOFOLLOW_ANY` (`ELOOP`).
+    FilesystemLoop,
+    /| Advisory lock acquisition conflicted with an active holder (`EWOULDBLOCK` / `ERROR_LOCK_VIOLATION`).
+    FileLockConflict,
+    /| Target resource is busy or locked by a concurrent share-mode violation (`EBUSY` / `ERROR_SHARING_VIOLATION`).
+    ResourceBusy,
+    /| Backing storage volume or quota has no remaining space (`ENOSPC` / `ERROR_DISK_FULL`).
+    StorageFull,
+    /| Stream or delimiter scan exceeded the caller's `max_bytes` / buffer cap.
+    StreamTooLong,
+    /| Implicit `.bat` or `.cmd` batch execution was rejected (`CVE-2024-24576` defense).
+    InvalidScriptExtension,
+    /| Operation is unsupported by the target OS, filesystem, or WASI sandbox (`ENOSYS` / `ENOTSUP`).
+    Unsupported,
+    /| Operation was canceled via `CancelToken` or asynchronous abort (`ECANCELED`).
+    Canceled,
+    /| Kernel or allocator ran out of memory (`ENOMEM` / `ERROR_NOT_ENOUGH_MEMORY`).
+    OutOfMemory,
+    /| Path or filename contains illegal characters, interior NULs, or exceeds component length limits.
+    InvalidFilename,
+    /| Mutating operation targeted a read-only mount (`EROFS` / `ERROR_WRITE_PROTECT`).
+    ReadOnlyFilesystem,
+    /| Process `argv` or environment block exceeded OS limits (`E2BIG`).
+    ArgumentListTooLong,
+    /| Unclassified host error preserved lossless inside `IoError.os_error()`.
+    Other,
+}
+
+/| Operation tag recorded inside `IoError` for zero-allocation contextual diagnostics (`STD-02` §2.1).
+@derive(Copy, Equatable, Hash, Clone, Debug)
+pub enum IoOp {
+    /| Unspecified I/O operation (`0`).
+    None,
+    /| Sequential or positional stream/file read (`1`).
+    Read,
+    /| Sequential, positional, or vectored stream/file write (`2`).
+    Write,
+    /| Buffered or device flush (`3`).
+    Flush,
+    /| Stream cursor seek (`4`).
+    Seek,
+    /| File or directory open/create (`5`).
+    Open,
+    /| Metadata stat or attribute query (`6`).
+    Stat,
+    /| Canonical physical path resolution (`7`).
+    Resolve,
+    /| Atomic or standard path rename (`8`).
+    Rename,
+    /| File or directory unlink/removal (`9`).
+    Unlink,
+    /| Directory creation (`10`).
+    Mkdir,
+    /| Directory entry enumeration (`11`).
+    Readdir,
+    /| Reflink, hardlink, or file copy materialization (`12`).
+    Clone,
+    /| Read-only memory map setup or teardown (`13`).
+    Mmap,
+    /| Advisory file lock acquisition or release (`14`).
+    Lock,
+    /| Filesystem change watcher registration or poll (`15`).
+    Watch,
+    /| Child process spawn (`16`).
+    Spawn,
+    /| Child process wait or signal (`17`).
+    Wait,
+    /| Process environment or working-directory lookup/mutation (`18`).
+    Env,
+}
+
+/| Exact 64-bit bitfield layout of inline `IoError` words (`2 + 6 + 8 + 8 + 8 + 32 == 64` bits).
+@derive(Copy, Equatable)
+pub bit_field IoErrorBits: u64 {
+    /| Low 2-bit discriminant (`0b10` = inline OS/kind error with `bit[0] == 0`).
+    pub tag: u8 | 2,
+    /| Encoded `ErrDomain` code (`0..=5`).
+    pub domain: u8 | 6,
+    /| Encoded `IoErrorKind` code (`0..=255`).
+    pub kind: u8 | 8,
+    /| Encoded `IoOp` code (`0..=18`).
+    pub op: u8 | 8,
+    /| Optional thread-local `Context.diagnostics` path-ring slot index (`0` when unused).
+    pub diag_slot: u8 | 8,
+    /| Unmodified 32-bit OS error code (`errno`, Win32 `DWORD`, `NTSTATUS`, or `__wasi_errno_t`).
+    pub raw_code: u32 | 32,
+}
+
+/| Register-sized 8-byte I/O error (`swifterror`-compatible, `packed_repr >= 2`, `bit[0] == 0`, `0` heap allocs).
+@repr(C) @derive(Copy, Equatable, Hash)
+pub struct IoError {
+    /| Non-zero even 64-bit payload (`tag == 0b10` for inline errors; `0` and `1` reserved as niches).
+    pub(pkg) packed_repr: u64 is 2..=u64.MAX,
+}
+
+// ------------------ OutBuf & Vectored Slices ------------------
+/| Write-only cursor over uninitialized or mutable bytes preventing uninitialized reads in safe code (`STD-02` §1.1).
+@repr(C)
+pub struct OutBuf {
+    /| Base pointer to the backing byte region (`0..filled_bytes` initialized, `filled_bytes..cap` uninitialized).
+    ptr: *mut u8,
+    /| Total byte capacity of `ptr`.
+    cap: usize,
+    /| Monotonic count of initialized bytes in `0..=cap`.
+    filled_bytes: usize,
+}
+
+/| Win64 `WSABUF`-exact immutable slice representation (`16 B`: `u32` length + pad + pointer).
+@repr(C) @derive(Copy)
+struct WinIoSliceRaw {
+    /| Byte length clamped to `u32.MAX` matching `WSABUF.len`.
+    len_u32: u32,
+    /| Explicit 4-byte Win64 alignment padding before `WSABUF.buf` (`0`).
+    _pad: u32 = 0,
+    /| Read-only byte buffer pointer (`WSABUF.buf`).
+    ptr: *u8,
+}
+
+/| POSIX `struct iovec` (`16 B`) and WASI `ciovec` (`8 B`) immutable slice representation.
+@repr(C) @derive(Copy)
+struct PosixIoSliceRaw {
+    /| Read-only byte buffer pointer (`iov_base` / `buf`).
+    ptr: *u8,
+    /| Byte length of `ptr` (`iov_len` / `buf_len`).
+    len_usize: usize,
+}
+
+/| Active target ABI layout for `IoSlice` (`WinIoSliceRaw` on Windows).
+@cfg(target.os == "windows")
+type ActiveIoSliceRaw = WinIoSliceRaw;
+
+/| Active target ABI layout for `IoSlice` (`PosixIoSliceRaw` on POSIX and WASI).
+@cfg(not (target.os == "windows"))
+type ActiveIoSliceRaw = PosixIoSliceRaw;
+
+/| Scatter-gather immutable byte slice ABI-identical to Win64 `WSABUF`, POSIX `iovec`, and WASI `ciovec`.
+@repr(C) @derive(Copy)
+pub struct IoSlice {
+    /| Target-exact `WSABUF` or `iovec` / `ciovec` fields.
+    raw: ActiveIoSliceRaw,
+}
+
+/| Win64 `WSABUF`-exact mutable slice representation (`16 B`: `u32` length + pad + pointer).
+@repr(C)
+struct WinIoSliceMutRaw {
+    /| Byte length clamped to `u32.MAX` matching `WSABUF.len`.
+    len_u32: u32,
+    /| Explicit 4-byte Win64 alignment padding before `WSABUF.buf` (`0`).
+    _pad: u32 = 0,
+    /| Mutable byte buffer pointer (`WSABUF.buf`).
+    ptr: *mut u8,
+}
+
+/| POSIX and WASI `iovec` mutable slice representation (`16 B` on 64-bit, `8 B` on `wasm32`).
+@repr(C)
+struct PosixIoSliceMutRaw {
+    /| Mutable byte buffer pointer (`iov_base` / `buf`).
+    ptr: *mut u8,
+    /| Byte length of `ptr` (`iov_len` / `buf_len`).
+    len_usize: usize,
+}
+
+/| Active target ABI layout for `IoSliceMut` (`WinIoSliceMutRaw` on Windows).
+@cfg(target.os == "windows")
+type ActiveIoSliceMutRaw = WinIoSliceMutRaw;
+
+/| Active target ABI layout for `IoSliceMut` (`PosixIoSliceMutRaw` on POSIX and WASI).
+@cfg(not (target.os == "windows"))
+type ActiveIoSliceMutRaw = PosixIoSliceMutRaw;
+
+/| Scatter-gather mutable byte slice ABI-identical to Win64 `WSABUF` and POSIX/WASI `iovec` (non-`Copy`).
+@repr(C)
+pub struct IoSliceMut {
+    /| Target-exact `WSABUF` or `iovec` fields.
+    raw: ActiveIoSliceMutRaw,
+}
+
+/| Cursor origin and signed/unsigned offset for `Seek.seek` (`STD-02` §2.1).
+@derive(Copy, Equatable, Hash, Clone, Debug)
+pub enum SeekFrom {
+    /| Absolute byte offset relative to stream byte `0`.
+    Start(u64),
+    /| Signed byte offset relative to the end of the stream.
+    End(i64),
+    /| Signed byte offset relative to the current stream position.
+    Current(i64),
+}
+
+// ------------------ Stream Handles & VTables ------------------
+/| Function-pointer dispatch table for `Seek` (`STD-02` §2.1).
+@repr(C)
+pub struct SeekVTable {
+    /| Repositions `ctx` according to `pos` and returns the resulting absolute byte offset.
+    pub seek: fn(*mut opaque, SeekFrom) -> u64!IoError,
+}
+
+/| Type-erased `Copy` stream seeker (`16 B` on 64-bit, `8 B` on `wasm32`; `sizeof(Seek?) == sizeof(Seek)`).
+@repr(C) @derive(Copy)
+pub struct Seek {
+    /| Borrowed mutable stream state pointer.
+    pub(pkg) ctx: *mut opaque,
+    /| Non-null static dispatch table (`0x0` niche reserved for `Seek?`).
+    @non_null
+    pub(pkg) vtable: *SeekVTable,
+}
+
+/| Function-pointer dispatch table for `Reader` (`STD-02` §2.1).
+@repr(C)
+pub struct ReaderVTable {
+    /| Reads available bytes into uninitialized `out`, advancing `out` and returning bytes read (`0` on EOF).
+    pub read_out: fn(*mut opaque, &mut OutBuf) -> usize!IoError,
+    /| Optional scatter read implementation (`read_vectored` falls back to first non-empty buffer when `.None`).
+    pub read_vectored: (fn(*mut opaque, &mut [IoSliceMut]) -> usize!IoError)? = .None,
+    /| Optional fast skip/seek implementation (`discard` falls back to stack `OutBuf` draining when `.None`).
+    pub discard: (fn(*mut opaque, u64) -> u64!IoError)? = .None,
+}
+
+/| Type-erased `Copy` input stream (`16 B` on 64-bit, `8 B` on `wasm32`; `sizeof(Reader?) == sizeof(Reader)`).
+@repr(C) @derive(Copy)
+pub struct Reader {
+    /| Borrowed mutable reader state pointer (or immediate byte value for `Reader.repeat`).
+    pub(pkg) ctx: *mut opaque,
+    /| Non-null static dispatch table (`0x0` niche reserved for `Reader?`).
+    @non_null
+    pub(pkg) vtable: *ReaderVTable,
+}
+
+/| Function-pointer dispatch table for `Writer` (`STD-02` §2.1).
+@repr(C)
+pub struct WriterVTable {
+    /| Writes a non-empty prefix of `buf` into `ctx` and returns the byte count accepted.
+    pub write: fn(*mut opaque, &[u8]) -> usize!IoError,
+    /| Optional gather write implementation (`write_vectored` writes first non-empty slice when `.None`).
+    pub write_vectored: (fn(*mut opaque, &[IoSlice]) -> usize!IoError)? = .None,
+    /| Optional buffered or device flush callback (`.Ok(())` no-op when `.None`).
+    pub flush: (fn(*mut opaque) -> unit!IoError)? = .None,
+}
+
+/| Type-erased `Copy` output stream (`16 B` on 64-bit, `8 B` on `wasm32`; `sizeof(Writer?) == sizeof(Writer)`).
+@repr(C) @derive(Copy)
+pub struct Writer {
+    /| Borrowed mutable writer state pointer.
+    pub(pkg) ctx: *mut opaque,
+    /| Non-null static dispatch table (`0x0` niche reserved for `Writer?`).
+    @non_null
+    pub(pkg) vtable: *WriterVTable,
+}
+
+/| Stack-resident `512 B` coalescing bridge adapting `Writer` to `FmtWriter` with zero heap allocations.
+@repr(C)
+struct WriterFmtBridge {
+    /| Target `Writer` receiving coalesced chunks.
+    target: *mut Writer,
+    /| Stack scratch buffer batching small format pieces and scalar digits.
+    scratch: [u8; 512],
+    /| Active byte count in `scratch` (`0..=512`).
+    filled: usize,
+    /| Exact `IoError` preserved across `FmtError.IoFailure` return edges.
+    sticky_err: IoError?,
+}
+
+// ---------------- Buffered Streams & Adapters -----------------
+/| Non-generic `48 B` (64-bit) buffered reader hoisting the active window above `Reader` (`AutoDrop` frees `System` buf).
+@repr(C)
+pub struct BufReader {
+    /| Upstream unbuffered `Reader` handle.
+    upstream: Reader,
+    /| Backing buffer pointer (`16 B`-aligned when owned from `cx.mem.System`).
+    buf_ptr: *mut u8,
+    /| Capacity in `bits 0..BITS-1`; MSB (`BUF_READER_OWNS_SYS_MASK`) marks `System`-owned buffer.
+    cap_and_flag: usize,
+    /| Start index of unconsumed bytes within `0..=filled`.
+    pos: usize,
+    /| Exclusive end index of valid bytes read from `upstream` within `0..=capacity()`.
+    filled: usize,
+}
+
+/| Non-generic `32 B` (64-bit) `@linear` buffered writer requiring explicit `close` or `discard` (`E0304`).
+@repr(C) @linear
+pub struct BufWriter {
+    /| Downstream unbuffered `Writer` handle.
+    downstream: Writer,
+    /| Backing buffer pointer (`16 B`-aligned when owned from `cx.mem.System`).
+    buf_ptr: *mut u8,
+    /| Count of unflushed bytes currently buffered in `0..=capacity()`.
+    filled: u32,
+    /| `bits 0..29` = capacity; `bit 30` = `OWNS_SYSTEM_BUF`; `bit 31` = `LINE_BUFFERED`.
+    cap_and_flags: u32,
+}
+
+/| Zero-allocation `FmtWriter` adapter streaming `FmtArgs` directly into `BufWriter.buf_ptr`.
+@repr(C)
+struct BufWriterFmtBridge {
+    /| Target `BufWriter` receiving formatted pieces.
+    target: *mut BufWriter,
+    /| Exact `IoError` captured if a flush fails mid-format.
+    sticky_err: IoError?,
+}
+
+/| Adapter capping total bytes read from an upstream `Reader` at `remaining_bytes` (`STD-02` §2.1).
+@repr(C)
+pub struct LimitReader {
+    /| Wrapped upstream `Reader`.
+    upstream: Reader,
+    /| Maximum unread byte budget remaining before synthetic EOF (`0`).
+    remaining_bytes: u64,
+}
+
+/| In-memory `Reader` and `Seek` cursor over an immutable byte slice `&[u8]` (`STD-02` §2.1).
+@repr(C)
+pub struct ByteReader {
+    /| Backing read-only byte slice.
+    data: &[u8],
+    /| Current read cursor offset (`may exceed data.len()` after `Seek`, yielding `0` on `read_out`).
+    pos: usize = 0,
+}
+
+/| Fixed-capacity in-memory `Writer` and `Seek` cursor over a mutable byte slice `&mut [u8]` (`STD-02` §2.1).
+@repr(C)
+pub struct SliceWriter {
+    /| Backing mutable byte buffer pointer.
+    ptr: *mut u8,
+    /| Total byte capacity of `ptr`.
+    cap: usize,
+    /| Current write cursor offset in `0..=cap`.
+    pos: usize = 0,
+}
+
+// ------------------ Locked Standard Streams -------------------
+/| C-ABI callback signature for `ReactorVTable.submit_io` (`slot 3` of `ReactorVTable`).
+type ReactorSubmitFn = extern "C" fn(ctx: *mut opaque, sub: *IoSubmission) -> i64;
+
+/| Lazily mapped `24 KiB` standard-stream buffer slab (`0` pre-`main` constructors, `0` cost when unused).
+@repr(C, align: 16)
+struct StdioSlab {
+    /| `8 KiB` buffered `stdin` window preserved across `StdinLock` acquisitions.
+    stdin_buf: [u8; 8_192],
+    /| Saved `stdin` read offset in `0..=stdin_filled`.
+    stdin_pos: usize,
+    /| Saved `stdin` valid byte count in `0..=8192`.
+    stdin_filled: usize,
+    /| `8 KiB` buffered `stdout` window.
+    stdout_buf: [u8; 8_192],
+    /| Saved `stdout` buffered byte count in `0..=8192`.
+    stdout_filled: u32,
+    /| `8 KiB` buffered `stderr` coalescing window.
+    stderr_buf: [u8; 8_192],
+    /| Saved `stderr` buffered byte count in `0..=8192`.
+    stderr_filled: u32,
+}
+
+/| `24 B` zero-initialized control block residing in `@tls_alloc_state()` bytes `224..248` (`0` pre-`main` init).
+@repr(C, align: 8)
+struct StdioTlsHeader {
+    /| Lazily mapped `StdioSlab` (`null` until first `stdin_locked` / `stdout_locked` / `stderr_locked`).
+    slab_ptr: *mut StdioSlab,
+    /| Atomic reentrancy/spin lock byte for `stdin` (`0` = unlocked, `1` = locked).
+    stdin_lock: u8,
+    /| Atomic reentrancy/spin lock byte for `stdout` (`0` = unlocked, `1` = locked).
+    stdout_lock: u8,
+    /| Atomic reentrancy/spin lock byte for `stderr` (`0` = unlocked, `1` = locked).
+    stderr_lock: u8,
+    /| Cached TTY probe state (`0` = unprobed, `1` = pipe/file block-buffered, `3` = TTY line-buffered).
+    tty_state: u8,
+    /| Emergency `8 B` inline buffer used if `System.alloc_pages` fails under simulated OOM.
+    emergency_buf: [u8; 8],
+}
+
+/| `@linear` exclusive guard over buffered standard input (`fd = 0`; must call `.release()`, `E0304`).
+@linear
+pub struct StdinLock {
+    /| Buffered `stdin` reader (`8 KiB` window).
+    inner_reader: BufReader,
+    /| Encoded pointer to the owning `StdioTlsHeader` control block (`0` when detached).
+    lock_token: usize,
+}
+
+/| `@linear` exclusive guard over buffered standard output or standard error (`must` release/flush, `E0304`).
+@linear
+pub struct StdoutLock {
+    /| Buffered `stdout`/`stderr` writer (`8 KiB` window; auto-line-buffered on TTY for `stdout`).
+    inner_writer: BufWriter,
+    /| Encoded `(header_addr | stream_tag)` (`bit 0`: `0` = `stdout`, `1` = `stderr`).
+    lock_token: usize,
+}
+
+/| Canonical `@linear` guard alias for locked buffered standard error (`fd = 2`).
+pub type StderrLock = StdoutLock;
+
+// --------------------------------------- CONSTS ----------------------------------------
+/| Default `8 KiB` (`8,192 B`) buffer size for `BufReader`, `BufWriter`, `copy_stream`, and `stdio`.
+pub const DEFAULT_IO_BUF_SIZE: usize = 8_192;
+
+/| Default `1 MiB` (`1,048,576 B`) safety cap for `BufReader.read_until_into`.
+const DEFAULT_READ_UNTIL_MAX: usize = 1_048_576;
+
+/| Inline tag `0b10` (`2`) keeping `IoError.packed_repr >= 2` and `bit[0] == 0`.
+const IO_ERR_INLINE_TAG: u8 = 2_u8;
+
+/| `BufReader.cap_and_flag` MSB bit indicating `buf_ptr` was allocated from `cx.mem.System`.
+const BUF_READER_OWNS_SYS_MASK: usize = ~(usize.MAX >> 1_usize);
+
+/| `BufReader.cap_and_flag` low-bits capacity mask.
+const BUF_READER_CAP_MASK: usize = usize.MAX >> 1_usize;
+
+/| `BufWriter.cap_and_flags` `30`-bit capacity mask (`bits 0..29`, up to `1 GiB - 1`).
+const BUF_WRITER_CAP_MASK: u32 = 0x3FFF_FFFF_u32;
+
+/| `BufWriter.cap_and_flags` bit `30` indicating `buf_ptr` was allocated from `cx.mem.System`.
+const BUF_WRITER_OWNS_SYS_FLAG: u32 = 0x4000_0000_u32;
+
+/| `BufWriter.cap_and_flags` bit `31` enabling automatic flush on `b'\n'`.
+const BUF_WRITER_LINE_BUF_FLAG: u32 = 0x8000_0000_u32;
+
+/| Alignment (`16 B`) used for `System`-owned `BufReader` / `BufWriter` buffers.
+const OWNED_IO_BUF_ALIGN: usize = 16;
+
+/| Byte offset (`224`) inside the `256 B` `@tls_alloc_state()` block reserved for `StdioTlsHeader`.
+const STDIO_TLS_OFFSET: usize = 224;
+
+/| Low-bit tag on `StdoutLock.lock_token` distinguishing `stderr` (`1`) from `stdout` (`0`).
+const STDIO_TOKEN_STDERR_BIT: usize = 1;
+
+/| SWAR `0x01` broadcast multiplier for 8-byte parallel byte search on `wasm32` and tails.
+const SWAR_ONES_U64: u64 = 0x0101_0101_0101_0101_u64;
+
+/| SWAR `0x80` high-bit lane mask for 8-byte parallel zero-byte detection.
+const SWAR_HIGHS_U64: u64 = 0x8080_8080_8080_8080_u64;
+
+/| Static `.rodata` empty byte slice avoiding stack array materialization on `E0306` return edges.
+const EMPTY_BYTES: &[u8] = b"";
+
+/| Non-null odd `Reader.vtable` sentinel (`0x1`) identifying `Reader.empty()` (`@align_of[ReaderVTable]() >= 4`).
+const READER_SENTINEL_EMPTY: usize = 1_usize;
+
+/| Non-null odd `Reader.vtable` sentinel (`0x3`) identifying `Reader.repeat(byte_val)`.
+const READER_SENTINEL_REPEAT: usize = 3_usize;
+
+/| Non-null odd `Reader.vtable` sentinel (`0x5`) identifying `BufReader.as_reader()`.
+const READER_SENTINEL_BUF: usize = 5_usize;
+
+/| Non-null odd `Reader.vtable` sentinel (`0x7`) identifying `LimitReader.as_reader()`.
+const READER_SENTINEL_LIMIT: usize = 7_usize;
+
+/| Non-null odd `Reader.vtable` sentinel (`0x9`) identifying `ByteReader.as_reader()`.
+const READER_SENTINEL_BYTES: usize = 9_usize;
+
+/| Non-null odd `Reader.vtable` sentinel (`0xB`) identifying `stdin` (`fd = 0`).
+const READER_SENTINEL_STDIN: usize = 11_usize;
+
+/| Non-null odd `Reader.vtable` sentinel (`0xD`) identifying `cx.fs.File.as_reader()`.
+pub(super) const READER_SENTINEL_FILE: usize = 13_usize;
+
+/| Non-null odd `Writer.vtable` sentinel (`0x1`) identifying `Writer.sink()` (`@align_of[WriterVTable]() >= 4`).
+const WRITER_SENTINEL_SINK: usize = 1_usize;
+
+/| Non-null odd `Writer.vtable` sentinel (`0x3`) identifying `BufWriter.as_writer()`.
+const WRITER_SENTINEL_BUF: usize = 3_usize;
+
+/| Non-null odd `Writer.vtable` sentinel (`0x5`) identifying `SliceWriter.as_writer()`.
+const WRITER_SENTINEL_SLICE: usize = 5_usize;
+
+/| Non-null odd `Writer.vtable` sentinel (`0x7`) identifying `stdout` / `stderr` (`fd = 1, 2`).
+const WRITER_SENTINEL_STDIO: usize = 7_usize;
+
+/| Non-null odd `Writer.vtable` sentinel (`0x9`) identifying `cx.fs.File.as_writer()`.
+pub(super) const WRITER_SENTINEL_FILE: usize = 9_usize;
+
+/| Non-null odd `Seek.vtable` sentinel (`0x1`) identifying `ByteReader.as_seeker()` (`@align_of[SeekVTable]() >= 4`).
+const SEEK_SENTINEL_BYTES: usize = 1_usize;
+
+/| Non-null odd `Seek.vtable` sentinel (`0x3`) identifying `SliceWriter.as_seeker()`.
+const SEEK_SENTINEL_SLICE: usize = 3_usize;
+
+/| Non-null odd `Seek.vtable` sentinel (`0x5`) identifying `cx.fs.File.as_seeker()`.
+pub(super) const SEEK_SENTINEL_FILE: usize = 5_usize;
+
+// -------------------------------------- INTERNALS --------------------------------------
+// ------------- Target IoSlice Layout Projections --------------
+impl WinIoSliceRaw {
+    /| Constructs a Win64 `WSABUF`-compatible descriptor clamping `slice.len()` to `u32.MAX`.
+    fn from_slice(slice: &[u8], /) -> WinIoSliceRaw {
+        let clamped_len: u32 = if slice.len() > (u32.MAX as usize) => u32.MAX
+            else slice.len() as u32;
+        WinIoSliceRaw {
+            len_u32: clamped_len,
+            _pad: 0_u32,
+            ptr: slice.as_ptr(),
+        }
+    }
+
+    /| Returns the underlying read-only byte pointer.
+    fn raw_ptr(self) -> *u8 = self.ptr;
+
+    /| Returns the clamped byte length as `usize`.
+    fn raw_len(self) -> usize = self.len_u32 as usize;
+}
+
+impl PosixIoSliceRaw {
+    /| Constructs a POSIX `iovec` / WASI `ciovec`-compatible descriptor.
+    fn from_slice(slice: &[u8], /) -> PosixIoSliceRaw {
+        PosixIoSliceRaw {
+            ptr: slice.as_ptr(),
+            len_usize: slice.len(),
+        }
+    }
+
+    /| Returns the underlying read-only byte pointer.
+    fn raw_ptr(self) -> *u8 = self.ptr;
+
+    /| Returns the byte length as `usize`.
+    fn raw_len(self) -> usize = self.len_usize;
+}
+
+impl WinIoSliceMutRaw {
+    /| Constructs a Win64 `WSABUF`-compatible mutable descriptor clamping `slice.len()` to `u32.MAX`.
+    fn from_slice(slice: &mut [u8], /) -> WinIoSliceMutRaw {
+        let clamped_len: u32 = if slice.len() > (u32.MAX as usize) => u32.MAX
+            else slice.len() as u32;
+        WinIoSliceMutRaw {
+            len_u32: clamped_len,
+            _pad: 0_u32,
+            ptr: slice.as_mut_ptr(),
+        }
+    }
+
+    /| Returns the underlying mutable byte pointer.
+    fn raw_ptr(&self) -> *mut u8 = self.ptr;
+
+    /| Returns the clamped byte length as `usize`.
+    fn raw_len(&self) -> usize = self.len_u32 as usize;
+}
+
+impl PosixIoSliceMutRaw {
+    /| Constructs a POSIX / WASI `iovec`-compatible mutable descriptor.
+    fn from_slice(slice: &mut [u8], /) -> PosixIoSliceMutRaw {
+        PosixIoSliceMutRaw {
+            ptr: slice.as_mut_ptr(),
+            len_usize: slice.len(),
+        }
+    }
+
+    /| Returns the underlying mutable byte pointer.
+    fn raw_ptr(&self) -> *mut u8 = self.ptr;
+
+    /| Returns the byte length as `usize`.
+    fn raw_len(&self) -> usize = self.len_usize;
+}
+
+// ------------------ SIMD & SWAR Byte Search -------------------
+/| Scans `haystack` for the first `needle` byte using `16 B` SIMD (`x86_64` / `aarch64`) + `8 B` SWAR tail.
+@cfg(target.arch == "x86_64" or target.arch == "aarch64")
+@std_cap_boundary(clears: [unsafe_op, may_panic])
+fn find_byte_fast(haystack: &[u8], needle: u8, /) -> usize? {
+    let total: usize = haystack.len();
+    if total == 0_usize {
+        return .None;
+    }
+    let base_ptr: *u8 = haystack.as_ptr();
+    var idx = 0_usize;
+    if total >= 16_usize {
+        let needle_vec: [u8; 16] = @simd_splat[[u8; 16]](needle);
+        while idx <= total -% 16_usize {
+            let chunk_vec: [u8; 16] = unsafe {
+                @simd_load_unaligned[[u8; 16]](base_ptr.add(idx))
+            };
+            let mask_bits: u16 = @simd_bitmask(@simd_eq(chunk_vec, needle_vec));
+            if mask_bits != 0_u16 {
+                return .Some(idx +% (mask_bits.trailing_zeros() as usize));
+            }
+            idx = idx +% 16_usize;
+        }
+    }
+    find_byte_swar_tail(haystack, needle, idx)
+}
+
+/| Scans `haystack` for the first `needle` byte on `wasm32` and portable targets using `8 B` SWAR.
+@cfg(not (target.arch == "x86_64" or target.arch == "aarch64"))
+@std_cap_boundary(clears: [unsafe_op, may_panic])
+fn find_byte_fast(haystack: &[u8], needle: u8, /) -> usize? {
+    find_byte_swar_tail(haystack, needle, 0_usize)
+}
+
+/| Shared 8-byte SWAR + scalar tail scanner locating `needle` in `haystack[idx..]`.
+@std_cap_boundary(clears: [unsafe_op, may_panic])
+fn find_byte_swar_tail(haystack: &[u8], needle: u8, var idx: usize, /) -> usize? {
+    let total: usize = haystack.len();
+    let base_ptr: *u8 = haystack.as_ptr();
+    if idx +% 8_usize <= total {
+        let broadcast: u64 = (needle as u64) *% SWAR_ONES_U64;
+        while idx <= total -% 8_usize {
+            var word = 0_u64;
+            unsafe {
+                @memcpy((&raw mut word) as *mut opaque, base_ptr.add(idx) as *opaque, 8_usize);
+            }
+            let xored: u64 = word ^ broadcast;
+            let zero_mask: u64 = (xored -% SWAR_ONES_U64) & (~xored) & SWAR_HIGHS_U64;
+            if zero_mask != 0_u64 {
+                return .Some(idx +% ((zero_mask.trailing_zeros() >> 3_u32) as usize));
+            }
+            idx = idx +% 8_usize;
+        }
+    }
+    while idx < total {
+        if haystack[idx] == needle {
+            return .Some(idx);
+        }
+        idx += 1_usize;
+    }
+    .None
+}
+
+/| Scans `haystack` from the end and returns the index of the last occurrence of `needle`.
+@std_cap_boundary(clears: [may_panic])
+fn rfind_byte(haystack: &[u8], needle: u8, /) -> usize? {
+    let total: usize = haystack.len();
+    var idx: usize = total;
+    while idx > 0_usize {
+        idx -= 1_usize;
+        if idx < total and haystack[idx] == needle {
+            return .Some(idx);
+        }
+    }
+    .None
+}
+
+/| Packs `IoErrorBits` into a range-refined `IoError` (`tag == 0b10` -> `packed_repr >= 2`, `@no_panic`).
+fn pack_io_error_bits(bits: IoErrorBits, /) -> IoError {
+    let raw_word: u64 = (@bit_cast[u64](bits) & ~3_u64) | 2_u64;
+    IoError {
+        packed_repr: raw_word.narrow[u64 is 2..=u64.MAX](),
+    }
+}
+
+/| Maps canonical Linux/POSIX fault numbers to `IoErrorKind` identically across all host and target OSes.
+fn map_sim_fault_code(code: i32, /) -> IoErrorKind {
+    match code {
+        1 => .PermissionDenied,
+        2 => .NotFound,
+        4 => .Interrupted,
+        7 => .ArgumentListTooLong,
+        9 => .InvalidInput,
+        11 => .WouldBlock,
+        12 => .OutOfMemory,
+        13 => .PermissionDenied,
+        16 => .ResourceBusy,
+        17 => .AlreadyExists,
+        18 => .CrossesDevices,
+        19 => .Unsupported,
+        20 => .NotADirectory,
+        21 => .IsADirectory,
+        22 => .InvalidInput,
+        27 => .StorageFull,
+        28 => .StorageFull,
+        29 => .InvalidInput,
+        30 => .ReadOnlyFilesystem,
+        32 => .BrokenPipe,
+        35 => .FileLockConflict,
+        36 => .InvalidFilename,
+        38 => .Unsupported,
+        39 => .DirectoryNotEmpty,
+        40 => .FilesystemLoop,
+        84 => .InvalidData,
+        95 => .Unsupported,
+        110 => .TimedOut,
+        125 => .Canceled,
+        _ => .Other,
+    }
+}
+
+/| Computes the new stream cursor offset for `SeekFrom` against `(cur_pos, end_len)` with overflow checks.
+fn compute_seek_offset(cur_pos: u64, end_len: u64, origin: SeekFrom, /) -> u64!IoError {
+    match origin {
+        .Start(abs_off) => .Ok(abs_off),
+        .Current(rel_delta) => apply_signed_seek_delta(cur_pos, rel_delta),
+        .End(end_delta) => apply_signed_seek_delta(end_len, end_delta),
+    }
+}
+
+/| Adds signed `delta` to `base`, failing with `IoErrorKind.InvalidInput` on negative or `u64` overflow.
+fn apply_signed_seek_delta(base: u64, delta: i64, /) -> u64!IoError {
+    if delta >= 0_i64 {
+        let add_u64 = delta as u64;
+        if add_u64 > u64.MAX -% base {
+            return .Err(IoError.from_kind(.InvalidInput, op: .Seek));
+        }
+        return .Ok(base +% add_u64);
+    }
+    let mag_u64: u64 = (0_u64 -% @bit_cast[u64](delta));
+    if mag_u64 > base {
+        return .Err(IoError.from_kind(.InvalidInput, op: .Seek));
+    }
+    .Ok(base -% mag_u64)
+}
+
+/| Clamps a `u64` byte budget down to `usize` without truncating on `32`-bit `wasm32`.
+fn clamp_u64_to_usize(val: u64, /) -> usize {
+    if val > (usize.MAX as u64) => usize.MAX else val as usize
+}
+
+// ----------------- VTable Callbacks & Bridges -----------------
+/| `Reader.empty()` `read_out` callback always returning `0` (EOF).
+fn empty_read_out_cb(ctx: *mut opaque, out: &mut OutBuf) -> usize!IoError {
+    _ = ctx;
+    _ = out;
+    .Ok(0_usize)
+}
+
+/| `Reader.empty()` `read_vectored` callback always returning `0` (EOF).
+fn empty_read_vectored_cb(ctx: *mut opaque, bufs: &mut [IoSliceMut]) -> usize!IoError {
+    _ = ctx;
+    _ = bufs;
+    .Ok(0_usize)
+}
+
+/| `Reader.empty()` `discard` callback always returning `0`.
+fn empty_discard_cb(ctx: *mut opaque, bytes: u64) -> u64!IoError {
+    _ = ctx;
+    _ = bytes;
+    .Ok(0_u64)
+}
+
+/| `Reader.repeat(byte_val)` `read_out` callback filling `out` with `(ctx as usize) as u8`.
+@std_cap_boundary(clears: [unsafe_op])
+fn repeat_read_out_cb(ctx: *mut opaque, out: &mut OutBuf) -> usize!IoError {
+    let (dst_ptr, rem_len) = out.unfilled_raw();
+    if rem_len > 0_usize {
+        let fill_byte = ((ctx as usize) & 0xFF_usize) as u8;
+        unsafe {
+            @memset(dst_ptr as *mut opaque, fill_byte, rem_len);
+            out.advance_init(rem_len);
+        }
+    }
+    .Ok(rem_len)
+}
+
+/| `Reader.repeat(byte_val)` `discard` callback advancing `bytes` in `O(1)`.
+fn repeat_discard_cb(ctx: *mut opaque, bytes: u64) -> u64!IoError {
+    _ = ctx;
+    .Ok(bytes)
+}
+
+/| `Writer.sink()` `write` callback accepting all `buf.len()` bytes.
+fn sink_write_cb(ctx: *mut opaque, buf: &[u8]) -> usize!IoError {
+    _ = ctx;
+    .Ok(buf.len())
+}
+
+/| `Writer.sink()` `write_vectored` callback accepting the saturating sum of all `IoSlice` lengths.
+fn sink_write_vectored_cb(ctx: *mut opaque, bufs: &[IoSlice]) -> usize!IoError {
+    _ = ctx;
+    var total = 0_usize;
+    for slice in bufs {
+        total = total +| slice.len();
+    }
+    .Ok(total)
+}
+
+/| `Writer.sink()` `flush` no-op callback.
+fn sink_flush_cb(ctx: *mut opaque) -> unit!IoError {
+    _ = ctx;
+    .Ok(())
+}
+
+/| `FmtWriter` callback batching formatted chunks into `WriterFmtBridge.scratch` (`512 B` stack buffer).
+@std_cap_boundary(clears: [unsafe_op])
+fn writer_fmt_bridge_cb(ctx: *mut opaque, chunk: &[u8]) -> unit!FmtError {
+    let bridge_ptr = ctx as *mut WriterFmtBridge;
+    if bridge_ptr.is_null() {
+        return .Ok(());
+    }
+    if chunk.is_empty() {
+        return .Ok(());
+    }
+    let bridge: &mut WriterFmtBridge = unsafe {
+        &mut bridge_ptr.*
+    };
+    let target_ptr: *mut Writer = bridge.target;
+    if target_ptr.is_null() {
+        return .Ok(());
+    }
+    let writer_ref: &mut Writer = unsafe {
+        &mut target_ptr.*
+    };
+    let chunk_len: usize = chunk.len();
+    let spare: usize = 512_usize -| bridge.filled;
+    if chunk_len <= spare {
+        unsafe {
+            @memcpy(
+                (&raw mut bridge.scratch[0]).add(bridge.filled) as *mut opaque,
+                chunk.as_ptr() as *opaque,
+                chunk_len,
+            );
+        }
+        bridge.filled = bridge.filled +% chunk_len;
+        return .Ok(());
+    }
+    if bridge.filled > 0_usize {
+        let buffered_slice: &[u8] = unsafe {
+            @slice_from_raw_parts(&raw bridge.scratch[0], bridge.filled)
+        };
+        bridge.filled = 0_usize;
+        writer_ref.write_all(buffered_slice) catch |err| {
+            bridge.sticky_err = .Some(err);
+            return .Err(.IoFailure);
+        };
+    }
+    if chunk_len >= 512_usize {
+        writer_ref.write_all(chunk) catch |err| {
+            bridge.sticky_err = .Some(err);
+            return .Err(.IoFailure);
+        };
+        return .Ok(());
+    }
+    unsafe {
+        @memcpy(&raw mut bridge.scratch[0] as *mut opaque, chunk.as_ptr() as *opaque, chunk_len);
+    }
+    bridge.filled = chunk_len;
+    .Ok(())
+}
+
+/| `FmtWriter` callback streaming formatted chunks directly into `BufWriter`.
+@std_cap_boundary(clears: [unsafe_op])
+fn buf_writer_fmt_bridge_cb(ctx: *mut opaque, chunk: &[u8]) -> unit!FmtError {
+    let bridge_ptr = ctx as *mut BufWriterFmtBridge;
+    if bridge_ptr.is_null() {
+        return .Ok(());
+    }
+    if chunk.is_empty() {
+        return .Ok(());
+    }
+    let bridge: &mut BufWriterFmtBridge = unsafe {
+        &mut bridge_ptr.*
+    };
+    let target_ptr: *mut BufWriter = bridge.target;
+    if target_ptr.is_null() {
+        return .Ok(());
+    }
+    let buf_writer: &mut BufWriter = unsafe {
+        &mut target_ptr.*
+    };
+    buf_writer.write_all(chunk) catch |err| {
+        bridge.sticky_err = .Some(err);
+        return .Err(.IoFailure);
+    };
+    .Ok(())
+}
+
+/| `BufReader.as_reader()` `read_out` callback draining buffered bytes first and bypassing buffer on large reads.
+@std_cap_boundary(clears: [unsafe_op])
+fn buf_reader_read_out_cb(ctx: *mut opaque, out: &mut OutBuf) -> usize!IoError {
+    let br_ptr = ctx as *mut BufReader;
+    if br_ptr.is_null() {
+        return .Ok(0_usize);
+    }
+    if out.is_full() {
+        return .Ok(0_usize);
+    }
+    let reader_ref: &mut BufReader = unsafe {
+        &mut br_ptr.*
+    };
+    if reader_ref.available() > 0_usize {
+        let copied: usize = out.append(reader_ref.buffered());
+        reader_ref.consume(copied);
+        return .Ok(copied);
+    }
+    let cap: usize = reader_ref.capacity();
+    if cap == 0_usize or out.remaining() >= cap {
+        return reader_ref.upstream.read_out(&mut out.*);
+    }
+    reader_ref.pos = 0_usize;
+    reader_ref.filled = 0_usize;
+    var refill_out = unsafe {
+        OutBuf.from_raw_parts(reader_ref.buf_ptr, cap)
+    };
+    let n: usize = reader_ref.upstream.read_out(&mut refill_out)?;
+    reader_ref.filled = n;
+    if n == 0_usize {
+        return .Ok(0_usize);
+    }
+    let copied: usize = out.append(reader_ref.buffered());
+    reader_ref.consume(copied);
+    .Ok(copied)
+}
+
+/| `BufReader.as_reader()` `discard` callback consuming buffered window before delegating to `upstream`.
+@std_cap_boundary(clears: [unsafe_op])
+fn buf_reader_discard_cb(ctx: *mut opaque, bytes: u64) -> u64!IoError {
+    let br_ptr = ctx as *mut BufReader;
+    if br_ptr.is_null() {
+        return .Ok(0_u64);
+    }
+    if bytes == 0_u64 {
+        return .Ok(0_u64);
+    }
+    let reader_ref: &mut BufReader = unsafe {
+        &mut br_ptr.*
+    };
+    let avail = reader_ref.available() as u64;
+    if bytes <= avail {
+        reader_ref.consume(bytes as usize);
+        return .Ok(bytes);
+    }
+    reader_ref.consume(reader_ref.available());
+    let rem_skip: u64 = bytes -% avail;
+    let skipped_upstream: u64 = reader_ref.upstream.discard(rem_skip)?;
+    .Ok(avail +% skipped_upstream)
+}
+
+/| `BufWriter.as_writer()` `write` callback forwarding to `BufWriter.write`.
+@std_cap_boundary(clears: [unsafe_op])
+fn buf_writer_write_cb(ctx: *mut opaque, data: &[u8]) -> usize!IoError {
+    let bw_ptr = ctx as *mut BufWriter;
+    if bw_ptr.is_null() {
+        return .Ok(0_usize);
+    }
+    let writer_ref: &mut BufWriter = unsafe {
+        &mut bw_ptr.*
+    };
+    writer_ref.write(data)
+}
+
+/| `BufWriter.as_writer()` `write_vectored` callback forwarding to `BufWriter.write_vectored`.
+@std_cap_boundary(clears: [unsafe_op])
+fn buf_writer_write_vectored_cb(ctx: *mut opaque, bufs: &[IoSlice]) -> usize!IoError {
+    let bw_ptr = ctx as *mut BufWriter;
+    if bw_ptr.is_null() {
+        return .Ok(0_usize);
+    }
+    let writer_ref: &mut BufWriter = unsafe {
+        &mut bw_ptr.*
+    };
+    writer_ref.write_vectored(bufs)
+}
+
+/| `BufWriter.as_writer()` `flush` callback forwarding to `BufWriter.flush`.
+@std_cap_boundary(clears: [unsafe_op])
+fn buf_writer_flush_cb(ctx: *mut opaque) -> unit!IoError {
+    let bw_ptr = ctx as *mut BufWriter;
+    if bw_ptr.is_null() {
+        return .Ok(());
+    }
+    let writer_ref: &mut BufWriter = unsafe {
+        &mut bw_ptr.*
+    };
+    writer_ref.flush()
+}
+
+/| Flushes `buf_ptr[0..filled]` into `downstream` and calls `downstream.flush()` during `BufWriter.close`.
+@std_cap_boundary(clears: [unsafe_op])
+fn flush_raw_buf_writer_parts(
+    downstream: &mut Writer,
+    buf_ptr: *mut u8,
+    filled: u32,
+    /,
+) -> unit!IoError {
+    if filled > 0_u32 and not buf_ptr.is_null() {
+        let slice: &[u8] = unsafe {
+            @slice_from_raw_parts(buf_ptr as *u8, filled as usize)
+        };
+        downstream.write_all(slice)?;
+    }
+    downstream.flush()
+}
+
+/| `LimitReader.as_reader()` `read_out` callback forwarding to `LimitReader.read_out`.
+@std_cap_boundary(clears: [unsafe_op])
+fn limit_reader_read_out_cb(ctx: *mut opaque, out: &mut OutBuf) -> usize!IoError {
+    let lr_ptr = ctx as *mut LimitReader;
+    if lr_ptr.is_null() {
+        return .Ok(0_usize);
+    }
+    let limit_ref: &mut LimitReader = unsafe {
+        &mut lr_ptr.*
+    };
+    limit_ref.read_out(out)
+}
+
+/| `LimitReader.as_reader()` `discard` callback capping skip count at `remaining_bytes`.
+@std_cap_boundary(clears: [unsafe_op])
+fn limit_reader_discard_cb(ctx: *mut opaque, bytes: u64) -> u64!IoError {
+    let lr_ptr = ctx as *mut LimitReader;
+    if lr_ptr.is_null() {
+        return .Ok(0_u64);
+    }
+    if bytes == 0_u64 {
+        return .Ok(0_u64);
+    }
+    let limit_ref: &mut LimitReader = unsafe {
+        &mut lr_ptr.*
+    };
+    let capped: u64 = if bytes < limit_ref.remaining_bytes => bytes else limit_ref.remaining_bytes;
+    if capped == 0_u64 {
+        return .Ok(0_u64);
+    }
+    let skipped: u64 = limit_ref.upstream.discard(capped)?;
+    limit_ref.remaining_bytes = limit_ref.remaining_bytes -| skipped;
+    .Ok(skipped)
+}
+
+/| `ByteReader.as_reader()` `read_out` callback forwarding to `ByteReader.read_out`.
+@std_cap_boundary(clears: [unsafe_op])
+fn byte_reader_read_out_cb(ctx: *mut opaque, out: &mut OutBuf) -> usize!IoError {
+    let br_ptr = ctx as *mut ByteReader;
+    if br_ptr.is_null() {
+        return .Ok(0_usize);
+    }
+    let cursor: &mut ByteReader = unsafe {
+        &mut br_ptr.*
+    };
+    cursor.read_out(out)
+}
+
+/| `ByteReader.as_reader()` `read_vectored` callback copying across multiple `IoSliceMut` buffers in one call.
+@std_cap_boundary(clears: [unsafe_op, may_panic])
+fn byte_reader_read_vectored_cb(ctx: *mut opaque, bufs: &mut [IoSliceMut]) -> usize!IoError {
+    let br_ptr = ctx as *mut ByteReader;
+    if br_ptr.is_null() {
+        return .Ok(0_usize);
+    }
+    let cursor: &mut ByteReader = unsafe {
+        &mut br_ptr.*
+    };
+    var total_copied = 0_usize;
+    var idx = 0_usize;
+    let slice_count: usize = bufs.len();
+    while idx < slice_count {
+        if cursor.is_empty() {
+            break;
+        }
+        let dst_slice: &mut [u8] = bufs[idx].as_mut_slice();
+        let dst_len: usize = dst_slice.len();
+        if dst_len > 0_usize {
+            var out = OutBuf.over_slice(dst_slice);
+            let n: usize = cursor.read_out(&mut out)?;
+            total_copied = total_copied +% n;
+            if n < dst_len {
+                break;
+            }
+        }
+        idx += 1_usize;
+    }
+    .Ok(total_copied)
+}
+
+/| `ByteReader.as_reader()` `discard` callback advancing `pos` in `O(1)`.
+@std_cap_boundary(clears: [unsafe_op])
+fn byte_reader_discard_cb(ctx: *mut opaque, bytes: u64) -> u64!IoError {
+    let br_ptr = ctx as *mut ByteReader;
+    if br_ptr.is_null() {
+        return .Ok(0_u64);
+    }
+    if bytes == 0_u64 {
+        return .Ok(0_u64);
+    }
+    let cursor: &mut ByteReader = unsafe {
+        &mut br_ptr.*
+    };
+    let avail = cursor.remaining() as u64;
+    let skip_u64: u64 = if bytes < avail => bytes else avail;
+    cursor.pos = cursor.pos +% (skip_u64 as usize);
+    .Ok(skip_u64)
+}
+
+/| `ByteReader.as_seeker()` `seek` callback forwarding to `ByteReader.seek`.
+@std_cap_boundary(clears: [unsafe_op])
+fn byte_reader_seek_cb(ctx: *mut opaque, pos: SeekFrom) -> u64!IoError {
+    let br_ptr = ctx as *mut ByteReader;
+    if br_ptr.is_null() {
+        return .Ok(0_u64);
+    }
+    let cursor: &mut ByteReader = unsafe {
+        &mut br_ptr.*
+    };
+    cursor.seek(pos)
+}
+
+/| `SliceWriter.as_writer()` `write` callback forwarding to `SliceWriter.write`.
+@std_cap_boundary(clears: [unsafe_op])
+fn slice_writer_write_cb(ctx: *mut opaque, data: &[u8]) -> usize!IoError {
+    let sw_ptr = ctx as *mut SliceWriter;
+    if sw_ptr.is_null() {
+        return .Ok(0_usize);
+    }
+    let cursor: &mut SliceWriter = unsafe {
+        &mut sw_ptr.*
+    };
+    cursor.write(data)
+}
+
+/| `SliceWriter.as_writer()` `write_vectored` callback copying scatter slices sequentially into `SliceWriter`.
+@std_cap_boundary(clears: [unsafe_op])
+fn slice_writer_write_vectored_cb(ctx: *mut opaque, bufs: &[IoSlice]) -> usize!IoError {
+    let sw_ptr = ctx as *mut SliceWriter;
+    if sw_ptr.is_null() {
+        return .Ok(0_usize);
+    }
+    let cursor: &mut SliceWriter = unsafe {
+        &mut sw_ptr.*
+    };
+    var total_written = 0_usize;
+    for slice in bufs {
+        let bytes: &[u8] = slice.as_slice();
+        if not bytes.is_empty() {
+            let n: usize = cursor.write(bytes)?;
+            total_written = total_written +% n;
+            if n < bytes.len() {
+                break;
+            }
+        }
+    }
+    .Ok(total_written)
+}
+
+/| `SliceWriter.as_seeker()` `seek` callback forwarding to `SliceWriter.seek`.
+@std_cap_boundary(clears: [unsafe_op])
+fn slice_writer_seek_cb(ctx: *mut opaque, pos: SeekFrom) -> u64!IoError {
+    let sw_ptr = ctx as *mut SliceWriter;
+    if sw_ptr.is_null() {
+        return .Ok(0_u64);
+    }
+    let cursor: &mut SliceWriter = unsafe {
+        &mut sw_ptr.*
+    };
+    cursor.seek(pos)
+}
+
+/| Copies all non-empty `bufs` sequentially into `buf_ptr[filled..]` and returns the updated `filled` count.
+@std_cap_boundary(clears: [unsafe_op])
+fn copy_io_slices_to_buf(buf_ptr: *mut u8, var filled: u32, bufs: &[IoSlice], /) -> u32 {
+    for slice in bufs {
+        let bytes: &[u8] = slice.as_slice();
+        if not bytes.is_empty() {
+            unsafe {
+                @memcpy(
+                    buf_ptr.add(filled as usize) as *mut opaque,
+                    bytes.as_ptr() as *opaque,
+                    bytes.len(),
+                );
+            }
+            filled = filled +% (bytes.len() as u32);
+        }
+    }
+    filled
+}
+
+/| Writes one `16`-slice stack batch starting with `tail_part` followed by `bufs[next_idx..]` (`0` heap allocs).
+@std_cap_boundary(clears: [may_panic])
+fn write_vectored_tail_batch(
+    writer: &mut Writer,
+    tail_part: &[u8],
+    bufs: &[IoSlice],
+    next_idx: usize,
+    /,
+) -> usize!IoError {
+    var batch: [IoSlice; 16] = [IoSlice.new(EMPTY_BYTES); 16];
+    batch[0] = IoSlice.new(tail_part);
+    let total_bufs: usize = bufs.len();
+    let avail: usize = total_bufs -| next_idx;
+    let extra_n: usize = if avail < 15_usize => avail else 15_usize;
+    var idx = 0_usize;
+    while idx < extra_n {
+        let src_idx: usize = next_idx +% idx;
+        let dst_idx: usize = idx + 1_usize;
+        if src_idx < total_bufs and dst_idx < 16_usize {
+            batch[dst_idx] = bufs[src_idx];
+        }
+        idx += 1_usize;
+    }
+    let batch_len: usize = extra_n + 1_usize;
+    if batch_len <= 16_usize {
+        return writer.write_vectored(batch[0..batch_len]);
+    }
+    writer.write_vectored(&batch)
+}
+
+// --------------- Host & Reactor Stdio Dispatch ----------------
+/| Returns pointer to the `24 B` zero-initialized `StdioTlsHeader` at `@tls_alloc_state() + 224` (`224..248`).
+@std_cap_boundary(clears: [unsafe_op])
+fn stdio_tls_header() -> *mut StdioTlsHeader {
+    let raw_tls = @tls_alloc_state() as *mut u8;
+    if raw_tls.is_null() {
+        return @default_init[*mut StdioTlsHeader]();
+    }
+    unsafe {
+        raw_tls.add(STDIO_TLS_OFFSET) as *mut StdioTlsHeader
+    }
+}
+
+/| Acquires an atomic `u8` spin lock (`0 -> 1`, Acquire), aborting on same-thread reentrant deadlock.
+@std_cap_boundary(clears: [unsafe_op])
+fn acquire_stdio_lock(lock_ptr: *mut u8, /) {
+    if lock_ptr.is_null() {
+        return;
+    }
+    var spins = 0_u32;
+    while true {
+        let (_, is_acquired) = unsafe {
+            @atomic_cmpxchg(lock_ptr, 0_u8, 1_u8, 2_u8, 0_u8, 0_u8)
+        };
+        if is_acquired {
+            return;
+        }
+        spins = spins +% 1_u32;
+        if spins > 1_000_000_u32 {
+            panic("cx.io: reentrant deadlock on locked standard stream");
+        }
+    }
+}
+
+/| Releases an atomic `u8` lock (`1 -> 0`, Release).
+@std_cap_boundary(clears: [unsafe_op])
+fn release_stdio_lock(lock_ptr: *mut u8, /) {
+    if not lock_ptr.is_null() {
+        unsafe {
+            @atomic_store(lock_ptr, 0_u8, 3_u8);
+        }
+    }
+}
+
+/| Lazily maps the `StdioSlab` (`24 KiB` inside one `64 KiB` OS page) on first `stdio` lock acquisition.
+@std_cap_boundary(clears: [unsafe_op, alloc])
+fn ensure_stdio_slab(hdr: &mut StdioTlsHeader, /) -> *mut StdioSlab {
+    if not hdr.slab_ptr.is_null() {
+        return hdr.slab_ptr;
+    }
+    if System.alloc_pages(@size_of[StdioSlab]()) is .Ok(raw_pages) {
+        let mapped_slab = raw_pages as *mut StdioSlab;
+        hdr.slab_ptr = mapped_slab;
+        return mapped_slab;
+    }
+    @default_init[*mut StdioSlab]()
+}
+
+/| Returns `true` when `stdout` (`fd = 1`) is attached to an interactive terminal (cached after first probe).
+@std_cap_boundary(clears: [ffi, unsafe_op, indirect_opaque])
+fn is_stdout_tty_cached(hdr: &mut StdioTlsHeader, /) -> bool {
+    let reactor_slot = context.reactor;
+    let vt_raw: *opaque = unsafe {
+        (&raw reactor_slot as **opaque).*
+    };
+    if not vt_raw.is_null() {
+        return false;
+    }
+    let cur_state: u8 = unsafe {
+        @atomic_load(&raw hdr.tty_state, 2_u8)
+    };
+    if cur_state != 0_u8 {
+        return (cur_state & 2_u8) != 0_u8;
+    }
+    let is_tty: bool = is_host_stdout_tty();
+    let next_state: u8 = if is_tty => 3_u8 else 1_u8;
+    unsafe {
+        @atomic_store(&raw mut hdr.tty_state, next_state, 3_u8);
+    }
+    is_tty
+}
+
+/| Submits `SIM_OP_STDIO_RW` to `context.reactor.vtable.submit_io` when attached (`flags`: `0` = read, `1` = write).
+@std_cap_boundary(clears: [ffi, unsafe_op, indirect_opaque])
+fn try_reactor_stdio_rw(
+    fd_num: i32,
+    is_write: bool,
+    buf_ptr: *mut u8,
+    buf_len: usize,
+    /,
+) -> (usize!IoError)? {
+    let reactor_slot = context.reactor;
+    let vt_ptr: *u8 = unsafe {
+        (&raw reactor_slot as **u8).*
+    };
+    if vt_ptr.is_null() {
+        return .None;
+    }
+    let slot_ptr: *(ReactorSubmitFn?) = unsafe {
+        vt_ptr.add(3_usize * @size_of[usize]()) as *(ReactorSubmitFn?)
+    };
+    if slot_ptr.is_null() {
+        return .None;
+    }
+    let opt_submit: ReactorSubmitFn? = unsafe {
+        slot_ptr.*
+    };
+    let submit_cb: ReactorSubmitFn = opt_submit orelse return .None;
+    let clamped_u32: u32 = if buf_len > (u32.MAX as usize) => u32.MAX else buf_len as u32;
+    let sub = IoSubmission {
+        kind: SIM_OP_STDIO_RW,
+        flags: if is_write => 1_u8 else 0_u8,
+        worker_id: 0_u16,
+        fd_or_handle: fd_num,
+        offset_or_ns: 0_u64,
+        buf_ptr,
+        buf_len: clamped_u32,
+        slot_index: 0_u32,
+    };
+    let reactor_ctx_slot = context.reactor_ctx;
+    let state_ptr: *mut opaque = unsafe {
+        (&raw reactor_ctx_slot as **mut opaque).*
+    };
+    let sim_rc: i64 = unsafe {
+        submit_cb(state_ptr, &raw sub)
+    };
+    if sim_rc == SIM_UNHANDLED_SENTINEL {
+        return .None;
+    }
+    if sim_rc >= 0_i64 {
+        let transferred: usize = if (sim_rc as u64) > (buf_len as u64) => buf_len
+            else sim_rc as usize;
+        return .Some(.Ok(transferred));
+    }
+    let fault_code = (0_i64 -% sim_rc) as i32;
+    let io_op: IoOp = if is_write => .Write else .Read;
+    .Some(.Err(IoError.from_raw_os(fault_code, domain: .SimFault, op: io_op)))
+}
+
+/| Raw `stdin` (`fd = 0`) `ReaderVTable.read_out` callback routing `context.reactor` -> host OS.
+@std_cap_boundary(clears: [ffi, unsafe_op, indirect_opaque])
+fn raw_stdin_read_out_cb(ctx: *mut opaque, out: &mut OutBuf) -> usize!IoError {
+    _ = ctx;
+    let (dst_ptr, rem_len) = out.unfilled_raw();
+    if rem_len == 0_usize {
+        return .Ok(0_usize);
+    }
+    if try_reactor_stdio_rw(0, false, dst_ptr, rem_len) is .Some(sim_res) {
+        let sim_n: usize = sim_res?;
+        unsafe {
+            out.advance_init(sim_n);
+        }
+        return .Ok(sim_n);
+    }
+    let host_n: usize = host_stdin_read(dst_ptr, rem_len)?;
+    unsafe {
+        out.advance_init(host_n);
+    }
+    .Ok(host_n)
+}
+
+/| Raw `stdout`/`stderr` (`ctx` encodes `1` or `2`) `WriterVTable.write` callback routing `context.reactor` -> host OS.
+@std_cap_boundary(clears: [ffi, unsafe_op, indirect_opaque])
+fn raw_stdio_write_cb(ctx: *mut opaque, data: &[u8]) -> usize!IoError {
+    if data.is_empty() {
+        return .Ok(0_usize);
+    }
+    let fd_num = (ctx as usize) as i32;
+    if try_reactor_stdio_rw(fd_num, true, data.as_ptr() as *mut u8, data.len()) is .Some(sim_res) {
+        return sim_res;
+    }
+    host_stdio_write(fd_num, data)
+}
+
+/| Linux host `isatty(STDOUT_FILENO)` predicate.
+@cfg(target.os == "linux") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn is_host_stdout_tty() -> bool {
+    unsafe {
+        sys.linux.linux_isatty(sys.linux.STDOUT_FILENO) != 0
+    }
+}
+
+/| Linux host `read(STDIN_FILENO, dst_ptr, cap)` wrapper.
+@cfg(target.os == "linux") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn host_stdin_read(dst_ptr: *mut u8, cap: usize, /) -> usize!IoError {
+    let rc: isize = unsafe {
+        sys.linux.linux_posix_read(sys.linux.STDIN_FILENO, dst_ptr, cap)
+    };
+    if rc < 0_isize {
+        let errno_ptr: *mut i32 = unsafe {
+            sys.linux.linux_errno_location()
+        };
+        let code: i32 = if errno_ptr.is_null() {
+            sys.linux.EIO
+        } else {
+            unsafe {
+                errno_ptr.*
+            }
+        };
+        return .Err(IoError.from_raw_os(code, domain: .PosixErrno, op: .Read));
+    }
+    .Ok(rc as usize)
+}
+
+/| Linux host `write(fd_num, data)` wrapper.
+@cfg(target.os == "linux") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn host_stdio_write(fd_num: i32, data: &[u8], /) -> usize!IoError {
+    let rc: isize = unsafe {
+        sys.linux.linux_posix_write(fd_num, data.as_ptr(), data.len())
+    };
+    if rc < 0_isize {
+        let errno_ptr: *mut i32 = unsafe {
+            sys.linux.linux_errno_location()
+        };
+        let code: i32 = if errno_ptr.is_null() {
+            sys.linux.EIO
+        } else {
+            unsafe {
+                errno_ptr.*
+            }
+        };
+        return .Err(IoError.from_raw_os(code, domain: .PosixErrno, op: .Write));
+    }
+    .Ok(rc as usize)
+}
+
+/| macOS Darwin host `isatty(STDOUT_FILENO)` predicate.
+@cfg(target.os == "macos") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn is_host_stdout_tty() -> bool {
+    unsafe {
+        sys.macos.darwin_isatty(sys.macos.STDOUT_FILENO) != 0
+    }
+}
+
+/| macOS Darwin host `read(STDIN_FILENO, dst_ptr, cap)` wrapper.
+@cfg(target.os == "macos") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn host_stdin_read(dst_ptr: *mut u8, cap: usize, /) -> usize!IoError {
+    let rc: isize = unsafe {
+        sys.macos.darwin_read(sys.macos.STDIN_FILENO, dst_ptr, cap)
+    };
+    if rc < 0_isize {
+        let errno_ptr: *mut i32 = unsafe {
+            sys.macos.darwin_errno_location()
+        };
+        let code: i32 = if errno_ptr.is_null() {
+            sys.macos.EIO
+        } else {
+            unsafe {
+                errno_ptr.*
+            }
+        };
+        return .Err(IoError.from_raw_os(code, domain: .PosixErrno, op: .Read));
+    }
+    .Ok(rc as usize)
+}
+
+/| macOS Darwin host `write(fd_num, data)` wrapper.
+@cfg(target.os == "macos") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn host_stdio_write(fd_num: i32, data: &[u8], /) -> usize!IoError {
+    let rc: isize = unsafe {
+        sys.macos.darwin_write(fd_num, data.as_ptr(), data.len())
+    };
+    if rc < 0_isize {
+        let errno_ptr: *mut i32 = unsafe {
+            sys.macos.darwin_errno_location()
+        };
+        let code: i32 = if errno_ptr.is_null() {
+            sys.macos.EIO
+        } else {
+            unsafe {
+                errno_ptr.*
+            }
+        };
+        return .Err(IoError.from_raw_os(code, domain: .PosixErrno, op: .Write));
+    }
+    .Ok(rc as usize)
+}
+
+/| Windows host `GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE))` TTY predicate.
+@cfg(target.os == "windows") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn is_host_stdout_tty() -> bool {
+    let handle: *mut opaque = unsafe {
+        sys.windows.win32_get_std_handle(sys.windows.STD_OUTPUT_HANDLE)
+    };
+    if handle.is_null() or (handle as isize) == sys.windows.INVALID_HANDLE_BITS {
+        return false;
+    }
+    var mode_out = 0_u32;
+    unsafe {
+        sys.windows.win32_get_console_mode(handle, &raw mut mode_out) != 0
+    }
+}
+
+/| Windows host `ReadFile(STD_INPUT_HANDLE)` wrapper normalizing pipe closure (`ERROR_BROKEN_PIPE`) to EOF (`0`).
+@cfg(target.os == "windows") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn host_stdin_read(dst_ptr: *mut u8, cap: usize, /) -> usize!IoError {
+    let handle: *mut opaque = unsafe {
+        sys.windows.win32_get_std_handle(sys.windows.STD_INPUT_HANDLE)
+    };
+    if handle.is_null() or (handle as isize) == sys.windows.INVALID_HANDLE_BITS {
+        return .Ok(0_usize);
+    }
+    let chunk_u32: u32 = if cap > 0x7FFF_FFFF_usize => 0x7FFF_FFFF_u32 else cap as u32;
+    var read_bytes = 0_u32;
+    let ok: i32 = unsafe {
+        sys.windows.win32_read_file(
+            handle,
+            dst_ptr,
+            chunk_u32,
+            &raw mut read_bytes,
+            @default_init[*mut opaque](),
+        )
+    };
+    if ok == 0 {
+        let win_err: u32 = unsafe {
+            sys.windows.win32_get_last_error()
+        };
+        if win_err == sys.windows.ERROR_BROKEN_PIPE or win_err == sys.windows.ERROR_HANDLE_EOF {
+            return .Ok(0_usize);
+        }
+        return .Err(IoError.from_raw_os(@bit_cast[i32](win_err), domain: .Win32Error, op: .Read));
+    }
+    .Ok(read_bytes as usize)
+}
+
+/| Windows host `WriteFile(STD_OUTPUT_HANDLE / STD_ERROR_HANDLE)` wrapper.
+@cfg(target.os == "windows") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn host_stdio_write(fd_num: i32, data: &[u8], /) -> usize!IoError {
+    let std_id: u32 = if fd_num == 2 => sys.windows.STD_ERROR_HANDLE
+        else sys.windows.STD_OUTPUT_HANDLE;
+    let handle: *mut opaque = unsafe {
+        sys.windows.win32_get_std_handle(std_id)
+    };
+    if handle.is_null() or (handle as isize) == sys.windows.INVALID_HANDLE_BITS {
+        return .Ok(data.len());
+    }
+    let chunk_u32: u32 = if data.len() > 0x7FFF_FFFF_usize => 0x7FFF_FFFF_u32 else data.len() as u32;
+    var wrote_bytes = 0_u32;
+    let ok: i32 = unsafe {
+        sys.windows.win32_write_file(
+            handle,
+            data.as_ptr(),
+            chunk_u32,
+            &raw mut wrote_bytes,
+            @default_init[*mut opaque](),
+        )
+    };
+    if ok == 0 {
+        let win_err: u32 = unsafe {
+            sys.windows.win32_get_last_error()
+        };
+        return .Err(IoError.from_raw_os(@bit_cast[i32](win_err), domain: .Win32Error, op: .Write));
+    }
+    .Ok(wrote_bytes as usize)
+}
+
+/| WASI Preview 1 `fd_fdstat_get(1)` TTY predicate (`WASI_FILETYPE_CHARACTER_DEVICE`).
+@cfg(target.os == "wasi") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn is_host_stdout_tty() -> bool {
+    var stat_out = @default_init[sys.wasi.WasiFdstat]();
+    let rc: u16 = unsafe {
+        sys.wasi.wasi_fd_fdstat_get(sys.wasi.WASI_STDOUT_FD, &raw mut stat_out)
+    };
+    rc == 0_u16 and stat_out.fs_filetype == sys.wasi.WASI_FILETYPE_CHARACTER_DEVICE
+}
+
+/| WASI Preview 1 `fd_read(0)` wrapper.
+@cfg(target.os == "wasi") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn host_stdin_read(dst_ptr: *mut u8, cap: usize, /) -> usize!IoError {
+    let iov = sys.wasi.WasiIovec {
+        buf_ptr: dst_ptr,
+        buf_len: cap,
+    };
+    var nread = 0_usize;
+    let rc: u16 = unsafe {
+        sys.wasi.wasi_fd_read(sys.wasi.WASI_STDIN_FD, &raw iov, 1_usize, &raw mut nread)
+    };
+    if rc != 0_u16 {
+        return .Err(IoError.from_raw_os(rc as i32, domain: .WasiErrno, op: .Read));
+    }
+    .Ok(nread)
+}
+
+/| WASI Preview 1 `fd_write(fd_num)` wrapper.
+@cfg(target.os == "wasi") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn host_stdio_write(fd_num: i32, data: &[u8], /) -> usize!IoError {
+    let ciov = sys.wasi.WasiCiovec {
+        buf_ptr: data.as_ptr(),
+        buf_len: data.len(),
+    };
+    var nwritten = 0_usize;
+    let rc: u16 = unsafe {
+        sys.wasi.wasi_fd_write(fd_num, &raw ciov, 1_usize, &raw mut nwritten)
+    };
+    if rc != 0_u16 {
+        return .Err(IoError.from_raw_os(rc as i32, domain: .WasiErrno, op: .Write));
+    }
+    .Ok(nwritten)
+}
+
+/| Freestanding target TTY stub (`wasm32-unknown-freestanding`) keeping zero host imports.
+@cfg(not (
+    target.os == "linux" or target.os == "macos" or target.os == "windows" or target.os == "wasi"
+))
+fn is_host_stdout_tty() -> bool = false;
+
+/| Freestanding target `stdin` stub returning immediate EOF (`0`).
+@cfg(not (
+    target.os == "linux" or target.os == "macos" or target.os == "windows" or target.os == "wasi"
+))
+fn host_stdin_read(dst_ptr: *mut u8, cap: usize, /) -> usize!IoError {
+    _ = dst_ptr;
+    _ = cap;
+    .Ok(0_usize)
+}
+
+/| Freestanding target `stdout`/`stderr` stub discarding bytes without host imports.
+@cfg(not (
+    target.os == "linux" or target.os == "macos" or target.os == "windows" or target.os == "wasi"
+))
+fn host_stdio_write(fd_num: i32, data: &[u8], /) -> usize!IoError {
+    _ = fd_num;
+    .Ok(data.len())
+}
+
+/| Acquires locked buffered `stdout` (`is_stderr == false`) or `stderr` (`is_stderr == true`).
+@std_cap_boundary(clears: [ffi, unsafe_op, alloc, may_panic, indirect_opaque])
+fn lock_stdio_output_stream(is_stderr: bool, /) -> StdoutLock {
+    let fd_usize: usize = if is_stderr => 2_usize else 1_usize;
+    let raw_writer = Writer {
+        ctx: fd_usize as *mut opaque,
+        vtable: WRITER_SENTINEL_STDIO as *WriterVTable,
+    };
+    let hdr_ptr: *mut StdioTlsHeader = stdio_tls_header();
+    if hdr_ptr.is_null() {
+        return StdoutLock {
+            inner_writer: BufWriter {
+                downstream: raw_writer,
+                buf_ptr: @default_init[*mut u8](),
+                filled: 0_u32,
+                cap_and_flags: 0_u32,
+            },
+            lock_token: if is_stderr => STDIO_TOKEN_STDERR_BIT else 0_usize,
+        };
+    }
+    let hdr_addr = hdr_ptr as usize;
+    let token_bits: usize = hdr_addr | (if is_stderr => STDIO_TOKEN_STDERR_BIT else 0_usize);
+    let hdr: &mut StdioTlsHeader = unsafe {
+        &mut hdr_ptr.*
+    };
+    let lock_ptr: *mut u8 = if is_stderr => &raw mut hdr.stderr_lock else &raw mut hdr.stdout_lock;
+    acquire_stdio_lock(lock_ptr);
+
+    let line_flag: u32 = if not is_stderr and is_stdout_tty_cached(hdr) => BUF_WRITER_LINE_BUF_FLAG
+        else 0_u32;
+    let slab_ptr: *mut StdioSlab = ensure_stdio_slab(hdr);
+    if not slab_ptr.is_null() {
+        let slab: &mut StdioSlab = unsafe {
+            &mut slab_ptr.*
+        };
+        let (buf_base, prev_filled) = if is_stderr {
+            (&raw mut slab.stderr_buf[0], slab.stderr_filled)
+        } else {
+            (&raw mut slab.stdout_buf[0], slab.stdout_filled)
+        };
+        return StdoutLock {
+            inner_writer: BufWriter {
+                downstream: raw_writer,
+                buf_ptr: buf_base,
+                filled: prev_filled,
+                cap_and_flags: (DEFAULT_IO_BUF_SIZE as u32) | line_flag,
+            },
+            lock_token: token_bits,
+        };
+    }
+    let em_off: usize = if is_stderr => 5_usize else 2_usize;
+    StdoutLock {
+        inner_writer: BufWriter {
+            downstream: raw_writer,
+            buf_ptr: unsafe {
+                (&raw mut hdr.emergency_buf[0]).add(em_off)
+            },
+            filled: 0_u32,
+            cap_and_flags: 3_u32 | line_flag,
+        },
+        lock_token: token_bits,
+    }
+}
+
+/| Persists `remaining_filled` into `StdioSlab` (when active) and unlocks `stdout` or `stderr`.
+@std_cap_boundary(clears: [unsafe_op])
+fn finish_stdout_lock_token(lock_token: usize, remaining_filled: u32, /) {
+    let is_stderr: bool = (lock_token & STDIO_TOKEN_STDERR_BIT) != 0_usize;
+    let hdr_addr: usize = lock_token & ~STDIO_TOKEN_STDERR_BIT;
+    let hdr_ptr = hdr_addr as *mut StdioTlsHeader;
+    if hdr_ptr.is_null() {
+        return;
+    }
+    let hdr: &mut StdioTlsHeader = unsafe {
+        &mut hdr_ptr.*
+    };
+    let slab_ptr: *mut StdioSlab = hdr.slab_ptr;
+    if not slab_ptr.is_null() {
+        let slab: &mut StdioSlab = unsafe {
+            &mut slab_ptr.*
+        };
+        if is_stderr {
+            slab.stderr_filled = remaining_filled;
+        } else {
+            slab.stdout_filled = remaining_filled;
+        }
+    }
+    let lock_ptr: *mut u8 = if is_stderr => &raw mut hdr.stderr_lock else &raw mut hdr.stdout_lock;
+    release_stdio_lock(lock_ptr);
+}
+
+// ------------------------------------- PUBLIC API --------------------------------------
+// ------------------ IoError & Error Domains -------------------
+impl ErrDomain {
+    /| Encodes `self` into its compact 6-bit integer discriminant (`0..=5`).
+    @expect(unused-pkg-visibility, reason: "used by cx.fs, cx.env, and cx.process in Phase 11.2b")
+    pub(pkg) fn to_code(self) -> u8 {
+        match self {
+            .Generic => 0_u8,
+            .PosixErrno => 1_u8,
+            .Win32Error => 2_u8,
+            .NtStatus => 3_u8,
+            .WasiErrno => 4_u8,
+            .SimFault => 5_u8,
+        }
+    }
+
+    /| Decodes a 6-bit integer discriminant back into `ErrDomain` (defaulting unknown codes to `.Generic`).
+    @expect(unused-pkg-visibility, reason: "used by cx.fs, cx.env, and cx.process in Phase 11.2b")
+    pub(pkg) fn from_code(code: u8, /) -> ErrDomain {
+        match code {
+            1_u8 => .PosixErrno,
+            2_u8 => .Win32Error,
+            3_u8 => .NtStatus,
+            4_u8 => .WasiErrno,
+            5_u8 => .SimFault,
+            _ => .Generic,
+        }
+    }
+}
+
+impl IoErrorKind {
+    /| Encodes `self` into its 8-bit `IoErrorBits.kind` wire code (`0..=26`, `255` for `.Other`).
+    @expect(unused-pkg-visibility, reason: "used by cx.fs, cx.env, and cx.process in Phase 11.2b")
+    pub(pkg) fn to_code(self) -> u8 {
+        match self {
+            .NotFound => 0_u8,
+            .PermissionDenied => 1_u8,
+            .AlreadyExists => 2_u8,
+            .WouldBlock => 3_u8,
+            .Interrupted => 4_u8,
+            .TimedOut => 5_u8,
+            .UnexpectedEof => 6_u8,
+            .WriteZero => 7_u8,
+            .BrokenPipe => 8_u8,
+            .InvalidInput => 9_u8,
+            .InvalidData => 10_u8,
+            .DirectoryNotEmpty => 11_u8,
+            .IsADirectory => 12_u8,
+            .NotADirectory => 13_u8,
+            .CrossesDevices => 14_u8,
+            .FilesystemLoop => 15_u8,
+            .FileLockConflict => 16_u8,
+            .ResourceBusy => 17_u8,
+            .StorageFull => 18_u8,
+            .StreamTooLong => 19_u8,
+            .InvalidScriptExtension => 20_u8,
+            .Unsupported => 21_u8,
+            .Canceled => 22_u8,
+            .OutOfMemory => 23_u8,
+            .InvalidFilename => 24_u8,
+            .ReadOnlyFilesystem => 25_u8,
+            .ArgumentListTooLong => 26_u8,
+            .Other => 255_u8,
+        }
+    }
+
+    /| Decodes an 8-bit `IoErrorBits.kind` wire code into `IoErrorKind` (mapping unknown codes to `.Other`).
+    @expect(unused-pkg-visibility, reason: "used by cx.fs, cx.env, and cx.process in Phase 11.2b")
+    pub(pkg) fn from_code(code: u8, /) -> IoErrorKind {
+        match code {
+            0_u8 => .NotFound,
+            1_u8 => .PermissionDenied,
+            2_u8 => .AlreadyExists,
+            3_u8 => .WouldBlock,
+            4_u8 => .Interrupted,
+            5_u8 => .TimedOut,
+            6_u8 => .UnexpectedEof,
+            7_u8 => .WriteZero,
+            8_u8 => .BrokenPipe,
+            9_u8 => .InvalidInput,
+            10_u8 => .InvalidData,
+            11_u8 => .DirectoryNotEmpty,
+            12_u8 => .IsADirectory,
+            13_u8 => .NotADirectory,
+            14_u8 => .CrossesDevices,
+            15_u8 => .FilesystemLoop,
+            16_u8 => .FileLockConflict,
+            17_u8 => .ResourceBusy,
+            18_u8 => .StorageFull,
+            19_u8 => .StreamTooLong,
+            20_u8 => .InvalidScriptExtension,
+            21_u8 => .Unsupported,
+            22_u8 => .Canceled,
+            23_u8 => .OutOfMemory,
+            24_u8 => .InvalidFilename,
+            25_u8 => .ReadOnlyFilesystem,
+            26_u8 => .ArgumentListTooLong,
+            _ => .Other,
+        }
+    }
+}
+
+impl IoOp {
+    /| Encodes `self` into its 8-bit `IoErrorBits.op` wire code (`0..=18`).
+    @expect(unused-pkg-visibility, reason: "used by cx.fs, cx.env, and cx.process in Phase 11.2b")
+    pub(pkg) fn to_code(self) -> u8 {
+        match self {
+            .None => 0_u8,
+            .Read => 1_u8,
+            .Write => 2_u8,
+            .Flush => 3_u8,
+            .Seek => 4_u8,
+            .Open => 5_u8,
+            .Stat => 6_u8,
+            .Resolve => 7_u8,
+            .Rename => 8_u8,
+            .Unlink => 9_u8,
+            .Mkdir => 10_u8,
+            .Readdir => 11_u8,
+            .Clone => 12_u8,
+            .Mmap => 13_u8,
+            .Lock => 14_u8,
+            .Watch => 15_u8,
+            .Spawn => 16_u8,
+            .Wait => 17_u8,
+            .Env => 18_u8,
+        }
+    }
+
+    /| Decodes an 8-bit `IoErrorBits.op` wire code into `IoOp` (mapping unknown codes to `.None`).
+    @expect(unused-pkg-visibility, reason: "used by cx.fs, cx.env, and cx.process in Phase 11.2b")
+    pub(pkg) fn from_code(code: u8, /) -> IoOp {
+        match code {
+            1_u8 => .Read,
+            2_u8 => .Write,
+            3_u8 => .Flush,
+            4_u8 => .Seek,
+            5_u8 => .Open,
+            6_u8 => .Stat,
+            7_u8 => .Resolve,
+            8_u8 => .Rename,
+            9_u8 => .Unlink,
+            10_u8 => .Mkdir,
+            11_u8 => .Readdir,
+            12_u8 => .Clone,
+            13_u8 => .Mmap,
+            14_u8 => .Lock,
+            15_u8 => .Watch,
+            16_u8 => .Spawn,
+            17_u8 => .Wait,
+            18_u8 => .Env,
+            _ => .None,
+        }
+    }
+}
+
+impl TrivialDrop for IoError {}
+
+impl IoError {
+    /| Constructs a zero-allocation `IoError` from `kind` and optional `op` (`ErrDomain.Generic`).
+    @inline @no_alloc @no_panic
+    pub fn from_kind(kind: IoErrorKind, /, *, op: IoOp = .None) -> IoError {
+        pack_io_error_bits(
+            IoErrorBits {
+                tag: IO_ERR_INLINE_TAG,
+                domain: ErrDomain.Generic.to_code(),
+                kind: kind.to_code(),
+                op: op.to_code(),
+                diag_slot: 0_u8,
+                raw_code: 0_u32,
+            },
+        )
+    }
+
+    /| Constructs a zero-allocation `IoError` classifying `raw_code` according to `domain`.
+    @inline @no_alloc @no_panic
+    pub fn from_raw_os(raw_code: i32, /, *, domain: ErrDomain, op: IoOp = .None) -> IoError {
+        IoError.from_raw_os_with_slot(raw_code, domain: domain, op: op, diag_slot: 0_u8)
+    }
+
+    /| Constructs an `IoError` carrying both `raw_code` and a thread-local `Context.diagnostics` `diag_slot`.
+    @expect(unused-pkg-visibility, reason: "used by cx.fs diagnostic path ring in Phase 11.2b")
+    pub(pkg) fn from_raw_os_with_slot(
+        raw_code: i32,
+        /,
+        *,
+        domain: ErrDomain,
+        op: IoOp = .None,
+        diag_slot: u8 = 0_u8,
+    ) -> IoError {
+        let mapped_kind: IoErrorKind = match domain {
+            .PosixErrno => IoError.map_posix_errno(raw_code),
+            .Win32Error => IoError.map_win32_error(@bit_cast[u32](raw_code)),
+            .NtStatus => IoError.map_ntstatus(raw_code),
+            .WasiErrno => IoError.map_wasi_errno((@bit_cast[u32](raw_code) & 0xFFFF_u32) as u16),
+            .SimFault => map_sim_fault_code(raw_code),
+            .Generic => .Other,
+        };
+        pack_io_error_bits(
+            IoErrorBits {
+                tag: IO_ERR_INLINE_TAG,
+                domain: domain.to_code(),
+                kind: mapped_kind.to_code(),
+                op: op.to_code(),
+                diag_slot,
+                raw_code: @bit_cast[u32](raw_code),
+            },
+        )
+    }
+
+    /| Classifies a Darwin (`macos`) POSIX `errno` into `IoErrorKind` (`EAGAIN = 35`, `EDEADLK = 11`, `ELOOP = 62`).
+    @cfg(target.os == "macos") @no_alloc @no_panic
+    pub fn map_posix_errno(errno_code: i32, /) -> IoErrorKind {
+        match errno_code {
+            1 => .PermissionDenied,
+            2 => .NotFound,
+            4 => .Interrupted,
+            7 => .ArgumentListTooLong,
+            9 => .InvalidInput,
+            11 => .FileLockConflict,
+            12 => .OutOfMemory,
+            13 => .PermissionDenied,
+            16 => .ResourceBusy,
+            17 => .AlreadyExists,
+            18 => .CrossesDevices,
+            19 => .Unsupported,
+            20 => .NotADirectory,
+            21 => .IsADirectory,
+            22 => .InvalidInput,
+            27 => .StorageFull,
+            28 => .StorageFull,
+            29 => .InvalidInput,
+            30 => .ReadOnlyFilesystem,
+            32 => .BrokenPipe,
+            35 => .WouldBlock,
+            45 => .Unsupported,
+            60 => .TimedOut,
+            62 => .FilesystemLoop,
+            63 => .InvalidFilename,
+            66 => .DirectoryNotEmpty,
+            78 => .Unsupported,
+            89 => .Canceled,
+            92 => .InvalidData,
+            102 => .Unsupported,
+            _ => .Other,
+        }
+    }
+
+    /| Classifies a Linux / standard POSIX `errno` into `IoErrorKind` (`EAGAIN = 11`, `EDEADLK = 35`, `ELOOP = 40`).
+    @cfg(not (target.os == "macos")) @no_alloc @no_panic
+    pub fn map_posix_errno(errno_code: i32, /) -> IoErrorKind = map_sim_fault_code(errno_code);
+
+    /| Classifies a Win32 `GetLastError` `DWORD` into `IoErrorKind`.
+    @no_alloc @no_panic
+    pub fn map_win32_error(win32_code: u32, /) -> IoErrorKind {
+        match win32_code {
+            1_u32 | 50_u32 | 120_u32 => .Unsupported,
+            2_u32 | 3_u32 | 15_u32 | 53_u32 | 67_u32 => .NotFound,
+            5_u32 | 1_314_u32 => .PermissionDenied,
+            6_u32 | 87_u32 | 131_u32 | 4_390_u32 => .InvalidInput,
+            8_u32 | 14_u32 | 1_450_u32 => .OutOfMemory,
+            13_u32 | 1_113_u32 => .InvalidData,
+            17_u32 => .CrossesDevices,
+            19_u32 => .ReadOnlyFilesystem,
+            32_u32 => .ResourceBusy,
+            33_u32 | 158_u32 => .FileLockConflict,
+            38_u32 => .UnexpectedEof,
+            39_u32 | 112_u32 => .StorageFull,
+            80_u32 | 183_u32 => .AlreadyExists,
+            109_u32 | 232_u32 | 233_u32 => .BrokenPipe,
+            121_u32 | 258_u32 | 1_460_u32 => .TimedOut,
+            123_u32 | 161_u32 | 206_u32 => .InvalidFilename,
+            145_u32 => .DirectoryNotEmpty,
+            267_u32 => .NotADirectory,
+            995_u32 | 1_223_u32 => .Canceled,
+            997_u32 | 10_035_u32 => .WouldBlock,
+            1_921_u32 => .FilesystemLoop,
+            10_004_u32 => .Interrupted,
+            _ => .Other,
+        }
+    }
+
+    /| Classifies a Windows Native `NTSTATUS` code into `IoErrorKind`.
+    @no_alloc @no_panic
+    pub fn map_ntstatus(nt_status: i32, /) -> IoErrorKind {
+        match @bit_cast[u32](nt_status) {
+            0xC000_0002_u32 | 0xC000_00BB_u32 => .Unsupported,
+            0xC000_0008_u32 | 0xC000_000D_u32 | 0xC000_0275_u32 => .InvalidInput,
+            0xC000_000F_u32 | 0xC000_0034_u32 | 0xC000_003A_u32 => .NotFound,
+            0xC000_0011_u32 => .UnexpectedEof,
+            0xC000_0017_u32 | 0xC000_009A_u32 => .OutOfMemory,
+            0xC000_0022_u32 | 0xC000_0061_u32 => .PermissionDenied,
+            0xC000_0033_u32 | 0xC000_0039_u32 | 0xC000_0106_u32 => .InvalidFilename,
+            0xC000_0035_u32 => .AlreadyExists,
+            0xC000_0043_u32 | 0xC000_0056_u32 => .ResourceBusy,
+            0xC000_0054_u32 | 0xC000_0055_u32 => .FileLockConflict,
+            0xC000_007F_u32 => .StorageFull,
+            0xC000_00A2_u32 => .ReadOnlyFilesystem,
+            0xC000_00B0_u32 | 0xC000_014B_u32 => .BrokenPipe,
+            0xC000_00B5_u32 => .TimedOut,
+            0xC000_00BA_u32 => .IsADirectory,
+            0xC000_00D4_u32 => .CrossesDevices,
+            0xC000_0101_u32 => .DirectoryNotEmpty,
+            0xC000_0103_u32 => .NotADirectory,
+            0xC000_0120_u32 => .Canceled,
+            0xC000_0279_u32 | 0xC000_04B3_u32 => .FilesystemLoop,
+            _ => .Other,
+        }
+    }
+
+    /| Classifies a WASI Preview 1 `__wasi_errno_t` code (`u16`) into `IoErrorKind`.
+    @no_alloc @no_panic
+    pub fn map_wasi_errno(wasi_code: u16, /) -> IoErrorKind {
+        match wasi_code {
+            1_u16 => .ArgumentListTooLong,
+            2_u16 | 63_u16 | 76_u16 => .PermissionDenied,
+            6_u16 => .WouldBlock,
+            8_u16 | 28_u16 | 70_u16 => .InvalidInput,
+            10_u16 => .ResourceBusy,
+            11_u16 => .Canceled,
+            16_u16 => .FileLockConflict,
+            20_u16 => .AlreadyExists,
+            22_u16 | 51_u16 => .StorageFull,
+            25_u16 => .InvalidData,
+            27_u16 => .Interrupted,
+            31_u16 => .IsADirectory,
+            32_u16 => .FilesystemLoop,
+            37_u16 => .InvalidFilename,
+            44_u16 => .NotFound,
+            48_u16 => .OutOfMemory,
+            52_u16 | 58_u16 => .Unsupported,
+            54_u16 => .NotADirectory,
+            55_u16 => .DirectoryNotEmpty,
+            64_u16 => .BrokenPipe,
+            69_u16 => .ReadOnlyFilesystem,
+            73_u16 => .TimedOut,
+            75_u16 => .CrossesDevices,
+            _ => .Other,
+        }
+    }
+
+    /| Extracts the normalized `IoErrorKind` of `self`.
+    @inline @no_alloc @no_panic
+    pub fn kind(self) -> IoErrorKind {
+        let bits = @bit_cast[IoErrorBits](self.packed_repr as u64);
+        IoErrorKind.from_code(bits.kind)
+    }
+
+    /| Extracts the `IoOp` operation context recorded on `self`.
+    @inline @no_alloc @no_panic
+    pub fn op(self) -> IoOp {
+        let bits = @bit_cast[IoErrorBits](self.packed_repr as u64);
+        IoOp.from_code(bits.op)
+    }
+
+    /| Extracts the `ErrDomain` origin recorded on `self`.
+    @inline @no_alloc @no_panic
+    pub fn domain(self) -> ErrDomain {
+        let bits = @bit_cast[IoErrorBits](self.packed_repr as u64);
+        ErrDomain.from_code(bits.domain)
+    }
+
+    /| Extracts the optional thread-local `Context.diagnostics` path-ring index (`0` when unset).
+    @expect(unused-pkg-visibility, reason: "reserved for cx.fs diagnostic path ring in Phase 11.2a")
+    pub(pkg) fn diag_slot(self) -> u8 {
+        let bits = @bit_cast[IoErrorBits](self.packed_repr as u64);
+        bits.diag_slot
+    }
+
+    /| Returns the raw 32-bit OS or `--sim` error code when `domain != .Generic`, or `.None` otherwise.
+    @inline @no_alloc @no_panic
+    pub fn os_error(self) -> i32? {
+        let bits = @bit_cast[IoErrorBits](self.packed_repr as u64);
+        if ErrDomain.from_code(bits.domain) == .Generic {
+            return .None;
+        }
+        .Some(@bit_cast[i32](bits.raw_code))
+    }
+
+    /| Returns `true` when `self.kind() == .Interrupted` (`EINTR` retry predicate).
+    @no_alloc @no_panic
+    pub fn is_interrupted(self) -> bool = self.kind() == .Interrupted;
+
+    /| Returns a static `.rodata` human-readable description for `self.kind()` (`0` heap allocations).
+    @no_alloc @no_panic
+    pub fn message(self) -> str {
+        match self.kind() {
+            .NotFound => "entity not found",
+            .PermissionDenied => "permission denied",
+            .AlreadyExists => "entity already exists",
+            .WouldBlock => "operation would block",
+            .Interrupted => "operation interrupted",
+            .TimedOut => "operation timed out",
+            .UnexpectedEof => "unexpected end of file",
+            .WriteZero => "write returned zero bytes",
+            .BrokenPipe => "broken pipe",
+            .InvalidInput => "invalid input parameter",
+            .InvalidData => "invalid stream data",
+            .DirectoryNotEmpty => "directory not empty",
+            .IsADirectory => "target is a directory",
+            .NotADirectory => "target is not a directory",
+            .CrossesDevices => "cross-device link or rename",
+            .FilesystemLoop => "filesystem symlink loop or confinement escape",
+            .FileLockConflict => "advisory file lock conflict",
+            .ResourceBusy => "resource busy",
+            .StorageFull => "no space left on storage device",
+            .StreamTooLong => "stream exceeded maximum byte limit",
+            .InvalidScriptExtension => "implicit batch script execution rejected",
+            .Unsupported => "operation not supported",
+            .Canceled => "operation canceled",
+            .OutOfMemory => "out of memory",
+            .InvalidFilename => "invalid filename or path",
+            .ReadOnlyFilesystem => "read-only filesystem",
+            .ArgumentListTooLong => "argument or environment list too long",
+            .Other => "unclassified I/O error",
+        }
+    }
+}
+
+impl Display for IoError {
+    /| Formats `self.message()` (plus `(os error <code>)` when present) into `out`.
+    @no_alloc
+    pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        _ = spec;
+        let msg: str = self.*.message();
+        if self.*.os_error() is .Some(code) {
+            return @fmt_write(out, f"{msg} (os error {code})");
+        }
+        out.write_str(msg)
+    }
+}
+
+impl Debug for IoError {
+    /| Formats structural `IoError` fields (`kind`, `op`, `domain`, `os_error`) into `out`.
+    @no_alloc
+    pub fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        _ = spec;
+        let err_val: IoError = self.*;
+        @fmt_write(
+            out,
+            f"IoError {{ kind: {err_val.kind():?}, op: {err_val.op():?}, domain: {err_val.domain():?}, os_error: {err_val.os_error():?} }}",
+        )
+    }
+}
+
+// ------------------ OutBuf & Vectored Slices ------------------
+impl OutBuf {
+    /| Wraps uninitialized stack/array storage `buf` (`&out [u8; N]`) with `0` `memset` cost (`STD-02` §2.1).
+    @no_alloc @no_panic
+    pub fn over_uninit[const N: usize](buf: &out [u8; N], /) -> OutBuf {
+        OutBuf {
+            ptr: (&raw mut buf.*) as *mut u8,
+            cap: N,
+            filled_bytes: 0_usize,
+        }
+    }
+
+    /| Wraps an initialized mutable slice `buf` with `filled_len()` reset to `0`.
+    @inline @no_alloc @no_panic
+    pub fn over_slice(buf: &mut [u8], /) -> OutBuf {
+        OutBuf {
+            ptr: buf.as_mut_ptr(),
+            cap: buf.len(),
+            filled_bytes: 0_usize,
+        }
+    }
+
+    /| Constructs an `OutBuf` over caller-proven writable `ptr[0..cap]` (`filled_len() = 0`).
+    @inline @no_alloc @no_panic
+    pub unsafe fn from_raw_parts(ptr: *mut u8, cap: usize, /) -> OutBuf {
+        OutBuf {
+            ptr,
+            cap,
+            filled_bytes: 0_usize,
+        }
+    }
+
+    /| Returns the total byte capacity of `self`.
+    @no_alloc @no_panic
+    pub fn capacity(&self) -> usize = self.cap;
+
+    /| Returns the count of initialized bytes written into `self` so far.
+    @no_alloc @no_panic
+    pub fn filled_len(&self) -> usize = self.filled_bytes;
+
+    /| Returns the remaining uninitialized capacity (`capacity() - filled_len()`).
+    @no_alloc @no_panic
+    pub fn remaining(&self) -> usize = self.cap -| self.filled_bytes;
+
+    /| Returns `true` when zero bytes have been written to `self`.
+    @no_alloc @no_panic
+    pub fn is_empty(&self) -> bool = self.filled_bytes == 0_usize;
+
+    /| Returns `true` when `filled_len() == capacity()`.
+    @no_alloc @no_panic
+    pub fn is_full(&self) -> bool = self.filled_bytes >= self.cap;
+
+    /| Borrows the initialized prefix `0..filled_len()` as `&[u8]`.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
+    pub fn filled(&self) -> &[u8] {
+        if self.filled_bytes == 0_usize or self.ptr.is_null() {
+            return EMPTY_BYTES;
+        }
+        unsafe {
+            @slice_from_raw_parts(self.ptr as *u8, self.filled_bytes)
+        }
+    }
+
+    /| Resets `filled_len()` to `0` without touching backing memory.
+    @inline @no_alloc @no_panic
+    pub fn clear(&mut self) {
+        self.filled_bytes = 0_usize;
+    }
+
+    /| Copies `min(src.len(), remaining())` bytes into `self`, advancing `filled_len()` and returning copied count.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
+    pub fn append(&mut self, src: &[u8], /) -> usize {
+        let rem: usize = self.remaining();
+        let copy_n: usize = if src.len() < rem => src.len() else rem;
+        if copy_n > 0_usize and not self.ptr.is_null() {
+            unsafe {
+                @memcpy(
+                    self.ptr.add(self.filled_bytes) as *mut opaque,
+                    src.as_ptr() as *opaque,
+                    copy_n,
+                );
+            }
+            self.filled_bytes = self.filled_bytes +% copy_n;
+        }
+        copy_n
+    }
+
+    /| Returns `(unfilled_base_ptr, remaining_len)` for FFI / syscall read wrappers.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
+    pub fn unfilled_raw(&mut self) -> (*mut u8, usize) {
+        let rem: usize = self.remaining();
+        if self.ptr.is_null() {
+            return (self.ptr, rem);
+        }
+        let raw_dst: *mut u8 = unsafe {
+            self.ptr.add(self.filled_bytes)
+        };
+        (raw_dst, rem)
+    }
+
+    /| Marks `n` additional bytes in `unfilled_raw()` as initialized (`caller` must have written `n` bytes).
+    @inline @no_alloc @no_panic
+    pub unsafe fn advance_init(&mut self, n: usize, /) {
+        let rem: usize = self.remaining();
+        debug_assert(n <= rem, "OutBuf.advance_init exceeded remaining capacity");
+        let step: usize = if n <= rem => n else rem;
+        self.filled_bytes = self.filled_bytes +% step;
+    }
+}
+
+impl TrivialDrop for IoSlice {}
+
+impl TrivialDrop for IoSliceMut {}
+
+impl IoSlice {
+    /| Wraps `slice` in a target-ABI `IoSlice` (`WSABUF` on Windows, `iovec` / `ciovec` on POSIX / WASI).
+    @inline @no_alloc @no_panic
+    pub fn new(slice: &[u8], /) -> IoSlice {
+        IoSlice {
+            raw: ActiveIoSliceRaw.from_slice(slice),
+        }
+    }
+
+    /| Projects `self` back as `&[u8]`.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
+    pub fn as_slice(self) -> &[u8] {
+        let byte_len: usize = self.raw.raw_len();
+        if byte_len == 0_usize {
+            return EMPTY_BYTES;
+        }
+        unsafe {
+            @slice_from_raw_parts(self.raw.raw_ptr(), byte_len)
+        }
+    }
+
+    /| Returns the byte length of `self`.
+    @no_alloc @no_panic
+    pub fn len(self) -> usize = self.raw.raw_len();
+
+    /| Returns `true` when `self.len() == 0`.
+    @no_alloc @no_panic
+    pub fn is_empty(self) -> bool = self.raw.raw_len() == 0_usize;
+
+    /| Advances `slices` past `n` consumed bytes, trimming the leading partial `IoSlice` in place when needed.
+    @std_cap_boundary(clears: [may_panic]) @no_alloc @no_panic
+    pub fn advance_slices(slices: &mut &mut [IoSlice], var n: usize, /) {
+        var idx = 0_usize;
+        let total_slices: usize = slices.*.len();
+        while idx < total_slices {
+            let cur_len: usize = slices.*[idx].len();
+            if n < cur_len {
+                let full_bytes: &[u8] = slices.*[idx].as_slice();
+                if n < full_bytes.len() {
+                    slices.*[idx] = IoSlice.new(full_bytes[n..full_bytes.len()]);
+                }
+                slices.* = slices.*[idx..total_slices];
+                return;
+            }
+            n = n -% cur_len;
+            idx += 1_usize;
+        }
+        slices.* = slices.*[total_slices..total_slices];
+    }
+}
+
+impl IoSliceMut {
+    /| Wraps mutable `slice` in a target-ABI `IoSliceMut` (`WSABUF` on Windows, `iovec` on POSIX / WASI).
+    @inline @no_alloc @no_panic
+    pub fn new(slice: &mut [u8], /) -> IoSliceMut {
+        IoSliceMut {
+            raw: ActiveIoSliceMutRaw.from_slice(slice),
+        }
+    }
+
+    /| Borrows `self` immutably as `&[u8]`.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
+    pub fn as_slice(&self) -> &[u8] {
+        let byte_len: usize = self.raw.raw_len();
+        if byte_len == 0_usize {
+            return EMPTY_BYTES;
+        }
+        unsafe {
+            @slice_from_raw_parts(self.raw.raw_ptr() as *u8, byte_len)
+        }
+    }
+
+    /| Borrows `self` mutably as `&mut [u8]`.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        let byte_len: usize = self.raw.raw_len();
+        unsafe {
+            @slice_from_raw_parts_mut(self.raw.raw_ptr(), byte_len)
+        }
+    }
+
+    /| Returns the byte length of `self`.
+    @no_alloc @no_panic
+    pub fn len(&self) -> usize = self.raw.raw_len();
+
+    /| Returns `true` when `self.len() == 0`.
+    @no_alloc @no_panic
+    pub fn is_empty(&self) -> bool = self.raw.raw_len() == 0_usize;
+
+    /| Advances `slices` past `n` filled bytes, trimming the leading partial `IoSliceMut` in place when needed.
+    @std_cap_boundary(clears: [unsafe_op, may_panic]) @no_alloc @no_panic
+    pub fn advance_mut_slices(slices: &mut &mut [IoSliceMut], var n: usize, /) {
+        var idx = 0_usize;
+        let total_slices: usize = slices.*.len();
+        while idx < total_slices {
+            let cur_len: usize = slices.*[idx].len();
+            if n < cur_len {
+                let rem_len: usize = cur_len -% n;
+                let base_ptr: *mut u8 = slices.*[idx].raw.raw_ptr();
+                let next_ptr: *mut u8 = unsafe {
+                    base_ptr.add(n)
+                };
+                slices.*[idx] = IoSliceMut.new(
+                    unsafe {
+                        @slice_from_raw_parts_mut(next_ptr, rem_len)
+                    },
+                );
+                slices.* = slices.*[idx..total_slices];
+                return;
+            }
+            n = n -% cur_len;
+            idx += 1_usize;
+        }
+        slices.* = slices.*[total_slices..total_slices];
+    }
+}
+
+// ------------------ Stream Handles & VTables ------------------
+impl Seek {
+    /| Constructs a `Seek` handle from a raw context pointer and non-null `SeekVTable`.
+    @no_alloc @no_panic
+    pub unsafe fn from_raw(ctx: *mut opaque, vtable: *SeekVTable, /) -> Seek = Seek {
+        ctx,
+        vtable,
+    };
+
+    /| Repositions the stream cursor according to `pos` and returns the new byte offset from start.
+    @std_cap_boundary(clears: [fs, blocking_sync, ffi, unsafe_op])
+    pub fn seek(&mut self, pos: SeekFrom, /) -> u64!IoError {
+        let vt_addr = self.vtable as usize;
+        if (vt_addr & 1_usize) != 0_usize {
+            return match vt_addr {
+                SEEK_SENTINEL_BYTES => byte_reader_seek_cb(self.ctx, pos),
+                SEEK_SENTINEL_FILE => file_sentinel_seek(self.ctx, pos),
+                _ => slice_writer_seek_cb(self.ctx, pos),
+            };
+        }
+        let seek_fn = unsafe {
+            self.vtable.*.seek
+        };
+        seek_fn(self.ctx, pos)
+    }
+
+    /| Queries the current stream byte offset (`seek(.Current(0))`).
+    @inline
+    pub fn stream_position(&mut self) -> u64!IoError {
+        self.seek(.Current(0_i64))
+    }
+
+    /| Rewinds the stream cursor to byte `0` (`seek(.Start(0))`).
+    @inline
+    pub fn rewind(&mut self) -> unit!IoError {
+        _ = self.seek(.Start(0_u64))?;
+        .Ok(())
+    }
+}
+
+impl Reader {
+    /| Constructs a `Reader` handle from a raw context pointer and non-null `ReaderVTable`.
+    @no_alloc @no_panic
+    pub unsafe fn from_raw(ctx: *mut opaque, vtable: *ReaderVTable, /) -> Reader = Reader {
+        ctx,
+        vtable,
+    };
+
+    /| Borrows a `ByteReader` cursor as a `Reader`.
+    @inline @no_alloc @no_panic
+    pub fn from_bytes(cursor: &mut ByteReader, /) -> Reader {
+        cursor.as_reader()
+    }
+
+    /| Returns a stateless `Reader` that immediately yields `0` bytes (EOF) on every read.
+    @inline @no_alloc @no_panic
+    pub fn empty() -> Reader {
+        Reader {
+            ctx: @default_init[*mut opaque](),
+            vtable: READER_SENTINEL_EMPTY as *ReaderVTable,
+        }
+    }
+
+    /| Returns a stateless `Reader` yielding an infinite stream of `byte_val` with zero allocations.
+    @inline @no_alloc @no_panic
+    pub fn repeat(byte_val: u8, /) -> Reader {
+        Reader {
+            ctx: (byte_val as usize) as *mut opaque,
+            vtable: READER_SENTINEL_REPEAT as *ReaderVTable,
+        }
+    }
+
+    /| Reads available bytes into uninitialized `out` (`0` = EOF) without zero-initializing `out`.
+    @std_cap_boundary(clears: [fs, blocking_sync, ffi, unsafe_op])
+    pub fn read_out(&mut self, out: &mut OutBuf, /) -> usize!IoError {
+        let vt_addr = self.vtable as usize;
+        if (vt_addr & 1_usize) != 0_usize {
+            return match vt_addr {
+                READER_SENTINEL_EMPTY => empty_read_out_cb(self.ctx, out),
+                READER_SENTINEL_REPEAT => repeat_read_out_cb(self.ctx, out),
+                READER_SENTINEL_BUF => buf_reader_read_out_cb(self.ctx, out),
+                READER_SENTINEL_LIMIT => limit_reader_read_out_cb(self.ctx, out),
+                READER_SENTINEL_BYTES => byte_reader_read_out_cb(self.ctx, out),
+                READER_SENTINEL_FILE => file_sentinel_read_out(self.ctx, out),
+                _ => raw_stdin_read_out_cb(self.ctx, out),
+            };
+        }
+        let read_fn = unsafe {
+            self.vtable.*.read_out
+        };
+        read_fn(self.ctx, out)
+    }
+
+    /| Reads available bytes into `buf` (`0` = EOF).
+    @inline
+    pub fn read(&mut self, buf: &mut [u8], /) -> usize!IoError {
+        if buf.is_empty() {
+            return .Ok(0_usize);
+        }
+        var out = OutBuf.over_slice(buf);
+        self.read_out(&mut out)
+    }
+
+    /| Reads into scatter-gather `bufs`, falling back to the first non-empty slice when `vtable.read_vectored` is `.None`.
+    @std_cap_boundary(clears: [fs, blocking_sync, ffi, unsafe_op, may_panic])
+    pub fn read_vectored(&mut self, bufs: &mut [IoSliceMut], /) -> usize!IoError {
+        let vt_addr = self.vtable as usize;
+        if (vt_addr & 1_usize) != 0_usize {
+            if vt_addr == READER_SENTINEL_EMPTY {
+                let reborrowed: &mut [IoSliceMut] = unsafe {
+                    @slice_from_raw_parts_mut(bufs.as_mut_ptr(), bufs.len())
+                };
+                return empty_read_vectored_cb(self.ctx, reborrowed);
+            } else if vt_addr == READER_SENTINEL_BYTES {
+                let reborrowed: &mut [IoSliceMut] = unsafe {
+                    @slice_from_raw_parts_mut(bufs.as_mut_ptr(), bufs.len())
+                };
+                return byte_reader_read_vectored_cb(self.ctx, reborrowed);
+            } else if vt_addr == READER_SENTINEL_FILE {
+                let reborrowed: &mut [IoSliceMut] = unsafe {
+                    @slice_from_raw_parts_mut(bufs.as_mut_ptr(), bufs.len())
+                };
+                return file_sentinel_read_vectored(self.ctx, reborrowed);
+            }
+        } else {
+            let opt_vec_fn = unsafe {
+                self.vtable.*.read_vectored
+            };
+            if opt_vec_fn is .Some(vec_fn) {
+                let reborrowed: &mut [IoSliceMut] = unsafe {
+                    @slice_from_raw_parts_mut(bufs.as_mut_ptr(), bufs.len())
+                };
+                return vec_fn(self.ctx, reborrowed);
+            }
+        }
+        var idx = 0_usize;
+        let count: usize = bufs.len();
+        while idx < count {
+            if not bufs[idx].is_empty() {
+                return self.read(bufs[idx].as_mut_slice());
+            }
+            idx += 1_usize;
+        }
+        .Ok(0_usize)
+    }
+
+    /| Fills `buf` completely (retrying on `.Interrupted`), or returns `.Err(.UnexpectedEof)` on premature EOF.
+    @std_cap_boundary(clears: [may_panic])
+    pub fn read_exact(&mut self, buf: &mut [u8], /) -> unit!IoError {
+        var filled = 0_usize;
+        let target_len: usize = buf.len();
+        while filled < target_len {
+            let n: usize = self.read(buf[filled..target_len]) catch |err| {
+                if err.is_interrupted() {
+                    continue;
+                }
+                return .Err(err);
+            };
+            if n == 0_usize {
+                return .Err(IoError.from_kind(.UnexpectedEof, op: .Read));
+            }
+            filled = filled +% n;
+        }
+        .Ok(())
+    }
+
+    /| Appends exactly `exact_len` bytes into `out` without `memset`, failing with `.UnexpectedEof` on short stream.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn read_exact_out(&mut self, out: &mut OutBuf, exact_len: usize, /) -> unit!IoError {
+        if exact_len > out.remaining() {
+            return .Err(IoError.from_kind(.InvalidInput, op: .Read));
+        }
+        var got = 0_usize;
+        while got < exact_len {
+            let (dst_ptr, _) = out.unfilled_raw();
+            let need: usize = exact_len -% got;
+            var sub_out = unsafe {
+                OutBuf.from_raw_parts(dst_ptr, need)
+            };
+            let n: usize = self.read_out(&mut sub_out) catch |err| {
+                if err.is_interrupted() {
+                    continue;
+                }
+                return .Err(err);
+            };
+            if n == 0_usize {
+                return .Err(IoError.from_kind(.UnexpectedEof, op: .Read));
+            }
+            unsafe {
+                out.advance_init(n);
+            }
+            got = got +% n;
+        }
+        .Ok(())
+    }
+
+    /| Appends all remaining bytes from `self` into `dst`, failing with `.StreamTooLong` if stream exceeds `max_bytes`.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn read_to_end(
+        &mut self,
+        dst: &mut Vec[u8],
+        /,
+        *,
+        max_bytes: usize = usize.MAX,
+    ) -> usize!IoError {
+        var total_read = 0_usize;
+        var raw_chunk: [u8; 4_096];
+        while true {
+            var out = OutBuf.over_uninit(&out raw_chunk);
+            if max_bytes < usize.MAX and total_read == max_bytes {
+                var probe_out = unsafe {
+                    OutBuf.from_raw_parts(out.unfilled_raw().0, 1_usize)
+                };
+                let probe_n: usize = self.read_out(&mut probe_out) catch |err| {
+                    if err.is_interrupted() {
+                        continue;
+                    }
+                    return .Err(err);
+                };
+                if probe_n > 0_usize {
+                    return .Err(IoError.from_kind(.StreamTooLong, op: .Read));
+                }
+                return .Ok(total_read);
+            }
+            let rem_max: usize = max_bytes -| total_read;
+            let budget: usize = if max_bytes == usize.MAX or rem_max >= 4_096_usize => 4_096_usize
+                else rem_max;
+            var bounded_out = unsafe {
+                OutBuf.from_raw_parts(out.unfilled_raw().0, budget)
+            };
+            let n: usize = self.read_out(&mut bounded_out) catch |err| {
+                if err.is_interrupted() {
+                    continue;
+                }
+                return .Err(err);
+            };
+            if n == 0_usize {
+                return .Ok(total_read);
+            }
+            dst.try_reserve(n) catch {
+                return .Err(IoError.from_kind(.OutOfMemory, op: .Read));
+            };
+            dst.extend_from_slice(bounded_out.filled());
+            total_read = total_read +% n;
+        }
+        .Ok(total_read)
+    }
+
+    /| Reads all remaining UTF-8 bytes into `dst`, returning `.Err(.InvalidData)` without mutating `dst` on invalid UTF-8.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn read_to_string(
+        &mut self,
+        dst: &mut String,
+        /,
+        *,
+        max_bytes: usize = usize.MAX,
+    ) -> usize!IoError {
+        var raw_vec = Vec[u8].new();
+        let count: usize = self.read_to_end(&mut raw_vec, max_bytes: max_bytes)?;
+        if count == 0_usize {
+            return .Ok(0_usize);
+        }
+        if dst.is_empty() {
+            let owned_str: String = String.from_utf8(own raw_vec) catch {
+                return .Err(IoError.from_kind(.InvalidData, op: .Read));
+            };
+            dst.* = own owned_str;
+            return .Ok(count);
+        }
+        let slice: &[u8] = raw_vec.as_slice();
+        if not is_valid_utf8(slice) {
+            return .Err(IoError.from_kind(.InvalidData, op: .Read));
+        }
+        let valid_str: str = unsafe {
+            @str_from_utf8_unchecked(slice)
+        };
+        dst.try_push_str(valid_str) catch {
+            return .Err(IoError.from_kind(.OutOfMemory, op: .Read));
+        };
+        .Ok(count)
+    }
+
+    /| Reads all remaining bytes directly into `arena` (`0` heap drop overhead) up to `max_bytes`.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn read_all_arena(
+        &mut self,
+        arena: &mut Arena,
+        /,
+        *,
+        max_bytes: usize = usize.MAX,
+    ) -> (&[u8])!IoError {
+        var buf = Vec[u8].in_arena(arena);
+        _ = self.read_to_end(&mut buf, max_bytes: max_bytes)?;
+        let (ptr, len, _, _) = (own buf).into_raw_parts();
+        if len == 0_usize {
+            return .Ok(EMPTY_BYTES);
+        }
+        .Ok(
+            unsafe {
+                @slice_from_raw_parts(ptr as *u8, len)
+            },
+        )
+    }
+
+    /| Skips up to `bytes` from `self`, using `vtable.discard` when available or draining into a stack `OutBuf`.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn discard(&mut self, bytes: u64, /) -> u64!IoError {
+        if bytes == 0_u64 {
+            return .Ok(0_u64);
+        }
+        let vt_addr = self.vtable as usize;
+        if (vt_addr & 1_usize) != 0_usize {
+            if vt_addr == READER_SENTINEL_EMPTY {
+                return empty_discard_cb(self.ctx, bytes);
+            } else if vt_addr == READER_SENTINEL_REPEAT {
+                return repeat_discard_cb(self.ctx, bytes);
+            } else if vt_addr == READER_SENTINEL_BUF {
+                while true {
+                    let n: u64 = buf_reader_discard_cb(self.ctx, bytes) catch |err| {
+                        if err.is_interrupted() {
+                            continue;
+                        }
+                        return .Err(err);
+                    };
+                    return .Ok(n);
+                }
+            } else if vt_addr == READER_SENTINEL_LIMIT {
+                while true {
+                    let n: u64 = limit_reader_discard_cb(self.ctx, bytes) catch |err| {
+                        if err.is_interrupted() {
+                            continue;
+                        }
+                        return .Err(err);
+                    };
+                    return .Ok(n);
+                }
+            } else if vt_addr == READER_SENTINEL_BYTES {
+                return byte_reader_discard_cb(self.ctx, bytes);
+            }
+        } else {
+            let opt_discard_fn = unsafe {
+                self.vtable.*.discard
+            };
+            if opt_discard_fn is .Some(discard_fn) {
+                while true {
+                    let n: u64 = discard_fn(self.ctx, bytes) catch |err| {
+                        if err.is_interrupted() {
+                            continue;
+                        }
+                        return .Err(err);
+                    };
+                    return .Ok(n);
+                }
+            }
+        }
+        var skipped = 0_u64;
+        var scratch: [u8; 4_096];
+        while skipped < bytes {
+            let rem_u64: u64 = bytes -% skipped;
+            let chunk_cap: usize = if rem_u64 < 4_096_u64 => rem_u64 as usize else 4_096_usize;
+            var base_out = OutBuf.over_uninit(&out scratch);
+            var bounded_out = unsafe {
+                OutBuf.from_raw_parts(base_out.unfilled_raw().0, chunk_cap)
+            };
+            let n: usize = self.read_out(&mut bounded_out) catch |err| {
+                if err.is_interrupted() {
+                    continue;
+                }
+                return .Err(err);
+            };
+            if n == 0_usize {
+                break;
+            }
+            skipped = skipped +% (n as u64);
+        }
+        .Ok(skipped)
+    }
+}
+
+impl Writer {
+    /| Constructs a `Writer` handle from a raw context pointer and non-null `WriterVTable`.
+    @no_alloc @no_panic
+    pub unsafe fn from_raw(ctx: *mut opaque, vtable: *WriterVTable, /) -> Writer = Writer {
+        ctx,
+        vtable,
+    };
+
+    /| Returns a stateless null sink `Writer` that discards all written bytes in `O(1)`.
+    @inline @no_alloc @no_panic
+    pub fn sink() -> Writer {
+        Writer {
+            ctx: @default_init[*mut opaque](),
+            vtable: WRITER_SENTINEL_SINK as *WriterVTable,
+        }
+    }
+
+    /| Borrows a `SliceWriter` cursor as a `Writer`.
+    @inline @no_alloc @no_panic
+    pub fn over_slice(cursor: &mut SliceWriter, /) -> Writer {
+        cursor.as_writer()
+    }
+
+    /| Writes a prefix of `buf` into the underlying sink and returns the byte count accepted.
+    @std_cap_boundary(clears: [fs, blocking_sync, ffi, unsafe_op])
+    pub fn write(&mut self, buf: &[u8], /) -> usize!IoError {
+        let vt_addr = self.vtable as usize;
+        if (vt_addr & 1_usize) != 0_usize {
+            return match vt_addr {
+                WRITER_SENTINEL_SINK => sink_write_cb(self.ctx, buf),
+                WRITER_SENTINEL_BUF => buf_writer_write_cb(self.ctx, buf),
+                WRITER_SENTINEL_SLICE => slice_writer_write_cb(self.ctx, buf),
+                WRITER_SENTINEL_FILE => file_sentinel_write(self.ctx, buf),
+                _ => raw_stdio_write_cb(self.ctx, buf),
+            };
+        }
+        let write_fn = unsafe {
+            self.vtable.*.write
+        };
+        write_fn(self.ctx, buf)
+    }
+
+    /| Writes all of `buf` (retrying on `.Interrupted`), returning `.Err(.WriteZero)` if progress stalls.
+    @std_cap_boundary(clears: [may_panic])
+    pub fn write_all(&mut self, buf: &[u8], /) -> unit!IoError {
+        let total: usize = buf.len();
+        var written = 0_usize;
+        while written < total {
+            let n: usize = self.write(buf[written..total]) catch |err| {
+                if err.is_interrupted() {
+                    continue;
+                }
+                return .Err(err);
+            };
+            if n == 0_usize {
+                return .Err(IoError.from_kind(.WriteZero, op: .Write));
+            }
+            written = written +| n;
+        }
+        .Ok(())
+    }
+
+    /| Writes a single byte `byte_val` into `self`.
+    @inline
+    pub fn write_byte(&mut self, byte_val: u8, /) -> unit!IoError {
+        self.write_all(&[byte_val])
+    }
+
+    /| Writes `count` repetitions of `byte_val` in `256 B` stack-batched chunks (`0` heap allocations).
+    @std_cap_boundary(clears: [may_panic])
+    pub fn write_splat(&mut self, byte_val: u8, var count: usize, /) -> unit!IoError {
+        if count == 0_usize {
+            return .Ok(());
+        }
+        let batch: [u8; 256] = [byte_val; 256];
+        while count >= 256_usize {
+            self.write_all(&batch)?;
+            count -= 256_usize;
+        }
+        if count > 0_usize {
+            self.write_all(batch[0..count])?;
+        }
+        .Ok(())
+    }
+
+    /| Writes scatter-gather `bufs`, falling back to the first non-empty `IoSlice` when `vtable.write_vectored` is `.None`.
+    @std_cap_boundary(clears: [fs, blocking_sync, ffi, unsafe_op])
+    pub fn write_vectored(&mut self, bufs: &[IoSlice], /) -> usize!IoError {
+        let vt_addr = self.vtable as usize;
+        if (vt_addr & 1_usize) != 0_usize {
+            if vt_addr == WRITER_SENTINEL_SINK {
+                return sink_write_vectored_cb(self.ctx, bufs);
+            } else if vt_addr == WRITER_SENTINEL_BUF {
+                return buf_writer_write_vectored_cb(self.ctx, bufs);
+            } else if vt_addr == WRITER_SENTINEL_SLICE {
+                return slice_writer_write_vectored_cb(self.ctx, bufs);
+            } else if vt_addr == WRITER_SENTINEL_FILE {
+                return file_sentinel_write_vectored(self.ctx, bufs);
+            }
+        } else {
+            let opt_vec_fn = unsafe {
+                self.vtable.*.write_vectored
+            };
+            if opt_vec_fn is .Some(vec_fn) {
+                return vec_fn(self.ctx, bufs);
+            }
+        }
+        for slice in bufs {
+            if not slice.is_empty() {
+                return self.write(slice.as_slice());
+            }
+        }
+        .Ok(0_usize)
+    }
+
+    /| Writes every byte across `bufs` (retrying on `.Interrupted` and handling partial mid-slice progress).
+    @std_cap_boundary(clears: [may_panic])
+    pub fn write_all_vectored(&mut self, bufs: &[IoSlice], /) -> unit!IoError {
+        let total_slices: usize = bufs.len();
+        var slice_idx = 0_usize;
+        var head_skip = 0_usize;
+        while slice_idx < total_slices {
+            let first_full: &[u8] = bufs[slice_idx].as_slice();
+            if head_skip >= first_full.len() {
+                head_skip = 0_usize;
+                slice_idx += 1_usize;
+                continue;
+            }
+            if head_skip > 0_usize {
+                let tail_part: &[u8] = first_full[head_skip..first_full.len()];
+                var wrote: usize = write_vectored_tail_batch(
+                    self,
+                    tail_part,
+                    bufs,
+                    slice_idx + 1_usize,
+                ) catch |err| {
+                    if err.is_interrupted() {
+                        continue;
+                    }
+                    return .Err(err);
+                };
+                if wrote == 0_usize {
+                    return .Err(IoError.from_kind(.WriteZero, op: .Write));
+                }
+                if wrote < tail_part.len() {
+                    head_skip = head_skip +% wrote;
+                    continue;
+                }
+                wrote = wrote -% tail_part.len();
+                head_skip = 0_usize;
+                slice_idx += 1_usize;
+                while slice_idx < total_slices {
+                    let step_len: usize = bufs[slice_idx].len();
+                    if wrote < step_len {
+                        break;
+                    }
+                    wrote = wrote -% step_len;
+                    slice_idx += 1_usize;
+                }
+                head_skip = wrote;
+                continue;
+            }
+            var wrote_direct: usize = self.write_vectored(bufs[slice_idx..total_slices]) catch |err| {
+                if err.is_interrupted() {
+                    continue;
+                }
+                return .Err(err);
+            };
+            if wrote_direct == 0_usize {
+                return .Err(IoError.from_kind(.WriteZero, op: .Write));
+            }
+            while slice_idx < total_slices {
+                let step_len: usize = bufs[slice_idx].len();
+                if wrote_direct < step_len {
+                    break;
+                }
+                wrote_direct = wrote_direct -% step_len;
+                slice_idx += 1_usize;
+            }
+            head_skip = wrote_direct;
+        }
+        .Ok(())
+    }
+
+    /| Streams `args` (`SE-12` `FmtArgs`) via a `512 B` stack coalescing bridge with `0` heap allocations.
+    @std_cap_boundary(clears: [unsafe_op, alloc]) @no_alloc
+    pub fn print(&mut self, args: FmtArgs, /) -> unit!IoError {
+        var bridge = WriterFmtBridge {
+            target: &raw mut self.*,
+            scratch: [0_u8; 512],
+            filled: 0_usize,
+            sticky_err: .None,
+        };
+        var fmt_sink = FmtWriter {
+            ctx: (&raw mut bridge) as *mut opaque,
+            write_fn: writer_fmt_bridge_cb,
+        };
+        @fmt_write(&mut fmt_sink, args) catch {
+            return .Err(bridge.sticky_err orelse IoError.from_kind(.Other, op: .Write));
+        };
+        if bridge.filled > 0_usize {
+            let tail_slice: &[u8] = unsafe {
+                @slice_from_raw_parts(&raw bridge.scratch[0], bridge.filled)
+            };
+            self.write_all(tail_slice)?;
+        }
+        .Ok(())
+    }
+
+    /| Flushes buffered downstream state when `vtable.flush` is present (retrying on `.Interrupted`).
+    @std_cap_boundary(clears: [fs, blocking_sync, ffi, unsafe_op])
+    pub fn flush(&mut self) -> unit!IoError {
+        let vt_addr = self.vtable as usize;
+        if (vt_addr & 1_usize) != 0_usize {
+            return match vt_addr {
+                WRITER_SENTINEL_SINK => sink_flush_cb(self.ctx),
+                WRITER_SENTINEL_BUF => {
+                    while true {
+                        buf_writer_flush_cb(self.ctx) catch |err| {
+                            if err.is_interrupted() {
+                                continue;
+                            }
+                            return .Err(err);
+                        };
+                        break;
+                    }
+                    .Ok(())
+                },
+                WRITER_SENTINEL_FILE => {
+                    while true {
+                        file_sentinel_flush(self.ctx) catch |err| {
+                            if err.is_interrupted() {
+                                continue;
+                            }
+                            return .Err(err);
+                        };
+                        break;
+                    }
+                    .Ok(())
+                },
+                _ => .Ok(()),
+            };
+        }
+        let opt_flush_fn = unsafe {
+            self.vtable.*.flush
+        };
+        if opt_flush_fn is .Some(flush_fn) {
+            while true {
+                flush_fn(self.ctx) catch |err| {
+                    if err.is_interrupted() {
+                        continue;
+                    }
+                    return .Err(err);
+                };
+                return .Ok(());
+            }
+        }
+        .Ok(())
+    }
+}
+
+// ---------------- Buffered Streams & Adapters -----------------
+impl BufReader {
+    /| Allocates an `8 KiB` (`DEFAULT_IO_BUF_SIZE`) `BufReader` backed by `cx.mem.System` (`AutoDrop` frees on exit).
+    pub fn new(upstream: Reader, /) -> BufReader {
+        BufReader.with_capacity(upstream, DEFAULT_IO_BUF_SIZE)
+    }
+
+    /| Allocates a `cap`-byte `BufReader` backed by `cx.mem.System` (`cap == 0` defaults to `DEFAULT_IO_BUF_SIZE`).
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn with_capacity(upstream: Reader, cap: usize, /) -> BufReader {
+        let eff_cap: usize = if cap == 0_usize => DEFAULT_IO_BUF_SIZE
+            else (cap & BUF_READER_CAP_MASK);
+        let raw_ptr: *mut u8 = System
+            .handle()
+            .alloc(
+                Layout { size: eff_cap, alignment: OWNED_IO_BUF_ALIGN },
+            ) catch {
+            panic(f"BufReader.with_capacity({eff_cap=}) out of memory");
+        };
+        BufReader {
+            upstream,
+            buf_ptr: raw_ptr,
+            cap_and_flag: eff_cap | BUF_READER_OWNS_SYS_MASK,
+            pos: 0_usize,
+            filled: 0_usize,
+        }
+    }
+
+    /| Wraps uninitialized stack/array storage `backing` (`0` heap allocations, `0` `memset`).
+    @no_alloc @no_panic
+    pub fn over_uninit[const N: usize](upstream: Reader, backing: &out [u8; N], /) -> BufReader {
+        BufReader {
+            upstream,
+            buf_ptr: (&raw mut backing.*) as *mut u8,
+            cap_and_flag: N & BUF_READER_CAP_MASK,
+            pos: 0_usize,
+            filled: 0_usize,
+        }
+    }
+
+    /| Wraps caller-provided mutable slice `backing` (`0` heap allocations).
+    @inline @no_alloc @no_panic
+    pub fn over_slice(upstream: Reader, backing: &mut [u8], /) -> BufReader {
+        BufReader {
+            upstream,
+            buf_ptr: backing.as_mut_ptr(),
+            cap_and_flag: backing.len() & BUF_READER_CAP_MASK,
+            pos: 0_usize,
+            filled: 0_usize,
+        }
+    }
+
+    /| Allocates an unzeroed `cap`-byte buffer inside `arena` (`AutoDrop` is a no-op because `OWNS_SYS == 0`).
+    pub fn in_arena(
+        arena: &mut Arena,
+        upstream: Reader,
+        /,
+        *,
+        cap: usize = DEFAULT_IO_BUF_SIZE,
+    ) -> BufReader {
+        let eff_cap: usize = if cap == 0_usize => DEFAULT_IO_BUF_SIZE
+            else (cap & BUF_READER_CAP_MASK);
+        let slice: &mut [u8] = arena.alloc_slice[u8](eff_cap, zeroed: false);
+        BufReader {
+            upstream,
+            buf_ptr: slice.as_mut_ptr(),
+            cap_and_flag: eff_cap,
+            pos: 0_usize,
+            filled: 0_usize,
+        }
+    }
+
+    /| Returns the unconsumed byte count currently buffered (`filled - pos`).
+    @no_alloc @no_panic
+    pub fn available(&self) -> usize = self.filled -| self.pos;
+
+    /| Returns the backing buffer capacity in bytes.
+    @no_alloc @no_panic
+    pub fn capacity(&self) -> usize = self.cap_and_flag & BUF_READER_CAP_MASK;
+
+    /| Borrows the active unread window `buf[pos..filled]` as `&[u8]`.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
+    pub fn buffered(&self) -> &[u8] {
+        let avail: usize = self.available();
+        if avail == 0_usize or self.buf_ptr.is_null() {
+            return EMPTY_BYTES;
+        }
+        unsafe {
+            @slice_from_raw_parts(self.buf_ptr.add(self.pos) as *u8, avail)
+        }
+    }
+
+    /| Ensures at least `min_bytes` are buffered (or `&[]` at clean EOF), returning `.UnexpectedEof` on short tail.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn peek(&mut self, min_bytes: usize = 1_usize, /) -> (&[u8])!IoError {
+        let cap: usize = self.capacity();
+        if min_bytes > cap {
+            return .Err(IoError.from_kind(.InvalidInput, op: .Read));
+        }
+        if self.available() >= min_bytes {
+            return .Ok(self.buffered());
+        }
+        let tail_len: usize = self.available();
+        if tail_len > 0_usize and self.pos > 0_usize and not self.buf_ptr.is_null() {
+            unsafe {
+                @memmove(
+                    self.buf_ptr as *mut opaque,
+                    self.buf_ptr.add(self.pos) as *opaque,
+                    tail_len,
+                );
+            }
+        }
+        self.pos = 0_usize;
+        self.filled = tail_len;
+
+        while self.filled < min_bytes {
+            var out = unsafe {
+                OutBuf.from_raw_parts(self.buf_ptr.add(self.filled), cap -% self.filled)
+            };
+            let n: usize = self.upstream.read_out(&mut out) catch |err| {
+                if err.is_interrupted() {
+                    continue;
+                }
+                return .Err(err);
+            };
+            if n == 0_usize {
+                if self.filled == 0_usize {
+                    return .Ok(EMPTY_BYTES);
+                }
+                return .Err(IoError.from_kind(.UnexpectedEof, op: .Read));
+            }
+            self.filled = self.filled +% n;
+        }
+        .Ok(self.buffered())
+    }
+
+    /| Advances the read cursor by `n` buffered bytes, resetting `pos` and `filled` to `0` when drained.
+    @inline @no_alloc @no_panic
+    pub fn consume(&mut self, n: usize, /) {
+        let avail: usize = self.available();
+        debug_assert(n <= avail, "BufReader.consume exceeded buffered byte count");
+        let step: usize = if n <= avail => n else avail;
+        self.pos = self.pos +% step;
+        if self.pos >= self.filled {
+            self.pos = 0_usize;
+            self.filled = 0_usize;
+        }
+    }
+
+    /| Scans for `delim` via SIMD/SWAR + lazy tail rebase, returning slice excluding `delim` (or `.None` at EOF).
+    @std_cap_boundary(clears: [unsafe_op, may_panic])
+    pub fn read_until(&mut self, delim: u8, /) -> (&[u8])?!IoError {
+        let cap: usize = self.capacity();
+        var scanned_offset = 0_usize;
+        while true {
+            let window: &[u8] = self.buffered();
+            let win_len: usize = window.len();
+            if scanned_offset < win_len {
+                if find_byte_fast(window[scanned_offset..win_len], delim) is .Some(rel_idx) {
+                    let match_len: usize = scanned_offset +% rel_idx;
+                    let base_ptr: *u8 = unsafe {
+                        self.buf_ptr.add(self.pos) as *u8
+                    };
+                    self.pos = self.pos +% match_len +% 1_usize;
+                    if self.pos >= self.filled {
+                        self.pos = 0_usize;
+                        self.filled = 0_usize;
+                    }
+                    return .Ok(
+                        .Some(
+                            unsafe {
+                                @slice_from_raw_parts(base_ptr, match_len)
+                            },
+                        ),
+                    );
+                }
+                scanned_offset = win_len;
+            }
+            if win_len >= cap {
+                return .Err(IoError.from_kind(.StreamTooLong, op: .Read));
+            }
+            if self.pos > 0_usize and win_len > 0_usize and not self.buf_ptr.is_null() {
+                unsafe {
+                    @memmove(
+                        self.buf_ptr as *mut opaque,
+                        self.buf_ptr.add(self.pos) as *opaque,
+                        win_len,
+                    );
+                }
+            }
+            self.filled = win_len;
+            self.pos = 0_usize;
+
+            var out = unsafe {
+                OutBuf.from_raw_parts(self.buf_ptr.add(self.filled), cap -% self.filled)
+            };
+            let n: usize = self.upstream.read_out(&mut out) catch |err| {
+                if err.is_interrupted() {
+                    continue;
+                }
+                return .Err(err);
+            };
+            if n == 0_usize {
+                if self.filled == 0_usize {
+                    return .Ok(.None);
+                }
+                let final_len: usize = self.filled;
+                self.filled = 0_usize;
+                return .Ok(
+                    .Some(
+                        unsafe {
+                            @slice_from_raw_parts(self.buf_ptr as *u8, final_len)
+                        },
+                    ),
+                );
+            }
+            self.filled = self.filled +% n;
+        }
+        .Ok(.None)
+    }
+
+    /| Appends bytes up through `delim` into `dst` across multiple refills (capping at `max_bytes`, returning `0` on EOF).
+    @std_cap_boundary(clears: [unsafe_op, may_panic])
+    pub fn read_until_into(
+        &mut self,
+        delim: u8,
+        dst: &mut Vec[u8],
+        /,
+        *,
+        max_bytes: usize = DEFAULT_READ_UNTIL_MAX,
+    ) -> usize!IoError {
+        let cap: usize = self.capacity();
+        if cap == 0_usize {
+            return .Err(IoError.from_kind(.InvalidInput, op: .Read));
+        }
+        var total_appended = 0_usize;
+        while true {
+            if self.available() == 0_usize {
+                self.pos = 0_usize;
+                self.filled = 0_usize;
+                var refill = unsafe {
+                    OutBuf.from_raw_parts(self.buf_ptr, cap)
+                };
+                let n: usize = self.upstream.read_out(&mut refill) catch |err| {
+                    if err.is_interrupted() {
+                        continue;
+                    }
+                    return .Err(err);
+                };
+                if n == 0_usize {
+                    return .Ok(total_appended);
+                }
+                self.filled = n;
+            }
+            let window: &[u8] = self.buffered();
+            let win_len: usize = window.len();
+            if find_byte_fast(window, delim) is .Some(rel_idx) {
+                let take_len: usize = if rel_idx < win_len => rel_idx + 1_usize else win_len;
+                if take_len > max_bytes -| total_appended {
+                    return .Err(IoError.from_kind(.StreamTooLong, op: .Read));
+                }
+                dst.try_reserve(take_len) catch {
+                    return .Err(IoError.from_kind(.OutOfMemory, op: .Read));
+                };
+                if take_len <= win_len {
+                    dst.extend_from_slice(window[0..take_len]);
+                }
+                self.consume(take_len);
+                return .Ok(total_appended +% take_len);
+            }
+            if win_len > max_bytes -| total_appended {
+                return .Err(IoError.from_kind(.StreamTooLong, op: .Read));
+            }
+            dst.try_reserve(win_len) catch {
+                return .Err(IoError.from_kind(.OutOfMemory, op: .Read));
+            };
+            dst.extend_from_slice(window);
+            total_appended = total_appended +% win_len;
+            self.consume(win_len);
+        }
+        .Ok(total_appended)
+    }
+
+    /| Reads the next UTF-8 line stripped of `\n` / `\r\n`, returning `.None` on EOF or `.Err(.InvalidData)` on bad UTF-8.
+    @std_cap_boundary(clears: [unsafe_op, may_panic])
+    pub fn next_line(&mut self) -> str?!IoError {
+        let opt_raw: (&[u8])? = self.read_until(b'\n')?;
+        let raw_line: &[u8] = opt_raw orelse return .Ok(.None);
+        let raw_len: usize = raw_line.len();
+        let trimmed: &[u8] = if raw_len > 0_usize and raw_line[raw_len - 1_usize] == b'\r' {
+            raw_line[0..(raw_len - 1_usize)]
+        } else {
+            raw_line
+        };
+        if not is_valid_utf8(trimmed) {
+            return .Err(IoError.from_kind(.InvalidData, op: .Read));
+        }
+        .Ok(
+            .Some(
+                unsafe {
+                    @str_from_utf8_unchecked(trimmed)
+                },
+            ),
+        )
+    }
+
+    /| Borrows `self` as a type-erased `Reader`.
+    @inline @no_alloc @no_panic
+    pub fn as_reader(&mut self) -> Reader {
+        Reader {
+            ctx: (&raw mut self.*) as *mut opaque,
+            vtable: READER_SENTINEL_BUF as *ReaderVTable,
+        }
+    }
+}
+
+impl AutoDrop for BufReader {
+    /| Releases `buf_ptr` back to `cx.mem.System` iff `OWNS_SYSTEM_BUF` is set (`0` ops on stack/arena buffers).
+    @no_alloc @no_panic
+    pub fn drop(&mut self) {
+        if (self.cap_and_flag & BUF_READER_OWNS_SYS_MASK) != 0_usize {
+            let cap_bytes: usize = self.cap_and_flag & BUF_READER_CAP_MASK;
+            if cap_bytes > 0_usize and not self.buf_ptr.is_null() {
+                System
+                    .handle()
+                    .dealloc(
+                        self.buf_ptr,
+                        Layout { size: cap_bytes, alignment: OWNED_IO_BUF_ALIGN },
+                    );
+            }
+            self.cap_and_flag = 0_usize;
+        }
+    }
+}
+
+impl BufWriter {
+    /| Allocates an `8 KiB` (`DEFAULT_IO_BUF_SIZE`) `@linear BufWriter` via `cx.mem.System`.
+    pub fn new(downstream: Writer, /, *, line_buffered: bool = false) -> BufWriter {
+        BufWriter.with_capacity(downstream, DEFAULT_IO_BUF_SIZE, line_buffered: line_buffered)
+    }
+
+    /| Allocates a `cap`-byte (`<= 1 GiB - 1`) `@linear BufWriter` via `cx.mem.System`.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn with_capacity(
+        downstream: Writer,
+        cap: usize,
+        /,
+        *,
+        line_buffered: bool = false,
+    ) -> BufWriter {
+        let clamped_u32: u32 = if cap == 0_usize => DEFAULT_IO_BUF_SIZE as u32
+            else if cap > (BUF_WRITER_CAP_MASK as usize) => BUF_WRITER_CAP_MASK
+            else cap as u32;
+        let raw_ptr: *mut u8 = System
+            .handle()
+            .alloc(
+                Layout { size: clamped_u32 as usize, alignment: OWNED_IO_BUF_ALIGN },
+            ) catch {
+            panic(f"BufWriter.with_capacity({clamped_u32=}) out of memory");
+        };
+        let line_bit: u32 = if line_buffered => BUF_WRITER_LINE_BUF_FLAG else 0_u32;
+        BufWriter {
+            downstream,
+            buf_ptr: raw_ptr,
+            filled: 0_u32,
+            cap_and_flags: clamped_u32 | BUF_WRITER_OWNS_SYS_FLAG | line_bit,
+        }
+    }
+
+    /| Wraps uninitialized stack/array storage `backing` (`0` heap allocations, `0` `memset`).
+    @no_alloc @no_panic
+    pub fn over_uninit[const N: usize](
+        downstream: Writer,
+        backing: &out [u8; N],
+        /,
+        *,
+        line_buffered: bool = false,
+    ) -> BufWriter {
+        let cap_u32: u32 = if N > (BUF_WRITER_CAP_MASK as usize) => BUF_WRITER_CAP_MASK
+            else N as u32;
+        let line_bit: u32 = if line_buffered => BUF_WRITER_LINE_BUF_FLAG else 0_u32;
+        BufWriter {
+            downstream,
+            buf_ptr: (&raw mut backing.*) as *mut u8,
+            filled: 0_u32,
+            cap_and_flags: cap_u32 | line_bit,
+        }
+    }
+
+    /| Wraps caller-provided mutable slice `backing` (`0` heap allocations).
+    @inline @no_alloc @no_panic
+    pub fn over_slice(
+        downstream: Writer,
+        backing: &mut [u8],
+        /,
+        *,
+        line_buffered: bool = false,
+    ) -> BufWriter {
+        let cap_u32: u32 = if backing.len() > (BUF_WRITER_CAP_MASK as usize) => BUF_WRITER_CAP_MASK
+            else backing.len() as u32;
+        let line_bit: u32 = if line_buffered => BUF_WRITER_LINE_BUF_FLAG else 0_u32;
+        BufWriter {
+            downstream,
+            buf_ptr: backing.as_mut_ptr(),
+            filled: 0_u32,
+            cap_and_flags: cap_u32 | line_bit,
+        }
+    }
+
+    /| Allocates an unzeroed `cap`-byte buffer inside `arena` (`OWNS_SYSTEM_BUF == 0`).
+    pub fn in_arena(
+        arena: &mut Arena,
+        downstream: Writer,
+        /,
+        *,
+        cap: u32 = 8_192_u32,
+        line_buffered: bool = false,
+    ) -> BufWriter {
+        let eff_u32: u32 = if cap == 0_u32 => 8_192_u32 else (cap & BUF_WRITER_CAP_MASK);
+        let slice: &mut [u8] = arena.alloc_slice[u8](eff_u32 as usize, zeroed: false);
+        let line_bit: u32 = if line_buffered => BUF_WRITER_LINE_BUF_FLAG else 0_u32;
+        BufWriter {
+            downstream,
+            buf_ptr: slice.as_mut_ptr(),
+            filled: 0_u32,
+            cap_and_flags: eff_u32 | line_bit,
+        }
+    }
+
+    /| Returns the count of unflushed bytes currently buffered in `self`.
+    @no_alloc @no_panic
+    pub fn buffered_len(&self) -> usize = self.filled as usize;
+
+    /| Returns the total byte capacity of `self`'s internal buffer.
+    @no_alloc @no_panic
+    pub fn capacity(&self) -> usize = (self.cap_and_flags & BUF_WRITER_CAP_MASK) as usize;
+
+    /| Returns the remaining free buffer capacity (`capacity() - buffered_len()`).
+    @no_alloc @no_panic
+    pub fn spare_capacity(&self) -> usize = self.capacity() -| self.buffered_len();
+
+    /| Returns `true` when automatic newline (`b'\n'`) flushing is enabled on `self`.
+    @no_alloc @no_panic
+    pub fn is_line_buffered(&self) -> bool =
+        (self.cap_and_flags & BUF_WRITER_LINE_BUF_FLAG) != 0_u32;
+
+    /| Drains `buf_ptr[0..filled]` into `downstream`, preserving any unwritten suffix on partial failure.
+    @std_cap_boundary(clears: [unsafe_op, may_panic])
+    fn flush_buffer_only(&mut self) -> unit!IoError {
+        let total_buf = self.filled as usize;
+        if total_buf == 0_usize or self.buf_ptr.is_null() {
+            self.filled = 0_u32;
+            return .Ok(());
+        }
+        var written = 0_usize;
+        while written < total_buf {
+            let pending: &[u8] = unsafe {
+                @slice_from_raw_parts(self.buf_ptr.add(written) as *u8, total_buf -% written)
+            };
+            let res: usize!IoError = self.downstream.write(pending);
+            match res {
+                .Ok(n) => {
+                    if n == 0_usize {
+                        if written > 0_usize {
+                            let rem_zero: usize = total_buf -% written;
+                            unsafe {
+                                @memmove(
+                                    self.buf_ptr as *mut opaque,
+                                    self.buf_ptr.add(written) as *opaque,
+                                    rem_zero,
+                                );
+                            }
+                            self.filled = rem_zero as u32;
+                        }
+                        return .Err(IoError.from_kind(.WriteZero, op: .Write));
+                    }
+                    written = written +% n;
+                },
+                .Err(err) => {
+                    if err.is_interrupted() {
+                        continue;
+                    }
+                    if written > 0_usize {
+                        let rem_err: usize = total_buf -% written;
+                        unsafe {
+                            @memmove(
+                                self.buf_ptr as *mut opaque,
+                                self.buf_ptr.add(written) as *opaque,
+                                rem_err,
+                            );
+                        }
+                        self.filled = rem_err as u32;
+                    }
+                    return .Err(err);
+                },
+            }
+        }
+        self.filled = 0_u32;
+        .Ok(())
+    }
+
+    /| Appends `data` to `self` (flushing or bypassing when full, and honoring `is_line_buffered()`).
+    @std_cap_boundary(clears: [unsafe_op, may_panic])
+    pub fn write(&mut self, data: &[u8], /) -> usize!IoError {
+        let data_len: usize = data.len();
+        if data_len == 0_usize {
+            return .Ok(0_usize);
+        }
+        let cap: usize = self.capacity();
+        if cap == 0_usize or self.buf_ptr.is_null() {
+            return self.downstream.write(data);
+        }
+        if self.is_line_buffered() {
+            if rfind_byte(data, b'\n') is .Some(nl_idx) {
+                let prefix_len: usize = if nl_idx < data_len => nl_idx + 1_usize else data_len;
+                if prefix_len <= self.spare_capacity() {
+                    unsafe {
+                        @memcpy(
+                            self.buf_ptr.add(self.filled as usize) as *mut opaque,
+                            data.as_ptr() as *opaque,
+                            prefix_len,
+                        );
+                    }
+                    self.filled = self.filled +% (prefix_len as u32);
+                    self.flush()?;
+                } else {
+                    self.flush_buffer_only()?;
+                    if prefix_len <= data_len {
+                        self.downstream.write_all(data[0..prefix_len])?;
+                    }
+                    self.downstream.flush()?;
+                }
+                if prefix_len < data_len {
+                    let tail: &[u8] = data[prefix_len..data_len];
+                    if tail.len() >= cap {
+                        self.downstream.write_all(tail)?;
+                    } else {
+                        unsafe {
+                            @memcpy(
+                                self.buf_ptr as *mut opaque,
+                                tail.as_ptr() as *opaque,
+                                tail.len(),
+                            );
+                        }
+                        self.filled = tail.len() as u32;
+                    }
+                }
+                return .Ok(data_len);
+            }
+        }
+        if data_len <= self.spare_capacity() {
+            unsafe {
+                @memcpy(
+                    self.buf_ptr.add(self.filled as usize) as *mut opaque,
+                    data.as_ptr() as *opaque,
+                    data_len,
+                );
+            }
+            self.filled = self.filled +% (data_len as u32);
+            return .Ok(data_len);
+        }
+        self.flush_buffer_only()?;
+        if data_len >= cap {
+            return self.downstream.write(data);
+        }
+        unsafe {
+            @memcpy(self.buf_ptr as *mut opaque, data.as_ptr() as *opaque, data_len);
+        }
+        self.filled = data_len as u32;
+        .Ok(data_len)
+    }
+
+    /| Writes all bytes of `data` into `self` (coalescing in `buf_ptr` and honoring `is_line_buffered()`).
+    @std_cap_boundary(clears: [may_panic])
+    pub fn write_all(&mut self, data: &[u8], /) -> unit!IoError {
+        let total: usize = data.len();
+        var written = 0_usize;
+        while written < total {
+            let n: usize = self.write(data[written..total]) catch |err| {
+                if err.is_interrupted() {
+                    continue;
+                }
+                return .Err(err);
+            };
+            if n == 0_usize {
+                return .Err(IoError.from_kind(.WriteZero, op: .Write));
+            }
+            written = written +| n;
+        }
+        .Ok(())
+    }
+
+    /| Appends a single byte `byte_val` to `self` without slice loop overhead when buffer space remains.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn write_byte(&mut self, byte_val: u8, /) -> unit!IoError {
+        if self.capacity() == 0_usize or self.buf_ptr.is_null() {
+            return self.downstream.write_byte(byte_val);
+        }
+        if self.spare_capacity() == 0_usize {
+            self.flush_buffer_only()?;
+        }
+        let write_ptr: *mut u8 = unsafe {
+            self.buf_ptr.add(self.filled as usize)
+        };
+        if not write_ptr.is_null() {
+            unsafe {
+                write_ptr.* = byte_val;
+            }
+        }
+        self.filled = self.filled +% 1_u32;
+        if byte_val == b'\n' and self.is_line_buffered() {
+            return self.flush();
+        }
+        .Ok(())
+    }
+
+    /| Coalesces small scatter `bufs` into `self.buf_ptr` or forwards combined `IoSlice` vectors downstream.
+    @std_cap_boundary(clears: [unsafe_op, may_panic])
+    pub fn write_vectored(&mut self, bufs: &[IoSlice], /) -> usize!IoError {
+        var total_incoming = 0_usize;
+        for slice in bufs {
+            total_incoming = total_incoming +| slice.len();
+        }
+        if total_incoming == 0_usize {
+            return .Ok(0_usize);
+        }
+        if self.is_line_buffered() or self.buf_ptr.is_null() {
+            var written_lb = 0_usize;
+            for slice in bufs {
+                let bytes: &[u8] = slice.as_slice();
+                if not bytes.is_empty() {
+                    self.write_all(bytes)?;
+                    written_lb = written_lb +% bytes.len();
+                }
+            }
+            return .Ok(written_lb);
+        }
+        if total_incoming <= self.spare_capacity() {
+            self.filled = copy_io_slices_to_buf(self.buf_ptr, self.filled, bufs);
+            return .Ok(total_incoming);
+        }
+        if self.filled == 0_u32 {
+            return self.downstream.write_vectored(bufs);
+        }
+        var combined: [IoSlice; 16] = [IoSlice.new(EMPTY_BYTES); 16];
+        let buf_len = self.filled as usize;
+        combined[0] = IoSlice.new(
+            unsafe {
+                @slice_from_raw_parts(self.buf_ptr as *u8, buf_len)
+            },
+        );
+        let take_n: usize = if bufs.len() < 15_usize => bufs.len() else 15_usize;
+        var idx = 0_usize;
+        while idx < take_n {
+            if idx < bufs.len() and (idx + 1_usize) < 16_usize {
+                combined[idx + 1_usize] = bufs[idx];
+            }
+            idx += 1_usize;
+        }
+        let batch_total: usize = take_n + 1_usize;
+        let combined_view: &[IoSlice] = if batch_total <= 16_usize => combined[0..batch_total]
+            else &combined;
+        let written: usize = self.downstream.write_vectored(combined_view)?;
+        if written < buf_len {
+            let rem: usize = buf_len -% written;
+            unsafe {
+                @memmove(
+                    self.buf_ptr as *mut opaque,
+                    self.buf_ptr.add(written) as *opaque,
+                    rem,
+                );
+            }
+            self.filled = rem as u32;
+            self.flush_buffer_only()?;
+            return self.downstream.write_vectored(bufs);
+        }
+        self.filled = 0_u32;
+        if written > buf_len {
+            return .Ok(written -% buf_len);
+        }
+        if total_incoming <= self.capacity() {
+            self.filled = copy_io_slices_to_buf(self.buf_ptr, 0_u32, bufs);
+            return .Ok(total_incoming);
+        }
+        self.downstream.write_vectored(bufs)
+    }
+
+    /| Writes all bytes across `bufs` into `self` (coalescing small slices before flushing).
+    @std_cap_boundary(clears: [may_panic])
+    pub fn write_all_vectored(&mut self, bufs: &[IoSlice], /) -> unit!IoError {
+        if self.is_line_buffered() {
+            for slice in bufs {
+                let bytes: &[u8] = slice.as_slice();
+                if not bytes.is_empty() {
+                    self.write_all(bytes)?;
+                }
+            }
+            return .Ok(());
+        }
+        var adapter: Writer = self.as_writer();
+        adapter.write_all_vectored(bufs)
+    }
+
+    /| Streams `args` (`FmtArgs`) directly into `self.buf_ptr` with `0` heap allocations.
+    @std_cap_boundary(clears: [unsafe_op, alloc]) @no_alloc
+    pub fn print(&mut self, args: FmtArgs, /) -> unit!IoError {
+        var bridge = BufWriterFmtBridge {
+            target: &raw mut self.*,
+            sticky_err: .None,
+        };
+        var fmt_sink = FmtWriter {
+            ctx: (&raw mut bridge) as *mut opaque,
+            write_fn: buf_writer_fmt_bridge_cb,
+        };
+        @fmt_write(&mut fmt_sink, args) catch {
+            return .Err(bridge.sticky_err orelse IoError.from_kind(.Other, op: .Write));
+        };
+        .Ok(())
+    }
+
+    /| Drains all buffered bytes to `downstream` and invokes `downstream.flush()`.
+    pub fn flush(&mut self) -> unit!IoError {
+        self.flush_buffer_only()?;
+        self.downstream.flush()
+    }
+
+    /| Borrows `self` as a type-erased `Writer`.
+    @inline @no_alloc @no_panic
+    pub fn as_writer(&mut self) -> Writer {
+        Writer {
+            ctx: (&raw mut self.*) as *mut opaque,
+            vtable: WRITER_SENTINEL_BUF as *WriterVTable,
+        }
+    }
+
+    /| Flushes `self`, always deallocating `System`-owned buffer storage even if `flush()` fails, and returns flush status.
+    pub fn close(own self) -> unit!IoError {
+        let BufWriter { downstream, buf_ptr, filled, cap_and_flags } = self;
+        var target: Writer = downstream;
+        let flush_res: unit!IoError = flush_raw_buf_writer_parts(&mut target, buf_ptr, filled);
+        if (cap_and_flags & BUF_WRITER_OWNS_SYS_FLAG) != 0_u32 {
+            let cap_bytes = (cap_and_flags & BUF_WRITER_CAP_MASK) as usize;
+            if cap_bytes > 0_usize and not buf_ptr.is_null() {
+                System
+                    .handle()
+                    .dealloc(
+                        buf_ptr,
+                        Layout { size: cap_bytes, alignment: OWNED_IO_BUF_ALIGN },
+                    );
+            }
+        }
+        flush_res
+    }
+
+    /| Consumes `self` without flushing buffered bytes and deallocates `System`-owned buffer storage when present.
+    @no_alloc @no_panic
+    pub fn discard(own self) {
+        let BufWriter { buf_ptr, cap_and_flags, .. } = self;
+        if (cap_and_flags & BUF_WRITER_OWNS_SYS_FLAG) != 0_u32 {
+            let cap_bytes = (cap_and_flags & BUF_WRITER_CAP_MASK) as usize;
+            if cap_bytes > 0_usize and not buf_ptr.is_null() {
+                System
+                    .handle()
+                    .dealloc(
+                        buf_ptr,
+                        Layout { size: cap_bytes, alignment: OWNED_IO_BUF_ALIGN },
+                    );
+            }
+        }
+    }
+}
+
+impl LimitReader {
+    /| Wraps `upstream` so at most `limit` bytes can be read before synthetic EOF (`0`).
+    @no_alloc @no_panic
+    pub fn new(upstream: Reader, limit: u64, /) -> LimitReader = LimitReader {
+        upstream,
+        remaining_bytes: limit,
+    };
+
+    /| Returns the unread byte budget remaining on `self`.
+    @no_alloc @no_panic
+    pub fn remaining(&self) -> u64 = self.remaining_bytes;
+
+    /| Reads at most `min(out.remaining(), self.remaining())` bytes from `upstream` into `out`.
+    @std_cap_boundary(clears: [unsafe_op])
+    pub fn read_out(&mut self, out: &mut OutBuf, /) -> usize!IoError {
+        if self.remaining_bytes == 0_u64 or out.is_full() {
+            return .Ok(0_usize);
+        }
+        let max_usize: usize = clamp_u64_to_usize(self.remaining_bytes);
+        let (dst_ptr, out_rem) = out.unfilled_raw();
+        let cap_chunk: usize = if out_rem < max_usize => out_rem else max_usize;
+        var sub_out = unsafe {
+            OutBuf.from_raw_parts(dst_ptr, cap_chunk)
+        };
+        let n: usize = self.upstream.read_out(&mut sub_out)?;
+        unsafe {
+            out.advance_init(n);
+        }
+        self.remaining_bytes = self.remaining_bytes -| (n as u64);
+        .Ok(n)
+    }
+
+    /| Borrows `self` as a type-erased `Reader`.
+    @inline @no_alloc @no_panic
+    pub fn as_reader(&mut self) -> Reader {
+        Reader {
+            ctx: (&raw mut self.*) as *mut opaque,
+            vtable: READER_SENTINEL_LIMIT as *ReaderVTable,
+        }
+    }
+}
+
+impl ByteReader {
+    /| Constructs a `ByteReader` positioned at offset `0` of `data`.
+    @no_alloc @no_panic
+    pub fn new(data: &[u8], /) -> ByteReader = ByteReader {
+        data,
+        pos: 0_usize,
+    };
+
+    /| Returns the unread byte count remaining from `position()` to `data.len()`.
+    @no_alloc @no_panic
+    pub fn remaining(&self) -> usize = self.data.len() -| self.pos;
+
+    /| Returns the current cursor byte offset.
+    @no_alloc @no_panic
+    pub fn position(&self) -> u64 = self.pos as u64;
+
+    /| Returns `true` when zero unread bytes remain (`pos >= data.len()`).
+    @no_alloc @no_panic
+    pub fn is_empty(&self) -> bool = self.pos >= self.data.len();
+
+    /| Copies `min(remaining(), out.remaining())` bytes into `out` and advances `pos`.
+    @std_cap_boundary(clears: [may_panic]) @no_alloc @no_panic
+    pub fn read_out(&mut self, out: &mut OutBuf, /) -> usize!IoError {
+        if self.pos >= self.data.len() or out.is_full() {
+            return .Ok(0_usize);
+        }
+        let unread: &[u8] = self.data[self.pos..self.data.len()];
+        let copied: usize = out.append(unread);
+        self.pos = self.pos +% copied;
+        .Ok(copied)
+    }
+
+    /| Repositions `self.pos` according to `pos` (failing with `.InvalidInput` on negative or `> usize.MAX` offset).
+    @no_alloc @no_panic
+    pub fn seek(&mut self, pos: SeekFrom, /) -> u64!IoError {
+        let next_u64: u64 = compute_seek_offset(self.pos as u64, self.data.len() as u64, pos)?;
+        if next_u64 > (usize.MAX as u64) {
+            return .Err(IoError.from_kind(.InvalidInput, op: .Seek));
+        }
+        self.pos = next_u64 as usize;
+        .Ok(next_u64)
+    }
+
+    /| Borrows `self` as a `Reader`.
+    @inline @no_alloc @no_panic
+    pub fn as_reader(&mut self) -> Reader {
+        Reader {
+            ctx: (&raw mut self.*) as *mut opaque,
+            vtable: READER_SENTINEL_BYTES as *ReaderVTable,
+        }
+    }
+
+    /| Borrows `self` as a `Seek` handle.
+    @inline @no_alloc @no_panic
+    pub fn as_seeker(&mut self) -> Seek {
+        Seek {
+            ctx: (&raw mut self.*) as *mut opaque,
+            vtable: SEEK_SENTINEL_BYTES as *SeekVTable,
+        }
+    }
+}
+
+impl SliceWriter {
+    /| Constructs a `SliceWriter` writing from index `0` of `buf`.
+    @inline @no_alloc @no_panic
+    pub fn new(buf: &mut [u8], /) -> SliceWriter {
+        SliceWriter {
+            ptr: buf.as_mut_ptr(),
+            cap: buf.len(),
+            pos: 0_usize,
+        }
+    }
+
+    /| Borrows the slice prefix `0..position()` written up to the current cursor.
+    @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
+    pub fn written(&self) -> &[u8] {
+        let len: usize = if self.pos <= self.cap => self.pos else self.cap;
+        if len == 0_usize or self.ptr.is_null() {
+            return EMPTY_BYTES;
+        }
+        unsafe {
+            @slice_from_raw_parts(self.ptr as *u8, len)
+        }
+    }
+
+    /| Returns the current write cursor offset in `0..=cap`.
+    @no_alloc @no_panic
+    pub fn position(&self) -> u64 = self.pos as u64;
+
+    /| Returns the remaining writable capacity (`cap - pos`).
+    @no_alloc @no_panic
+    pub fn remaining(&self) -> usize = self.cap -| self.pos;
+
+    /| Returns `true` when the cursor sits at offset `0`.
+    @no_alloc @no_panic
+    pub fn is_empty(&self) -> bool = self.pos == 0_usize;
+
+    /| Returns `true` when `remaining() == 0`.
+    @no_alloc @no_panic
+    pub fn is_full(&self) -> bool = self.pos >= self.cap;
+
+    /| Copies `min(data.len(), remaining())` bytes into `self` and returns bytes written (`0` when full).
+    @std_cap_boundary(clears: [unsafe_op]) @no_alloc @no_panic
+    pub fn write(&mut self, data: &[u8], /) -> usize!IoError {
+        if data.is_empty() {
+            return .Ok(0_usize);
+        }
+        let rem: usize = self.remaining();
+        let copy_n: usize = if data.len() < rem => data.len() else rem;
+        if copy_n > 0_usize and not self.ptr.is_null() {
+            unsafe {
+                @memcpy(
+                    self.ptr.add(self.pos) as *mut opaque,
+                    data.as_ptr() as *opaque,
+                    copy_n,
+                );
+            }
+            self.pos = self.pos +% copy_n;
+        }
+        .Ok(copy_n)
+    }
+
+    /| Repositions `self.pos` within `0..=cap` (failing with `.InvalidInput` if `< 0` or `> cap`).
+    @no_alloc @no_panic
+    pub fn seek(&mut self, pos: SeekFrom, /) -> u64!IoError {
+        let next_u64: u64 = compute_seek_offset(self.pos as u64, self.cap as u64, pos)?;
+        if next_u64 > (self.cap as u64) {
+            return .Err(IoError.from_kind(.InvalidInput, op: .Seek));
+        }
+        self.pos = next_u64 as usize;
+        .Ok(next_u64)
+    }
+
+    /| Borrows `self` as a `Writer`.
+    @inline @no_alloc @no_panic
+    pub fn as_writer(&mut self) -> Writer {
+        Writer {
+            ctx: (&raw mut self.*) as *mut opaque,
+            vtable: WRITER_SENTINEL_SLICE as *WriterVTable,
+        }
+    }
+
+    /| Borrows `self` as a `Seek` handle.
+    @inline @no_alloc @no_panic
+    pub fn as_seeker(&mut self) -> Seek {
+        Seek {
+            ctx: (&raw mut self.*) as *mut opaque,
+            vtable: SEEK_SENTINEL_SLICE as *SeekVTable,
+        }
+    }
+}
+
+/| Streams all bytes from `src` into `dst` using an uninitialized `8 KiB` stack buffer (`0` `memset`, `0` heap allocs).
+@std_cap_boundary(clears: [unsafe_op])
+pub fn copy_stream(
+    src: &mut Reader,
+    dst: &mut Writer,
+    /,
+    *,
+    max_bytes: u64 = u64.MAX,
+) -> u64!IoError {
+    var total_copied = 0_u64;
+    var raw_buf: [u8; DEFAULT_IO_BUF_SIZE];
+    while true {
+        var base_out = OutBuf.over_uninit(&out raw_buf);
+        if max_bytes < u64.MAX and total_copied == max_bytes {
+            var probe_out = unsafe {
+                OutBuf.from_raw_parts(base_out.unfilled_raw().0, 1_usize)
+            };
+            let probe_n: usize = src.read_out(&mut probe_out) catch |err| {
+                if err.is_interrupted() {
+                    continue;
+                }
+                return .Err(err);
+            };
+            if probe_n > 0_usize {
+                return .Err(IoError.from_kind(.StreamTooLong, op: .Read));
+            }
+            return .Ok(total_copied);
+        }
+        let rem_u64: u64 = max_bytes -| total_copied;
+        let chunk_cap: usize = if max_bytes == u64.MAX or rem_u64 >= (DEFAULT_IO_BUF_SIZE as u64) => DEFAULT_IO_BUF_SIZE
+            else rem_u64 as usize;
+        var bounded_out = unsafe {
+            OutBuf.from_raw_parts(base_out.unfilled_raw().0, chunk_cap)
+        };
+        let n: usize = src.read_out(&mut bounded_out) catch |err| {
+            if err.is_interrupted() {
+                continue;
+            }
+            return .Err(err);
+        };
+        if n == 0_usize {
+            return .Ok(total_copied);
+        }
+        dst.write_all(bounded_out.filled())?;
+        total_copied = total_copied +% (n as u64);
+    }
+    .Ok(total_copied)
+}
+
+// ------------------ Locked Standard Streams -------------------
+impl StdinLock {
+    /| Borrows the inner `8 KiB` `BufReader` over standard input (`fd = 0`).
+    @no_alloc @no_panic
+    pub fn reader(&mut self) -> &mut BufReader = &mut self.inner_reader;
+
+    /| Saves any unread lookahead window back to `StdioSlab` and releases the `stdin` lock.
+    @std_cap_boundary(emits: [fs, blocking_sync], clears: [ffi, unsafe_op, indirect_opaque])
+    @no_alloc @no_panic
+    pub fn release(own self) {
+        let StdinLock { inner_reader, lock_token } = self;
+        let hdr_ptr = lock_token as *mut StdioTlsHeader;
+        if not hdr_ptr.is_null() {
+            let hdr: &mut StdioTlsHeader = unsafe {
+                &mut hdr_ptr.*
+            };
+            let slab_ptr: *mut StdioSlab = hdr.slab_ptr;
+            if not slab_ptr.is_null() {
+                let slab: &mut StdioSlab = unsafe {
+                    &mut slab_ptr.*
+                };
+                slab.stdin_pos = inner_reader.pos;
+                slab.stdin_filled = inner_reader.filled;
+            }
+            release_stdio_lock(&raw mut hdr.stdin_lock);
+        }
+    }
+}
+
+impl StdoutLock {
+    /| Borrows the inner `8 KiB` `BufWriter` over `stdout` / `stderr`.
+    @no_alloc @no_panic
+    pub fn writer(&mut self) -> &mut BufWriter = &mut self.inner_writer;
+
+    /| Writes all of `data` into the locked buffered standard stream.
+    @std_cap_boundary(emits: [fs, blocking_sync], clears: [ffi, unsafe_op, indirect_opaque])
+    pub fn write_all(&mut self, data: &[u8], /) -> unit!IoError {
+        self.inner_writer.write_all(data)
+    }
+
+    /| Formats `args` (`FmtArgs`) into the locked buffered standard stream with `0` heap allocations.
+    @std_cap_boundary(emits: [fs, blocking_sync], clears: [ffi, unsafe_op, alloc, indirect_opaque])
+    @no_alloc
+    pub fn print(&mut self, args: FmtArgs, /) -> unit!IoError {
+        self.inner_writer.print(args)
+    }
+
+    /| Flushes buffered bytes to `context.reactor` or the host OS descriptor.
+    @std_cap_boundary(emits: [fs, blocking_sync], clears: [ffi, unsafe_op, indirect_opaque])
+    pub fn flush(&mut self) -> unit!IoError {
+        self.inner_writer.flush()
+    }
+
+    /| Flushes all buffered bytes, releases the stream lock, and propagates any flush `IoError`.
+    @std_cap_boundary(emits: [fs, blocking_sync], clears: [ffi, unsafe_op, indirect_opaque])
+    pub fn flush_and_release(own self) -> unit!IoError {
+        let StdoutLock { var inner_writer, lock_token } = self;
+        let flush_res: unit!IoError = inner_writer.flush();
+        let rem_filled: u32 = inner_writer.filled;
+        inner_writer.discard();
+        finish_stdout_lock_token(lock_token, rem_filled);
+        flush_res
+    }
+
+    /| Flushes buffered bytes on best-effort and releases the stream lock (`defer`-safe).
+    @std_cap_boundary(emits: [fs, blocking_sync], clears: [ffi, unsafe_op, indirect_opaque])
+    pub fn release(own self) {
+        let StdoutLock { var inner_writer, lock_token } = self;
+        inner_writer.flush() catch {};
+        let rem_filled: u32 = inner_writer.filled;
+        inner_writer.discard();
+        finish_stdout_lock_token(lock_token, rem_filled);
+    }
+}
+
+/| Acquires exclusive buffered access to standard input (`fd = 0`, `8 KiB` window).
+@std_cap_boundary(emits: [fs, blocking_sync], clears: [
+    ffi,
+    unsafe_op,
+    alloc,
+    may_panic,
+    indirect_opaque,
+])
+pub fn stdin_locked() -> StdinLock {
+    let raw_reader = Reader {
+        ctx: @default_init[*mut opaque](),
+        vtable: READER_SENTINEL_STDIN as *ReaderVTable,
+    };
+    let hdr_ptr: *mut StdioTlsHeader = stdio_tls_header();
+    if hdr_ptr.is_null() {
+        return StdinLock {
+            inner_reader: BufReader {
+                upstream: raw_reader,
+                buf_ptr: @default_init[*mut u8](),
+                cap_and_flag: 0_usize,
+                pos: 0_usize,
+                filled: 0_usize,
+            },
+            lock_token: 0_usize,
+        };
+    }
+    let hdr_addr = hdr_ptr as usize;
+    let hdr: &mut StdioTlsHeader = unsafe {
+        &mut hdr_ptr.*
+    };
+    acquire_stdio_lock(&raw mut hdr.stdin_lock);
+    let slab_ptr: *mut StdioSlab = ensure_stdio_slab(hdr);
+    if not slab_ptr.is_null() {
+        let slab: &mut StdioSlab = unsafe {
+            &mut slab_ptr.*
+        };
+        return StdinLock {
+            inner_reader: BufReader {
+                upstream: raw_reader,
+                buf_ptr: &raw mut slab.stdin_buf[0],
+                cap_and_flag: DEFAULT_IO_BUF_SIZE,
+                pos: slab.stdin_pos,
+                filled: slab.stdin_filled,
+            },
+            lock_token: hdr_addr,
+        };
+    }
+    StdinLock {
+        inner_reader: BufReader {
+            upstream: raw_reader,
+            buf_ptr: &raw mut hdr.emergency_buf[0],
+            cap_and_flag: 2_usize,
+            pos: 0_usize,
+            filled: 0_usize,
+        },
+        lock_token: hdr_addr,
+    }
+}
+
+/| Acquires exclusive buffered access to standard output (`fd = 1`; auto-line-buffered on TTY).
+@std_cap_boundary(emits: [fs, blocking_sync], clears: [
+    ffi,
+    unsafe_op,
+    alloc,
+    may_panic,
+    indirect_opaque,
+])
+pub fn stdout_locked() -> StdoutLock {
+    lock_stdio_output_stream(false)
+}
+
+/| Acquires exclusive buffered access to standard error (`fd = 2`).
+@std_cap_boundary(emits: [fs, blocking_sync], clears: [
+    ffi,
+    unsafe_op,
+    alloc,
+    may_panic,
+    indirect_opaque,
+])
+pub fn stderr_locked() -> StderrLock {
+    lock_stdio_output_stream(true)
+}
+
+/| Formats `args` into locked `stdout` (`0` heap allocations) and flushes in a single coalesced write.
+@std_cap_boundary(emits: [fs, blocking_sync], clears: [
+    ffi,
+    unsafe_op,
+    alloc,
+    may_panic,
+    indirect_opaque,
+])
+pub fn print(args: FmtArgs, /) {
+    var out: StdoutLock = stdout_locked();
+    out.print(args) catch {};
+    out.release();
+}
+
+/| Formats `args` followed by `"\n"` into locked `stdout` (`0` heap allocations) and flushes.
+@std_cap_boundary(emits: [fs, blocking_sync], clears: [
+    ffi,
+    unsafe_op,
+    alloc,
+    may_panic,
+    indirect_opaque,
+])
+pub fn println(args: FmtArgs = "", /) {
+    var out: StdoutLock = stdout_locked();
+    if out.print(args) is .Ok(_) {
+        out.write_all(b"\n") catch {};
+    }
+    out.release();
+}
+
+/| Formats `args` into locked `stderr` (`0` heap allocations) and flushes immediately.
+@std_cap_boundary(emits: [fs, blocking_sync], clears: [
+    ffi,
+    unsafe_op,
+    alloc,
+    may_panic,
+    indirect_opaque,
+])
+pub fn eprint(args: FmtArgs, /) {
+    var err_out: StderrLock = stderr_locked();
+    err_out.print(args) catch {};
+    err_out.release();
+}
+
+/| Formats `args` followed by `"\n"` into locked `stderr` (`0` heap allocations) and flushes immediately.
+@std_cap_boundary(emits: [fs, blocking_sync], clears: [
+    ffi,
+    unsafe_op,
+    alloc,
+    may_panic,
+    indirect_opaque,
+])
+pub fn eprintln(args: FmtArgs = "", /) {
+    var err_out: StderrLock = stderr_locked();
+    if err_out.print(args) is .Ok(_) {
+        err_out.write_all(b"\n") catch {};
+    }
+    err_out.release();
+}
+
+// ---------------------------------------- TESTS ----------------------------------------
+/| Stateful mock writer recording `write_count`, `flush_count`, and optional failure triggers for unit tests.
+struct FailingTestSink {
+    /| Captured output bytes.
+    buf: [u8; 64],
+    /| Number of bytes accepted before failure.
+    len: usize,
+    /| Count of `flush` invocations observed.
+    flushes: usize,
+    /| When `true`, `write` and `flush` fail with `StorageFull`.
+    fail_all: bool,
+}
+
+impl FailingTestSink {
+    /| `WriterVTable.write` callback for `FailingTestSink`.
+    @std_cap_boundary(clears: [unsafe_op, may_panic])
+    fn write_cb(ctx: *mut opaque, data: &[u8]) -> usize!IoError {
+        let sink_ptr = ctx as *mut FailingTestSink;
+        if sink_ptr.is_null() {
+            return .Ok(0_usize);
+        }
+        let sink: &mut FailingTestSink = unsafe {
+            &mut sink_ptr.*
+        };
+        if sink.fail_all {
+            return .Err(IoError.from_kind(.StorageFull, op: .Write));
+        }
+        let rem: usize = 64_usize -| sink.len;
+        let take_n: usize = if data.len() < rem => data.len() else rem;
+        if take_n > 0_usize {
+            unsafe {
+                @memcpy(
+                    (&raw mut sink.buf[0]).add(sink.len) as *mut opaque,
+                    data.as_ptr() as *opaque,
+                    take_n,
+                );
+            }
+            sink.len = sink.len +% take_n;
+        }
+        .Ok(take_n)
+    }
+
+    /| `WriterVTable.flush` callback for `FailingTestSink`.
+    @std_cap_boundary(clears: [unsafe_op])
+    fn flush_cb(ctx: *mut opaque) -> unit!IoError {
+        let sink_ptr = ctx as *mut FailingTestSink;
+        if sink_ptr.is_null() {
+            return .Ok(());
+        }
+        let sink: &mut FailingTestSink = unsafe {
+            &mut sink_ptr.*
+        };
+        sink.flushes = sink.flushes +% 1_usize;
+        if sink.fail_all {
+            return .Err(IoError.from_kind(.StorageFull, op: .Flush));
+        }
+        .Ok(())
+    }
+}
+
+/| Full 8-word C-ABI reactor table layout used by `context.reactor` standard-stream unit tests.
+@repr(C)
+struct MockStdioReactorVTable {
+    /| Slots `0..2`: Unused clock and RNG callbacks (`[0; 3]`).
+    head_slots: [usize; 3],
+    /| Slot `3`: `submit_io` callback.
+    submit_io: ReactorSubmitFn?,
+    /| Slots `4..7`: Unused async proactor callbacks (`[0; 4]`).
+    tail_slots: [usize; 4],
+}
+
+/| Mock `--sim` stdio state capturing `stdout`/`stderr` and feeding `stdin` via `ReactorVTable.submit_io`.
+struct MockSimStdio {
+    /| Fixtures fed to `stdin` (`fd = 0`).
+    stdin_src: [u8; 32],
+    /| Length of `stdin_src`.
+    stdin_len: usize,
+    /| Current read cursor in `stdin_src`.
+    stdin_pos: usize,
+    /| Captured `stdout` (`fd = 1`) bytes.
+    stdout_cap: [u8; 64],
+    /| Captured `stdout` byte count.
+    stdout_len: usize,
+    /| Captured `stderr` (`fd = 2`) bytes.
+    stderr_cap: [u8; 64],
+    /| Captured `stderr` byte count.
+    stderr_len: usize,
+}
+
+/| C-ABI `ReactorVTable.submit_io` handler intercepting `SIM_OP_STDIO_RW` in unit tests.
+@std_cap_boundary(clears: [unsafe_op])
+extern "C" fn mock_sim_submit_io(ctx: *mut opaque, sub_ptr: *IoSubmission) -> i64 {
+    if ctx.is_null() {
+        return SIM_UNHANDLED_SENTINEL;
+    }
+    if sub_ptr.is_null() {
+        return SIM_UNHANDLED_SENTINEL;
+    }
+    let sub: IoSubmission = unsafe {
+        sub_ptr.*
+    };
+    let kind_code: u8 = sub.kind;
+    let rw_flags: u8 = sub.flags;
+    let fd_num: i32 = sub.fd_or_handle;
+    let buf_ptr: *mut u8 = sub.buf_ptr;
+    let req_len = sub.buf_len as usize;
+    if kind_code != SIM_OP_STDIO_RW {
+        return SIM_UNHANDLED_SENTINEL;
+    }
+    let state_ptr = ctx as *mut MockSimStdio;
+    if state_ptr.is_null() {
+        return SIM_UNHANDLED_SENTINEL;
+    }
+    let state: &mut MockSimStdio = unsafe {
+        &mut state_ptr.*
+    };
+    if rw_flags == 0_u8 and fd_num == 0 {
+        let avail: usize = state.stdin_len -| state.stdin_pos;
+        let copy_n: usize = if req_len < avail => req_len else avail;
+        if copy_n > 0_usize and not buf_ptr.is_null() {
+            unsafe {
+                @memcpy(
+                    buf_ptr as *mut opaque,
+                    (&raw state.stdin_src[0]).add(state.stdin_pos) as *opaque,
+                    copy_n,
+                );
+            }
+            state.stdin_pos = state.stdin_pos +% copy_n;
+        }
+        return copy_n as i64;
+    }
+    if rw_flags == 1_u8 and (fd_num == 1 or fd_num == 2) {
+        if fd_num == 1 {
+            let avail_out: usize = 64_usize -| state.stdout_len;
+            let copy_out: usize = if req_len < avail_out => req_len else avail_out;
+            if copy_out > 0_usize and not buf_ptr.is_null() {
+                unsafe {
+                    @memcpy(
+                        (&raw mut state.stdout_cap[0]).add(state.stdout_len) as *mut opaque,
+                        buf_ptr as *opaque,
+                        copy_out,
+                    );
+                }
+                state.stdout_len = state.stdout_len +% copy_out;
+            }
+        } else {
+            let avail_err: usize = 64_usize -| state.stderr_len;
+            let copy_err: usize = if req_len < avail_err => req_len else avail_err;
+            if copy_err > 0_usize and not buf_ptr.is_null() {
+                unsafe {
+                    @memcpy(
+                        (&raw mut state.stderr_cap[0]).add(state.stderr_len) as *mut opaque,
+                        buf_ptr as *opaque,
+                        copy_err,
+                    );
+                }
+                state.stderr_len = state.stderr_len +% copy_err;
+            }
+        }
+        return req_len as i64;
+    }
+    SIM_UNHANDLED_SENTINEL
+}
+
+test "IoError layout, niche size, and OS error mappers" {
+    assert(@size_of[IoErrorKind?]() == 1_usize);
+    assert(@size_of[IoOp?]() == 1_usize);
+    assert(@size_of[IoError]() == 8_usize);
+    assert(@size_of[IoError?]() == 8_usize);
+    assert(@size_of[IoErrorBits]() == 8_usize);
+
+    let generic_err = IoError.from_kind(.InvalidScriptExtension, op: .Spawn);
+    assert((generic_err.packed_repr as u64 & 1_u64) == 0_u64);
+    assert(generic_err.kind() == .InvalidScriptExtension);
+    assert(generic_err.op() == .Spawn);
+    assert(generic_err.domain() == .Generic);
+    assert(generic_err.os_error() == .None);
+    assert(not generic_err.is_interrupted());
+
+    let win_err = IoError.from_raw_os(32, domain: .Win32Error, op: .Rename);
+    assert(win_err.kind() == .ResourceBusy);
+    assert(win_err.op() == .Rename);
+    assert(win_err.domain() == .Win32Error);
+    assert(win_err.os_error() == .Some(32));
+
+    let nt_err = IoError.from_raw_os(@bit_cast[i32](0xC000_04B3_u32), domain: .NtStatus, op: .Open);
+    assert(nt_err.kind() == .FilesystemLoop);
+
+    let wasi_err = IoError.from_raw_os(76, domain: .WasiErrno, op: .Resolve);
+    assert(wasi_err.kind() == .PermissionDenied);
+
+    let intr_err = IoError.from_raw_os(4, domain: .PosixErrno, op: .Read);
+    assert(intr_err.is_interrupted());
+
+    // Target-OS-independent `.SimFault` codes (`11 == WouldBlock`, `35 == FileLockConflict` even on macOS):
+    assert(IoError.from_raw_os(11, domain: .SimFault, op: .Read).kind() == .WouldBlock);
+    assert(IoError.from_raw_os(35, domain: .SimFault, op: .Lock).kind() == .FileLockConflict);
+    assert(IoError.from_raw_os(5, domain: .SimFault, op: .Read).kind() == .Other);
+    assert(IoError.from_raw_os(40, domain: .SimFault, op: .Open).kind() == .FilesystemLoop);
+    assert(IoError.from_raw_os(110, domain: .SimFault, op: .Read).kind() == .TimedOut);
+
+    let formatted = String.fmt(f"{win_err}");
+    assert(formatted.as_str() == "resource busy (os error 32)");
+}
+
+test "OutBuf, IoSlice, and IoSliceMut zero-memset and advance invariants" {
+    var raw_backing: [u8; 16];
+    var out = OutBuf.over_uninit(&out raw_backing);
+    assert(out.capacity() == 16_usize);
+    assert(out.is_empty());
+    assert(not out.is_full());
+    assert(out.append(b"corex") == 5_usize);
+    assert(out.append(b"-io-stream-overflow") == 11_usize);
+    assert(out.is_full());
+    assert(out.filled() == "corex-io-stream-".as_bytes());
+    out.clear();
+    assert(out.is_empty());
+
+    var slices_arr: [IoSlice; 3] = [
+        IoSlice.new(b"ab"),
+        IoSlice.new(EMPTY_BYTES),
+        IoSlice.new(b"cdef"),
+    ];
+    var slices_view: &mut [IoSlice] = &mut slices_arr;
+    IoSlice.advance_slices(&mut slices_view, 4_usize);
+    assert(slices_view.len() == 1_usize);
+    if slices_view.get(0) is .Some(first_slice) {
+        assert(first_slice.as_slice() == "ef".as_bytes());
+    }
+
+    var mut_a: [u8; 3] = [b'1', b'2', b'3'];
+    var mut_b: [u8; 4] = [b'4', b'5', b'6', b'7'];
+    var mut_arr: [IoSliceMut; 2] = [IoSliceMut.new(&mut mut_a), IoSliceMut.new(&mut mut_b)];
+    var mut_view: &mut [IoSliceMut] = &mut mut_arr;
+    IoSliceMut.advance_mut_slices(&mut mut_view, 5_usize);
+    assert(mut_view.len() == 1_usize);
+    if mut_view.get(0) is .Some(first_mut) {
+        assert(first_mut.as_slice() == "67".as_bytes());
+    }
+}
+
+test "BufReader peek, consume, SIMD/SWAR read_until, and CRLF next_line" {
+    if @size_of[usize]() == 8_usize {
+        assert(@size_of[BufReader]() == 48_usize);
+        assert(@size_of[BufWriter]() == 32_usize);
+        assert(@size_of[Reader]() == 16_usize);
+        assert(@size_of[Reader?]() == 16_usize);
+        assert(@size_of[Writer]() == 16_usize);
+        assert(@size_of[Seek]() == 16_usize);
+    }
+
+    var cursor = ByteReader.new(b"alpha\r\nbeta\ngamma-tail");
+    var raw_buf: [u8; 8];
+    var br = BufReader.over_uninit(cursor.as_reader(), &out raw_buf);
+
+    let peeked: &[u8] = br.peek(5_usize) catch unreachable;
+    if peeked.len() >= 5_usize {
+        assert(peeked[0..5] == "alpha".as_bytes());
+    }
+
+    let line1: str? = br.next_line() catch unreachable;
+    assert(line1 == .Some("alpha"));
+
+    let line2: str? = br.next_line() catch unreachable;
+    assert(line2 == .Some("beta"));
+
+    // `"gamma-tail"` is 10 bytes > 8-byte buffer -> `read_until` returns `StreamTooLong`,
+    // whereas `read_until_into` streams across multiple refills cleanly!
+    if br.read_until(b'\n') is .Err(err) {
+        assert(err.kind() == .StreamTooLong);
+    } else {
+        assert(false);
+    }
+
+    var cursor2 = ByteReader.new(b"long-line-across-refills\ndone");
+    var br_sys = BufReader.with_capacity(cursor2.as_reader(), 6_usize);
+    var line_vec = Vec[u8].new();
+    let n_into: usize = br_sys.read_until_into(b'\n', &mut line_vec) catch unreachable;
+    assert(n_into == 25_usize);
+    assert(line_vec.as_slice() == "long-line-across-refills\n".as_bytes());
+    let final_line: str? = br_sys.next_line() catch unreachable;
+    assert(final_line == .Some("done"));
+    let eof_line: str? = br_sys.next_line() catch unreachable;
+    assert(eof_line == .None);
+}
+
+test "BufWriter vectored coalescing, FmtArgs print, and close on flush error" {
+    var dst_bytes: [u8; 64] = [0_u8; 64];
+    var sw = SliceWriter.new(&mut dst_bytes);
+    var bw = BufWriter.new(sw.as_writer());
+    let parts: [IoSlice; 3] = [
+        IoSlice.new(b"item="),
+        IoSlice.new(b"42"),
+        IoSlice.new(b"; "),
+    ];
+    let vec_n: usize = bw.write_vectored(&parts) catch unreachable;
+    assert(vec_n == 9_usize);
+    bw.print(f"ok={true}") catch unreachable;
+    assert(sw.position() == 0_u64);
+    bw.close() catch unreachable;
+    assert(sw.written() == "item=42; ok=true".as_bytes());
+
+    // Verify `BufWriter.close` frees `System` buffer and propagates `.Err` when downstream flush fails:
+    var fail_sink = FailingTestSink {
+        buf: [0_u8; 64],
+        len: 0_usize,
+        flushes: 0_usize,
+        fail_all: true,
+    };
+    let fail_vtable = WriterVTable {
+        write: FailingTestSink.write_cb,
+        write_vectored: .None,
+        flush: .Some(FailingTestSink.flush_cb),
+    };
+    let fail_writer = unsafe {
+        Writer.from_raw((&raw mut fail_sink) as *mut opaque, &raw fail_vtable)
+    };
+    var bw_fail = BufWriter.with_capacity(fail_writer, 32_usize);
+    bw_fail.write_all(b"buffered") catch unreachable;
+    if bw_fail.close() is .Err(err) {
+        assert(err.kind() == .StorageFull);
+    } else {
+        assert(false);
+    }
+}
+
+test "BufWriter write_all_vectored after pre-buffering hello over SliceWriter" {
+    // [1] Direct `SliceWriter` with an `8 B` `BufWriter` overflowing spare capacity after `"hello"`:
+    var direct_storage: [u8; 32] = [0_u8; 32];
+    var direct_sw = SliceWriter.new(&mut direct_storage);
+    var raw_backing1: [u8; 8];
+    var bw_direct = BufWriter.over_uninit(direct_sw.as_writer(), &out raw_backing1);
+    bw_direct.write_all(b"hello") catch unreachable;
+    let tail_slices1: [IoSlice; 2] = [IoSlice.new(b" "), IoSlice.new(b"world!")];
+    bw_direct.write_all_vectored(&tail_slices1) catch unreachable;
+    bw_direct.close() catch unreachable;
+    assert(direct_sw.written() == "hello world!".as_bytes());
+
+    // [2] Single-slice `WriterVTable` (`write_vectored: .None`) forcing `written == buf_len` (`<= cap` & `> cap`):
+    let single_slice_vtable = WriterVTable {
+        write: slice_writer_write_cb,
+        write_vectored: .None,
+        flush: .None,
+    };
+    var small_storage: [u8; 32] = [0_u8; 32];
+    var small_sw = SliceWriter.new(&mut small_storage);
+    let small_writer = unsafe {
+        Writer.from_raw((&raw mut small_sw) as *mut opaque, &raw single_slice_vtable)
+    };
+    var raw_backing2: [u8; 8];
+    var bw_small = BufWriter.over_uninit(small_writer, &out raw_backing2);
+    bw_small.write_all(b"hello") catch unreachable;
+    let tail_slices2: [IoSlice; 2] = [IoSlice.new(b" "), IoSlice.new(b"ok")];
+    bw_small.write_all_vectored(&tail_slices2) catch unreachable;
+    bw_small.close() catch unreachable;
+    assert(small_sw.written() == "hello ok".as_bytes());
+
+    var large_storage: [u8; 32] = [0_u8; 32];
+    var large_sw = SliceWriter.new(&mut large_storage);
+    let large_writer = unsafe {
+        Writer.from_raw((&raw mut large_sw) as *mut opaque, &raw single_slice_vtable)
+    };
+    var raw_backing3: [u8; 8];
+    var bw_large = BufWriter.over_uninit(large_writer, &out raw_backing3);
+    bw_large.write_all(b"hello") catch unreachable;
+    let tail_slices3: [IoSlice; 2] = [IoSlice.new(b" "), IoSlice.new(b"oversized-tail")];
+    bw_large.write_all_vectored(&tail_slices3) catch unreachable;
+    bw_large.close() catch unreachable;
+    assert(large_sw.written() == "hello oversized-tail".as_bytes());
+}
+
+test "LimitReader, ByteReader/SliceWriter seek, repeat, and copy_stream" {
+    let rep = Reader.repeat(b'Z');
+    var lim = LimitReader.new(rep, 12_u64);
+    var lim_reader: Reader = lim.as_reader();
+    var dst_storage: [u8; 32] = [0_u8; 32];
+    var sw = SliceWriter.new(&mut dst_storage);
+    var sw_writer: Writer = sw.as_writer();
+
+    let copied: u64 = copy_stream(&mut lim_reader, &mut sw_writer, max_bytes: 12_u64)
+        catch unreachable;
+    assert(copied == 12_u64);
+    assert(sw.written() == "ZZZZZZZZZZZZ".as_bytes());
+
+    var seeker: Seek = sw.as_seeker();
+    seeker.rewind() catch unreachable;
+    sw_writer.print("ABCD") catch unreachable;
+    let end_pos: u64 = seeker.seek(.End(-2_i64)) catch unreachable;
+    assert(end_pos == 30_u64);
+    let written_view: &[u8] = sw.written();
+    if written_view.len() >= 12_usize {
+        assert(written_view[0..12] == "ABCDZZZZZZZZ".as_bytes());
+    }
+}
+
+test "Reactor-routed stdin_locked, stdout_locked, stderr_locked, println, and eprintln" {
+    var sim_state = MockSimStdio {
+        stdin_src: [0_u8; 32],
+        stdin_len: 11_usize,
+        stdin_pos: 0_usize,
+        stdout_cap: [0_u8; 64],
+        stdout_len: 0_usize,
+        stderr_cap: [0_u8; 64],
+        stderr_len: 0_usize,
+    };
+    let fixture = b"line1\nline2";
+    var idx = 0_usize;
+    while idx < fixture.len() and idx < sim_state.stdin_src.len() {
+        sim_state.stdin_src[idx] = fixture[idx];
+        idx += 1_usize;
+    }
+
+    let vtable = MockStdioReactorVTable {
+        head_slots: [0_usize; 3],
+        submit_io: .Some(mock_sim_submit_io),
+        tail_slots: [0_usize; 4],
+    };
+
+    with context.reactor = &raw vtable {
+        with context.reactor_ctx = (&raw mut sim_state) as *mut opaque {
+            var in_guard1: StdinLock = stdin_locked();
+            let first_line: str? = in_guard1.reader().next_line() catch unreachable;
+            assert(first_line == .Some("line1"));
+            in_guard1.release();
+
+            // Unread lookahead `"line2"` in `StdioSlab` is preserved across `StdinLock` scopes:
+            var in_guard2: StdinLock = stdin_locked();
+            let second_line: str? = in_guard2.reader().next_line() catch unreachable;
+            assert(second_line == .Some("line2"));
+            in_guard2.release();
+
+            println(f"count={2 + 3}");
+            eprintln(f"warn={7}");
+        }
+    }
+
+    let out_len: usize = sim_state.stdout_len;
+    let out_cap_ref: &[u8] = &sim_state.stdout_cap;
+    if out_len <= out_cap_ref.len() {
+        assert(out_cap_ref[0..out_len] == "count=5\n".as_bytes());
+    }
+    let err_len: usize = sim_state.stderr_len;
+    let err_cap_ref: &[u8] = &sim_state.stderr_cap;
+    if err_len <= err_cap_ref.len() {
+        assert(err_cap_ref[0..err_len] == "warn=7\n".as_bytes());
+    }
+}

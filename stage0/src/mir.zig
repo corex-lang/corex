@@ -1062,6 +1062,8 @@ pub const MirCallSite = struct {
     is_c_variadic: bool = false,
     /// `true` when the call expression lies inside an `unsafe { … }` block or `unsafe fn` body.
     is_unsafe_call: bool = false,
+    /// `true` when calling `.std_core` `OutBuf.over_uninit`, `BufReader.over_uninit`, or `BufWriter.over_uninit`.
+    is_uninit_backing_ctor: bool = false,
     /// Number of fixed non-variadic parameters when `is_c_variadic` is `true` (`SE-13`).
     fixed_arity: u16 = 0,
     /// Source token of the call expression.
@@ -1308,6 +1310,8 @@ pub const MirBody = struct {
     is_ghost_stripped: bool = false,
     /// `true` when annotated `@noalloc` / `contextless` (`V6` verification).
     is_contextless: bool = false,
+    /// `true` when synthesized automatically by `@derive(…)` (`Debug`, `Equatable`, `Comparable`, `Hash`, `Clone`, `Default`).
+    is_derived: bool = false,
     /// `true` when lowered from an `async fn`, `async |…|`, `async { … }`, `async test`, or `task_group` nursery.
     is_async: bool = false,
     /// `true` if `MAX_MIR_INSTRUCTIONS`, `MAX_MIR_BLOCKS`, or projection caps overflowed (`E0508`).
@@ -1417,9 +1421,14 @@ pub const MirBody = struct {
             .has_ghost_instructions = self.has_ghost_instructions,
             .is_ghost_stripped = self.is_ghost_stripped,
             .is_contextless = self.is_contextless,
+            .is_derived = self.is_derived,
             .is_async = self.is_async,
             .has_overflowed_limits = self.has_overflowed_limits,
             .is_sast_elaborated = self.is_sast_elaborated,
+            .is_sast_default_probe = self.is_sast_default_probe,
+            .is_sast_subscript_probe = self.is_sast_subscript_probe,
+            .sast_owner_def_id = self.sast_owner_def_id,
+            .sast_owner_symbol = self.sast_owner_symbol,
         };
         errdefer copy.deinit();
 
@@ -6895,6 +6904,13 @@ const MirLowerer = struct {
             @intCast(@min(sv.paramCount(), std.math.maxInt(u16)))
         else
             @intCast(@min(arg_words.items.len, std.math.maxInt(u16)));
+        const callee_canon_sym = if (!direct_sym.isNone())
+            direct_sym
+        else if (!direct_def.isNone())
+            (self.sym_table.def_to_symbol.get(direct_def.asInt()) orelse .none)
+        else
+            .none;
+        const is_uninit_backing_ctor = type_system.isStdUninitBackingBorrowCtor(self.sym_table, callee_canon_sym);
         try self.body.calls.append(self.body.allocator, .{
             .callee_val = callee_val,
             .direct_def_id = direct_def,
@@ -6910,6 +6926,7 @@ const MirLowerer = struct {
             .is_callee_contextless = is_callee_contextless,
             .is_c_variadic = is_c_variadic,
             .is_unsafe_call = call_node.flags.is_unsafe,
+            .is_uninit_backing_ctor = is_uninit_backing_ctor,
             .fixed_arity = fixed_arity,
             .origin_token = tok,
         });
@@ -6946,7 +6963,7 @@ const MirLowerer = struct {
         for (set_places.items) |set_place| {
             const place_rec = self.body.places.items[set_place.asInt()];
             if (place_rec.proj_len == 0) {
-                if (self.is_for_sast and is_fallible_result_call) {
+                if (self.is_for_sast and (is_fallible_result_call or is_uninit_backing_ctor)) {
                     try self.registerStorageLocalInCurrentScope(LocalId.fromInt(place_rec.base), tok);
                 } else {
                     try self.markStorageInit(LocalId.fromInt(place_rec.base), tok);
@@ -9359,16 +9376,16 @@ const MirLowerer = struct {
 
     // --------- Explicit Signed / Unsigned / Float Opcodes ---------
 
-    /// Unwraps `distinct`, `.bit_field_ty`, and backed `.enum_ty` to their underlying scalar carrier `TypeId`.
+    /// Unwraps `distinct`, refinement predicates, `.bit_field_ty`, and backed `.enum_ty` to their underlying scalar carrier `TypeId`.
     fn unwrapScalarCarrierType(self: *const MirLowerer, ty: TypeId) TypeId {
-        var cur = self.pool.unwrapUnderlyingType(ty);
+        var cur = self.pool.unwrapRefinementBase(self.pool.unwrapUnderlyingType(ty));
         if (cur.isError()) return cur;
         const node = self.pool.getNode(cur);
         if (node.tag == .bit_field_ty) {
-            cur = self.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs));
+            cur = self.pool.unwrapRefinementBase(self.pool.unwrapUnderlyingType(TypeId.fromInt(node.lhs)));
         } else if (node.tag == .enum_ty) {
             if (self.pool.getEnumBackingIntType(cur)) |backing_int| {
-                cur = self.pool.unwrapUnderlyingType(backing_int);
+                cur = self.pool.unwrapRefinementBase(self.pool.unwrapUnderlyingType(backing_int));
             }
         }
         return cur;
@@ -9391,7 +9408,7 @@ const MirLowerer = struct {
 
     /// Returns `true` if `ty` unwraps to `f32` or `f64`.
     fn isFloatType(self: *const MirLowerer, ty: TypeId) bool {
-        const unwrapped = self.pool.unwrapUnderlyingType(ty);
+        const unwrapped = self.pool.unwrapRefinementBase(self.pool.unwrapUnderlyingType(ty));
         return unwrapped == .f32_ty or unwrapped == .f64_ty or unwrapped == .untyped_float_ty;
     }
 
@@ -9468,7 +9485,9 @@ const MirLowerer = struct {
                 const unwrapped_src = self.pool.unwrapUnderlyingType(src_ty);
                 const unwrapped_dst = self.pool.unwrapUnderlyingType(dst_ty);
                 if (unwrapped_src != unwrapped_dst and
-                    (unwrapped_src == .str_ty or unionSliceElemType(self.pool, unwrapped_src) != null))
+                    (unwrapped_src == .str_ty or
+                        unionSliceElemType(self.pool, unwrapped_src) != null or
+                        type_system.hasUnionAsBytesCapability(self.pool, self.sym_table, unwrapped_src)))
                 {
                     break :blk_noop .bitcast_op;
                 }
@@ -11742,6 +11761,7 @@ const MirLowerer = struct {
         self.body.target_layout = self.hir_store.target_layout;
         self.body.is_async = fn_meta.is_async;
         self.body.is_contextless = fn_meta.is_contextless and !fn_meta.is_async;
+        self.body.is_derived = fn_meta.is_derived;
         self.body.is_sast_default_probe = fn_meta.is_sast_default_probe;
         self.body.is_sast_subscript_probe = is_sast_sub;
         if (fn_meta.is_subscript) {

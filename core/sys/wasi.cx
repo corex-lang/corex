@@ -1,19 +1,144 @@
 /# WebAssembly System Interface (`wasm32-wasi` Preview 1) Descriptors (`core.sys.wasi`)
 /#
-/# Defines `WasiCiovec` scatter/gather I/O descriptors (`@repr(C)`), WASI Preview 1 error and
-/# stream constants, and `wasi_snapshot_preview1` `fd_write` / `proc_exit` `extern "C"` prototypes.
+/# Defines `@repr(C)` WASI Preview 1 scatter/gather, metadata, directory-stream, preopen, and poll
+/# descriptors alongside canonical error, rights, open-flag, and clock constants and all 31
+/# `wasi_snapshot_preview1` `extern "C"` host-import prototypes needed by `cx.{io,path,fs,time,env,process}`.
 /#
-/# Safe `write_stdout`, `write_stderr`, and `exit_process` wrappers lower through `@sys_write` and
-/# `@sys_exit`, which emit `fd_write` / `proc_exit` directly on `wasm32-wasi` targets.
+/# Both `-ofmt=c` and `LLVM` emit `import_module("wasi_snapshot_preview1")` for every symbol listed
+/# in `codegen_abi.WASI_PREVIEW1_IMPORT_SET`; safe stream and exit helpers delegate to `@sys_*`.
 
 // ---------------------------------------- TYPES ----------------------------------------
-/| WASI scatter/gather read buffer descriptor (`__wasi_ciovec_t`, `@repr(C)`).
+/| WASI scatter/gather mutable read buffer descriptor (`__wasi_iovec_t`, `@repr(C)`).
+@repr(C)
+pub struct WasiIovec {
+    /| Linear-memory pointer to the destination byte buffer.
+    pub buf_ptr: *mut u8,
+    /| Number of contiguous bytes available in `buf_ptr`.
+    pub buf_len: usize,
+}
+
+/| WASI scatter/gather const write buffer descriptor (`__wasi_ciovec_t`, `@repr(C)`).
 @repr(C)
 pub struct WasiCiovec {
     /| Linear-memory pointer to the start of the byte buffer.
     pub buf_ptr: *u8,
     /| Number of contiguous bytes in `buf_ptr`.
     pub buf_len: usize,
+}
+
+/| WASI descriptor status and capability rights record (`__wasi_fdstat_t`, `24` bytes).
+@repr(C, align: 8)
+pub struct WasiFdstat {
+    /| Descriptor file type (`WASI_FILETYPE_*`).
+    pub fs_filetype: u8,
+    /| Reserved alignment byte (`0`).
+    pub pad0: u8,
+    /| Descriptor status flags (`WASI_FDFLAGS_*`).
+    pub fs_flags: u16,
+    /| Reserved alignment word (`0`).
+    pub pad1: u32,
+    /| Base capability rights bitmask (`WASI_RIGHTS_*`).
+    pub fs_rights_base: u64,
+    /| Inherited child capability rights bitmask (`WASI_RIGHTS_*`).
+    pub fs_rights_inheriting: u64,
+}
+
+/| WASI file metadata and nanosecond timestamp record (`__wasi_filestat_t`, `64` bytes).
+@repr(C, align: 8)
+pub struct WasiFilestat {
+    /| Device identifier containing the file.
+    pub dev: u64,
+    /| File serial / inode number.
+    pub ino: u64,
+    /| File type (`WASI_FILETYPE_*`).
+    pub filetype: u8,
+    /| Reserved alignment padding (`[0; 7]`).
+    pub pad0: [u8; 7],
+    /| Number of hard links to the file.
+    pub nlink: u64,
+    /| File size in bytes for regular files.
+    pub size: u64,
+    /| Last data access timestamp in nanoseconds since the Unix epoch.
+    pub atim: u64,
+    /| Last data modification timestamp in nanoseconds since the Unix epoch.
+    pub mtim: u64,
+    /| Last status change timestamp in nanoseconds since the Unix epoch.
+    pub ctim: u64,
+}
+
+/| WASI preopened capability directory descriptor (`__wasi_prestat_t`, `8` bytes on `wasm32`).
+@repr(C)
+pub struct WasiPrestat {
+    /| Preopen resource tag (`WASI_PREOPENTYPE_DIR = 0`).
+    pub tag: u8,
+    /| Reserved alignment bytes (`[0; 3]`).
+    pub pad0: [u8; 3],
+    /| Byte length of the preopened directory path in `fd_prestat_dir_name`.
+    pub pr_name_len: usize,
+}
+
+/| WASI `fd_readdir` entry header preceding `d_namlen` UTF-8 filename bytes (`24` bytes).
+@repr(C, align: 8)
+pub struct WasiDirentHdr {
+    /| Opaque cookie of the next directory entry in the stream.
+    pub d_next: u64,
+    /| File serial / inode number of this entry.
+    pub d_ino: u64,
+    /| Byte length of the entry name immediately following this 24-byte header.
+    pub d_namlen: u32,
+    /| Entry file type (`WASI_FILETYPE_*`).
+    pub d_type: u8,
+    /| Trailing struct alignment bytes (`[0; 3]`).
+    pub pad0: [u8; 3],
+}
+
+/| WASI clock subscription payload embedded inside `WasiSubscription` (`32` bytes).
+@repr(C, align: 8)
+pub struct WasiSubscriptionClock {
+    /| Clock identifier (`WASI_CLOCKID_REALTIME` or `WASI_CLOCKID_MONOTONIC`).
+    pub clock_id: u32,
+    /| Reserved alignment word (`0`).
+    pub pad0: u32,
+    /| Relative duration or absolute deadline in nanoseconds.
+    pub timeout: u64,
+    /| Allowable coalescing slack in nanoseconds.
+    pub precision: u64,
+    /| Clock subscription flags (`WASI_SUBCLOCKFLAGS_ABSTIME = 1`, `0` for relative).
+    pub flags: u16,
+    /| Reserved tail padding (`[0; 3]`).
+    pub pad1: [u16; 3],
+}
+
+/| WASI `poll_oneoff` subscription record (`__wasi_subscription_t`, `48` bytes).
+@repr(C, align: 8)
+pub struct WasiSubscription {
+    /| Caller-supplied correlation token echoed into `WasiEvent.userdata`.
+    pub userdata: u64,
+    /| Subscription discriminant (`WASI_EVENTTYPE_CLOCK`, `FD_READ`, or `FD_WRITE`).
+    pub event_tag: u8,
+    /| Reserved union-alignment bytes (`[0; 7]`).
+    pub pad0: [u8; 7],
+    /| Clock or descriptor subscription payload (`fd` occupies `clock_id` for `FD_READ`/`FD_WRITE`).
+    pub clock_or_fd: WasiSubscriptionClock,
+}
+
+/| WASI `poll_oneoff` completion event record (`__wasi_event_t`, `32` bytes).
+@repr(C, align: 8)
+pub struct WasiEvent {
+    /| Correlation token copied from the triggering `WasiSubscription`.
+    pub userdata: u64,
+    /| `WASI_ERRNO_*` status (`0` on success).
+    pub error_code: u16,
+    /| Event kind (`WASI_EVENTTYPE_*`).
+    pub event_type: u8,
+    /| Reserved alignment bytes (`[0; 5]`).
+    pub pad0: [u8; 5],
+    /| Available byte count for `FD_READ` / `FD_WRITE` readiness events.
+    pub nbytes: u64,
+    /| Event state flags (`WASI_EVENTRWFLAGS_FD_READWRITE_HANGUP = 1`).
+    pub rw_flags: u16,
+    /| Reserved tail padding (`[0; 3]`).
+    pub pad1: [u16; 3],
 }
 
 // --------------------------------------- CONSTS ----------------------------------------
@@ -26,10 +151,241 @@ pub const WASI_STDOUT_FD: i32 = 1;
 /| WASI standard error descriptor (`2`).
 pub const WASI_STDERR_FD: i32 = 2;
 
-/| WASI `ERRNO_SUCCESS` status code (`0`).
+/| WASI `PREOPENTYPE_DIR` tag (`0`).
+pub const WASI_PREOPENTYPE_DIR: u8 = 0;
+
+/| WASI `CLOCKID_REALTIME` wall-clock identifier (`0`).
+pub const WASI_CLOCKID_REALTIME: u32 = 0;
+
+/| WASI `CLOCKID_MONOTONIC` monotonic-clock identifier (`1`).
+pub const WASI_CLOCKID_MONOTONIC: u32 = 1;
+
+/| WASI `WHENCE_SET` seek origin (`0`).
+pub const WASI_WHENCE_SET: u8 = 0;
+
+/| WASI `WHENCE_CUR` seek origin (`1`).
+pub const WASI_WHENCE_CUR: u8 = 1;
+
+/| WASI `WHENCE_END` seek origin (`2`).
+pub const WASI_WHENCE_END: u8 = 2;
+
+/| WASI `EVENTTYPE_CLOCK` subscription tag (`0`).
+pub const WASI_EVENTTYPE_CLOCK: u8 = 0;
+
+/| WASI `EVENTTYPE_FD_READ` subscription tag (`1`).
+pub const WASI_EVENTTYPE_FD_READ: u8 = 1;
+
+/| WASI `EVENTTYPE_FD_WRITE` subscription tag (`2`).
+pub const WASI_EVENTTYPE_FD_WRITE: u8 = 2;
+
+/| WASI `FILETYPE_UNKNOWN` (`0`).
+pub const WASI_FILETYPE_UNKNOWN: u8 = 0;
+
+/| WASI `FILETYPE_BLOCK_DEVICE` (`1`).
+pub const WASI_FILETYPE_BLOCK_DEVICE: u8 = 1;
+
+/| WASI `FILETYPE_CHARACTER_DEVICE` (`2`).
+pub const WASI_FILETYPE_CHARACTER_DEVICE: u8 = 2;
+
+/| WASI `FILETYPE_DIRECTORY` (`3`).
+pub const WASI_FILETYPE_DIRECTORY: u8 = 3;
+
+/| WASI `FILETYPE_REGULAR_FILE` (`4`).
+pub const WASI_FILETYPE_REGULAR_FILE: u8 = 4;
+
+/| WASI `FILETYPE_SOCKET_DGRAM` (`5`).
+pub const WASI_FILETYPE_SOCKET_DGRAM: u8 = 5;
+
+/| WASI `FILETYPE_SOCKET_STREAM` (`6`).
+pub const WASI_FILETYPE_SOCKET_STREAM: u8 = 6;
+
+/| WASI `FILETYPE_SYMBOLIC_LINK` (`7`).
+pub const WASI_FILETYPE_SYMBOLIC_LINK: u8 = 7;
+
+/| WASI `LOOKUPFLAGS_SYMLINK_FOLLOW` path-resolution flag (`1`).
+pub const WASI_LOOKUPFLAGS_SYMLINK_FOLLOW: u32 = 1;
+
+/| WASI `OFLAGS_CREAT` open flag (`1`).
+pub const WASI_OFLAGS_CREAT: u16 = 0x0001;
+
+/| WASI `OFLAGS_DIRECTORY` open flag (`2`).
+pub const WASI_OFLAGS_DIRECTORY: u16 = 0x0002;
+
+/| WASI `OFLAGS_EXCL` exclusive-create open flag (`4`).
+pub const WASI_OFLAGS_EXCL: u16 = 0x0004;
+
+/| WASI `OFLAGS_TRUNC` truncate open flag (`8`).
+pub const WASI_OFLAGS_TRUNC: u16 = 0x0008;
+
+/| WASI `FDFLAGS_APPEND` descriptor flag (`1`).
+pub const WASI_FDFLAGS_APPEND: u16 = 0x0001;
+
+/| WASI `FDFLAGS_DSYNC` descriptor flag (`2`).
+pub const WASI_FDFLAGS_DSYNC: u16 = 0x0002;
+
+/| WASI `FDFLAGS_NONBLOCK` descriptor flag (`4`).
+pub const WASI_FDFLAGS_NONBLOCK: u16 = 0x0004;
+
+/| WASI `FDFLAGS_RSYNC` descriptor flag (`8`).
+pub const WASI_FDFLAGS_RSYNC: u16 = 0x0008;
+
+/| WASI `FDFLAGS_SYNC` descriptor flag (`16`).
+pub const WASI_FDFLAGS_SYNC: u16 = 0x0010;
+
+/| WASI `RIGHTS_FD_DATASYNC` (`1 << 0`).
+pub const WASI_RIGHTS_FD_DATASYNC: u64 = 1_u64 << 0;
+
+/| WASI `RIGHTS_FD_READ` (`1 << 1`).
+pub const WASI_RIGHTS_FD_READ: u64 = 1_u64 << 1;
+
+/| WASI `RIGHTS_FD_SEEK` (`1 << 2`).
+pub const WASI_RIGHTS_FD_SEEK: u64 = 1_u64 << 2;
+
+/| WASI `RIGHTS_FD_FDSTAT_SET_FLAGS` (`1 << 3`).
+pub const WASI_RIGHTS_FD_FDSTAT_SET_FLAGS: u64 = 1_u64 << 3;
+
+/| WASI `RIGHTS_FD_SYNC` (`1 << 4`).
+pub const WASI_RIGHTS_FD_SYNC: u64 = 1_u64 << 4;
+
+/| WASI `RIGHTS_FD_TELL` (`1 << 5`).
+pub const WASI_RIGHTS_FD_TELL: u64 = 1_u64 << 5;
+
+/| WASI `RIGHTS_FD_WRITE` (`1 << 6`).
+pub const WASI_RIGHTS_FD_WRITE: u64 = 1_u64 << 6;
+
+/| WASI `RIGHTS_FD_FILESTAT_GET` (`1 << 21`).
+pub const WASI_RIGHTS_FD_FILESTAT_GET: u64 = 1_u64 << 21;
+
+/| WASI `RIGHTS_FD_FILESTAT_SET_SIZE` (`1 << 22`).
+pub const WASI_RIGHTS_FD_FILESTAT_SET_SIZE: u64 = 1_u64 << 22;
+
+/| WASI full Preview 1 capability mask (`0x1FFF_FFFF`).
+pub const WASI_RIGHTS_ALL: u64 = 0x1FFF_FFFF;
+
+/| WASI `ERRNO_SUCCESS` (`0`).
 pub const WASI_ERRNO_SUCCESS: u16 = 0;
 
+/| WASI `ERRNO_ACCES` permission denied (`2`).
+pub const WASI_ERRNO_ACCES: u16 = 2;
+
+/| WASI `ERRNO_AGAIN` would block (`6`).
+pub const WASI_ERRNO_AGAIN: u16 = 6;
+
+/| WASI `ERRNO_BADF` invalid file descriptor (`8`).
+pub const WASI_ERRNO_BADF: u16 = 8;
+
+/| WASI `ERRNO_BUSY` resource busy (`10`).
+pub const WASI_ERRNO_BUSY: u16 = 10;
+
+/| WASI `ERRNO_EXIST` file already exists (`20`).
+pub const WASI_ERRNO_EXIST: u16 = 20;
+
+/| WASI `ERRNO_INTR` interrupted syscall (`27`).
+pub const WASI_ERRNO_INTR: u16 = 27;
+
+/| WASI `ERRNO_INVAL` invalid argument (`28`).
+pub const WASI_ERRNO_INVAL: u16 = 28;
+
+/| WASI `ERRNO_IO` I/O failure (`29`).
+pub const WASI_ERRNO_IO: u16 = 29;
+
+/| WASI `ERRNO_ISDIR` target is a directory (`31`).
+pub const WASI_ERRNO_ISDIR: u16 = 31;
+
+/| WASI `ERRNO_LOOP` symlink loop (`32`).
+pub const WASI_ERRNO_LOOP: u16 = 32;
+
+/| WASI `ERRNO_NAMETOOLONG` filename too long (`37`).
+pub const WASI_ERRNO_NAMETOOLONG: u16 = 37;
+
+/| WASI `ERRNO_NOENT` no such file or directory (`44`).
+pub const WASI_ERRNO_NOENT: u16 = 44;
+
+/| WASI `ERRNO_NOMEM` out of memory (`48`).
+pub const WASI_ERRNO_NOMEM: u16 = 48;
+
+/| WASI `ERRNO_NOSPC` no space left on device (`51`).
+pub const WASI_ERRNO_NOSPC: u16 = 51;
+
+/| WASI `ERRNO_NOSYS` unsupported operation (`52`).
+pub const WASI_ERRNO_NOSYS: u16 = 52;
+
+/| WASI `ERRNO_NOTDIR` not a directory (`54`).
+pub const WASI_ERRNO_NOTDIR: u16 = 54;
+
+/| WASI `ERRNO_NOTEMPTY` directory not empty (`55`).
+pub const WASI_ERRNO_NOTEMPTY: u16 = 55;
+
+/| WASI `ERRNO_PERM` operation not permitted (`63`).
+pub const WASI_ERRNO_PERM: u16 = 63;
+
+/| WASI `ERRNO_PIPE` broken pipe (`64`).
+pub const WASI_ERRNO_PIPE: u16 = 64;
+
+/| WASI `ERRNO_ROFS` read-only filesystem (`69`).
+pub const WASI_ERRNO_ROFS: u16 = 69;
+
+/| WASI `ERRNO_SPIPE` invalid seek on pipe (`70`).
+pub const WASI_ERRNO_SPIPE: u16 = 70;
+
+/| WASI `ERRNO_TIMEDOUT` operation timed out (`73`).
+pub const WASI_ERRNO_TIMEDOUT: u16 = 73;
+
+/| WASI `ERRNO_NOTCAPABLE` sandbox capability violation (`76` – `RESOLVE_BENEATH` escape!).
+pub const WASI_ERRNO_NOTCAPABLE: u16 = 76;
+
 // ------------------------------------- PUBLIC API --------------------------------------
+/| WASI Preview 1 `args_sizes_get(argc_out, argv_buf_size_out)` import prototype.
+@link(name: "args_sizes_get")
+pub extern "C" fn wasi_args_sizes_get(argc_out: *mut usize, argv_buf_size_out: *mut usize) -> u16;
+
+/| WASI Preview 1 `args_get(argv_ptrs_out, argv_buf_out)` import prototype.
+@link(name: "args_get")
+pub extern "C" fn wasi_args_get(argv_ptrs_out: *mut *mut u8, argv_buf_out: *mut u8) -> u16;
+
+/| WASI Preview 1 `environ_sizes_get(env_count_out, env_buf_size_out)` import prototype.
+@link(name: "environ_sizes_get")
+pub extern "C" fn wasi_environ_sizes_get(env_count_out: *mut usize, env_buf_size_out: *mut usize) -> u16;
+
+/| WASI Preview 1 `environ_get(environ_ptrs_out, environ_buf_out)` import prototype.
+@link(name: "environ_get")
+pub extern "C" fn wasi_environ_get(environ_ptrs_out: *mut *mut u8, environ_buf_out: *mut u8) -> u16;
+
+/| WASI Preview 1 `clock_time_get(clock_id, precision, time_ns_out)` import prototype.
+@link(name: "clock_time_get")
+pub extern "C" fn wasi_clock_time_get(clock_id: u32, precision: u64, time_ns_out: *mut u64) -> u16;
+
+/| WASI Preview 1 `fd_close(file_desc)` import prototype.
+@link(name: "fd_close")
+pub extern "C" fn wasi_fd_close(file_desc: i32) -> u16;
+
+/| WASI Preview 1 `fd_datasync(file_desc)` import prototype.
+@link(name: "fd_datasync")
+pub extern "C" fn wasi_fd_datasync(file_desc: i32) -> u16;
+
+/| WASI Preview 1 `fd_sync(file_desc)` import prototype.
+@link(name: "fd_sync")
+pub extern "C" fn wasi_fd_sync(file_desc: i32) -> u16;
+
+/| WASI Preview 1 `fd_read(file_desc, iovs_ptr, iovs_len, nread_out)` import prototype.
+@link(name: "fd_read")
+pub extern "C" fn wasi_fd_read(
+    file_desc: i32,
+    iovs_ptr: *WasiIovec,
+    iovs_len: usize,
+    nread_out: *mut usize,
+) -> u16;
+
+/| WASI Preview 1 `fd_pread(file_desc, iovs_ptr, iovs_len, offset, nread_out)` import prototype.
+@link(name: "fd_pread")
+pub extern "C" fn wasi_fd_pread(
+    file_desc: i32,
+    iovs_ptr: *WasiIovec,
+    iovs_len: usize,
+    offset: u64,
+    nread_out: *mut usize,
+) -> u16;
+
 /| WASI Preview 1 `fd_write(file_desc, iovs_ptr, iovs_len, nwritten_out)` import prototype.
 @link(name: "fd_write")
 pub extern "C" fn wasi_fd_write(
@@ -37,6 +393,148 @@ pub extern "C" fn wasi_fd_write(
     iovs_ptr: *WasiCiovec,
     iovs_len: usize,
     nwritten_out: *mut usize,
+) -> u16;
+
+/| WASI Preview 1 `fd_pwrite(file_desc, iovs_ptr, iovs_len, offset, nwritten_out)` import prototype.
+@link(name: "fd_pwrite")
+pub extern "C" fn wasi_fd_pwrite(
+    file_desc: i32,
+    iovs_ptr: *WasiCiovec,
+    iovs_len: usize,
+    offset: u64,
+    nwritten_out: *mut usize,
+) -> u16;
+
+/| WASI Preview 1 `fd_seek(file_desc, offset_delta, whence, newoffset_out)` import prototype.
+@link(name: "fd_seek")
+pub extern "C" fn wasi_fd_seek(
+    file_desc: i32,
+    offset_delta: i64,
+    whence: u8,
+    newoffset_out: *mut u64,
+) -> u16;
+
+/| WASI Preview 1 `fd_tell(file_desc, offset_out)` import prototype.
+@link(name: "fd_tell")
+pub extern "C" fn wasi_fd_tell(file_desc: i32, offset_out: *mut u64) -> u16;
+
+/| WASI Preview 1 `fd_fdstat_get(file_desc, stat_out)` import prototype.
+@link(name: "fd_fdstat_get")
+pub extern "C" fn wasi_fd_fdstat_get(file_desc: i32, stat_out: *mut WasiFdstat) -> u16;
+
+/| WASI Preview 1 `fd_filestat_get(file_desc, stat_out)` import prototype.
+@link(name: "fd_filestat_get")
+pub extern "C" fn wasi_fd_filestat_get(file_desc: i32, stat_out: *mut WasiFilestat) -> u16;
+
+/| WASI Preview 1 `fd_filestat_set_size(file_desc, byte_size)` import prototype.
+@link(name: "fd_filestat_set_size")
+pub extern "C" fn wasi_fd_filestat_set_size(file_desc: i32, byte_size: u64) -> u16;
+
+/| WASI Preview 1 `fd_prestat_get(file_desc, prestat_out)` import prototype.
+@link(name: "fd_prestat_get")
+pub extern "C" fn wasi_fd_prestat_get(file_desc: i32, prestat_out: *mut WasiPrestat) -> u16;
+
+/| WASI Preview 1 `fd_prestat_dir_name(file_desc, path_out, path_len)` import prototype.
+@link(name: "fd_prestat_dir_name")
+pub extern "C" fn wasi_fd_prestat_dir_name(file_desc: i32, path_out: *mut u8, path_len: usize) -> u16;
+
+/| WASI Preview 1 `fd_readdir(dir_fd, buf_out, buf_len, cookie, bufused_out)` import prototype.
+@link(name: "fd_readdir")
+pub extern "C" fn wasi_fd_readdir(
+    dir_fd: i32,
+    buf_out: *mut u8,
+    buf_len: usize,
+    cookie: u64,
+    bufused_out: *mut usize,
+) -> u16;
+
+/| WASI Preview 1 `path_create_directory(dir_fd, path_ptr, path_len)` import prototype.
+@link(name: "path_create_directory")
+pub extern "C" fn wasi_path_create_directory(dir_fd: i32, path_ptr: *u8, path_len: usize) -> u16;
+
+/| WASI Preview 1 `path_filestat_get(dir_fd, lookup_flags, path_ptr, path_len, stat_out)` prototype.
+@link(name: "path_filestat_get")
+pub extern "C" fn wasi_path_filestat_get(
+    dir_fd: i32,
+    lookup_flags: u32,
+    path_ptr: *u8,
+    path_len: usize,
+    stat_out: *mut WasiFilestat,
+) -> u16;
+
+/| WASI Preview 1 `path_link(...)` hardlink creation import prototype.
+@link(name: "path_link")
+pub extern "C" fn wasi_path_link(
+    old_dir_fd: i32,
+    old_flags: u32,
+    old_path_ptr: *u8,
+    old_path_len: usize,
+    new_dir_fd: i32,
+    new_path_ptr: *u8,
+    new_path_len: usize,
+) -> u16;
+
+/| WASI Preview 1 `path_open(...)` capability-confined file/directory open import prototype.
+@link(name: "path_open")
+pub extern "C" fn wasi_path_open(
+    dir_fd: i32,
+    dirflags: u32,
+    path_ptr: *u8,
+    path_len: usize,
+    oflags: u16,
+    fs_rights_base: u64,
+    fs_rights_inheriting: u64,
+    fdflags: u16,
+    opened_fd_out: *mut i32,
+) -> u16;
+
+/| WASI Preview 1 `path_readlink(dir_fd, path_ptr, path_len, buf_out, buf_len, bufused_out)` prototype.
+@link(name: "path_readlink")
+pub extern "C" fn wasi_path_readlink(
+    dir_fd: i32,
+    path_ptr: *u8,
+    path_len: usize,
+    buf_out: *mut u8,
+    buf_len: usize,
+    bufused_out: *mut usize,
+) -> u16;
+
+/| WASI Preview 1 `path_remove_directory(dir_fd, path_ptr, path_len)` import prototype.
+@link(name: "path_remove_directory")
+pub extern "C" fn wasi_path_remove_directory(dir_fd: i32, path_ptr: *u8, path_len: usize) -> u16;
+
+/| WASI Preview 1 `path_rename(old_fd, old_ptr, old_len, new_fd, new_ptr, new_len)` prototype.
+@link(name: "path_rename")
+pub extern "C" fn wasi_path_rename(
+    old_dir_fd: i32,
+    old_path_ptr: *u8,
+    old_path_len: usize,
+    new_dir_fd: i32,
+    new_path_ptr: *u8,
+    new_path_len: usize,
+) -> u16;
+
+/| WASI Preview 1 `path_symlink(old_ptr, old_len, dir_fd, new_ptr, new_len)` import prototype.
+@link(name: "path_symlink")
+pub extern "C" fn wasi_path_symlink(
+    old_path_ptr: *u8,
+    old_path_len: usize,
+    dir_fd: i32,
+    new_path_ptr: *u8,
+    new_path_len: usize,
+) -> u16;
+
+/| WASI Preview 1 `path_unlink_file(dir_fd, path_ptr, path_len)` import prototype.
+@link(name: "path_unlink_file")
+pub extern "C" fn wasi_path_unlink_file(dir_fd: i32, path_ptr: *u8, path_len: usize) -> u16;
+
+/| WASI Preview 1 `poll_oneoff(in_subs, out_events, nsubscriptions, nevents_out)` import prototype.
+@link(name: "poll_oneoff")
+pub extern "C" fn wasi_poll_oneoff(
+    in_subs: *WasiSubscription,
+    out_events: *mut WasiEvent,
+    nsubscriptions: usize,
+    nevents_out: *mut usize,
 ) -> u16;
 
 /| WASI Preview 1 `proc_exit(exit_code)` import prototype.

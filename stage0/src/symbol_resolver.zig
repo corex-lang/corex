@@ -572,8 +572,8 @@ pub const SymbolFlags = packed struct(u32) {
     shorthand_field_mod: u2 = 0,
     /// Byte distance `decl_span.start_byte - field_pat_start_byte` when `shorthand_field_mod != 0`.
     shorthand_lead_bytes: u8 = 0,
-    /// Reserved zero-initialized bit keeping `SymbolFlags` exact at 32 bits.
-    _reserved: u1 = 0,
+    /// `true` if pruned by a false `@cfg(…)` predicate during module signature resolution (`SE-18`).
+    is_cfg_disabled: bool = false,
 };
 
 /// 2-byte bit-packed Phase 6 contract, safety, and FFI attributes attached to `SymbolRecord` (`DR-17`, `DR-20`).
@@ -722,6 +722,8 @@ pub const SymbolRecord = struct {
     explicit_align_log2_plus1: u8 = 0,
     /// `true` if the declaration (or an enclosing `impl`) carries at least one `@cfg(…)` attribute (`SE-18`).
     has_cfg_attr: bool = false,
+    /// `true` if this method symbol was synthesized automatically by `@derive(…)`.
+    is_derived: bool = false,
     /// Packed alignment cap (`packed: 1|2|4|8|16`), `@inline` mode, and `fn` value reification flags (`DR-24`).
     layout_inline_flags: SymbolLayoutInlineFlags = .{},
     /// Optional enclosing `impl` CST node carrying `@cfg(…)` (`CstNodeIndex.none` when absent).
@@ -3787,8 +3789,10 @@ pub const SymbolTable = struct {
     type_to_symbol: std.AutoHashMapUnmanaged(u32, SymbolIndex) = .empty,
     /// Registered `@from` (`FromError`) `(source_err_ty, target_err_ty)` pairs for `?` upcasting (`DR-07`).
     from_error_pairs: std.AutoHashMapUnmanaged(u64, void) = .empty,
-    /// Maps `(source_err_ty, target_err_ty)` to the conversion `fn` `DefId` when backed by an `@from fn`.
+    /// Maps `(source_err_ty, target_err_ty)` to the conversion `fn` or `impl` `DefId` when backed by `@from`.
     from_error_fn_defs: std.AutoHashMapUnmanaged(u64, DefId) = .empty,
+    /// Maps `(source_err_ty, target_err_ty)` to the conversion `fn` or `impl` method `SymbolIndex`.
+    from_error_fn_syms: std.AutoHashMapUnmanaged(u64, SymbolIndex) = .empty,
     /// Registered `(target_ty, trait_sym_idx)` pairs from `impl Trait for Type` and `@derive(Trait)`.
     trait_impl_pairs: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// Maps an `impl Trait for Type` method `SymbolIndex.asInt()` to its implemented `trait_sym` `SymbolIndex`.
@@ -3914,6 +3918,7 @@ pub const SymbolTable = struct {
         self.type_to_symbol.deinit(self.allocator);
         self.from_error_pairs.deinit(self.allocator);
         self.from_error_fn_defs.deinit(self.allocator);
+        self.from_error_fn_syms.deinit(self.allocator);
         self.trait_impl_pairs.deinit(self.allocator);
         self.impl_method_trait.deinit(self.allocator);
         self.pending_imports.deinit(self.allocator);
@@ -3986,6 +3991,7 @@ pub const SymbolTable = struct {
         self.type_to_symbol.clearRetainingCapacity();
         self.from_error_pairs.clearRetainingCapacity();
         self.from_error_fn_defs.clearRetainingCapacity();
+        self.from_error_fn_syms.clearRetainingCapacity();
         self.trait_impl_pairs.clearRetainingCapacity();
         self.impl_method_trait.clearRetainingCapacity();
         self.pending_imports.clearRetainingCapacity();
@@ -5635,6 +5641,16 @@ pub const SymbolTable = struct {
 
             // [2.6] Real module declaration or `pub use` import supersedes a synthetic `is_builtin` stub:
             if (existing.flags.is_builtin and !record.flags.is_builtin) {
+                if (self.scope_members.getPtr(record.scope_id.asInt())) |members_list| {
+                    var write_idx: usize = 0;
+                    for (members_list.items) |cand_idx| {
+                        if (cand_idx != existing_idx) {
+                            members_list.items[write_idx] = cand_idx;
+                            write_idx += 1;
+                        }
+                    }
+                    members_list.items.len = write_idx;
+                }
                 const real_idx = try self.appendSymbol(record);
                 try self.scoped_map.put(self.allocator, key, real_idx);
                 if (!record.def_id.isNone()) {
@@ -5711,25 +5727,55 @@ pub const SymbolTable = struct {
         return .none;
     }
 
-    /// Looks up a type `SymbolIndex` inside `cx.<submod_name>` in $O(1)$ when `stdlib/cx` is mounted.
+    /// Looks up a type `SymbolIndex` inside `cx.<submod_name>` (or `core.<submod_name>`) in $O(1)$.
     pub fn lookupCxSubmoduleSymbol(
         self: *const SymbolTable,
         interner: *const StringInterner,
         submod_name: []const u8,
         type_name: []const u8,
     ) SymbolIndex {
+        const submod_id = interner.lookup(submod_name) orelse return .none;
+        const type_sym_id = interner.lookup(type_name) orelse return .none;
         const root_scope = if (!self.cx_prelude_scope.isNone())
             self.cx_prelude_scope
         else
             self.cx_root_scope;
-        if (root_scope.isNone()) return .none;
-        const submod_id = interner.lookup(submod_name) orelse return .none;
-        const type_sym_id = interner.lookup(type_name) orelse return .none;
-        const mod_sym_idx = self.lookupInScopeDirect(root_scope, submod_id, NamespaceMask.VALUE_ONLY);
-        if (mod_sym_idx.isNone()) return .none;
-        const mod_scope = self.getSymbol(mod_sym_idx).target_scope;
-        if (mod_scope.isNone()) return .none;
-        return self.lookupInScopeDirect(mod_scope, type_sym_id, NamespaceMask.TYPE_ONLY);
+        if (!root_scope.isNone()) {
+            const mod_sym_idx = self.lookupInScopeDirect(root_scope, submod_id, NamespaceMask.VALUE_ONLY);
+            if (!mod_sym_idx.isNone()) {
+                const mod_rec = self.getSymbol(mod_sym_idx);
+                const resolved_mod = if (mod_rec.kind == .use_alias_sym and !mod_rec.target_symbol.isNone())
+                    self.getSymbol(mod_rec.target_symbol)
+                else
+                    mod_rec;
+                if (!resolved_mod.target_scope.isNone()) {
+                    const found = self.lookupInScopeDirect(
+                        resolved_mod.target_scope,
+                        type_sym_id,
+                        NamespaceMask.TYPE_ONLY,
+                    );
+                    if (!found.isNone()) return found;
+                }
+            }
+        }
+        if (!self.prelude_scope.isNone()) {
+            if (interner.lookup("core")) |core_id| {
+                const core_idx = self.lookupInScopeDirect(self.prelude_scope, core_id, NamespaceMask.VALUE_ONLY);
+                if (!core_idx.isNone()) {
+                    const core_scope = self.getSymbol(core_idx).target_scope;
+                    if (!core_scope.isNone()) {
+                        const sub_idx = self.lookupInScopeDirect(core_scope, submod_id, NamespaceMask.VALUE_ONLY);
+                        if (!sub_idx.isNone()) {
+                            const sub_scope = self.getSymbol(sub_idx).target_scope;
+                            if (!sub_scope.isNone()) {
+                                return self.lookupInScopeDirect(sub_scope, type_sym_id, NamespaceMask.TYPE_ONLY);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return .none;
     }
 
     /// Resolves a nominal struct `TypeId` inside `cx.<submod_name>` in $O(1)$ when `stdlib/cx` is mounted.
@@ -11107,6 +11153,7 @@ pub fn collectFileModuleItems(
     }
     for (stale_from_keys.items) |stale_pair_key| {
         _ = sym_table.from_error_fn_defs.remove(stale_pair_key);
+        _ = sym_table.from_error_fn_syms.remove(stale_pair_key);
         _ = sym_table.from_error_pairs.remove(stale_pair_key);
     }
 
@@ -11513,6 +11560,37 @@ fn collectStructOrBitFieldMembers(
     cst_arena: *const LosslessCstArena,
     diagnostic_sink: ?*DiagnosticSink,
 ) !void {
+    return collectStructOrBitFieldMembersWithDefaults(
+        sym_table,
+        interner,
+        file_id,
+        member_scope,
+        owner_def_id,
+        item_cst,
+        source,
+        token_buffer,
+        cst_arena,
+        .private,
+        false,
+        diagnostic_sink,
+    );
+}
+
+/// Collects `.struct_field` / `.bit_field_member` CST nodes into `member_scope` with configurable default visibility.
+fn collectStructOrBitFieldMembersWithDefaults(
+    sym_table: *SymbolTable,
+    interner: *StringInterner,
+    file_id: FileId,
+    member_scope: ScopeId,
+    owner_def_id: DefId,
+    item_cst: CstNodeIndex,
+    source: []const u8,
+    token_buffer: *const TokenBuffer,
+    cst_arena: *const LosslessCstArena,
+    default_field_vis: Visibility,
+    is_enum_variant_fields: bool,
+    diagnostic_sink: ?*DiagnosticSink,
+) !void {
     if (item_cst.isNone() or item_cst.asInt() >= cst_arena.countNodes()) return;
     const start_idx: usize = item_cst.asInt();
     const root_rec = cst_arena.getNode(item_cst);
@@ -11528,7 +11606,7 @@ fn collectStructOrBitFieldMembers(
         const node = cst_arena.getNode(cst_id);
         if (node.kind == .struct_field or node.kind == .bit_field_member) {
             const field_end = @min(cursor + @max(@as(usize, node.subtree_size), 1), end_idx);
-            var field_vis: Visibility = .private;
+            var field_vis: Visibility = default_field_vis;
             var field_tok: TokenIndex = .none;
             var bit_width: u16 = 0;
             var has_seen_pipe = false;
@@ -11664,7 +11742,10 @@ fn collectStructOrBitFieldMembers(
                         .kind = .field_sym,
                         .namespace = .value_ns,
                         .visibility = field_vis,
-                        .flags = .{ .is_pub = (field_vis == .public) },
+                        .flags = .{
+                            .is_pub = (field_vis == .public),
+                            .is_used = is_enum_variant_fields,
+                        },
                         .extra_flags = .{
                             .is_deprecated = is_field_dep,
                             .is_non_null = has_field_non_null,
@@ -11819,6 +11900,25 @@ fn collectEnumVariants(
             if (!var_tok.isNone()) {
                 const var_name = extractTokenSlice(source, token_buffer, var_tok);
                 if (var_name.len > 0) {
+                    var has_struct_fields = false;
+                    var scan_cur = cursor + 1;
+                    while (scan_cur < var_end) : (scan_cur += 1) {
+                        if (cst_arena.getNode(CstNodeIndex.fromInt(@intCast(scan_cur))).kind == .struct_field) {
+                            has_struct_fields = true;
+                            break;
+                        }
+                    }
+                    const var_field_scope: ScopeId = if (has_struct_fields)
+                        try sym_table.scope_arena.allocScope(
+                            .nominal_type_scope,
+                            variant_scope,
+                            owner_def_id,
+                            file_id,
+                            .{},
+                        )
+                    else
+                        .none;
+
                     const var_sym = try interner.intern(var_name);
                     const is_var_dep = has_var_dep and var_dep_meta.is_deprecated;
                     const var_sym_idx = try sym_table.defineSymbol(.{
@@ -11833,12 +11933,29 @@ fn collectEnumVariants(
                         },
                         .extra_flags = .{ .is_deprecated = is_var_dep },
                         .scope_id = variant_scope,
+                        .target_scope = var_field_scope,
                         .owner_def_id = owner_def_id,
                         .cst_node = cst_id,
                         .decl_span = token_buffer.getTokenSpan(file_id, var_tok),
                         .member_ordinal = ordinal,
                         .has_cfg_attr = has_var_cfg,
                     }, diagnostic_sink);
+                    if (!var_field_scope.isNone()) {
+                        try collectStructOrBitFieldMembersWithDefaults(
+                            sym_table,
+                            interner,
+                            file_id,
+                            var_field_scope,
+                            owner_def_id,
+                            cst_id,
+                            source,
+                            token_buffer,
+                            cst_arena,
+                            enum_visibility,
+                            true,
+                            diagnostic_sink,
+                        );
+                    }
                     if (!var_allow_mask.isEmpty()) {
                         try sym_table.mergeSymbolAllowMask(var_sym_idx, var_allow_mask);
                     }
@@ -12205,7 +12322,7 @@ fn resolveUseTreeCst(
 
         for (members_snapshot) |member_idx| {
             const member = sym_table.getSymbol(member_idx).*;
-            if (member.has_cfg_attr) {
+            if (member.has_cfg_attr or member.flags.is_builtin) {
                 const scoped_key = packScopedSymbolKey(target_scope, member.name, member.namespace);
                 if (sym_table.scoped_map.get(scoped_key)) |active_idx| {
                     if (active_idx != member_idx and

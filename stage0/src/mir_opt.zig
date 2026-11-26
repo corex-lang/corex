@@ -1734,6 +1734,11 @@ fn spliceDirectCallSite(
                     .type_args_len = new_ta_len,
                     .ret_ty = old_cs.ret_ty,
                     .is_callee_contextless = old_cs.is_callee_contextless,
+                    .is_abort_on_panic = old_cs.is_abort_on_panic,
+                    .is_c_variadic = old_cs.is_c_variadic,
+                    .is_unsafe_call = old_cs.is_unsafe_call,
+                    .is_uninit_backing_ctor = old_cs.is_uninit_backing_ctor,
+                    .fixed_arity = old_cs.fixed_arity,
                     .origin_token = old_cs.origin_token,
                 });
                 const old_ne = callee.extra_edges.items[cal_bb.terminator.edge_start];
@@ -3564,6 +3569,17 @@ fn specializeMonomorphizedUnaryInst(
                     .operands = .{ .lhs = inst.operands.lhs, .rhs = 0 },
                 };
             }
+            if (ukind == .bitcast_op and pool.isSliceRefType(unwrapped_dst)) {
+                const src_outer = pool.getNode(unwrapped_src);
+                if (src_outer.tag == .ref_ty or src_outer.tag == .mut_ref_ty) {
+                    const src_inner = pool.unwrapUnderlyingType(TypeId.fromInt(src_outer.lhs));
+                    if (pool.getNode(src_inner).tag == .array_ty) {
+                        var arr_cast = inst;
+                        arr_cast.aux_u16 = @backingInt(UnaryOpKind.ptr_cast);
+                        return arr_cast;
+                    }
+                }
+            }
             const is_src_float = unwrapped_src == .f32_ty or unwrapped_src == .f64_ty;
             const is_dst_float = unwrapped_dst == .f32_ty or unwrapped_dst == .f64_ty;
             var updated = inst;
@@ -3871,6 +3887,274 @@ fn resolveMonomorphizedTraitMethodCall(
             cal_inst.operands.rhs = impl_sym_idx.asInt();
             spec.insts.set(sub_cs.callee_val.asInt(), cal_inst);
         }
+    }
+}
+
+/// Rewrites monomorphized `SE-09` `[S: str | &[u8] | Path]` `.as_bytes()` casts on nominal structs into `<Struct>.as_bytes` calls.
+fn rewriteMonomorphizedUnionAsBytesInsts(
+    allocator: std.mem.Allocator,
+    spec: *MirBody,
+    pool: *InternPool,
+    sym_table: *const SymbolTable,
+) !void {
+    var did_split = false;
+    var bb_i: usize = 0;
+    while (bb_i < spec.blocks.items.len) : (bb_i += 1) {
+        const bb_id = MirBlockId.fromInt(@intCast(bb_i));
+        const bb_insts = spec.getBlockInsts(bb_id);
+        for (bb_insts, 0..) |inst_vid, k| {
+            const inst = spec.getInst(inst_vid);
+            const is_bitcast_uop = inst.op == .unary_op and
+                @as(UnaryOpKind, @fromBackingInt(@intCast(@as(u8, @truncate(inst.aux_u16))))) == .bitcast_op;
+            if (!is_bitcast_uop and inst.op != .copy_val) continue;
+            if (inst.operands.lhs >= spec.insts.len) continue;
+
+            const uw_dst = pool.unwrapUnderlyingType(inst.type_id);
+            const dst_node = pool.getNode(uw_dst);
+            if (dst_node.tag != .ref_ty) continue;
+            const dst_slice = pool.unwrapUnderlyingType(TypeId.fromInt(dst_node.lhs));
+            const dst_slice_node = pool.getNode(dst_slice);
+            if (dst_slice_node.tag != .slice_ty or
+                pool.unwrapUnderlyingType(TypeId.fromInt(dst_slice_node.lhs)) != .u8_ty)
+            {
+                continue;
+            }
+
+            const src_vid = MirValueId.fromInt(inst.operands.lhs);
+            const raw_src_ty = spec.getInst(src_vid).type_id;
+            const uw_src = pool.unwrapUnderlyingType(raw_src_ty);
+            if (uw_src.isError() or hasGenericVarsInType(pool, uw_src)) continue;
+
+            const src_outer = pool.getNode(uw_src);
+            const is_src_ref = src_outer.tag == .ref_ty or src_outer.tag == .mut_ref_ty;
+            const nom_ty = if (is_src_ref)
+                pool.unwrapUnderlyingType(TypeId.fromInt(src_outer.lhs))
+            else
+                uw_src;
+            const nom_node = pool.getNode(nom_ty);
+            if (nom_node.tag != .struct_ty) continue;
+
+            const nom_sym_idx = SymbolIndex.fromInt(nom_node.rhs);
+            if (nom_sym_idx.isNone() or nom_sym_idx.asInt() >= sym_table.symbols.items.len) continue;
+            const nom_sym = sym_table.getSymbol(nom_sym_idx).*;
+            if (nom_sym.target_scope.isNone()) continue;
+
+            var as_bytes_sym_idx: SymbolIndex = .none;
+            for (sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
+                const mem_sym = sym_table.getSymbol(mem_idx).*;
+                if (mem_sym.kind == .fn_sym and std.mem.eql(u8, mem_sym.name_text, "as_bytes")) {
+                    as_bytes_sym_idx = mem_idx;
+                    break;
+                }
+            }
+            if (as_bytes_sym_idx.isNone()) continue;
+            const as_bytes_sym = sym_table.getSymbol(as_bytes_sym_idx).*;
+            const sig_view = pool.getFnSignatureView(as_bytes_sym.type_id) orelse continue;
+            if (sig_view.paramCount() != 1 or sig_view.getParamMode(0) != .let_mode) continue;
+
+            const origin_tok = if (inst_vid.asInt() < spec.origin_tokens.items.len)
+                spec.origin_tokens.items[inst_vid.asInt()]
+            else
+                TokenIndex.none;
+            const nom_subst = type_system.NominalTypeSubst.init(pool, sym_table, nom_ty);
+            const param0_ty = nom_subst.resolve(sig_view.getParamType(0));
+            const uw_param0 = pool.unwrapUnderlyingType(param0_ty);
+
+            var pre_insts: std.ArrayListUnmanaged(MirValueId) = .empty;
+            defer pre_insts.deinit(allocator);
+            try pre_insts.appendSlice(allocator, bb_insts[0..k]);
+
+            var post_insts_copy: std.ArrayListUnmanaged(MirValueId) = .empty;
+            defer post_insts_copy.deinit(allocator);
+            try post_insts_copy.appendSlice(allocator, bb_insts[k + 1 ..]);
+
+            var arg0_vid = src_vid;
+            if (pool.getNode(uw_param0).tag == .ref_ty) {
+                if (is_src_ref) {
+                    if (raw_src_ty != param0_ty) {
+                        arg0_vid = try spec.appendInst(.{
+                            .op = .copy_val,
+                            .flags = .{ .is_synthetic = true },
+                            .type_id = param0_ty,
+                            .operands = .{ .lhs = src_vid.asInt(), .rhs = 0 },
+                        }, origin_tok);
+                        try pre_insts.append(allocator, arg0_vid);
+                    }
+                } else {
+                    const tmp_loc_idx: u32 = @intCast(spec.locals.items.len);
+                    try spec.locals.append(
+                        spec.allocator,
+                        mir.LocalDecl.init(
+                            .empty,
+                            nom_ty,
+                            origin_tok,
+                            0,
+                            .let_mode,
+                            .{ .is_mut = true, .is_synthetic_temp = true, .is_address_taken = true },
+                        ),
+                    );
+                    if (spec.local_scope_depths.items.len + 1 == spec.locals.items.len) {
+                        try spec.local_scope_depths.append(spec.allocator, 1);
+                    }
+                    const tmp_pl_idx: u32 = @intCast(spec.places.items.len);
+                    try spec.places.append(spec.allocator, .{
+                        .base = tmp_loc_idx,
+                        .proj_start = 0,
+                        .proj_len = 0,
+                    });
+                    const st_vid = try spec.appendInst(.{
+                        .op = .place_store,
+                        .flags = .{ .has_side_effects = true, .is_synthetic = true },
+                        .type_id = .unit_ty,
+                        .operands = .{ .lhs = tmp_pl_idx, .rhs = src_vid.asInt() },
+                    }, origin_tok);
+                    try pre_insts.append(allocator, st_vid);
+                    arg0_vid = try spec.appendInst(.{
+                        .op = .place_addr,
+                        .flags = .{ .is_synthetic = true },
+                        .type_id = param0_ty,
+                        .operands = .{ .lhs = tmp_pl_idx, .rhs = 0 },
+                    }, origin_tok);
+                    try pre_insts.append(allocator, arg0_vid);
+                }
+            } else if (is_src_ref) {
+                const ref_loc_idx: u32 = @intCast(spec.locals.items.len);
+                try spec.locals.append(
+                    spec.allocator,
+                    mir.LocalDecl.init(
+                        .empty,
+                        raw_src_ty,
+                        origin_tok,
+                        0,
+                        .let_mode,
+                        .{ .is_mut = true, .is_synthetic_temp = true },
+                    ),
+                );
+                if (spec.local_scope_depths.items.len + 1 == spec.locals.items.len) {
+                    try spec.local_scope_depths.append(spec.allocator, 1);
+                }
+                const ref_pl_idx: u32 = @intCast(spec.places.items.len);
+                try spec.places.append(spec.allocator, .{
+                    .base = ref_loc_idx,
+                    .proj_start = 0,
+                    .proj_len = 0,
+                });
+                const deref_proj_idx: u24 = @intCast(spec.projections.items.len);
+                try spec.projections.append(spec.allocator, .{ .kind = .deref, .payload = 0 });
+                const deref_pl_idx: u32 = @intCast(spec.places.items.len);
+                try spec.places.append(spec.allocator, .{
+                    .base = ref_loc_idx,
+                    .proj_start = deref_proj_idx,
+                    .proj_len = 1,
+                });
+                const st_vid = try spec.appendInst(.{
+                    .op = .place_store,
+                    .flags = .{ .has_side_effects = true, .is_synthetic = true },
+                    .type_id = .unit_ty,
+                    .operands = .{ .lhs = ref_pl_idx, .rhs = src_vid.asInt() },
+                }, origin_tok);
+                try pre_insts.append(allocator, st_vid);
+                arg0_vid = try spec.appendInst(.{
+                    .op = .place_load,
+                    .flags = .{ .is_synthetic = true },
+                    .type_id = param0_ty,
+                    .operands = .{ .lhs = deref_pl_idx, .rhs = 0 },
+                }, origin_tok);
+                try pre_insts.append(allocator, arg0_vid);
+            }
+
+            const callee_vid = try spec.appendInst(.{
+                .op = .fn_addr,
+                .flags = .{ .is_synthetic = true },
+                .type_id = as_bytes_sym.type_id,
+                .operands = .{
+                    .lhs = as_bytes_sym.def_id.asInt(),
+                    .rhs = as_bytes_sym_idx.asInt(),
+                },
+            }, origin_tok);
+            try pre_insts.append(allocator, callee_vid);
+
+            const cs_args_start: u32 = @intCast(spec.extra_args.items.len);
+            try spec.extra_args.append(spec.allocator, arg0_vid.asInt());
+            const cs_modes_start: u32 = @intCast(spec.call_arg_modes.items.len);
+            try spec.call_arg_modes.append(spec.allocator, .let_mode);
+            const nom_type_args = pool.getGenericTypeArgs(nom_ty);
+            const cs_ta_start: u32 = @intCast(spec.extra_args.items.len);
+            if (nom_type_args.len > 0) {
+                try spec.extra_args.appendSlice(spec.allocator, nom_type_args);
+            }
+            const new_cs_idx: u32 = @intCast(spec.calls.items.len);
+            try spec.calls.append(spec.allocator, .{
+                .callee_val = callee_vid,
+                .direct_def_id = as_bytes_sym.def_id,
+                .direct_symbol = as_bytes_sym_idx,
+                .args_start = cs_args_start,
+                .args_len = 1,
+                .modes_start = cs_modes_start,
+                .type_args_start = cs_ta_start,
+                .type_args_len = @intCast(nom_type_args.len),
+                .ret_ty = inst.type_id,
+                .is_callee_contextless = as_bytes_sym.flags.is_comptime or as_bytes_sym.flags.is_builtin,
+                .fixed_arity = 1,
+                .origin_token = origin_tok,
+            });
+
+            const cont_bb_id = MirBlockId.fromInt(@intCast(spec.blocks.items.len));
+            spec.insts.set(inst_vid.asInt(), .{
+                .op = .block_param,
+                .flags = .{ .is_synthetic = true },
+                .type_id = inst.type_id,
+                .operands = .{ .lhs = cont_bb_id.asInt(), .rhs = 0 },
+            });
+            const bp_start: u32 = @intCast(spec.block_params.items.len);
+            try spec.block_params.append(spec.allocator, inst_vid);
+
+            const pre_start: u32 = @intCast(spec.block_insts.items.len);
+            try spec.block_insts.appendSlice(spec.allocator, pre_insts.items);
+            const post_start: u32 = @intCast(spec.block_insts.items.len);
+            try spec.block_insts.appendSlice(spec.allocator, post_insts_copy.items);
+
+            const old_bb = spec.blocks.items[bb_i];
+            const old_term = old_bb.terminator;
+            for (spec.extra_edges.items[old_term.edge_start .. old_term.edge_start + old_term.edge_len]) |*edge| {
+                edge.src_bb = cont_bb_id;
+            }
+            for (spec.loop_contracts.items) |*lc_item| {
+                if (lc_item.latch_bb == bb_id) lc_item.latch_bb = cont_bb_id;
+            }
+
+            var cont_bb_rec = mir.MirBasicBlock{
+                .param_start = bp_start,
+                .inst_start = post_start,
+                .inst_len = @intCast(post_insts_copy.items.len),
+                .terminator = old_term,
+            };
+            cont_bb_rec.setParamLen(1);
+            cont_bb_rec.setSealed(true);
+            cont_bb_rec.setCleanupPad(old_bb.isCleanupPad());
+            try spec.blocks.append(spec.allocator, cont_bb_rec);
+
+            const call_edge_idx: u32 = @intCast(spec.extra_edges.items.len);
+            try spec.extra_edges.append(spec.allocator, .{
+                .src_bb = bb_id,
+                .target_bb = cont_bb_id,
+                .args_start = 0,
+                .args_len = 0,
+            });
+            spec.blocks.items[bb_i].inst_start = pre_start;
+            spec.blocks.items[bb_i].inst_len = @intCast(pre_insts.items.len);
+            spec.blocks.items[bb_i].terminator = .{
+                .kind = .call,
+                .edge_len = 1,
+                .cond_or_val = new_cs_idx,
+                .edge_start = call_edge_idx,
+            };
+            did_split = true;
+            break;
+        }
+    }
+    if (did_split) {
+        try rebuildPredsAndSweepUnreachable(allocator, spec);
     }
 }
 
@@ -4969,6 +5253,8 @@ fn specializeClosureTemplateRecursive(
         }
     }
 
+    try rewriteMonomorphizedUnionAsBytesInsts(allocator, &spec, pool, sym_table);
+
     for (spec.calls.items) |*sub_cs| {
         sub_cs.ret_ty = try substituteMirType(allocator, pool, sub_cs.ret_ty, subst, 0);
         if (sub_cs.type_args_len > 0 and
@@ -5017,6 +5303,12 @@ fn specializeClosureTemplateRecursive(
     instance_count.* += 1;
     const spec_def = DefId.fromInt(next_synth_def_raw.*);
     next_synth_def_raw.* += 1;
+    if (spec.sast_owner_symbol.isNone() and !clos_tmpl.symbol_index.isNone()) {
+        spec.sast_owner_symbol = clos_tmpl.symbol_index;
+    }
+    if (spec.sast_owner_def_id.isNone() and !clos_tmpl.def_id.isNone()) {
+        spec.sast_owner_def_id = clos_tmpl.def_id;
+    }
     spec.def_id = spec_def;
     spec.symbol_index = .none;
     var name_buf: [128]u8 = undefined;
@@ -5642,6 +5934,7 @@ fn runPassD5MonomorphizeAndPromote(
                     );
                 }
             }
+            try rewriteMonomorphizedUnionAsBytesInsts(allocator, &spec, pool, sym_table);
             var has_nested_generic_call = false;
             for (spec.calls.items) |*sub_cs| {
                 sub_cs.ret_ty = try substituteMirType(allocator, pool, sub_cs.ret_ty, &subst, 0);
@@ -5808,6 +6101,12 @@ fn runPassD5MonomorphizeAndPromote(
                 next_synth_def_raw += 1;
                 break :blk_sdef out_def;
             };
+            if (spec.sast_owner_symbol.isNone() and !tmpl.symbol_index.isNone()) {
+                spec.sast_owner_symbol = tmpl.symbol_index;
+            }
+            if (spec.sast_owner_def_id.isNone() and !tmpl.def_id.isNone()) {
+                spec.sast_owner_def_id = tmpl.def_id;
+            }
             spec.def_id = spec_def;
             spec.symbol_index = .none;
             if (is_async_spec) {
@@ -6841,6 +7140,24 @@ fn runPassR3ValueRangeProp(
                                     ctx.m_body.insts.set(raw, updated);
                                     try ctx.setScopedRange(raw, .{ .min_val = min_ov[0], .max_val = max_ov[0] });
                                 }
+                            }
+                        } else if (bkind == .bit_and and lr.min_val >= 0 and rr.min_val >= 0) {
+                            try ctx.setScopedRange(raw, .{ .min_val = 0, .max_val = @min(lr.max_val, rr.max_val) });
+                        } else if (bkind == .bit_or and lr.min_val >= 0 and rr.min_val >= 0) {
+                            if (fullTypeIntRange(ctx.intern_pool, inst.type_id, ctx.layout)) |ty_bounds| {
+                                const lo_bound: i128 = @max(lr.min_val, rr.min_val);
+                                const or_hi: u128 = @as(u128, @intCast(lr.max_val)) | @as(u128, @intCast(rr.max_val));
+                                const hi_mask: u128 = if (or_hi == 0)
+                                    0
+                                else blk_m: {
+                                    const lz = @clz(or_hi);
+                                    break :blk_m if (lz == 0)
+                                        std.math.maxInt(u128)
+                                    else
+                                        (@as(u128, 1) << @intCast(128 - lz)) - 1;
+                                };
+                                const hi_clamped: i128 = @intCast(@min(hi_mask, @as(u128, @intCast(@max(ty_bounds.max_val, 0)))));
+                                try ctx.setScopedRange(raw, .{ .min_val = lo_bound, .max_val = @max(lo_bound, hi_clamped) });
                             }
                         }
                     },
@@ -8314,6 +8631,7 @@ fn computeMirBodyStructuralHashWithInterner(
     hasher.update(std.mem.asBytes(&body.param_count));
     hasher.update(&[_]u8{
         @intFromBool(body.is_contextless),
+        @intFromBool(body.is_derived),
         @intFromBool(body.is_ghost_stripped),
         @intFromBool(body.is_async),
         target_layout.ptr_byte_size,
@@ -8800,6 +9118,7 @@ pub fn isMirBodyStructurallyEqual(
 ) !bool {
     if (body_a.param_count != body_b.param_count or
         body_a.is_contextless != body_b.is_contextless or
+        body_a.is_derived != body_b.is_derived or
         body_a.is_ghost_stripped != body_b.is_ghost_stripped or
         body_a.is_async != body_b.is_async or
         body_a.locals.items.len != body_b.locals.items.len or

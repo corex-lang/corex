@@ -257,6 +257,16 @@ pub fn build(builder: *std.Build) void {
         "llvm-prefix",
         "Optional LLVM 20–23 installation prefix enabling the static C++20 corex_llvm bridge",
     );
+    const test_filter_opt = builder.option(
+        []const u8,
+        "test-filter",
+        "Optional test name substring filter for zig build test",
+    );
+    const test_filters: []const []const u8 = if (test_filter_opt) |tf| &.{tf} else &.{};
+    const ext_test_filters: []const []const u8 = if (test_filter_opt) |tf|
+        &.{ tf, "test_runner_references_all" }
+    else
+        &.{};
 
     const build_options = builder.addOptions();
     build_options.addOption(bool, "has_llvm_cpp_bridge", llvm_prefix_opt != null);
@@ -301,6 +311,7 @@ pub fn build(builder: *std.Build) void {
     const root_unit_tests = builder.addTest(.{
         .name = "corex-stage0-unit",
         .root_module = corex_mod,
+        .filters = test_filters,
     });
     test_step.dependOn(&builder.addRunArtifact(root_unit_tests).step);
 
@@ -315,6 +326,7 @@ pub fn build(builder: *std.Build) void {
     const external_tests = builder.addTest(.{
         .name = "corex-test-runner",
         .root_module = external_test_mod,
+        .filters = ext_test_filters,
     });
     test_step.dependOn(&builder.addRunArtifact(external_tests).step);
 

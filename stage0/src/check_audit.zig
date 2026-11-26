@@ -6985,7 +6985,6 @@ pub fn lintDefBodyW0202(
         const impl_members = checker.getNodeExtraSlice(item_ast_node, true);
         var mem_cursor: usize = 0;
         for (checker.sym_table.getOwnerDefMembers(def_id)) |cand_sym_idx| {
-            if (checker.isSymbolCfgDisabled(cand_sym_idx)) continue;
             const cand_sym = checker.sym_table.getSymbol(cand_sym_idx).*;
             if (cand_sym.owner_def_id != def_id) continue;
             if (cand_sym.kind != .fn_sym and cand_sym.kind != .const_sym) continue;
@@ -7003,6 +7002,7 @@ pub fn lintDefBodyW0202(
                     break;
                 }
             }
+            if (checker.isSymbolCfgDisabled(cand_sym_idx)) continue;
             try lintSingleItemBodyAst(checker, cand_sym_idx, matched_mem_ast, &suppressed_headers, sink_opt);
         }
         return;

@@ -7,7 +7,6 @@
 const std = @import("std");
 
 // ---------------------------------------- TYPES ----------------------------------------
-
 /// Strongly typed opaque handle representing either a native OS reactor or a deterministic `SimWorld`.
 pub const ReactorCtx = opaque {};
 /// Lifecycle state of an `InFlightOpSlot` in the completion proactor table (`DR-08` §5.3).
@@ -59,8 +58,15 @@ pub const InFlightOpSlot = extern struct {
 };
 /// Normalized 16-byte completion queue entry shared across all OS reactors and `SimWorld`.
 pub const ReactorCqe = extern struct { user_data: u64 = 0, result: i32 = 0, flags: u32 = 0 };
-/// Canonical proactor I/O operation opcode submitted via `ReactorVTable.submit_io`.
-pub const IoOpKind = enum(u8) { nop = 0, read = 1, write = 2, accept = 3, connect = 4, timer = 5, close = 6 };
+// zig fmt: off
+/// Canonical proactor & `--sim` `SimVfs`/`SimReactor` opcode submitted via `ReactorVTable.submit_io` (`STD-02`).
+pub const IoOpKind = enum(u8) {
+    nop = 0, read = 1, write = 2, accept = 3, connect = 4, timer = 5, close = 6, stdio_rw = 7, fs_open = 8,
+    fs_op_beneath = 9, fs_rw = 10, fs_seek = 11, fs_stat = 12, fs_sync = 13, fs_close = 14, fs_mmap = 15,
+    fs_resolve = 16, fs_rename_atomic = 17, fs_materialize = 18, fs_dir_op = 19, fs_lock = 20, fs_watch_poll = 21,
+    sleep_ns = 22, env_op = 23, proc_op = 24,
+};
+// zig fmt: on
 /// C-ABI proactor submission descriptor passed to `ReactorVTable.submit_io`.
 pub const IoSubmission = extern struct {
     kind: IoOpKind = .nop,
@@ -168,20 +174,14 @@ pub const CompletionReaper = struct {
         return self.slots[key.slot_index].buf;
     }
     /// Polls `vtable.poll_or_park` in 16-CQE batches until `quarantined_count == 0`, EOF/error, or `max_polls`.
-    pub fn drainQuarantinedBarrier(
-        self: *CompletionReaper,
-        vtable: *const ReactorVTable,
-        ctx: *ReactorCtx,
-        max_polls: u32,
-        on_orphan: ?ReapOrphanFn,
-    ) bool {
+    pub fn drainQuarantinedBarrier(self: *CompletionReaper, vt: *const ReactorVTable, ctx: *ReactorCtx, max_polls: u32, cb: ?ReapOrphanFn) bool {
         var cqe_batch: [16]ReactorCqe = @splat(.{});
         var poll_count: u32 = 0;
         while (self.quarantined_count > 0 and poll_count < max_polls) : (poll_count += 1) {
-            const polled_count = vtable.poll_or_park(ctx, &cqe_batch, cqe_batch.len, true);
+            const polled_count = vt.poll_or_park(ctx, &cqe_batch, cqe_batch.len, true);
             if (polled_count == 0 or polled_count > cqe_batch.len) break;
             for (cqe_batch[0..polled_count]) |cqe| if (self.reapCompletion(cqe)) |out| {
-                if (out.state == .free and out.orphan_action != .none) if (on_orphan) |cb| cb(ctx, out);
+                if (out.state == .free and out.orphan_action != .none) if (cb) |orphan_fn| orphan_fn(ctx, out);
             };
         }
         return self.quarantined_count == 0;
@@ -189,14 +189,14 @@ pub const CompletionReaper = struct {
 };
 
 // --------------------------------------- CONSTS ----------------------------------------
-
 /// Sentinel `u32` index marking the end of `CompletionReaper`'s intrusive free list.
 pub const FREE_SLOT_SENTINEL: u32 = std.math.maxInt(u32);
+/// Sentinel returned by `noopSubmitIo` (`minInt(i64)`) distinguishing passive/async reactors from active `SimReactor` handlers.
+pub const SIM_UNHANDLED_SENTINEL: i64 = std.math.minInt(i64);
 /// Deterministic loopback/host no-op `ReactorVTable` when no OS completion ring is attached.
 pub const DEFAULT_NOOP_REACTOR_VTABLE: ReactorVTable = .{};
 
 // -------------------------------------- INTERNALS --------------------------------------
-
 /// Returns deterministic `1.0 s` (`1_000_000_000` ns) monotonic origin for the no-op reactor.
 fn noopMonotonicNs(_: *ReactorCtx) callconv(.c) u64 {
     return 1_000_000_000;
@@ -209,9 +209,9 @@ fn noopWallEpochNs(_: *ReactorCtx) callconv(.c) i64 {
 fn noopFillRng(_: *ReactorCtx, out_ptr: [*]u8, out_len: usize) callconv(.c) void {
     @memset(out_ptr[0..out_len], 0);
 }
-/// Synchronous no-op submission returning `0`.
+/// Synchronous no-op submission returning `SIM_UNHANDLED_SENTINEL` so callers route straight to host OS syscalls outside `--sim`.
 fn noopSubmitIo(_: *ReactorCtx, _: *const IoSubmission) callconv(.c) i64 {
-    return 0;
+    return SIM_UNHANDLED_SENTINEL;
 }
 /// Synchronous no-op cancellation hook.
 fn noopCancelIo(_: *ReactorCtx, _: u32, _: u16) callconv(.c) void {}
@@ -233,14 +233,12 @@ fn recycleSlotToFree(reaper: *CompletionReaper, slot_index: u32, generation: u16
 }
 
 // ------------------------------------- PUBLIC API --------------------------------------
-
 /// Initializes a two-phase DMA quarantine and zombie-CQE slot manager over `slots`.
 pub fn initCompletionReaper(slots: []InFlightOpSlot) CompletionReaper {
     return CompletionReaper.init(slots);
 }
 
 // ---------------------------------------- MAIN -----------------------------------------
-
 comptime {
     std.debug.assert(@sizeOf(GenStateReaper) == 4 and @sizeOf(IoUserData) == 8 and @sizeOf(IoBuf) == 24);
     std.debug.assert(@sizeOf(InFlightOpSlot) == 64 and @alignOf(InFlightOpSlot) == 64 and @sizeOf(ReactorCqe) == 16);

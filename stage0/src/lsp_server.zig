@@ -5038,75 +5038,87 @@ fn classifySymbolSemanticStyle(
     return .{ .tok_type = tok_type, .mod_bits = mods };
 }
 
-/// Resolves the identifier `TokenIndex` representing `ast_id` (unwrapping `.` on variants/members and `@` on intrinsics).
+/// Resolves the identifier `TokenIndex` representing `ast_id` (unwrapping calls, generics, `.` members, `:=`, and `@`).
 fn resolveAstNodeFocalToken(
     parsed_art: *const query_db.ParsedCstArtifact,
     ast_id: NodeIndex,
 ) TokenIndex {
-    const ast_node = parsed_art.ast_arena.getNode(ast_id);
+    const node_count = parsed_art.ast_arena.countNodes();
     const tok_count = parsed_art.token_buffer.countTokens();
-    switch (ast_node.tag) {
-        .field_access => {
-            if (ast_node.rhs.tag == .token and ast_node.rhs.payload < tok_count) {
-                return TokenIndex.fromInt(ast_node.rhs.payload);
-            }
-        },
-        .method_call => {
-            if (ast_node.rhs.tag == .extra and ast_node.rhs.payload < parsed_art.ast_arena.extra_data.items.len) {
-                const member_raw = parsed_art.ast_arena.extra_data.items[ast_node.rhs.payload];
-                if (member_raw < tok_count) return TokenIndex.fromInt(member_raw);
-            }
-        },
-        .contextual_variant => {
-            if (ast_node.lhs.tag == .token and ast_node.lhs.payload < tok_count) {
-                return TokenIndex.fromInt(ast_node.lhs.payload);
-            }
-        },
-        .incomplete_call => {
-            if (ast_node.lhs.tag == .token and ast_node.lhs.payload < tok_count and
-                !ast_node.main_token.isNone() and ast_node.main_token.asInt() < tok_count and
-                parsed_art.token_buffer.getToken(ast_node.main_token).kind == .dot)
-            {
-                return TokenIndex.fromInt(ast_node.lhs.payload);
-            }
-        },
-        .ident_expr => {
-            if (ast_node.lhs.tag == .token and ast_node.lhs.payload < tok_count and
-                !ast_node.main_token.isNone() and ast_node.main_token.asInt() < tok_count and
-                parsed_art.token_buffer.getToken(ast_node.main_token).kind == .at)
-            {
-                return TokenIndex.fromInt(ast_node.lhs.payload);
-            }
-        },
-        .variant_pat => {
-            const pat_cst = parsed_art.ast_arena.getCstOrigin(ast_id);
-            if (!pat_cst.isNone() and pat_cst.asInt() < parsed_art.cst_arena.countNodes()) {
-                const start_idx: usize = pat_cst.asInt();
-                const end_idx = @min(
-                    start_idx + @max(@as(usize, parsed_art.cst_arena.getNode(pat_cst).subtree_size), 1),
-                    parsed_art.cst_arena.countNodes(),
-                );
-                var last_ident_tok: TokenIndex = .none;
-                var cur = start_idx + 1;
-                while (cur < end_idx) : (cur += 1) {
-                    const sub = parsed_art.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
-                    if (sub.subtree_size <= 1 and !sub.flags.is_bracketed and
-                        !sub.flags.is_missing_or_injected and !sub.token.isNone() and
-                        sub.token.asInt() < tok_count)
-                    {
-                        const leaf_kind = parsed_art.token_buffer.getToken(sub.token).kind;
-                        if (leaf_kind == .lparen or leaf_kind == .lbrace) break;
-                        if (symbol_resolver.isIdentifierToken(leaf_kind)) {
-                            last_ident_tok = sub.token;
+    var cur_id = ast_id;
+    var depth: u32 = 0;
+    while (!cur_id.isNone() and cur_id.asInt() < node_count and depth < 16) : (depth += 1) {
+        const ast_node = parsed_art.ast_arena.getNode(cur_id);
+        switch (ast_node.tag) {
+            .call_expr, .generic_call, .struct_lit, .generic_type => {
+                if (ast_node.lhs.tag == .node and ast_node.lhs.payload < node_count) {
+                    cur_id = NodeIndex.fromInt(ast_node.lhs.payload);
+                    continue;
+                }
+            },
+            .field_access => {
+                if (ast_node.rhs.tag == .token and ast_node.rhs.payload < tok_count) {
+                    return TokenIndex.fromInt(ast_node.rhs.payload);
+                }
+            },
+            .method_call => {
+                if (ast_node.rhs.tag == .extra and ast_node.rhs.payload < parsed_art.ast_arena.extra_data.items.len) {
+                    const member_raw = parsed_art.ast_arena.extra_data.items[ast_node.rhs.payload];
+                    if (member_raw < tok_count) return TokenIndex.fromInt(member_raw);
+                }
+            },
+            .contextual_variant, .walrus_expr => {
+                if (ast_node.lhs.tag == .token and ast_node.lhs.payload < tok_count) {
+                    return TokenIndex.fromInt(ast_node.lhs.payload);
+                }
+            },
+            .incomplete_call => {
+                if (ast_node.lhs.tag == .token and ast_node.lhs.payload < tok_count and
+                    !ast_node.main_token.isNone() and ast_node.main_token.asInt() < tok_count and
+                    parsed_art.token_buffer.getToken(ast_node.main_token).kind == .dot)
+                {
+                    return TokenIndex.fromInt(ast_node.lhs.payload);
+                }
+            },
+            .ident_expr => {
+                if (ast_node.lhs.tag == .token and ast_node.lhs.payload < tok_count and
+                    !ast_node.main_token.isNone() and ast_node.main_token.asInt() < tok_count and
+                    parsed_art.token_buffer.getToken(ast_node.main_token).kind == .at)
+                {
+                    return TokenIndex.fromInt(ast_node.lhs.payload);
+                }
+            },
+            .variant_pat => {
+                const pat_cst = parsed_art.ast_arena.getCstOrigin(cur_id);
+                if (!pat_cst.isNone() and pat_cst.asInt() < parsed_art.cst_arena.countNodes()) {
+                    const start_idx: usize = pat_cst.asInt();
+                    const end_idx = @min(
+                        start_idx + @max(@as(usize, parsed_art.cst_arena.getNode(pat_cst).subtree_size), 1),
+                        parsed_art.cst_arena.countNodes(),
+                    );
+                    var last_ident_tok: TokenIndex = .none;
+                    var cur = start_idx + 1;
+                    while (cur < end_idx) : (cur += 1) {
+                        const sub = parsed_art.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+                        if (sub.subtree_size <= 1 and !sub.flags.is_bracketed and
+                            !sub.flags.is_missing_or_injected and !sub.token.isNone() and
+                            sub.token.asInt() < tok_count)
+                        {
+                            const leaf_kind = parsed_art.token_buffer.getToken(sub.token).kind;
+                            if (leaf_kind == .lparen or leaf_kind == .lbrace) break;
+                            if (symbol_resolver.isIdentifierToken(leaf_kind)) {
+                                last_ident_tok = sub.token;
+                            }
                         }
                     }
+                    if (!last_ident_tok.isNone()) return last_ident_tok;
                 }
-                if (!last_ident_tok.isNone()) return last_ident_tok;
-            }
-        },
-        else => {},
+            },
+            else => {},
+        }
+        return ast_node.main_token;
     }
-    return ast_node.main_token;
+    return .none;
 }
 
 /// Emits semantic comment spans for `piece`, splitting `TRIVIA_FLAG_COALESCED` runs into individual comments.
@@ -8465,6 +8477,8 @@ fn collectSymbolOccurrencesInFile(
             const n_rec = parsed_art.ast_arena.getNode(n_id);
             if (n_rec.tag == .bind_pat or n_rec.tag == .local_var_decl) {
                 if (!n_rec.main_token.isNone()) try write_tok_set.put(arena_alloc, n_rec.main_token.asInt(), {});
+            } else if (n_rec.tag == .walrus_expr and n_rec.lhs.tag == .token) {
+                try write_tok_set.put(arena_alloc, n_rec.lhs.payload, {});
             } else if (n_rec.tag == .assign_stmt and n_rec.lhs.tag == .node) {
                 const lhs_n = parsed_art.ast_arena.getNode(NodeIndex.fromInt(n_rec.lhs.payload));
                 if (!lhs_n.main_token.isNone()) try write_tok_set.put(arena_alloc, lhs_n.main_token.asInt(), {});
@@ -8495,6 +8509,8 @@ fn collectSymbolOccurrencesInFile(
                 if (is_matched) {
                     const hit_tok = resolveAstNodeFocalToken(parsed_art, ast_id);
                     if (!hit_tok.isNone() and hit_tok.asInt() < parsed_art.token_buffer.countTokens()) {
+                        const hit_kind = parsed_art.token_buffer.getToken(hit_tok).kind;
+                        if (!isUserIdentifierToken(hit_kind)) continue;
                         const cand_sp = parsed_art.token_buffer.getTokenSpan(scan_fid, hit_tok);
                         if (!is_including_declaration) {
                             if (live_canonical_decl) |live_decl| {

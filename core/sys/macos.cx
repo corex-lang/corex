@@ -1,10 +1,143 @@
-/# Apple macOS Darwin `libSystem` Constants and C-ABI Prototypes (`core.sys.macos`)
+/# Apple macOS Darwin `libSystem` Constants, Descriptors & C-ABI Prototypes (`core.sys.macos`)
 /#
-/# Declares canonical Darwin file-descriptor constants, Apple Silicon (`aarch64-macos`) `128B`
-/# cache-line constant, and `libSystem.B.dylib` `write` / `_exit` `extern "C"` prototypes.
+/# Declares `@repr(C)` Darwin BSD records (`DarwinStat64` `144B`, `DarwinDirent64Hdr`,
+/# `DarwinKevent64` `48B`, `DarwinMachTimebaseInfo`, `PosixIovec`, `PosixTimespec`, `PosixPollFd`),
+/# macOS `fcntl`/`kqueue`/`clonefileat` constants, and `libSystem.B.dylib` `extern "C"` prototypes.
 /#
-/# On macOS, userland binaries link against `libSystem` rather than invoking unstable raw traps;
-/# safe stream helpers route through `@sys_write` and `@sys_exit`.
+/# On `x86_64-apple-darwin`, `stat`/`fstat`/`lstat`/`fstatat` link to `*$INODE64` whereas on
+/# `aarch64-apple-darwin` plain symbols natively address the identical `144`-byte `DarwinStat64` ABI.
+
+// ---------------------------------------- TYPES ----------------------------------------
+/| Darwin scatter/gather I/O buffer vector (`struct iovec`, `16` bytes on 64-bit targets).
+@repr(C)
+pub struct PosixIovec {
+    /| Base address of the contiguous read or write byte region.
+    pub iov_base: *mut u8,
+    /| Number of bytes in `iov_base`.
+    pub iov_len: usize,
+}
+
+/| Darwin nanosecond timestamp and interval (`struct timespec`, `16` bytes on LP64).
+@repr(C, align: 8)
+pub struct PosixTimespec {
+    /| Whole seconds component.
+    pub tv_sec: i64,
+    /| Nanoseconds component (`0..999_999_999`).
+    pub tv_nsec: i64,
+}
+
+/| Darwin readiness descriptor entry (`struct pollfd`, `8` bytes).
+@repr(C)
+pub struct PosixPollFd {
+    /| File descriptor to monitor.
+    pub file_desc: i32,
+    /| Requested readiness event mask (`POLLIN`, `POLLOUT`).
+    pub events: i16,
+    /| Returned readiness event mask populated by the kernel.
+    pub revents: i16,
+}
+
+/| Darwin 64-bit inode metadata record (`struct stat` / `struct stat64`, exact `144` bytes).
+@repr(C, align: 8)
+pub struct DarwinStat64 {
+    /| Device identifier (`dev_t`).
+    pub st_dev: i32,
+    /| File type and POSIX permission bits (`mode_t`).
+    pub st_mode: u16,
+    /| Hardlink count (`nlink_t`).
+    pub st_nlink: u16,
+    /| 64-bit inode number (`__darwin_ino64_t`).
+    pub st_ino: u64,
+    /| Owner user identifier (`uid_t`).
+    pub st_uid: u32,
+    /| Owner group identifier (`gid_t`).
+    pub st_gid: u32,
+    /| Special device identifier (`dev_t`).
+    pub st_rdev: i32,
+    /| Explicit alignment word before 8-byte aligned `timespec` fields (`0`).
+    pub pad0: i32,
+    /| Last data access timestamp.
+    pub st_atimespec: PosixTimespec,
+    /| Last data modification timestamp.
+    pub st_mtimespec: PosixTimespec,
+    /| Last status-change timestamp.
+    pub st_ctimespec: PosixTimespec,
+    /| File creation / birth timestamp (`st_birthtimespec`).
+    pub st_birthtimespec: PosixTimespec,
+    /| Logical file size in bytes (`off_t`).
+    pub st_size: i64,
+    /| Allocated 512-byte block count (`blkcnt_t`).
+    pub st_blocks: i64,
+    /| Optimal filesystem I/O block size (`blksize_t`).
+    pub st_blksize: i32,
+    /| User-defined BSD file flags (`UF_*` / `SF_*`).
+    pub st_flags: u32,
+    /| File generation number.
+    pub st_gen: u32,
+    /| Reserved legacy word (`0`).
+    pub st_lspare: i32,
+    /| Reserved trailing quadwords bringing `sizeof(DarwinStat64)` to `144` bytes.
+    pub st_qspare: [i64; 2],
+}
+
+/| Darwin 64-bit directory entry header (`__getdirentries64`, `d_name` starts at byte offset `21`).
+@repr(C, align: 8)
+pub struct DarwinDirent64Hdr {
+    /| 64-bit inode number.
+    pub d_ino: u64,
+    /| Seek cookie to the next directory entry.
+    pub d_seekoff: u64,
+    /| Total byte length of this directory record.
+    pub d_reclen: u16,
+    /| Exact byte length of `d_name` (excluding NUL terminator).
+    pub d_namlen: u16,
+    /| Entry file type (`DT_REG`, `DT_DIR`, `DT_LNK`, `DT_UNKNOWN`).
+    pub d_type: u8,
+    /| First 3 bytes of the NUL-terminated entry name at byte offset `21`.
+    pub d_name_first: [u8; 3],
+}
+
+/| Darwin `kevent64_s` event registration and completion record (`48` bytes).
+@repr(C, align: 8)
+pub struct DarwinKevent64 {
+    /| Event identifier (`fd` for `EVFILT_VNODE`).
+    pub ident: u64,
+    /| Kernel filter (`EVFILT_VNODE = -4`).
+    pub filter: i16,
+    /| Action flags (`EV_ADD`, `EV_ENABLE`, `EV_CLEAR`, `EV_DELETE`).
+    pub flags: u16,
+    /| Filter-specific vnode flags (`NOTE_WRITE`, `NOTE_RENAME`, `NOTE_DELETE`).
+    pub fflags: u32,
+    /| Filter-specific signed data payload.
+    pub data: i64,
+    /| Opaque user correlation token echoed on delivery.
+    pub udata: u64,
+    /| Extended filter arguments (`[0; 2]`).
+    pub ext: [u64; 2],
+}
+
+/| Darwin Mach tick-to-nanosecond conversion fraction (`mach_timebase_info_data_t`, `8` bytes).
+@repr(C)
+pub struct DarwinMachTimebaseInfo {
+    /| Numerator of the nanosecond-per-tick ratio (`125` on Apple Silicon `24 MHz` counter).
+    pub numer: u32,
+    /| Denominator of the nanosecond-per-tick ratio (`3` on Apple Silicon `24 MHz` counter).
+    pub denom: u32,
+}
+
+/| Darwin `posix_spawn_file_actions_t` handle (`void *` pointer wrapper on `libSystem`).
+@repr(C)
+pub struct PosixSpawnFileActions {
+    /| Opaque pointer managed by `posix_spawn_file_actions_init` / `destroy`.
+    pub opaque_ptr: *mut opaque,
+}
+
+/| Darwin `posix_spawnattr_t` handle (`void *` pointer wrapper on `libSystem`).
+@repr(C)
+pub struct PosixSpawnAttr {
+    /| Opaque pointer managed by `posix_spawnattr_init` / `destroy`.
+    pub opaque_ptr: *mut opaque,
+}
 
 // --------------------------------------- CONSTS ----------------------------------------
 /| Darwin standard input file descriptor (`0`).
@@ -19,10 +152,707 @@ pub const STDERR_FILENO: i32 = 2;
 /| Apple Silicon M-series architectural coherency granule (`128` bytes, `DR-08`).
 pub const APPLE_SILICON_CACHE_LINE_BYTES: usize = 128;
 
+/| Darwin `MAXPATHLEN` buffer capacity required by `fcntl(fd, F_GETPATH, buf)` (`1024` bytes).
+pub const DARWIN_MAXPATHLEN: usize = 1024;
+
+/| Darwin `AT_FDCWD` sentinel resolving relative paths against the current working directory (`-2`).
+pub const AT_FDCWD: i32 = -2;
+
+/| Do not follow terminal symbolic link (`0x0020`).
+pub const AT_SYMLINK_NOFOLLOW: i32 = 0x0020;
+
+/| Follow symbolic links (`0x0040`).
+pub const AT_SYMLINK_FOLLOW: i32 = 0x0040;
+
+/| Remove directory instead of unlinking file in `unlinkat` (`0x0080`).
+pub const AT_REMOVEDIR: i32 = 0x0080;
+
+/| Reject any symbolic link encountered along the path (`0x0800`).
+pub const AT_SYMLINK_NOFOLLOW_ANY: i32 = 0x0800;
+
+/| Open for reading only (`0x0000`).
+pub const O_RDONLY: i32 = 0x0000;
+
+/| Open for writing only (`0x0001`).
+pub const O_WRONLY: i32 = 0x0001;
+
+/| Open for reading and writing (`0x0002`).
+pub const O_RDWR: i32 = 0x0002;
+
+/| Non-blocking descriptor mode (`0x0004`).
+pub const O_NONBLOCK: i32 = 0x0004;
+
+/| Append writes to end of file (`0x0008`).
+pub const O_APPEND: i32 = 0x0008;
+
+/| Atomically acquire shared `flock` during `openat` (`0x0010`).
+pub const O_SHLOCK: i32 = 0x0010;
+
+/| Atomically acquire exclusive `flock` during `openat` (`0x0020`).
+pub const O_EXLOCK: i32 = 0x0020;
+
+/| Reject terminal symbolic links (`0x0100`).
+pub const O_NOFOLLOW: i32 = 0x0100;
+
+/| Create file if absent (`0x0200`).
+pub const O_CREAT: i32 = 0x0200;
+
+/| Truncate existing regular file (`0x0400`).
+pub const O_TRUNC: i32 = 0x0400;
+
+/| Fail if file already exists when paired with `O_CREAT` (`0x0800`).
+pub const O_EXCL: i32 = 0x0800;
+
+/| Event-notification-only descriptor (`O_EVTONLY = 0x8000` for `kqueue` `EVFILT_VNODE`).
+pub const O_EVTONLY: i32 = 0x8000;
+
+/| Require opened target to be a directory (`0x0010_0000`).
+pub const O_DIRECTORY: i32 = 0x0010_0000;
+
+/| Open a symbolic link inode itself without dereferencing (`O_SYMLINK = 0x0020_0000`).
+pub const O_SYMLINK: i32 = 0x0020_0000;
+
+/| Synchronized data-integrity writes (`0x0040_0000`).
+pub const O_DSYNC: i32 = 0x0040_0000;
+
+/| Set close-on-exec atomically at descriptor creation (`0x0100_0000`).
+pub const O_CLOEXEC: i32 = 0x0100_0000;
+
+/| Reject symlinks across ALL intermediate and terminal path components (`0x2000_0000`).
+pub const O_NOFOLLOW_ANY: i32 = 0x2000_0000;
+
+/| `fcntl` query canonical filesystem path of an open descriptor (`50`).
+pub const F_GETPATH: i32 = 50;
+
+/| `fcntl` full physical NVMe media cache flush (`51`, `DurabilityMode.PowerSafe`).
+pub const F_FULLFSYNC: i32 = 51;
+
+/| `fcntl` APFS write-order barrier without full drive stall (`85`, `DurabilityMode.CrashSafe`).
+pub const F_BARRIERFSYNC: i32 = 85;
+
+/| `fcopyfile` copy file data payload flag (`1 << 3`).
+pub const COPYFILE_DATA: u32 = 0x0000_0008;
+
+/| Seek relative to start of file (`0`).
+pub const SEEK_SET: i32 = 0;
+
+/| Seek relative to current file offset (`1`).
+pub const SEEK_CUR: i32 = 1;
+
+/| Seek relative to end of file (`2`).
+pub const SEEK_END: i32 = 2;
+
+/| Pages cannot be accessed (`0`).
+pub const PROT_NONE: i32 = 0;
+
+/| Pages may be read (`1`).
+pub const PROT_READ: i32 = 1;
+
+/| Pages may be written (`2`).
+pub const PROT_WRITE: i32 = 2;
+
+/| Share mapping updates across processes (`0x0001`).
+pub const MAP_SHARED: i32 = 0x0001;
+
+/| Private copy-on-write mapping (`0x0002`).
+pub const MAP_PRIVATE: i32 = 0x0002;
+
+/| Shared `flock` lock (`1`).
+pub const LOCK_SH: i32 = 1;
+
+/| Exclusive `flock` lock (`2`).
+pub const LOCK_EX: i32 = 2;
+
+/| Non-blocking `flock` modifier (`4`).
+pub const LOCK_NB: i32 = 4;
+
+/| Release `flock` lock (`8`).
+pub const LOCK_UN: i32 = 8;
+
+/| `kqueue` add event to queue (`0x0001`).
+pub const EV_ADD: u16 = 0x0001;
+
+/| `kqueue` remove event from queue (`0x0002`).
+pub const EV_DELETE: u16 = 0x0002;
+
+/| `kqueue` enable event reporting (`0x0004`).
+pub const EV_ENABLE: u16 = 0x0004;
+
+/| `kqueue` edge-triggered state reset after retrieval (`0x0020`).
+pub const EV_CLEAR: u16 = 0x0020;
+
+/| `kqueue` filesystem vnode filter (`-4`).
+pub const EVFILT_VNODE: i16 = -4;
+
+/| `EVFILT_VNODE` target unlinked (`0x0000_0001`).
+pub const NOTE_DELETE: u32 = 0x0000_0001;
+
+/| `EVFILT_VNODE` data written (`0x0000_0002`).
+pub const NOTE_WRITE: u32 = 0x0000_0002;
+
+/| `EVFILT_VNODE` file size extended (`0x0000_0004`).
+pub const NOTE_EXTEND: u32 = 0x0000_0004;
+
+/| `EVFILT_VNODE` attributes modified (`0x0000_0008`).
+pub const NOTE_ATTRIB: u32 = 0x0000_0008;
+
+/| `EVFILT_VNODE` link count changed (`0x0000_0010`).
+pub const NOTE_LINK: u32 = 0x0000_0010;
+
+/| `EVFILT_VNODE` vnode renamed (`0x0000_0020`).
+pub const NOTE_RENAME: u32 = 0x0000_0020;
+
+/| `EVFILT_VNODE` access revoked / unmounted (`0x0000_0040`).
+pub const NOTE_REVOKE: u32 = 0x0000_0040;
+
+/| `poll` readable readiness bit (`0x0001`).
+pub const POLLIN: i16 = 0x0001;
+
+/| `poll` writable readiness bit (`0x0004`).
+pub const POLLOUT: i16 = 0x0004;
+
+/| `poll` error condition bit (`0x0008`).
+pub const POLLERR: i16 = 0x0008;
+
+/| `poll` hangup bit (`0x0010`).
+pub const POLLHUP: i16 = 0x0010;
+
+/| System wall-clock (`CLOCK_REALTIME = 0`).
+pub const CLOCK_REALTIME: i32 = 0;
+
+/| Suspend-aware monotonic clock (`CLOCK_MONOTONIC = 6` on Darwin).
+pub const CLOCK_MONOTONIC: i32 = 6;
+
+/| Raw awake-time monotonic clock (`CLOCK_UPTIME_RAW = 8` on Darwin).
+pub const CLOCK_UPTIME_RAW: i32 = 8;
+
+/| POSIX `st_mode` file-type bitmask (`0o170_000`).
+pub const S_IFMT: u16 = 0o170_000;
+
+/| POSIX FIFO mode tag (`0o010_000`).
+pub const S_IFIFO: u16 = 0o010_000;
+
+/| POSIX character device mode tag (`0o020_000`).
+pub const S_IFCHR: u16 = 0o020_000;
+
+/| POSIX directory mode tag (`0o040_000`).
+pub const S_IFDIR: u16 = 0o040_000;
+
+/| POSIX block device mode tag (`0o060_000`).
+pub const S_IFBLK: u16 = 0o060_000;
+
+/| POSIX regular file mode tag (`0o100_000`).
+pub const S_IFREG: u16 = 0o100_000;
+
+/| POSIX symbolic link mode tag (`0o120_000`).
+pub const S_IFLNK: u16 = 0o120_000;
+
+/| POSIX socket mode tag (`0o140_000`).
+pub const S_IFSOCK: u16 = 0o140_000;
+
+/| `dirent` unknown file type (`0`).
+pub const DT_UNKNOWN: u8 = 0;
+
+/| `dirent` FIFO type (`1`).
+pub const DT_FIFO: u8 = 1;
+
+/| `dirent` character device type (`2`).
+pub const DT_CHR: u8 = 2;
+
+/| `dirent` directory type (`4`).
+pub const DT_DIR: u8 = 4;
+
+/| `dirent` block device type (`6`).
+pub const DT_BLK: u8 = 6;
+
+/| `dirent` regular file type (`8`).
+pub const DT_REG: u8 = 8;
+
+/| `dirent` symbolic link type (`10`).
+pub const DT_LNK: u8 = 10;
+
+/| `dirent` socket type (`12`).
+pub const DT_SOCK: u8 = 12;
+
+/| Non-blocking `waitpid` option (`1`).
+pub const WNOHANG: i32 = 1;
+
+/| Immediate process termination signal (`9`).
+pub const SIGKILL: i32 = 9;
+
+/| Graceful termination signal (`15`).
+pub const SIGTERM: i32 = 15;
+
+/| Darwin `EPERM` operation not permitted (`1`).
+pub const EPERM: i32 = 1;
+
+/| Darwin `ENOENT` no such file or directory (`2`).
+pub const ENOENT: i32 = 2;
+
+/| Darwin `ESRCH` no such process (`3`).
+pub const ESRCH: i32 = 3;
+
+/| Darwin `EINTR` interrupted system call (`4`).
+pub const EINTR: i32 = 4;
+
+/| Darwin `EIO` input/output error (`5`).
+pub const EIO: i32 = 5;
+
+/| Darwin `ENXIO` no such device or address (`6`).
+pub const ENXIO: i32 = 6;
+
+/| Darwin `EBADF` bad file descriptor (`9`).
+pub const EBADF: i32 = 9;
+
+/| Darwin `ECHILD` no child processes (`10`).
+pub const ECHILD: i32 = 10;
+
+/| Darwin `EDEADLK` resource deadlock avoided (`11`).
+pub const EDEADLK: i32 = 11;
+
+/| Darwin `ENOMEM` cannot allocate memory (`12`).
+pub const ENOMEM: i32 = 12;
+
+/| Darwin `EACCES` permission denied (`13`).
+pub const EACCES: i32 = 13;
+
+/| Darwin `EFAULT` bad address (`14`).
+pub const EFAULT: i32 = 14;
+
+/| Darwin `EBUSY` resource busy (`16`).
+pub const EBUSY: i32 = 16;
+
+/| Darwin `EEXIST` file exists (`17`).
+pub const EEXIST: i32 = 17;
+
+/| Darwin `EXDEV` cross-device link (`18`).
+pub const EXDEV: i32 = 18;
+
+/| Darwin `ENODEV` operation not supported by device (`19`).
+pub const ENODEV: i32 = 19;
+
+/| Darwin `ENOTDIR` not a directory (`20`).
+pub const ENOTDIR: i32 = 20;
+
+/| Darwin `EISDIR` is a directory (`21`).
+pub const EISDIR: i32 = 21;
+
+/| Darwin `EINVAL` invalid argument (`22`).
+pub const EINVAL: i32 = 22;
+
+/| Darwin `ENFILE` too many open files in system (`23`).
+pub const ENFILE: i32 = 23;
+
+/| Darwin `EMFILE` too many open files (`24`).
+pub const EMFILE: i32 = 24;
+
+/| Darwin `ENOTTY` inappropriate ioctl for device (`25`).
+pub const ENOTTY: i32 = 25;
+
+/| Darwin `EFBIG` file too large (`27`).
+pub const EFBIG: i32 = 27;
+
+/| Darwin `ENOSPC` no space left on device (`28`).
+pub const ENOSPC: i32 = 28;
+
+/| Darwin `ESPIPE` illegal seek (`29`).
+pub const ESPIPE: i32 = 29;
+
+/| Darwin `EROFS` read-only filesystem (`30`).
+pub const EROFS: i32 = 30;
+
+/| Darwin `EPIPE` broken pipe (`32`).
+pub const EPIPE: i32 = 32;
+
+/| Darwin `ERANGE` result too large (`34`).
+pub const ERANGE: i32 = 34;
+
+/| Darwin `EAGAIN` / `EWOULDBLOCK` resource temporarily unavailable (`35`).
+pub const EAGAIN: i32 = 35;
+
+/| Darwin `ENOTSUP` / `EOPNOTSUPP` operation not supported (`45`).
+pub const ENOTSUP: i32 = 45;
+
+/| Darwin `ETIMEDOUT` operation timed out (`60`).
+pub const ETIMEDOUT: i32 = 60;
+
+/| Darwin `ELOOP` too many levels of symbolic links (`62` – returned by `O_NOFOLLOW_ANY`!).
+pub const ELOOP: i32 = 62;
+
+/| Darwin `ENAMETOOLONG` file name too long (`63`).
+pub const ENAMETOOLONG: i32 = 63;
+
+/| Darwin `ENOTEMPTY` directory not empty (`66`).
+pub const ENOTEMPTY: i32 = 66;
+
+/| Darwin `ESTALE` stale NFS file handle (`70`).
+pub const ESTALE: i32 = 70;
+
+/| Darwin `ENOSYS` function not implemented (`78`).
+pub const ENOSYS: i32 = 78;
+
 // ------------------------------------- PUBLIC API --------------------------------------
+/| Returns the hosted `main` `argc` count captured at startup.
+@link(name: "_cx_rt_get_argc")
+pub extern "C" fn darwin_rt_get_argc() -> i32;
+
+/| Returns the hosted `main` `argv` pointer array captured at startup.
+@link(name: "_cx_rt_get_argv")
+pub extern "C" fn darwin_rt_get_argv() -> *mut *mut u8;
+
+/| Returns pointer to the calling thread's `errno` slot (`__error` in `libSystem`).
+@link(name: "__error")
+pub extern "C" fn darwin_errno_location() -> *mut i32;
+
+/| Variadic Darwin `openat(dir_fd, path_ptr, flags, ...)` C-ABI prototype (`stack` varargs on ARM64!).
+@link(name: "openat") @no_alloc @no_panic
+pub extern "C" fn darwin_openat(dir_fd: i32, path_ptr: *u8, flags: i32, ...) -> i32;
+
+/| Typed wrapper invoking variadic `openat` with `u32`-promoted `mode_bits` (safe on Apple Silicon).
+@inline @no_alloc @no_panic
+pub unsafe fn darwin_openat_mode(dir_fd: i32, path_ptr: *u8, flags: i32, mode_bits: u32) -> i32 {
+    darwin_openat(dir_fd, path_ptr, flags, mode_bits)
+}
+
+/| Darwin `libSystem` `read(file_desc, buf_ptr, byte_len)` C-ABI prototype.
+@link(name: "read")
+pub extern "C" fn darwin_read(file_desc: i32, buf_ptr: *mut u8, byte_len: usize) -> isize;
+
 /| Darwin `libSystem` `write(file_desc, buf_ptr, byte_len)` C-ABI prototype.
 @link(name: "write")
 pub extern "C" fn darwin_write(file_desc: i32, buf_ptr: *u8, byte_len: usize) -> isize;
+
+/| Darwin `pread(file_desc, buf_ptr, byte_len, file_offset)` C-ABI prototype.
+@link(name: "pread")
+pub extern "C" fn darwin_pread(file_desc: i32, buf_ptr: *mut u8, byte_len: usize, file_offset: i64) -> isize;
+
+/| Darwin `pwrite(file_desc, buf_ptr, byte_len, file_offset)` C-ABI prototype.
+@link(name: "pwrite")
+pub extern "C" fn darwin_pwrite(file_desc: i32, buf_ptr: *u8, byte_len: usize, file_offset: i64) -> isize;
+
+/| Darwin scatter `readv(file_desc, iov_ptr, iov_cnt)` C-ABI prototype.
+@link(name: "readv")
+pub extern "C" fn darwin_readv(file_desc: i32, iov_ptr: *PosixIovec, iov_cnt: i32) -> isize;
+
+/| Darwin gather `writev(file_desc, iov_ptr, iov_cnt)` C-ABI prototype.
+@link(name: "writev")
+pub extern "C" fn darwin_writev(file_desc: i32, iov_ptr: *PosixIovec, iov_cnt: i32) -> isize;
+
+/| Darwin `lseek(file_desc, offset_delta, whence)` C-ABI prototype.
+@link(name: "lseek")
+pub extern "C" fn darwin_lseek(file_desc: i32, offset_delta: i64, whence: i32) -> i64;
+
+/| Darwin `ftruncate(file_desc, byte_size)` C-ABI prototype.
+@link(name: "ftruncate")
+pub extern "C" fn darwin_ftruncate(file_desc: i32, byte_size: i64) -> i32;
+
+/| Darwin `fchmod(file_desc, mode_bits)` C-ABI prototype (`mode_t` is `u16` promoted in C ABI).
+@link(name: "fchmod")
+pub extern "C" fn darwin_fchmod(file_desc: i32, mode_bits: u16) -> i32;
+
+/| Variadic Darwin `fcntl(file_desc, cmd_code, ...)` C-ABI prototype (`stack` varargs on ARM64!).
+@link(name: "fcntl") @no_alloc @no_panic
+pub extern "C" fn darwin_fcntl(file_desc: i32, cmd_code: i32, ...) -> i32;
+
+/| Typed wrapper invoking variadic `fcntl` with an integer `0` argument (`F_FULLFSYNC`, `F_BARRIERFSYNC`).
+@inline @no_alloc @no_panic
+pub unsafe fn darwin_fcntl_int(file_desc: i32, cmd_code: i32, arg_int: i32) -> i32 {
+    darwin_fcntl(file_desc, cmd_code, arg_int)
+}
+
+/| Typed wrapper invoking variadic `fcntl` with a buffer pointer (`F_GETPATH` -> `1024B` buffer).
+@inline @no_alloc @no_panic
+pub unsafe fn darwin_fcntl_ptr(file_desc: i32, cmd_code: i32, arg_ptr: *mut u8) -> i32 {
+    darwin_fcntl(file_desc, cmd_code, arg_ptr)
+}
+
+/| Darwin `fsync(file_desc)` page-cache flush prototype.
+@link(name: "fsync")
+pub extern "C" fn darwin_fsync(file_desc: i32) -> i32;
+
+/| Darwin `close(file_desc)` descriptor release prototype.
+@link(name: "close")
+pub extern "C" fn darwin_close(file_desc: i32) -> i32;
+
+/| Darwin `renameat(old_dir_fd, old_path_ptr, new_dir_fd, new_path_ptr)` prototype.
+@link(name: "renameat")
+pub extern "C" fn darwin_renameat(
+    old_dir_fd: i32,
+    old_path_ptr: *u8,
+    new_dir_fd: i32,
+    new_path_ptr: *u8,
+) -> i32;
+
+/| Darwin `unlinkat(dir_fd, path_ptr, flags)` prototype (`0` or `AT_REMOVEDIR`).
+@link(name: "unlinkat")
+pub extern "C" fn darwin_unlinkat(dir_fd: i32, path_ptr: *u8, flags: i32) -> i32;
+
+/| Darwin `mkdirat(dir_fd, path_ptr, mode_bits)` prototype.
+@link(name: "mkdirat")
+pub extern "C" fn darwin_mkdirat(dir_fd: i32, path_ptr: *u8, mode_bits: u16) -> i32;
+
+/| Darwin `linkat(old_dir_fd, old_path_ptr, new_dir_fd, new_path_ptr, flags)` prototype.
+@link(name: "linkat")
+pub extern "C" fn darwin_linkat(
+    old_dir_fd: i32,
+    old_path_ptr: *u8,
+    new_dir_fd: i32,
+    new_path_ptr: *u8,
+    flags: i32,
+) -> i32;
+
+/| Darwin `symlinkat(target_ptr, new_dir_fd, link_path_ptr)` prototype.
+@link(name: "symlinkat")
+pub extern "C" fn darwin_symlinkat(target_ptr: *u8, new_dir_fd: i32, link_path_ptr: *u8) -> i32;
+
+/| Darwin `readlinkat(dir_fd, path_ptr, buf_out, buf_cap)` prototype.
+@link(name: "readlinkat")
+pub extern "C" fn darwin_readlinkat(dir_fd: i32, path_ptr: *u8, buf_out: *mut u8, buf_cap: usize) -> isize;
+
+/| Darwin `realpath(path_ptr, resolved_buf_out)` canonical path prototype (`resolved_buf_out` >= `1024B`).
+@link(name: "realpath")
+pub extern "C" fn darwin_realpath(path_ptr: *u8, resolved_buf_out: *mut u8) -> *mut u8;
+
+/| Darwin `getcwd(buf_out, buf_cap)` current working directory prototype.
+@link(name: "getcwd")
+pub extern "C" fn darwin_getcwd(buf_out: *mut u8, buf_cap: usize) -> *mut u8;
+
+/| Darwin `chdir(path_ptr)` working-directory change prototype.
+@link(name: "chdir")
+pub extern "C" fn darwin_chdir(path_ptr: *u8) -> i32;
+
+/| Darwin APFS `clonefileat(src_dir_fd, src_ptr, dst_dir_fd, dst_ptr, clone_flags)` CoW clone prototype.
+@link(name: "clonefileat")
+pub extern "C" fn darwin_clonefileat(
+    src_dir_fd: i32,
+    src_path_ptr: *u8,
+    dst_dir_fd: i32,
+    dst_path_ptr: *u8,
+    clone_flags: u32,
+) -> i32;
+
+/| Darwin `fcopyfile(src_fd, dst_fd, state_ptr, copy_flags)` kernel-assisted copy prototype.
+@link(name: "fcopyfile")
+pub extern "C" fn darwin_fcopyfile(
+    src_fd: i32,
+    dst_fd: i32,
+    state_ptr: *mut opaque,
+    copy_flags: u32,
+) -> i32;
+
+/| Darwin `mmap(addr_hint, map_len, prot_flags, map_flags, file_desc, file_offset)` prototype.
+@link(name: "mmap")
+pub extern "C" fn darwin_mmap(
+    addr_hint: *mut opaque,
+    map_len: usize,
+    prot_flags: i32,
+    map_flags: i32,
+    file_desc: i32,
+    file_offset: i64,
+) -> *mut opaque;
+
+/| Darwin `munmap(base_addr, map_len)` prototype.
+@link(name: "munmap")
+pub extern "C" fn darwin_munmap(base_addr: *mut opaque, map_len: usize) -> i32;
+
+/| Darwin `flock(file_desc, lock_op)` advisory whole-file lock prototype.
+@link(name: "flock")
+pub extern "C" fn darwin_flock(file_desc: i32, lock_op: i32) -> i32;
+
+/| Darwin `kqueue()` event-notification descriptor creation prototype.
+@link(name: "kqueue")
+pub extern "C" fn darwin_kqueue() -> i32;
+
+/| Darwin `kevent64(...)` registration and completion wait prototype.
+@link(name: "kevent64")
+pub extern "C" fn darwin_kevent64(
+    kq_fd: i32,
+    change_list: *DarwinKevent64,
+    nchanges: i32,
+    event_list_out: *mut DarwinKevent64,
+    nevents: i32,
+    kevent_flags: u32,
+    timeout_ptr: *PosixTimespec,
+) -> i32;
+
+/| Darwin `poll(fds_ptr, nfds_count, timeout_ms)` readiness wait prototype.
+@link(name: "poll")
+pub extern "C" fn darwin_poll(fds_ptr: *mut PosixPollFd, nfds_count: u32, timeout_ms: i32) -> i32;
+
+/| Darwin `isatty(file_desc)` terminal detection prototype.
+@link(name: "isatty")
+pub extern "C" fn darwin_isatty(file_desc: i32) -> i32;
+
+/| Darwin `x86_64` `stat$INODE64(path_ptr, stat_out)` `144`-byte metadata prototype.
+@cfg(target.arch == "x86_64") @link(name: "stat$INODE64")
+pub extern "C" fn darwin_stat(path_ptr: *u8, stat_out: *mut DarwinStat64) -> i32;
+
+/| Darwin `aarch64` `stat(path_ptr, stat_out)` native `144`-byte metadata prototype.
+@cfg(not (target.arch == "x86_64")) @link(name: "stat")
+pub extern "C" fn darwin_stat(path_ptr: *u8, stat_out: *mut DarwinStat64) -> i32;
+
+/| Darwin `x86_64` `fstat$INODE64(file_desc, stat_out)` `144`-byte metadata prototype.
+@cfg(target.arch == "x86_64") @link(name: "fstat$INODE64")
+pub extern "C" fn darwin_fstat(file_desc: i32, stat_out: *mut DarwinStat64) -> i32;
+
+/| Darwin `aarch64` `fstat(file_desc, stat_out)` native `144`-byte metadata prototype.
+@cfg(not (target.arch == "x86_64")) @link(name: "fstat")
+pub extern "C" fn darwin_fstat(file_desc: i32, stat_out: *mut DarwinStat64) -> i32;
+
+/| Darwin `x86_64` `lstat$INODE64(path_ptr, stat_out)` `144`-byte no-follow metadata prototype.
+@cfg(target.arch == "x86_64") @link(name: "lstat$INODE64")
+pub extern "C" fn darwin_lstat(path_ptr: *u8, stat_out: *mut DarwinStat64) -> i32;
+
+/| Darwin `aarch64` `lstat(path_ptr, stat_out)` native `144`-byte no-follow metadata prototype.
+@cfg(not (target.arch == "x86_64")) @link(name: "lstat")
+pub extern "C" fn darwin_lstat(path_ptr: *u8, stat_out: *mut DarwinStat64) -> i32;
+
+/| Darwin `x86_64` `fstatat$INODE64(dir_fd, path_ptr, stat_out, flags)` `144`-byte metadata prototype.
+@cfg(target.arch == "x86_64") @link(name: "fstatat$INODE64")
+pub extern "C" fn darwin_fstatat(
+    dir_fd: i32,
+    path_ptr: *u8,
+    stat_out: *mut DarwinStat64,
+    flags: i32,
+) -> i32;
+
+/| Darwin `aarch64` `fstatat(dir_fd, path_ptr, stat_out, flags)` native `144`-byte metadata prototype.
+@cfg(not (target.arch == "x86_64")) @link(name: "fstatat")
+pub extern "C" fn darwin_fstatat(
+    dir_fd: i32,
+    path_ptr: *u8,
+    stat_out: *mut DarwinStat64,
+    flags: i32,
+) -> i32;
+
+/| Darwin `__getdirentries64(dir_fd, buf_out, buf_bytes, basep_inout)` directory batch read prototype.
+@link(name: "__getdirentries64")
+pub extern "C" fn darwin_getdirentries64(
+    dir_fd: i32,
+    buf_out: *mut u8,
+    buf_bytes: usize,
+    basep_inout: *mut i64,
+) -> isize;
+
+/| Darwin `clock_gettime(clock_id, tp_out)` nanosecond clock query prototype.
+@link(name: "clock_gettime")
+pub extern "C" fn darwin_clock_gettime(clock_id: i32, tp_out: *mut PosixTimespec) -> i32;
+
+/| Darwin `clock_gettime_nsec_np(clock_id)` single-call `u64` nanosecond clock prototype.
+@link(name: "clock_gettime_nsec_np")
+pub extern "C" fn darwin_clock_gettime_nsec_np(clock_id: i32) -> u64;
+
+/| Darwin `mach_continuous_time()` hardware-counter query including system sleep.
+@link(name: "mach_continuous_time")
+pub extern "C" fn darwin_mach_continuous_time() -> u64;
+
+/| Darwin `mach_timebase_info(info_out)` tick-to-nanosecond ratio query prototype.
+@link(name: "mach_timebase_info")
+pub extern "C" fn darwin_mach_timebase_info(info_out: *mut DarwinMachTimebaseInfo) -> i32;
+
+/| Darwin `nanosleep(req_time, rem_time_out)` sleep prototype.
+@link(name: "nanosleep")
+pub extern "C" fn darwin_nanosleep(req_time: *PosixTimespec, rem_time_out: *mut PosixTimespec) -> i32;
+
+/| Darwin `getenv(key_ptr)` environment lookup prototype.
+@link(name: "getenv")
+pub extern "C" fn darwin_getenv(key_ptr: *u8) -> *mut u8;
+
+/| Darwin `setenv(key_ptr, val_ptr, overwrite_flag)` prototype.
+@link(name: "setenv")
+pub extern "C" fn darwin_setenv(key_ptr: *u8, val_ptr: *u8, overwrite_flag: i32) -> i32;
+
+/| Darwin `unsetenv(key_ptr)` prototype.
+@link(name: "unsetenv")
+pub extern "C" fn darwin_unsetenv(key_ptr: *u8) -> i32;
+
+/| Darwin `_NSGetEnviron()` pointer to the process `environ` vector.
+@link(name: "_NSGetEnviron")
+pub extern "C" fn darwin_ns_get_environ() -> *mut *mut *mut u8;
+
+/| Darwin `_NSGetExecutablePath(buf_out, bufsize_inout)` executable path query prototype.
+@link(name: "_NSGetExecutablePath")
+pub extern "C" fn darwin_ns_get_executable_path(buf_out: *mut u8, bufsize_inout: *mut u32) -> i32;
+
+/| Darwin `getpid()` process identifier prototype.
+@link(name: "getpid")
+pub extern "C" fn darwin_getpid() -> i32;
+
+/| Darwin `pipe(pipe_fds_out)` unidirectional pipe creation prototype.
+@link(name: "pipe")
+pub extern "C" fn darwin_pipe(pipe_fds_out: *mut i32) -> i32;
+
+/| Darwin `posix_spawn_file_actions_init(actions_ptr)` prototype.
+@link(name: "posix_spawn_file_actions_init")
+pub extern "C" fn darwin_spawn_file_actions_init(actions_ptr: *mut PosixSpawnFileActions) -> i32;
+
+/| Darwin `posix_spawn_file_actions_destroy(actions_ptr)` prototype.
+@link(name: "posix_spawn_file_actions_destroy")
+pub extern "C" fn darwin_spawn_file_actions_destroy(actions_ptr: *mut PosixSpawnFileActions) -> i32;
+
+/| Darwin `posix_spawn_file_actions_adddup2(actions_ptr, src_fd, target_fd)` prototype.
+@link(name: "posix_spawn_file_actions_adddup2")
+pub extern "C" fn darwin_spawn_file_actions_adddup2(
+    actions_ptr: *mut PosixSpawnFileActions,
+    src_fd: i32,
+    target_fd: i32,
+) -> i32;
+
+/| Darwin `posix_spawn_file_actions_addclose(actions_ptr, file_desc)` prototype.
+@link(name: "posix_spawn_file_actions_addclose")
+pub extern "C" fn darwin_spawn_file_actions_addclose(
+    actions_ptr: *mut PosixSpawnFileActions,
+    file_desc: i32,
+) -> i32;
+
+/| Darwin macOS 10.15+ `posix_spawn_file_actions_addchdir_np(actions_ptr, dir_path_ptr)` prototype.
+@link(name: "posix_spawn_file_actions_addchdir_np")
+pub extern "C" fn darwin_spawn_file_actions_addchdir_np(
+    actions_ptr: *mut PosixSpawnFileActions,
+    dir_path_ptr: *u8,
+) -> i32;
+
+/| Darwin `posix_spawnattr_init(attr_ptr)` prototype.
+@link(name: "posix_spawnattr_init")
+pub extern "C" fn darwin_spawnattr_init(attr_ptr: *mut PosixSpawnAttr) -> i32;
+
+/| Darwin `posix_spawnattr_destroy(attr_ptr)` prototype.
+@link(name: "posix_spawnattr_destroy")
+pub extern "C" fn darwin_spawnattr_destroy(attr_ptr: *mut PosixSpawnAttr) -> i32;
+
+/| Darwin `posix_spawnattr_setflags(attr_ptr, spawn_flags)` prototype.
+@link(name: "posix_spawnattr_setflags")
+pub extern "C" fn darwin_spawnattr_setflags(attr_ptr: *mut PosixSpawnAttr, spawn_flags: i16) -> i32;
+
+/| Darwin `posix_spawn(...)` direct executable child-process creation prototype.
+@link(name: "posix_spawn")
+pub extern "C" fn darwin_posix_spawn(
+    pid_out: *mut i32,
+    exe_path_ptr: *u8,
+    actions_ptr: *PosixSpawnFileActions,
+    attr_ptr: *PosixSpawnAttr,
+    argv_ptrs: *mut *mut u8,
+    envp_ptrs: *mut *mut u8,
+) -> i32;
+
+/| Darwin `posix_spawnp(...)` `PATH`-searching child-process creation prototype.
+@link(name: "posix_spawnp")
+pub extern "C" fn darwin_posix_spawnp(
+    pid_out: *mut i32,
+    file_name_ptr: *u8,
+    actions_ptr: *PosixSpawnFileActions,
+    attr_ptr: *PosixSpawnAttr,
+    argv_ptrs: *mut *mut u8,
+    envp_ptrs: *mut *mut u8,
+) -> i32;
+
+/| Darwin `waitpid(child_pid, status_out, wait_options)` process reap prototype.
+@link(name: "waitpid")
+pub extern "C" fn darwin_waitpid(child_pid: i32, status_out: *mut i32, wait_options: i32) -> i32;
+
+/| Darwin `kill(target_pid, sig_num)` signal dispatch prototype.
+@link(name: "kill")
+pub extern "C" fn darwin_kill(target_pid: i32, sig_num: i32) -> i32;
 
 /| Darwin `libSystem` `_exit(status_code)` C-ABI prototype.
 @link(name: "_exit")

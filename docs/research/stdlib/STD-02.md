@@ -63,7 +63,7 @@ In `cx.time`, `Instant` (`8 B` `mono_ns: u64`) queries `clock_gettime(CLOCK_MONO
 
 In `cx.env`, mutating the process environment (`set_var`, `remove_var`) is marked `unsafe` in alignment with Rust 2024 Edition: POSIX `setenv`/`unsetenv` mutate global `char **environ` while C libraries invoke `getenv` without locks, creating multithreaded data races. Read-only `args_in(&mut arena)` slices Unix stack `argv` strings directly with zero heap allocations (and transcodes `GetCommandLineW` / `wasi.args_get` into `arena` on Windows/WASI). Standard directory resolution follows XDG on Linux (`$XDG_CACHE_HOME` if non-empty and absolute, else `$HOME/.cache`; `$XDG_CONFIG_HOME` → `$HOME/.config`; `$TMPDIR` → `/tmp`), Apple conventions on macOS (`$HOME/Library/Caches`, `$HOME/Library/Application Support`, `$TMPDIR` → `/tmp`), and `shell32.dll`-free lookups on Windows (`%LOCALAPPDATA%` with fallback to `advapi32!RegQueryValueExW` on `HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders\Local AppData` + `ExpandEnvironmentStringsW` so `corex` never depends on `shell32.dll` outside `DR-10`'s bundled `.def` sysroot, and `GetTempPath2W` dynamically resolved from `kernel32.dll` with `GetTempPathW` fallback). Callers such as `pkg_cache` always append a subdirectory (`cache_dir()?.join("corex")`) rather than writing loose files into `%LOCALAPPDATA%` root.
 
-In `cx.process`, POSIX spawning creates pipes with `O_CLOEXEC` (`pipe2` on Linux; `pipe` + `FD_CLOEXEC` under a spawn rwlock on macOS) and invokes `posix_spawn` with `POSIX_SPAWN_SETSIGDEF` / `POSIX_SPAWN_SETSIGMASK`. Because `posix_spawn_file_actions_addchdir` was newly standardized in POSIX.1-2024 (with `posix_spawn_file_actions_addchdir_np` deprecated in macOS 26.0 in favor of the standard symbol and absent on `glibc 2.17–2.28`, which includes `DR-10`'s `glibc 2.28` dynamic Linux baseline), `cx.process` resolves `posix_spawn_file_actions_addchdir` / `addchdir_np` weakly via `dlsym` and, when `cwd` is configured on `glibc <= 2.28`, falls back to `fork()` + `chdir` + `dup2` + `execve` with a `CLOEXEC` `errno` pipe reporting child `execve`/`chdir` failures cleanly to the parent. On Windows, `Command.spawn` eliminates `BatBadBut` (`CVE-2024-24576`, disclosed by RyotaK at Flatt Security): because `CreateProcessW` implicitly invokes `cmd.exe /c` on `.bat`/`.cmd` files – where `cmd.exe` expands `%CMDCMDLINE:~-1%` before quote parsing and breaks out of backslash-escaped quotes – `Command.new` searches `PATH` strictly for `.exe` (ignoring `PATHEXT`), passes the resolved absolute path in `lpApplicationName` (never `NULL`), and fails closed with `IoErrorKind.ProcessBatchRejected` on `.bat`/`.cmd` targets. When a developer explicitly opts into `Command.cmd_script(batch_path)`, `cx.process` invokes `System32\cmd.exe /d /v:off /e:on /c` directly and rejects `\r`/`\n`/`\0` while neutralizing `%` as `%%cd:~,%` and doubling quotes. Finally, `STARTUPINFOEXW` passes a deduplicated `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (`0x00020002`) filtering out `NULL`, `INVALID_HANDLE_VALUE`, and pre-Win8 console pseudohandles so concurrent threads never leak pipe handles into sibling children or trigger `CreateProcessW` `ERROR_INVALID_PARAMETER`.
+In `cx.process`, POSIX spawning creates pipes with `O_CLOEXEC` (`pipe2` on Linux; `pipe` + `FD_CLOEXEC` under a spawn rwlock on macOS) and invokes `posix_spawn` with `POSIX_SPAWN_SETSIGDEF` / `POSIX_SPAWN_SETSIGMASK`. Because `posix_spawn_file_actions_addchdir` was newly standardized in POSIX.1-2024 (with `posix_spawn_file_actions_addchdir_np` deprecated in macOS 26.0 in favor of the standard symbol and absent on `glibc 2.17–2.28`, which includes `DR-10`'s `glibc 2.28` dynamic Linux baseline), `cx.process` resolves `posix_spawn_file_actions_addchdir` / `addchdir_np` weakly via `dlsym` and, when `cwd` is configured on `glibc <= 2.28`, falls back to `fork()` + `chdir` + `dup2` + `execve` with a `CLOEXEC` `errno` pipe reporting child `execve`/`chdir` failures cleanly to the parent. On Windows, `Command.spawn` eliminates `BatBadBut` (`CVE-2024-24576`, disclosed by RyotaK at Flatt Security): because `CreateProcessW` implicitly invokes `cmd.exe /c` on `.bat`/`.cmd` files – where `cmd.exe` expands `%CMDCMDLINE:~-1%` before quote parsing and breaks out of backslash-escaped quotes – `Command.new` searches `PATH` strictly for `.exe` (ignoring `PATHEXT`), passes the resolved absolute path in `lpApplicationName` (never `NULL`), and fails closed with `IoErrorKind.InvalidScriptExtension` on `.bat`/`.cmd` targets. When a developer explicitly opts into `Command.cmd_script(batch_path)`, `cx.process` invokes `System32\cmd.exe /d /v:off /e:on /c` directly and rejects `"` / `\r` / `\n` / `\0` while neutralizing `%` as `%%cd:~,%` and doubling trailing `\`. Finally, `STARTUPINFOEXW` passes a deduplicated `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (`0x00020002`) filtering out `NULL`, `INVALID_HANDLE_VALUE`, and pre-Win8 console pseudohandles so concurrent threads never leak pipe handles into sibling children or trigger `CreateProcessW` `ERROR_INVALID_PARAMETER`.
 
 ---
 
@@ -116,11 +116,12 @@ pub enum IoErrorKind: u8 {
     FileLockConflict     = 16,
     ResourceBusy         = 17,
     StorageFull          = 18,
-    StreamTooLong        = 19,
-    ProcessBatchRejected = 20,
-    Unsupported          = 21,
-    Canceled            = 22,
-    Other                = 255,
+    StreamTooLong          = 19,
+    InvalidScriptExtension = 20,
+    Unsupported            = 21,
+    Canceled               = 22,
+    OutOfMemory            = 23,
+    Other                  = 255,
 }
 
 @derive(Copy, Equatable)
@@ -263,11 +264,34 @@ impl IoSlice {
     pub fn advance_slices(slices: &mut &[IoSlice], n: usize, /);
 }
 
+@repr(C)
+pub struct IoSliceMut {
+    // Platform-conditional `{ ptr, len }` (`iovec` / `iovec_t`) or `{ len_u32, _pad, ptr }` (`WSABUF`)
+}
+
 @derive(Copy, Equatable)
 pub enum SeekFrom {
     Start(u64),
     End(i64),
     Current(i64),
+}
+
+@repr(C)
+pub struct SeekVTable {
+    pub seek: fn(*mut opaque, SeekFrom) -> u64!IoError,
+}
+
+@repr(C)
+@derive(Copy)
+pub struct Seek {
+    pub(pkg) ctx: *mut opaque,
+    @non_null pub(pkg) vtable: *SeekVTable,
+}
+
+impl Seek {
+    pub fn seek(&mut self, pos: SeekFrom, /) -> u64!IoError;
+    pub fn stream_position(&mut self) -> u64!IoError;
+    pub fn rewind(&mut self) -> unit!IoError;
 }
 
 // ============================================================================
@@ -384,16 +408,19 @@ impl BufReader {
     pub fn as_reader(&mut self) -> Reader;
 }
 
-/// Exact 32-byte zero-heap-allocation buffered writer (`16B` Writer + `8B` ptr + `4B` filled + `4B` cap|flags).
+/// Exact 32-byte `@linear` buffered writer (`16B` Writer + `8B` ptr + `4B` filled + `4B` cap|flags).
+@linear
 @repr(C)
 pub struct BufWriter {
     downstream: Writer,
     buf_ptr: *mut u8,
     filled: u32,
-    cap_and_flags: u32, // Bits 0..30: capacity (up to 2 GiB - 1); Bit 31: line_buffered
+    cap_and_flags: u32, // Bits 0..29: capacity; Bit 30: owns_system_buf; Bit 31: line_buffered
 }
 
 impl BufWriter {
+    pub fn new(downstream: Writer, /, *, line_buffered: bool = false) -> Self;
+
     @inline @no_alloc @no_panic
     pub fn over_uninit[const N: usize](
         downstream: Writer,
@@ -419,7 +446,7 @@ impl BufWriter {
     pub fn buffered_len(&self) -> usize = self.filled as usize;
 
     @inline @no_alloc @no_panic
-    pub fn capacity(&self) -> usize = (self.cap_and_flags & 0x7FFF_FFFF_u32) as usize;
+    pub fn capacity(&self) -> usize = (self.cap_and_flags & 0x3FFF_FFFF_u32) as usize;
 
     @inline @no_alloc @no_panic
     pub fn spare_capacity(&self) -> usize = self.capacity() - self.buffered_len();
@@ -434,6 +461,8 @@ impl BufWriter {
     pub fn write_all_vectored(&mut self, bufs: &[IoSlice], /) -> unit!IoError;
     pub fn print(&mut self, args: FmtArgs, /) -> unit!IoError;
     pub fn flush(&mut self) -> unit!IoError;
+    pub fn close(own self) -> unit!IoError;
+    pub fn discard(own self);
     pub fn as_writer(&mut self) -> Writer;
 }
 
@@ -1387,8 +1416,8 @@ use cx.str.String;
 
 @derive(Copy, Equatable)
 pub enum VarError: u8 {
-    NotPresent  = 0,
-    NotUnicode  = 1,
+    NotFound    = 0,
+    InvalidData = 1,
     InvalidName = 2,
 }
 
@@ -1399,13 +1428,13 @@ pub fn args_in(arena: &mut Arena, /) -> &[str];
 pub fn args_os() -> Vec[PathBuf];
 
 @std_cap_boundary(emits: .ENV | .ALLOC, clears: .FFI | .UNSAFE_OP)
-pub fn var(key: str, /) -> String!VarError;
+pub fn get_var(key: str, /) -> String!VarError;
 
 @std_cap_boundary(emits: .ENV, clears: .FFI | .UNSAFE_OP)
-pub fn var_in(arena: &mut Arena, key: str, /) -> str!VarError;
+pub fn get_var_in(arena: &mut Arena, key: str, /) -> str!VarError;
 
 @std_cap_boundary(emits: .ENV | .ALLOC, clears: .FFI | .UNSAFE_OP)
-pub fn var_os(key: str, /) -> PathBuf?;
+pub fn get_var_os(key: str, /) -> PathBuf?;
 
 @std_cap_boundary(emits: .ENV | .ALLOC, clears: .FFI | .UNSAFE_OP)
 pub fn vars() -> Vec[(String, String)];
@@ -1496,7 +1525,7 @@ pub struct ExitStatus {
 
 impl ExitStatus {
     @inline @no_alloc @no_panic
-    pub fn success(self) -> bool = self.code() == .Some(0);
+    pub fn is_success(self) -> bool = self.code() == .Some(0);
 
     @inline @no_alloc @no_panic
     pub fn code(self) -> i32?;
@@ -1579,15 +1608,15 @@ impl Command {
     /// Explicit opt-in constructor for `.bat`/`.cmd` scripts on Windows (`cmd.exe /d /v:off /e:on /c` escaped).
     pub fn cmd_script[P: str | Path](batch_path: P, /) -> Self;
 
-    pub fn arg[S: str | Path](&mut self, a: S, /) -> &mut Self;
-    pub fn args[S: str | Path](&mut self, list: &[S], /) -> &mut Self;
-    pub fn current_dir[P: str | Path](&mut self, dir: P, /) -> &mut Self;
-    pub fn env(&mut self, key: str, val: str, /) -> &mut Self;
-    pub fn env_remove(&mut self, key: str, /) -> &mut Self;
-    pub fn env_clear(&mut self) -> &mut Self;
-    pub fn stdin(&mut self, cfg: own Stdio, /) -> &mut Self;
-    pub fn stdout(&mut self, cfg: own Stdio, /) -> &mut Self;
-    pub fn stderr(&mut self, cfg: own Stdio, /) -> &mut Self;
+    pub fn arg[S: str | Path](var self: own Self, a: S, /) -> Self;
+    pub fn args[S: str | Path](var self: own Self, list: &[S], /) -> Self;
+    pub fn current_dir[P: str | Path](var self: own Self, dir: P, /) -> Self;
+    pub fn env(var self: own Self, key: str, val: str, /) -> Self;
+    pub fn env_remove(var self: own Self, key: str, /) -> Self;
+    pub fn env_clear(var self: own Self) -> Self;
+    pub fn stdin(var self: own Self, cfg: own Stdio, /) -> Self;
+    pub fn stdout(var self: own Self, cfg: own Stdio, /) -> Self;
+    pub fn stderr(var self: own Self, cfg: own Stdio, /) -> Self;
 
     @std_cap_boundary(emits: .PROCESS | .FS | .ENV | .BLOCKING_SYNC, clears: .FFI | .UNSAFE_OP)
     pub fn spawn(own self) -> ChildProcess!IoError;

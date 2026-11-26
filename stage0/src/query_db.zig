@@ -1252,6 +1252,8 @@ const FilePass1State = struct {
     created_revision: Revision = .initial,
     /// `true` once Pass-2 `resolveFileUseImports` has already consumed `mod_scope`.
     has_consumed_pass2: bool = false,
+    /// `true` once `resolveFileUseImports` has already populated `mod_scope` (pre-resolved for `cx_stdlib_root_fid`).
+    has_resolved_uses: bool = false,
     /// `ItemTree.tree_fingerprint` from which `mod_scope` was collected.
     tree_fingerprint: Fingerprint128 = Fingerprint128.ZERO,
 };
@@ -3913,6 +3915,7 @@ fn computeMirBundleFingerprint(
         hashTypeCanonical(&hasher, pool, sym_table, body_item.ret_ty);
         hasher.updateU32(body_item.param_count);
         hasher.updateU8(@intFromBool(body_item.is_contextless));
+        hasher.updateU8(@intFromBool(body_item.is_derived));
         hasher.updateU8(@intFromBool(body_item.has_ghost_instructions));
         hasher.updateU32(@intCast(body_item.locals.items.len));
         for (body_item.locals.items) |loc| {
@@ -8428,7 +8431,8 @@ pub const CompilerDb = struct {
                     const mem_sym = ctx.db.symbol_table.getSymbol(mem_idx).*;
                     if (mem_sym.kind == .fn_sym and !mem_sym.name.isNone() and
                         (ctx.trait_names.contains(mem_sym.name.asInt()) or
-                            std.mem.eql(u8, mem_sym.name_text, "drop")))
+                            std.mem.eql(u8, mem_sym.name_text, "drop") or
+                            std.mem.eql(u8, mem_sym.name_text, "as_bytes")))
                     {
                         try ctx.enqueueDef(mem_sym.def_id);
                         try ctx.enqueueDef(mem_sym.owner_def_id);
@@ -8583,6 +8587,32 @@ pub const CompilerDb = struct {
                 while (interp_iter.next()) |interp_ptr| {
                     for (interp_ptr.holes) |hole| {
                         if (!hole.expr_type_id.isError()) try eq_ctx.enqueueTypeNominals(hole.expr_type_id, 0);
+                        for (hole.tokens) |tok_info| {
+                            if (!tok_info.symbol_index.isNone()) try eq_ctx.enqueueSymbol(tok_info.symbol_index);
+                            if (!tok_info.type_id.isError()) try eq_ctx.enqueueTypeNominals(tok_info.type_id, 0);
+                        }
+                        if (hole.sub_tables) |sub_st| {
+                            for (sub_st.node_symbols) |sym_idx| {
+                                if (!sym_idx.isNone()) try eq_ctx.enqueueSymbol(sym_idx);
+                            }
+                            var sub_conv_iter = sub_st.try_conversions.valueIterator();
+                            while (sub_conv_iter.next()) |conv_def_ptr| {
+                                try eq_ctx.enqueueDef(conv_def_ptr.*);
+                            }
+                            var sub_map_iter = sub_st.call_arg_mappings.valueIterator();
+                            while (sub_map_iter.next()) |map_ptr| {
+                                if (!map_ptr.callee_sym.isNone()) try eq_ctx.enqueueSymbol(map_ptr.callee_sym);
+                            }
+                            for (sub_st.node_types) |nty| {
+                                if (!nty.isError()) try eq_ctx.enqueueTypeNominals(nty, 0);
+                            }
+                            var sub_inst_iter = sub_st.call_instantiations.valueIterator();
+                            while (sub_inst_iter.next()) |slice_ptr| {
+                                for (slice_ptr.*) |ity| {
+                                    if (!ity.isError()) try eq_ctx.enqueueTypeNominals(ity, 0);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -10621,7 +10651,15 @@ pub const CompilerDb = struct {
                     (!p1_prev.mod_scope.isNone() and p1_prev.created_revision == self.current_revision)
                 else
                     false;
-                if (already_collected_in_rev) continue;
+                const is_other_in_pass2 = if (member_fid != caller_fid)
+                    if (self.file_pass1_states.get(member_fid.asInt())) |p1_cur|
+                        (!p1_cur.mod_scope.isNone() and p1_cur.has_consumed_pass2 and
+                            self.in_flight_keys.contains(QueryKey.forFile(.resolve_signatures, member_fid).asU64()))
+                    else
+                        false
+                else
+                    false;
+                if (already_collected_in_rev or is_other_in_pass2) continue;
                 _ = try self.ensureFilePass1Collected(member_fid, pkg_id);
                 _ = self.resolved_signatures.remove(member_fid.asInt());
                 const sig_qkey = QueryKey.forFile(.resolve_signatures, member_fid).asU64();
@@ -10711,6 +10749,71 @@ pub const CompilerDb = struct {
                 }
             }
         }
+    }
+
+    /// Pre-resolves `use` re-exports (`pub use core.{async, …}`) on `cx_stdlib_root_fid` before child modules resolve.
+    fn ensureCxStdlibRootUseImportsResolved(self: *CompilerDb) QueryError!void {
+        const cx_fid = self.cx_stdlib_root_fid;
+        if (cx_fid.isNone()) return;
+        const pass1_ptr = self.file_pass1_states.getPtr(cx_fid.asInt()) orelse return;
+        if (pass1_ptr.has_resolved_uses or pass1_ptr.mod_scope.isNone()) return;
+        const input_ptr = self.source_inputs.getPtr(cx_fid.asInt()) orelse return;
+        const parsed_ptr = self.parsed_artifacts.getPtr(cx_fid.asInt()) orelse return;
+
+        pass1_ptr.has_resolved_uses = true;
+        const is_cx_including_tests = try self.isIncludingTestsForFile(cx_fid);
+        const is_cx_core_allowed = self.isCoreAllowedForFile(cx_fid);
+        const cx_cfg = self.resolveCfgEnvForFile(cx_fid, is_cx_including_tests);
+
+        const was_core_allowed = self.symbol_table.is_internal_core;
+        const had_included_tests = self.symbol_table.is_including_tests;
+        const prev_cfg_env = self.symbol_table.cfg_env;
+        self.symbol_table.is_internal_core = is_cx_core_allowed;
+        self.symbol_table.is_including_tests = is_cx_including_tests;
+        self.symbol_table.cfg_env = cx_cfg;
+        defer {
+            self.symbol_table.is_internal_core = was_core_allowed;
+            self.symbol_table.is_including_tests = had_included_tests;
+            self.symbol_table.cfg_env = prev_cfg_env;
+        }
+
+        const cx_sig_sink = self.sig_diagnostics.getPtr(cx_fid.asInt()) orelse
+            try resetOrCreateDefDiagSink(&self.sig_diagnostics, self.allocator, cx_fid.asInt());
+        symbol_resolver.resolveFileUseImports(
+            &self.symbol_table,
+            &self.interner,
+            cx_fid,
+            input_ptr.owned_text,
+            &parsed_ptr.token_buffer,
+            &parsed_ptr.cst_arena,
+            cx_sig_sink,
+        ) catch return error.OutOfMemory;
+        self.symbol_table.syncCxPreludeScope(&self.interner, pass1_ptr.mod_scope) catch return error.OutOfMemory;
+    }
+
+    /// Walks `external_mod_files` upward (bounded to `64` hops) to locate `file_id`'s root barrel `FileId`.
+    fn findExternalModTreeRoot(self: *const CompilerDb, file_id: FileId) FileId {
+        var cur_fid = file_id;
+        var hops: u8 = 0;
+        while (hops < 64) : (hops += 1) {
+            var found_parent: ?FileId = null;
+            var ext_it = self.external_mod_files.iterator();
+            while (ext_it.next()) |ext_kv| {
+                if (ext_kv.value_ptr.* == cur_fid) {
+                    const cand_parent = FileId.fromInt(@truncate(ext_kv.key_ptr.* >> 32));
+                    if (!cand_parent.isNone() and cand_parent != cur_fid) {
+                        found_parent = cand_parent;
+                        break;
+                    }
+                }
+            }
+            if (found_parent) |parent_fid| {
+                cur_fid = parent_fid;
+            } else {
+                break;
+            }
+        }
+        return cur_fid;
     }
 
     /// Pre-collects Pass-1 module scopes across `pkg_id`'s entire `mod` subtree before any Pass-2 `use pkg.…` resolves.
@@ -10946,6 +11049,9 @@ pub const CompilerDb = struct {
                     }
                 }
             }
+            if (!is_caller_core_kernel and !self.cx_stdlib_root_fid.isNone()) {
+                try self.ensureCxStdlibRootUseImportsResolved();
+            }
         }
         if (self.package_root_files.contains(caller_pkg)) {
             try self.ensurePackageSubtreePass1(caller_pkg, &hasher, file_id, is_eligible_for_sig_reuse);
@@ -10963,6 +11069,22 @@ pub const CompilerDb = struct {
                                 self_lib_scope,
                             );
                         }
+                    }
+                }
+            }
+        } else if (caller_pkg != .std_core) {
+            const mod_tree_root = self.findExternalModTreeRoot(file_id);
+            if (mod_tree_root != file_id or self.parent_to_child_mods.contains(mod_tree_root.asInt())) {
+                try self.ensureModuleRootSubtreePass1(
+                    mod_tree_root,
+                    caller_pkg,
+                    &hasher,
+                    file_id,
+                    is_eligible_for_sig_reuse,
+                );
+                if (self.symbol_table.file_module_scopes.get(mod_tree_root.asInt())) |tree_root_scope| {
+                    if (!tree_root_scope.isNone() and self.symbol_table.lookupPackageRootScope(caller_pkg) == null) {
+                        try self.symbol_table.setPackageRootScope(caller_pkg, tree_root_scope);
                     }
                 }
             }
@@ -11005,7 +11127,9 @@ pub const CompilerDb = struct {
         defer stale_ext_keys.deinit(self.allocator);
         var ext_iter = self.symbol_table.external_module_scopes.keyIterator();
         while (ext_iter.next()) |ext_key_ptr| {
-            if (@as(u32, @truncate(ext_key_ptr.* >> 32)) == file_id.asInt()) {
+            if (@as(u32, @truncate(ext_key_ptr.* >> 32)) == file_id.asInt() and
+                !self.external_mod_files.contains(ext_key_ptr.*))
+            {
                 try stale_ext_keys.append(self.allocator, ext_key_ptr.*);
             }
         }
@@ -11143,15 +11267,17 @@ pub const CompilerDb = struct {
                     }
                 }
 
-                symbol_resolver.resolveFileUseImports(
-                    &self.symbol_table,
-                    &self.interner,
-                    file_id,
-                    input_ptr.owned_text,
-                    &parsed_ptr.token_buffer,
-                    &parsed_ptr.cst_arena,
-                    sig_sink,
-                ) catch return error.OutOfMemory;
+                if (!pass1_state.has_resolved_uses) {
+                    symbol_resolver.resolveFileUseImports(
+                        &self.symbol_table,
+                        &self.interner,
+                        file_id,
+                        input_ptr.owned_text,
+                        &parsed_ptr.token_buffer,
+                        &parsed_ptr.cst_arena,
+                        sig_sink,
+                    ) catch return error.OutOfMemory;
+                }
 
                 const can_borrow_sig_scratch = !self.is_tc_scratch_in_use;
                 if (can_borrow_sig_scratch) {
@@ -12042,7 +12168,8 @@ pub const CompilerDb = struct {
                     body_window.item_ast_node.asInt() < parsed_ptr.ast_arena.countNodes())
                 {
                     const sym_idx = def_sig.symbol_index;
-                    if (!checker.isSymbolCfgDisabled(sym_idx)) {
+                    const item_cst = parsed_ptr.ast_arena.getCstOrigin(body_window.item_ast_node);
+                    if (!checker.isSymbolCfgDisabled(sym_idx) and checker.isCstNodeCfgEnabled(item_cst)) {
                         const sym_mut = self.symbol_table.getSymbolMut(sym_idx);
                         sym_mut.ast_node = body_window.item_ast_node;
                         sym_mut.cst_node = parsed_ptr.ast_arena.getCstOrigin(body_window.item_ast_node);

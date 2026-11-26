@@ -2,7 +2,7 @@
 /#
 /# Defines CoreX's implicitly imported comparison, hashing, lifecycle, and zero-allocation
 /# formatting traits alongside `FmtWriter`, `FmtArg`, `Context`, `assert`, `panic`, and `dbg`,
-/# while mounting `cx.{col, math, mem, str}` and re-exporting Stage-1 `core` bridge modules.
+/# while mounting `cx.{col, env, fs, io, math, mem, path, process, str, time}` and Stage-1 `core` bridges.
 /#
 /# Every prelude descriptor (`Ordering`, `FmtSpec`, `FmtWriter`, `FmtArg`, `SourceLoc`) is an
 /# unboxed `Copy` value with zero pre-`main` static constructors across native and `wasm32` targets.
@@ -10,14 +10,32 @@
 /| Contiguous, ring, generational, and SIMD/SWAR SwissTable collections (`cx.col`).
 pub mod col;
 
+/| Process arguments, environment variables, working directory, and standard paths (`cx.env`).
+pub mod env;
+
+/| Capability-safe filesystem handles, thresholded `Mmap`, atomic publish, and watchers (`cx.fs`).
+pub mod fs;
+
+/| Zero-copy buffered streaming I/O, scatter-gather slices, and standard streams (`cx.io`).
+pub mod io;
+
 /| Zero-`libc` scalar, overflow-checked, IEEE-754 bit, and elementary math (`cx.math`).
 pub mod math;
 
 /| Arena, pool, fixed-buffer, OS/Wasm page allocators, and safe wire views (`cx.mem`).
 pub mod mem;
 
+/| Cross-platform WTF-8 `Path` views, 24-byte SSO `PathBuf`, and lexical normalization (`cx.path`).
+pub mod path;
+
+/| Injection-hardened child process spawning, pipes, and exit status (`cx.process`).
+pub mod process;
+
 /| 24-byte SSO `String`, UTF-8/Unicode tries, and zero-allocation formatters (`cx.str`).
 pub mod str;
+
+/| Overflow-free monotonic `Instant`, `Duration`, and Unix-epoch `SystemTime` clocks (`cx.time`).
+pub mod time;
 
 pub use col.{Map, Set, Vec};
 pub use core.{async, atomic, ffi, runtime, simd, sys};
@@ -219,9 +237,9 @@ pub const FMT_SPEC_NONE: u16 = 0xFFFF_u16;
 // -------------------------------------- INTERNALS --------------------------------------
 /| Encodes Unicode scalar codepoint `raw_cp` into `out_buf` (`1..=4` UTF-8 bytes), defaulting invalid codes to `' '`.
 fn encode_fill_utf8(raw_cp: u32, out_buf: &mut [u8; 4], /) -> usize {
-    let cp: u32 = if raw_cp == 0_u32 or raw_cp > 0x10_FFFF_u32 or (
-        raw_cp >= 0xD800_u32 and raw_cp <= 0xDFFF_u32
-    ) {
+    let cp: u32 = if raw_cp == 0_u32
+        or raw_cp > 0x10_FFFF_u32
+        or (raw_cp >= 0xD800_u32 and raw_cp <= 0xDFFF_u32) {
         0x20_u32
     } else {
         raw_cp
@@ -473,9 +491,9 @@ impl FmtSpec {
     @std_cap_boundary(clears: [unsafe_op]) @inline @no_alloc @no_panic
     pub fn fill_char(self) -> char {
         let raw_cp: u32 = self.flags_and_fill & 0x1F_FFFF_u32;
-        if raw_cp == 0_u32 or raw_cp > 0x10_FFFF_u32 or (
-            raw_cp >= 0xD800_u32 and raw_cp <= 0xDFFF_u32
-        ) {
+        if raw_cp == 0_u32
+            or raw_cp > 0x10_FFFF_u32
+            or (raw_cp >= 0xD800_u32 and raw_cp <= 0xDFFF_u32) {
             return ' ';
         }
         if raw_cp < 0x80_u32 {

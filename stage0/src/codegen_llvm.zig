@@ -716,56 +716,6 @@ const ABI_TYPE_BYTE_SIZE_MAP = std.StaticStringMap(u64).initComptime(.{
     .{ "{ ptr, ptr }", 16 },
 });
 
-/// O(1) static set of canonical `wasi_snapshot_preview1` host import names on `wasm32-wasi`.
-const WASI_PREVIEW1_IMPORT_SET = std.StaticStringMap(void).initComptime(.{
-    .{ "args_get", {} },
-    .{ "args_sizes_get", {} },
-    .{ "clock_res_get", {} },
-    .{ "clock_time_get", {} },
-    .{ "environ_get", {} },
-    .{ "environ_sizes_get", {} },
-    .{ "fd_advise", {} },
-    .{ "fd_allocate", {} },
-    .{ "fd_close", {} },
-    .{ "fd_datasync", {} },
-    .{ "fd_fdstat_get", {} },
-    .{ "fd_fdstat_set_flags", {} },
-    .{ "fd_fdstat_set_rights", {} },
-    .{ "fd_filestat_get", {} },
-    .{ "fd_filestat_set_size", {} },
-    .{ "fd_filestat_set_times", {} },
-    .{ "fd_pread", {} },
-    .{ "fd_prestat_dir_name", {} },
-    .{ "fd_prestat_get", {} },
-    .{ "fd_pwrite", {} },
-    .{ "fd_read", {} },
-    .{ "fd_readdir", {} },
-    .{ "fd_renumber", {} },
-    .{ "fd_seek", {} },
-    .{ "fd_sync", {} },
-    .{ "fd_tell", {} },
-    .{ "fd_write", {} },
-    .{ "path_create_directory", {} },
-    .{ "path_filestat_get", {} },
-    .{ "path_filestat_set_times", {} },
-    .{ "path_link", {} },
-    .{ "path_open", {} },
-    .{ "path_readlink", {} },
-    .{ "path_remove_directory", {} },
-    .{ "path_rename", {} },
-    .{ "path_symlink", {} },
-    .{ "path_unlink_file", {} },
-    .{ "poll_oneoff", {} },
-    .{ "proc_exit", {} },
-    .{ "proc_raise", {} },
-    .{ "random_get", {} },
-    .{ "sched_yield", {} },
-    .{ "sock_accept", {} },
-    .{ "sock_recv", {} },
-    .{ "sock_send", {} },
-    .{ "sock_shutdown", {} },
-});
-
 /// Monotonic atomic counter ensuring concurrent in-process LLVM driver runs use distinct scratch dirs.
 var next_llvm_scratch_seq = std.atomic.Value(u32).init(1);
 
@@ -819,14 +769,14 @@ fn resolveSourceLocFieldLayout(
 
 /// Resolves scalar integer bit-width and signedness for `raw_ty`, or `null` if non-integer.
 fn resolveIntegerInfo(emitter: *const LlvmModuleEmitter, raw_ty: TypeId) ?IntScalarInfo {
-    var ty = emitter.input.pool.unwrapUnderlyingType(raw_ty);
+    var ty = emitter.input.pool.unwrapRefinementBase(emitter.input.pool.unwrapUnderlyingType(raw_ty));
     if (!ty.isPrimitiveOrSentinel()) {
         const cur_node = emitter.input.pool.getNode(ty);
         if (cur_node.tag == .bit_field_ty) {
-            ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(cur_node.lhs));
+            ty = emitter.input.pool.unwrapRefinementBase(emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(cur_node.lhs)));
         } else if (cur_node.tag == .enum_ty) {
             if (emitter.input.pool.getEnumBackingIntType(ty)) |backing_ty| {
-                ty = emitter.input.pool.unwrapUnderlyingType(backing_ty);
+                ty = emitter.input.pool.unwrapRefinementBase(emitter.input.pool.unwrapUnderlyingType(backing_ty));
             }
         }
     }
@@ -848,11 +798,15 @@ fn resolveIntegerInfo(emitter: *const LlvmModuleEmitter, raw_ty: TypeId) ?IntSca
     };
 }
 
-/// Unwraps transparent `Result[T, never]`, `bit_field` backing types, and type aliases/newtypes.
+/// Unwraps transparent `Result[T, never]`, refinement predicates, `bit_field` backing types, and type aliases/newtypes.
 fn unwrapTransparentType(emitter: *LlvmModuleEmitter, raw_ty: TypeId) !TypeId {
     var cur_ty = emitter.input.pool.unwrapUnderlyingType(raw_ty);
     while (!cur_ty.isPrimitiveOrSentinel()) {
         const cur_node = emitter.input.pool.getNode(cur_ty);
+        if (cur_node.tag == .refined_ty) {
+            cur_ty = emitter.input.pool.unwrapUnderlyingType(emitter.input.pool.unwrapRefinementBase(cur_ty));
+            continue;
+        }
         if (cur_node.tag == .bit_field_ty) {
             cur_ty = emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(cur_node.lhs));
             continue;
@@ -1498,7 +1452,11 @@ fn maybeRegisterExternSymbol(
         (sym_rec.kind == .const_sym and blk_unbacked_const: {
             const resolved_def = if (!def_id.isNone()) def_id else sym_rec.def_id;
             if (emitter.input.const_rodata_map) |crm| {
-                break :blk_unbacked_const !crm.contains(resolved_def.asInt());
+                const is_backed = if (!resolved_def.isNone())
+                    crm.contains(resolved_def.asInt())
+                else
+                    crm.contains(0x8000_0000 | sym_idx.asInt());
+                break :blk_unbacked_const !is_backed;
             }
             break :blk_unbacked_const true;
         }))
@@ -2765,6 +2723,22 @@ fn emitRodataAndRuntimeHelpers(
 
     // [7] Runtime string constants & libc declarations for oracle tracing, panic, trap, and syscalls:
     const fn_attrs = fnUnwindAttrs(emitter);
+    if (hasReferencedRtProcessArgsLlvm(emitter)) {
+        _ = try emitter.markExternDeclared("_cx_rt_get_argc");
+        _ = try emitter.markExternDeclared("_cx_rt_get_argv");
+        const ptr_bytes = emitter.cfg.target.ptrBytes();
+        try emitter.print(
+            "@_cx_rt_argc = internal global i32 0, align 4\n" ++
+                "@_cx_rt_argv = internal global ptr null, align {d}\n\n" ++
+                "define i32 @_cx_rt_get_argc() {s} {{\nentry:\n" ++
+                "  %v = load i32, ptr @_cx_rt_argc, align 4\n" ++
+                "  ret i32 %v\n}}\n\n" ++
+                "define ptr @_cx_rt_get_argv() {s} {{\nentry:\n" ++
+                "  %v = load ptr, ptr @_cx_rt_argv, align {d}\n" ++
+                "  ret ptr %v\n}}\n\n",
+            .{ ptr_bytes, fn_attrs, fn_attrs, ptr_bytes },
+        );
+    }
     if (emitter.cfg.target.isFreestanding()) {
         if (emitter.has_fmt_rt_helpers) {
             try emitter.writeAll(
@@ -4827,6 +4801,19 @@ fn emitAsyncRuntimeHelpersLlvm(emitter: *LlvmModuleEmitter) !void {
     );
 }
 
+/// Returns `true` if any referenced `extern` symbol links to `_cx_rt_get_argc` or `_cx_rt_get_argv`.
+fn hasReferencedRtProcessArgsLlvm(emitter: *const LlvmModuleEmitter) bool {
+    for (emitter.extern_syms.items) |sym_idx| {
+        const sym_rec = emitter.input.sym_table.getSymbol(sym_idx).*;
+        const ffi_meta = extractSymFfiMetaLlvm(emitter, sym_idx);
+        const ext_name = if (ffi_meta.link_name.len > 0) ffi_meta.link_name else sym_rec.name_text;
+        if (std.mem.eql(u8, ext_name, "_cx_rt_get_argc") or std.mem.eql(u8, ext_name, "_cx_rt_get_argv")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// Emits external `declare` prototypes and `external global` symbols for all referenced `extern` FFI symbols.
 fn emitExternDeclarations(emitter: *LlvmModuleEmitter) !void {
     var emitted_decls: usize = 0;
@@ -4878,7 +4865,7 @@ fn emitExternDeclarations(emitter: *LlvmModuleEmitter) !void {
             if (param_count_emitted == 0) try emitter.writeAll("...");
         }
         if (emitter.cfg.target.isWasm()) {
-            const is_wasi_import = emitter.cfg.target.os == .wasi and WASI_PREVIEW1_IMPORT_SET.has(ext_name);
+            const is_wasi_import = emitter.cfg.target.os == .wasi and codegen_abi.WASI_PREVIEW1_IMPORT_SET.has(ext_name);
             const has_explicit_wasm = ffi_meta.wasm_import_module.len > 0 or ffi_meta.wasm_import_name.len > 0;
             if (has_explicit_wasm or is_wasi_import or emitter.cfg.target.isFreestanding()) {
                 const mod_raw = if (ffi_meta.wasm_import_module.len > 0)
@@ -10301,7 +10288,11 @@ fn emitMirInstLlvm(
                 if (sym_rec.kind == .const_sym) {
                     const resolved_def = if (!def_id.isNone()) def_id else sym_rec.def_id;
                     if (emitter.input.const_rodata_map) |crm| {
-                        if (crm.get(resolved_def.asInt())) |r_idx| {
+                        const rodata_idx_opt = if (!resolved_def.isNone())
+                            crm.get(resolved_def.asInt())
+                        else
+                            crm.get(0x8000_0000 | sym_idx.asInt());
+                        if (rodata_idx_opt) |r_idx| {
                             const sym_ty = try unwrapTransparentType(emitter, sym_rec.type_id);
                             const inst_ty = try unwrapTransparentType(emitter, inst.type_id);
                             const inst_node = emitter.input.pool.getNode(inst_ty);
@@ -12844,16 +12835,22 @@ fn emitAggregateMakeLlvm(
                     };
                     defer emitter.allocator.free(d_ptr);
 
+                    const fmt_fn_ref: []u8 = if (hval_ty.isError() or hval_ty == .never_ty)
+                        try emitter.allocator.dupe(u8, "null")
+                    else
+                        try std.fmt.allocPrint(emitter.allocator, "@_cx_fmt_ty_{d}", .{hval_ty.toU32()});
+                    defer emitter.allocator.free(fmt_fn_ref);
+
                     try state.print(
                         "  store ptr {s}, ptr {s}, align {d}\n" ++
                             "  %_faa_f_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
-                            "  store ptr @_cx_fmt_ty_{d}, ptr %_faa_f_{d}, align {d}\n" ++
+                            "  store ptr {s}, ptr %_faa_f_{d}, align {d}\n" ++
                             "  %_faa_l_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
                             "  store i32 %_v_{d}, ptr %_faa_l_{d}, align 4\n",
                         .{
                             data_ptr_s,           d_ptr,                              ptr_bytes,
                             sub_id,               args_slot,                          ptr_int,
-                            base_off + ptr_bytes, hval_ty.toU32(),                    sub_id,
+                            base_off + ptr_bytes, fmt_fn_ref,                         sub_id,
                             ptr_bytes,            sub_id,                             args_slot,
                             ptr_int,              base_off + 2 * @as(u64, ptr_bytes), spec_lo_raw,
                             sub_id,
@@ -15697,35 +15694,42 @@ fn emitIntrinsicOpLlvm(
                     emitter,
                     body.getInst(MirValueId.fromInt(args[0])).type_id,
                 );
-                const val_ptr: []u8 = if (try isZeroSizedType(emitter, val_ty))
-                    try std.fmt.allocPrint(emitter.allocator, "inttoptr ({s} 1 to ptr)", .{ptr_int})
-                else blk: {
-                    const val_lay = try emitter.resolver.resolveType(val_ty);
-                    const slot = try state.allocEntryBytes(val_lay.size_bytes, val_lay.alignBytes());
-                    const src_ssa = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
-                    defer emitter.allocator.free(src_ssa);
-                    try emitStoreValueToPtr(
-                        emitter,
-                        state,
-                        val_ty,
-                        src_ssa,
-                        slot,
-                        val_lay.alignBytes(),
-                        0,
-                        0,
-                        0,
+                if (val_ty.isError() or val_ty == .never_ty) {
+                    try state.print(
+                        "  %_v_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr @_cx_empty_cstr, 0\n",
+                        .{ dst_raw, ptr_int },
                     );
-                    break :blk slot;
-                };
-                defer emitter.allocator.free(val_ptr);
-                const buf_slot = try state.allocEntryBytes(24, 8);
-                defer emitter.allocator.free(buf_slot);
-                try state.print(
-                    "  store {{ ptr, i64, i64 }} zeroinitializer, ptr {s}, align 8\n" ++
-                        "  call void @_cx_fmt_ty_{d}(ptr {s}, ptr {s}, i32 %_v_{d}, i32 %_v_{d})\n" ++
-                        "  %_v_{d} = call {{ ptr, {s} }} @_cx_rt_buf_finish(ptr {s})\n",
-                    .{ buf_slot, val_ty.toU32(), buf_slot, val_ptr, args[1], args[2], dst_raw, ptr_int, buf_slot },
-                );
+                } else {
+                    const val_ptr: []u8 = if (try isZeroSizedType(emitter, val_ty))
+                        try std.fmt.allocPrint(emitter.allocator, "inttoptr ({s} 1 to ptr)", .{ptr_int})
+                    else blk: {
+                        const val_lay = try emitter.resolver.resolveType(val_ty);
+                        const slot = try state.allocEntryBytes(val_lay.size_bytes, val_lay.alignBytes());
+                        const src_ssa = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
+                        defer emitter.allocator.free(src_ssa);
+                        try emitStoreValueToPtr(
+                            emitter,
+                            state,
+                            val_ty,
+                            src_ssa,
+                            slot,
+                            val_lay.alignBytes(),
+                            0,
+                            0,
+                            0,
+                        );
+                        break :blk slot;
+                    };
+                    defer emitter.allocator.free(val_ptr);
+                    const buf_slot = try state.allocEntryBytes(24, 8);
+                    defer emitter.allocator.free(buf_slot);
+                    try state.print(
+                        "  store {{ ptr, i64, i64 }} zeroinitializer, ptr {s}, align 8\n" ++
+                            "  call void @_cx_fmt_ty_{d}(ptr {s}, ptr {s}, i32 %_v_{d}, i32 %_v_{d})\n" ++
+                            "  %_v_{d} = call {{ ptr, {s} }} @_cx_rt_buf_finish(ptr {s})\n",
+                        .{ buf_slot, val_ty.toU32(), buf_slot, val_ptr, args[1], args[2], dst_raw, ptr_int, buf_slot },
+                    );
+                }
             } else {
                 try state.print(
                     "  %_v_{d} = insertvalue {{ ptr, {s} }} zeroinitializer, ptr @_cx_empty_cstr, 0\n",
@@ -16283,7 +16287,9 @@ fn lookupCustomFmtBodyIndexLlvm(emitter: *const LlvmModuleEmitter, ty: TypeId, i
                 for (emitter.input.sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
                     const mem_sym = emitter.input.sym_table.getSymbol(mem_idx).*;
                     if (mem_sym.kind == .fn_sym and std.mem.eql(u8, mem_sym.name_text, target_method)) {
+                        if (is_debug and mem_sym.is_derived) continue;
                         if (resolveBodyIndex(emitter, mem_sym.def_id, mem_idx)) |found_b| {
+                            if (is_debug and emitter.input.bodies[found_b].is_derived) continue;
                             if (emitter.input.bodies[found_b].param_count == 3) return found_b;
                         }
                     }
@@ -16293,6 +16299,7 @@ fn lookupCustomFmtBodyIndexLlvm(emitter: *const LlvmModuleEmitter, ty: TypeId, i
     }
     const dot_suffix = if (is_debug) ".fmt_debug" else ".fmt";
     for (emitter.input.bodies, 0..) |*cand_b, b_idx| {
+        if (is_debug and cand_b.is_derived) continue;
         if (cand_b.param_count != 3 or cand_b.locals.items.len < 4) continue;
         const fn_name = emitter.input.interner.get(cand_b.name);
         if (!std.mem.eql(u8, fn_name, target_method) and !std.mem.endsWith(u8, fn_name, dot_suffix)) continue;
@@ -18235,33 +18242,102 @@ fn emitStd01IntrinsicOpLlvm(
             const dst_ty = try unwrapTransparentType(emitter, inst.type_id);
             const lay = try emitter.resolver.resolveType(dst_ty);
             const n: usize = @intCast(@min(lay.size_bytes, 16));
-            const arr_ty = body.getInst(MirValueId.fromInt(args[0])).type_id;
-            const slot = try state.allocEntryBytes(16, @max(lay.alignBytes(), 8));
+            const slot_align = @max(lay.alignBytes(), 8);
+            const raw_arr_ty = body.getInst(MirValueId.fromInt(args[0])).type_id;
+            const arr_ty = try unwrapTransparentType(emitter, raw_arr_ty);
+            const slot = try state.allocEntryBytes(16, slot_align);
             defer emitter.allocator.free(slot);
-            try emitMemsetZero(emitter, state, slot, 16, @max(lay.alignBytes(), 8));
-            if (kind == .from_le_bytes) {
-                const arr_s = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
-                defer emitter.allocator.free(arr_s);
-                try emitStoreValueToPtr(emitter, state, arr_ty, arr_s, slot, @max(lay.alignBytes(), 8), 0, 0, 0);
-            } else {
+            try emitMemsetZero(emitter, state, slot, 16, slot_align);
+
+            const src_ptr_ssa = blk_src: {
+                if (arr_ty == .str_ty or
+                    (!arr_ty.isPrimitiveOrSentinel() and
+                        (emitter.input.pool.getNode(arr_ty).tag == .slice_ty or
+                            emitter.input.pool.isSliceRefType(arr_ty))))
+                {
+                    const t_id = state.nextTmp();
+                    try state.print(
+                        "  %_fbs_p_{d} = extractvalue {{ ptr, {s} }} %_v_{d}, 0\n" ++
+                            "  %_fbs_l_{d} = extractvalue {{ ptr, {s} }} %_v_{d}, 1\n" ++
+                            "  %_fbs_oob_{d} = icmp ult {s} %_fbs_l_{d}, {d}\n",
+                        .{ t_id, ptr_int, args[0], t_id, ptr_int, args[0], t_id, ptr_int, t_id, n },
+                    );
+                    const oob_ssa = try std.fmt.allocPrint(emitter.allocator, "%_fbs_oob_{d}", .{t_id});
+                    defer emitter.allocator.free(oob_ssa);
+                    try emitInlineTrapIfTrue(emitter, state, oob_ssa, @intFromEnum(mir.MirTrapReason.bounds_check));
+                    break :blk_src try std.fmt.allocPrint(emitter.allocator, "%_fbs_p_{d}", .{t_id});
+                }
+                if (!arr_ty.isPrimitiveOrSentinel()) {
+                    const arr_node = emitter.input.pool.getNode(arr_ty);
+                    if (arr_node.tag == .ref_ty or arr_node.tag == .mut_ref_ty or arr_node.tag == .raw_ptr_ty) {
+                        const inner_ty = try unwrapTransparentType(emitter, TypeId.fromInt(arr_node.lhs));
+                        if (inner_ty == .str_ty or
+                            (!inner_ty.isPrimitiveOrSentinel() and
+                                (emitter.input.pool.getNode(inner_ty).tag == .slice_ty or
+                                    emitter.input.pool.isSliceRefType(inner_ty))))
+                        {
+                            const t_id = state.nextTmp();
+                            try state.print(
+                                "  %_fbs_sl_{d} = load {{ ptr, {s} }}, ptr %_v_{d}, align {d}\n" ++
+                                    "  %_fbs_p_{d} = extractvalue {{ ptr, {s} }} %_fbs_sl_{d}, 0\n" ++
+                                    "  %_fbs_l_{d} = extractvalue {{ ptr, {s} }} %_fbs_sl_{d}, 1\n" ++
+                                    "  %_fbs_oob_{d} = icmp ult {s} %_fbs_l_{d}, {d}\n",
+                                .{
+                                    t_id, ptr_int, args[0], ptr_bytes,
+                                    t_id, ptr_int, t_id,    t_id,
+                                    ptr_int, t_id, t_id,    ptr_int,
+                                    t_id, n,
+                                },
+                            );
+                            const oob_ssa = try std.fmt.allocPrint(emitter.allocator, "%_fbs_oob_{d}", .{t_id});
+                            defer emitter.allocator.free(oob_ssa);
+                            try emitInlineTrapIfTrue(emitter, state, oob_ssa, @intFromEnum(mir.MirTrapReason.bounds_check));
+                            break :blk_src try std.fmt.allocPrint(emitter.allocator, "%_fbs_p_{d}", .{t_id});
+                        }
+                        if (!inner_ty.isPrimitiveOrSentinel() and emitter.input.pool.getNode(inner_ty).tag == .array_ty) {
+                            const arr_len: u64 = emitter.input.pool.getNode(inner_ty).rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+                            if (arr_len < n) {
+                                const t_id = state.nextTmp();
+                                try state.print("  %_fbs_oob_{d} = icmp ult i64 {d}, {d}\n", .{ t_id, arr_len, n });
+                                const oob_ssa = try std.fmt.allocPrint(emitter.allocator, "%_fbs_oob_{d}", .{t_id});
+                                defer emitter.allocator.free(oob_ssa);
+                                try emitInlineTrapIfTrue(emitter, state, oob_ssa, @intFromEnum(mir.MirTrapReason.bounds_check));
+                            }
+                        }
+                        break :blk_src try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
+                    }
+                    if (arr_node.tag == .array_ty) {
+                        const arr_len: u64 = arr_node.rhs & ~type_system.SYMBOLIC_ARRAY_LEN_FLAG;
+                        if (arr_len < n) {
+                            const t_id = state.nextTmp();
+                            try state.print("  %_fbs_oob_{d} = icmp ult i64 {d}, {d}\n", .{ t_id, arr_len, n });
+                            const oob_ssa = try std.fmt.allocPrint(emitter.allocator, "%_fbs_oob_{d}", .{t_id});
+                            defer emitter.allocator.free(oob_ssa);
+                            try emitInlineTrapIfTrue(emitter, state, oob_ssa, @intFromEnum(mir.MirTrapReason.bounds_check));
+                        }
+                    }
+                }
                 const src_slot = try state.allocEntryBytes(16, 8);
-                defer emitter.allocator.free(src_slot);
                 try emitMemsetZero(emitter, state, src_slot, 16, 8);
                 const arr_s = try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
                 defer emitter.allocator.free(arr_s);
-                try emitStoreValueToPtr(emitter, state, arr_ty, arr_s, src_slot, 8, 0, 0, 0);
-                for (0..n) |bi| {
-                    const t_id = state.nextTmp();
-                    try state.print(
-                        "  %_fbe_sp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
-                            "  %_fbe_b_{d} = load i8, ptr %_fbe_sp_{d}, align 1\n" ++
-                            "  %_fbe_dp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
-                            "  store i8 %_fbe_b_{d}, ptr %_fbe_dp_{d}, align 1\n",
-                        .{ t_id, src_slot, ptr_int, n - 1 - bi, t_id, t_id, t_id, slot, ptr_int, bi, t_id, t_id },
-                    );
-                }
+                try emitStoreValueToPtr(emitter, state, raw_arr_ty, arr_s, src_slot, 8, 0, 0, 0);
+                break :blk_src src_slot;
+            };
+            defer emitter.allocator.free(src_ptr_ssa);
+
+            for (0..n) |bi| {
+                const src_idx = if (kind == .from_le_bytes) bi else (n - 1 - bi);
+                const t_id = state.nextTmp();
+                try state.print(
+                    "  %_fbe_sp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                        "  %_fbe_b_{d} = load i8, ptr %_fbe_sp_{d}, align 1\n" ++
+                        "  %_fbe_dp_{d} = getelementptr inbounds i8, ptr {s}, {s} {d}\n" ++
+                        "  store i8 %_fbe_b_{d}, ptr %_fbe_dp_{d}, align 1\n",
+                    .{ t_id, src_ptr_ssa, ptr_int, src_idx, t_id, t_id, t_id, slot, ptr_int, bi, t_id, t_id },
+                );
             }
-            const loaded = try emitLoadValueFromPtr(emitter, state, dst_ty, slot, @max(lay.alignBytes(), 8), null, 0, 0, 0);
+            const loaded = try emitLoadValueFromPtr(emitter, state, dst_ty, slot, slot_align, null, 0, 0, 0);
             defer emitter.allocator.free(loaded);
             const val_ty = try formatLlvmValueType(emitter, dst_ty);
             defer emitter.allocator.free(val_ty);
@@ -21834,7 +21910,14 @@ fn emitMainEntrypointWrapperLlvm(emitter: *LlvmModuleEmitter) !void {
     const ptr_int = ptrIntType(emitter);
     const fn_attrs = fnUnwindAttrs(emitter);
 
-    try emitter.print("define i32 @main() {s} {{\nentry:\n", .{fn_attrs});
+    const has_rt_args = hasReferencedRtProcessArgsLlvm(emitter) and
+        !emitter.cfg.target.isFreestanding() and
+        !emitter.cfg.target.isWasm();
+    if (has_rt_args) {
+        try emitter.print("define i32 @main(i32 %_cx_argc, ptr %_cx_argv) {s} {{\nentry:\n", .{fn_attrs});
+    } else {
+        try emitter.print("define i32 @main() {s} {{\nentry:\n", .{fn_attrs});
+    }
 
     var state = BodyEmitState{
         .allocator = emitter.allocator,
@@ -21848,6 +21931,13 @@ fn emitMainEntrypointWrapperLlvm(emitter: *LlvmModuleEmitter) !void {
     };
     defer state.deinit();
 
+    if (has_rt_args) {
+        try state.print(
+            "  store i32 %_cx_argc, ptr @_cx_rt_argc, align 4\n" ++
+                "  store ptr %_cx_argv, ptr @_cx_rt_argv, align {d}\n",
+            .{emitter.cfg.target.ptrBytes()},
+        );
+    }
     try state.writeAll("  call void @_cx_rt_init()\n");
     if (emitter.input.sim_seed != 0) {
         const sim_seed_i64: i64 = @bitCast(emitter.input.sim_seed);

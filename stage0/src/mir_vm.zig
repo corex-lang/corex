@@ -36,6 +36,7 @@ const mir = @import("mir.zig");
 const mir_sast = @import("mir_sast.zig");
 const mir_async = @import("mir_async.zig");
 const sim_seam = @import("sim_seam.zig");
+const mir_vm_sys_shim = @import("mir_vm_sys_shim.zig");
 
 const FileId = mem_foundation.FileId;
 const PackageId = vfs_sourcemap.PackageId;
@@ -708,7 +709,7 @@ const VmCallFrame = struct {
 };
 
 /// Callable entry registered in `MirVm` (`ComptimeAllocId.fromFnIndex(idx)`).
-const VmCallableEntry = struct {
+pub const VmCallableEntry = struct {
     /// Lowered `MirBody` pointer (`null` if `is_extern`).
     body: ?*const MirBody,
     /// Optional owning `DefId`.
@@ -1410,6 +1411,8 @@ pub const MirVm = struct {
     vaddr_spans: std.ArrayListUnmanaged(VmVirtualRange) = .empty,
     /// Next virtual base address (`16 MiB` base, fits cleanly in both `32-bit` and `64-bit` `usize`).
     next_vaddr: u64 = 0x0100_0000,
+    /// Lazily initialized host OS descriptor/handle state for `is_oracle_runtime_mode` `core.sys` shims (`STD-02`).
+    host_sys_state: ?mir_vm_sys_shim.VmHostSysState = null,
 
     /// Initializes a `MirVm` instance with reserved slot `0` (`.null_ptr`) in `allocations`.
     pub fn init(
@@ -1489,6 +1492,10 @@ pub const MirVm = struct {
         self.task_nodes.deinit(self.allocator);
         self.exec_ready_queue.deinit(self.allocator);
 
+        if (self.host_sys_state) |*sys_st| {
+            sys_st.deinit(self.allocator);
+            self.host_sys_state = null;
+        }
         for (self.allocations.items) |*alloc_rec| {
             alloc_rec.provenance.deinit(self.allocator);
         }
@@ -1969,7 +1976,7 @@ pub const MirVm = struct {
     }
 
     /// Advances `base` by `delta` bytes, trapping with `E0506` on non-addressable handles and `E0504` on `u32` overflow.
-    fn advanceSymbolicPtr(self: *MirVm, base: SymbolicPtr, delta: u64) VmEvalError!SymbolicPtr {
+    pub fn advanceSymbolicPtr(self: *MirVm, base: SymbolicPtr, delta: u64) VmEvalError!SymbolicPtr {
         if (delta == 0) return base;
         if (base.alloc_id.isNullOrNone() or base.alloc_id.isFnAddr()) {
             return self.failWithTrap(
@@ -2675,7 +2682,7 @@ pub const MirVm = struct {
     }
 
     /// Reads an arbitrary `u128` / `i128` integer value from `slot` (`inline_scalar` or snapshot).
-    fn readIntBitsFromSlot(self: *MirVm, slot: RegSlot, raw_ty: TypeId) VmEvalError!u128 {
+    pub fn readIntBitsFromSlot(self: *MirVm, slot: RegSlot, raw_ty: TypeId) VmEvalError!u128 {
         const info = resolveIntInfo(self.pool, raw_ty, self.options.target_layout) orelse return 0;
         const repr = classifyValueRepr(self.pool, self.sym_table, raw_ty, self.options.target_layout);
         if (repr == .inline_scalar and info.bits <= 64) {
@@ -2688,7 +2695,7 @@ pub const MirVm = struct {
     }
 
     /// Materializes a `RegSlot` for an integer of `raw_ty` from `val_u128`.
-    fn makeIntSlot(self: *MirVm, raw_ty: TypeId, val_u128: u128) VmEvalError!RegSlot {
+    pub fn makeIntSlot(self: *MirVm, raw_ty: TypeId, val_u128: u128) VmEvalError!RegSlot {
         const info = resolveIntInfo(self.pool, raw_ty, self.options.target_layout) orelse
             return .{ .scalar_u64 = 0 };
         const masked = maskToBitsU128(val_u128, info.bits);
@@ -4137,6 +4144,18 @@ pub const MirVm = struct {
                 return found_idx;
             }
         }
+        if (!resolved_def.isNone()) {
+            if (self.sym_table.def_to_symbol.get(resolved_def.asInt())) |canon_sym_idx| {
+                if (canon_sym_idx.asInt() < self.sym_table.symbols.items.len) {
+                    const canon_sym = self.sym_table.getSymbol(canon_sym_idx).*;
+                    if (canon_sym.flags.is_extern) {
+                        const ext_id = self.registerExternFn(canon_sym.def_id, canon_sym_idx) catch
+                            return error.OutOfMemory;
+                        return ext_id.payloadIndex();
+                    }
+                }
+            }
+        }
 
         if (!resolved_def.isNone()) {
             if (self.options.compiler_db) |db| {
@@ -4790,6 +4809,17 @@ pub const MirVm = struct {
         }
         const entry = self.callables.items[fn_idx];
         if (entry.is_extern) {
+            if (self.options.is_oracle_runtime_mode and self.isStdCoreCallable(entry)) {
+                if (try mir_vm_sys_shim.tryEvalStdCoreExternCall(
+                    self,
+                    frame_idx,
+                    entry,
+                    call_site,
+                    call_span,
+                )) |ext_slot| {
+                    return ext_slot;
+                }
+            }
             return self.failWithTrap(
                 error.ForbiddenOperation,
                 .e0503_forbidden_comptime_operation,
@@ -7026,6 +7056,26 @@ pub const MirVm = struct {
             return;
         }
 
+        // Owned stack-frame parameters (`text: own String`) are sealed `is_mutable = false` during
+        // body execution; unseal them for exclusive `&mut self` destructor teardown (`Drop.drop`).
+        var immut_restore_idx: ?usize = null;
+        if (place_ptr.alloc_id.domain() == .vm_alloc) {
+            const place_alloc_idx = place_ptr.alloc_id.payloadIndex();
+            if (place_alloc_idx > 0 and place_alloc_idx < self.allocations.items.len and
+                self.allocations.items[place_alloc_idx].is_live and
+                self.allocations.items[place_alloc_idx].is_stack_frame and
+                !self.allocations.items[place_alloc_idx].is_mutable)
+            {
+                self.allocations.items[place_alloc_idx].is_mutable = true;
+                immut_restore_idx = place_alloc_idx;
+            }
+        }
+        defer if (immut_restore_idx) |restore_idx| {
+            if (restore_idx < self.allocations.items.len) {
+                self.allocations.items[restore_idx].is_mutable = false;
+            }
+        };
+
         // [1] Invoke explicit user `Drop.drop` / `AutoDrop.drop` on outer nominal value first:
         if (try self.lookupDropCallableForType(ty)) |drop_fn_idx| {
             if (self.callables.items[drop_fn_idx].body) |drop_body| {
@@ -8532,9 +8582,9 @@ pub const MirVm = struct {
                         );
                         if (stored_repr == field_repr) {
                             try self.storeTypedSlotToMemoryAligned(field_ptr, field_info.field_ty, stored_slot, false);
-                        } else if ((stored_repr == .inline_ptr or stored_repr == .inline_scalar) and
-                            field_repr == .by_value_snapshot)
-                        {
+                        } else if (stored_repr == .inline_ptr and field_repr == .by_value_snapshot) {
+                            try self.writePointerAt(field_ptr, 0, stored_slot.sym_ptr);
+                        } else if (stored_repr == .inline_scalar and field_repr == .by_value_snapshot) {
                             const field_lay = type_system.computeTypeLayoutWithPool(
                                 self.pool,
                                 self.sym_table,
@@ -8547,9 +8597,10 @@ pub const MirVm = struct {
                                 const copy_len: usize = @intCast(@min(field_lay.byte_size, word_buf.len));
                                 try self.writeScalarBytes(field_ptr, 0, word_buf[0..copy_len]);
                             }
-                        } else if (stored_repr == .by_value_snapshot and
-                            (field_repr == .inline_scalar or field_repr == .inline_ptr))
-                        {
+                        } else if (stored_repr == .by_value_snapshot and field_repr == .inline_ptr) {
+                            const loaded_ptr = try self.readPointerAt(stored_slot.sym_ptr, 0);
+                            try self.writePointerAt(field_ptr, 0, loaded_ptr);
+                        } else if (stored_repr == .by_value_snapshot and field_repr == .inline_scalar) {
                             var word_buf: [8]u8 = @splat(0);
                             const stored_lay = type_system.computeTypeLayoutWithPool(
                                 self.pool,
@@ -8585,9 +8636,13 @@ pub const MirVm = struct {
                     if (stored_repr == dst_repr) {
                         return stored_slot;
                     }
-                    if ((stored_repr == .inline_ptr or stored_repr == .inline_scalar) and
-                        dst_repr == .by_value_snapshot)
-                    {
+                    if (stored_repr == .inline_ptr and dst_repr == .by_value_snapshot) {
+                        const wrapped_snap = try self.allocSnapshotForType(dst_ty, true);
+                        try self.writePointerAt(wrapped_snap, 0, stored_slot.sym_ptr);
+                        self.sealSnapshot(wrapped_snap);
+                        return .{ .sym_ptr = wrapped_snap };
+                    }
+                    if (stored_repr == .inline_scalar and dst_repr == .by_value_snapshot) {
                         const wrapped_snap = try self.allocSnapshotForType(dst_ty, true);
                         const dst_lay = type_system.computeTypeLayoutWithPool(
                             self.pool,
@@ -8604,9 +8659,10 @@ pub const MirVm = struct {
                         self.sealSnapshot(wrapped_snap);
                         return .{ .sym_ptr = wrapped_snap };
                     }
-                    if (stored_repr == .by_value_snapshot and
-                        (dst_repr == .inline_scalar or dst_repr == .inline_ptr))
-                    {
+                    if (stored_repr == .by_value_snapshot and dst_repr == .inline_ptr) {
+                        return .{ .sym_ptr = try self.readPointerAt(stored_slot.sym_ptr, 0) };
+                    }
+                    if (stored_repr == .by_value_snapshot and dst_repr == .inline_scalar) {
                         var word_buf: [8]u8 = @splat(0);
                         const stored_lay = type_system.computeTypeLayoutWithPool(
                             self.pool,
@@ -8821,8 +8877,21 @@ pub const MirVm = struct {
                     self.options.target_layout,
                 );
                 const n: usize = @intCast(@min(dst_lay.byte_size, 16));
+                const span_info = try self.extractWireBytesSpan(
+                    body.getInst(MirValueId.fromInt(args[0])).type_id,
+                    self.call_stack.items[frame_idx].regs[args[0]],
+                );
+                if (span_info.byte_len < n) {
+                    return self.failWithTrap(
+                        error.OutOfBounds,
+                        .e0504_comptime_out_of_bounds,
+                        "`@from_le_bytes` / `@from_be_bytes` slice shorter than destination type",
+                        "byte slice is shorter than target type width",
+                        null,
+                    );
+                }
                 var buf: [16]u8 = @splat(0);
-                try self.readScalarBytes(self.call_stack.items[frame_idx].regs[args[0]].sym_ptr, 0, buf[0..n]);
+                try self.readScalarBytes(span_info.data_ptr, 0, buf[0..n]);
                 if (kind == .from_be_bytes) std.mem.reverse(u8, buf[0..n]);
                 const dst_snap = try self.allocSnapshotForType(inst.type_id, true);
                 try self.writeScalarBytes(dst_snap, 0, buf[0..n]);
@@ -9775,10 +9844,31 @@ pub const MirVm = struct {
         return false;
     }
 
+    /// Returns `true` when `entry` is declared inside `PackageId.std_core` (`core/sys/*.cx`).
+    pub fn isStdCoreCallable(self: *const MirVm, entry: VmCallableEntry) bool {
+        const eff_sym_table = self.options.sym_table orelse self.sym_table;
+        var check_sym = entry.symbol_index;
+        if (check_sym.isNone() and !entry.def_id.isNone()) {
+            check_sym = eff_sym_table.def_to_symbol.get(entry.def_id.asInt()) orelse .none;
+        }
+        if (!check_sym.isNone() and check_sym.asInt() < eff_sym_table.symbols.items.len) {
+            const sym = eff_sym_table.getSymbol(check_sym).*;
+            if (eff_sym_table.getFilePackageId(sym.decl_span.file_id) == .std_core) return true;
+            if (eff_sym_table.isCoreKernelFile(sym.decl_span.file_id)) return true;
+        }
+        return false;
+    }
+
     /// Maps `sym_ptr` to a deterministic aligned virtual integer address for `.std_core` / oracle pointer tagging.
-    fn ptrToVirtualAddr(self: *MirVm, sym_ptr: SymbolicPtr, min_align_log2: u8) VmEvalError!u64 {
+    pub fn ptrToVirtualAddr(self: *MirVm, sym_ptr: SymbolicPtr, min_align_log2: u8) VmEvalError!u64 {
         if (sym_ptr.alloc_id.isNullOrNone()) return 0;
         if (sym_ptr.alloc_id == self.dangling_empty_alloc) {
+            if (sym_ptr.byte_offset == std.math.maxInt(u32)) {
+                return if (self.options.target_layout.ptr_byte_size == 4)
+                    @as(u64, std.math.maxInt(u32))
+                else
+                    std.math.maxInt(u64);
+            }
             return if (sym_ptr.byte_offset > 0)
                 sym_ptr.byte_offset
             else
@@ -9822,13 +9912,18 @@ pub const MirVm = struct {
     }
 
     /// Resolves a `.std_core` / oracle virtual integer address back into its owning `SymbolicPtr`.
-    fn virtualAddrToPtr(self: *MirVm, raw_addr: u64) VmEvalError!SymbolicPtr {
+    pub fn virtualAddrToPtr(self: *MirVm, raw_addr: u64) VmEvalError!SymbolicPtr {
         const masked = if (self.options.target_layout.ptr_byte_size == 4)
             raw_addr & 0xFFFF_FFFF
         else
             raw_addr;
         if (masked == 0) return SymbolicPtr.NULL;
-        if (masked < 0x0010_0000) {
+        if ((self.options.target_layout.ptr_byte_size == 8 and masked == std.math.maxInt(u64)) or
+            (self.options.target_layout.ptr_byte_size == 4 and masked == std.math.maxInt(u32)))
+        {
+            return .{ .alloc_id = self.dangling_empty_alloc, .byte_offset = std.math.maxInt(u32) };
+        }
+        if (masked < 0x0010_0000 or (masked >= 0x8000_0000 and masked <= 0x8000_000F)) {
             return .{ .alloc_id = self.dangling_empty_alloc, .byte_offset = @intCast(masked) };
         }
         const spans = self.vaddr_spans.items;
@@ -10238,10 +10333,11 @@ pub const MirVm = struct {
         return true;
     }
 
-    /// Looks up a 3-parameter `Display.fmt` or `Debug.fmt_debug` callable on nominal type `ty`.
+    /// Looks up a 3-parameter custom `Display.fmt` or `Debug.fmt_debug` callable on nominal type `ty`.
     fn lookupFmtTraitCallable(self: *MirVm, ty: TypeId, method_name: []const u8) VmEvalError!?u32 {
         const ty_node = self.pool.getNode(ty);
         if (ty_node.tag != .struct_ty and ty_node.tag != .enum_ty and ty_node.tag != .union_ty) return null;
+        const is_debug_method = std.mem.eql(u8, method_name, "fmt_debug");
         const sym_idx = SymbolIndex.fromInt(ty_node.rhs);
         if (!sym_idx.isNone() and sym_idx.asInt() < self.sym_table.symbols.items.len) {
             const nom_sym = self.sym_table.getSymbol(sym_idx).*;
@@ -10249,8 +10345,10 @@ pub const MirVm = struct {
                 for (self.sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
                     const mem_sym = self.sym_table.getSymbol(mem_idx).*;
                     if (mem_sym.kind == .fn_sym and std.mem.eql(u8, mem_sym.name_text, method_name)) {
+                        if (is_debug_method and mem_sym.is_derived) continue;
                         if (try self.tryResolveOrLoadCallable(mem_sym.def_id, mem_idx)) |found_idx| {
                             if (self.callables.items[found_idx].body) |cand_body| {
+                                if (is_debug_method and cand_body.is_derived) continue;
                                 if (cand_body.param_count == 3) return found_idx;
                             }
                         }

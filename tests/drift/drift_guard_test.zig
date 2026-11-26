@@ -2179,10 +2179,16 @@ test "test_drift_guard_phase111c_core_stdlib_and_comparisons_zero_warnings" {
     };
     const stdlib_paths = [_][]const u8{
         "stdlib/cx/mod.cx",
-        "stdlib/cx/mem.cx",
-        "stdlib/cx/math.cx",
         "stdlib/cx/col.cx",
+        "stdlib/cx/env.cx",
+        "stdlib/cx/fs.cx",
+        "stdlib/cx/io.cx",
+        "stdlib/cx/math.cx",
+        "stdlib/cx/mem.cx",
+        "stdlib/cx/path.cx",
+        "stdlib/cx/process.cx",
         "stdlib/cx/str.cx",
+        "stdlib/cx/time.cx",
     };
 
     // [1] Verify `core/**/*.cx` and `stdlib/cx/*.cx` emit 0 errors and 0 warnings under `--sast-strict`:
@@ -2236,10 +2242,16 @@ test "test_drift_guard_phase111c_core_stdlib_and_comparisons_zero_warnings" {
         const cx_mod_fid = all_fids[core_paths.len];
         try db.registerRootModule("cx", cx_mod_fid);
         try db.registerCxStdlibPreludeRoot(cx_mod_fid);
-        try db.bindExternalModule(cx_mod_fid, "mem", all_fids[core_paths.len + 1]);
-        try db.bindExternalModule(cx_mod_fid, "math", all_fids[core_paths.len + 2]);
-        try db.bindExternalModule(cx_mod_fid, "col", all_fids[core_paths.len + 3]);
-        try db.bindExternalModule(cx_mod_fid, "str", all_fids[core_paths.len + 4]);
+        try db.bindExternalModule(cx_mod_fid, "col", all_fids[core_paths.len + 1]);
+        try db.bindExternalModule(cx_mod_fid, "env", all_fids[core_paths.len + 2]);
+        try db.bindExternalModule(cx_mod_fid, "fs", all_fids[core_paths.len + 3]);
+        try db.bindExternalModule(cx_mod_fid, "io", all_fids[core_paths.len + 4]);
+        try db.bindExternalModule(cx_mod_fid, "math", all_fids[core_paths.len + 5]);
+        try db.bindExternalModule(cx_mod_fid, "mem", all_fids[core_paths.len + 6]);
+        try db.bindExternalModule(cx_mod_fid, "path", all_fids[core_paths.len + 7]);
+        try db.bindExternalModule(cx_mod_fid, "process", all_fids[core_paths.len + 8]);
+        try db.bindExternalModule(cx_mod_fid, "str", all_fids[core_paths.len + 9]);
+        try db.bindExternalModule(cx_mod_fid, "time", all_fids[core_paths.len + 10]);
 
         try db.setExplicitLintTargetFiles(&all_fids);
 

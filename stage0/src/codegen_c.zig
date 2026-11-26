@@ -350,28 +350,6 @@ const RAW_BLOB_BYTES_PER_LINE: usize = 16;
 /// Maximum pointer indirection / composite DFS depth enforced in Tier A emission.
 const MAX_C_TYPE_DEPTH: u32 = 64;
 
-/// Canonical WASI Preview 1 import symbol set routed to `"wasi_snapshot_preview1"` on `wasm32-wasi`.
-const WASI_PREVIEW1_IMPORT_SET = std.StaticStringMap(void).initComptime(.{
-    .{ "args_get", {} },
-    .{ "args_sizes_get", {} },
-    .{ "clock_res_get", {} },
-    .{ "clock_time_get", {} },
-    .{ "environ_get", {} },
-    .{ "environ_sizes_get", {} },
-    .{ "fd_close", {} },
-    .{ "fd_fdstat_get", {} },
-    .{ "fd_prestat_dir_name", {} },
-    .{ "fd_prestat_get", {} },
-    .{ "fd_read", {} },
-    .{ "fd_seek", {} },
-    .{ "fd_write", {} },
-    .{ "path_open", {} },
-    .{ "poll_oneoff", {} },
-    .{ "proc_exit", {} },
-    .{ "random_get", {} },
-    .{ "sched_yield", {} },
-});
-
 /// Static runtime C99 preamble providing UB-free arithmetic, 128-bit fallbacks, and oracle tracing.
 const C99_RUNTIME_PREAMBLE: []const u8 =
     \\#include <stdint.h>
@@ -473,15 +451,10 @@ const C99_RUNTIME_PREAMBLE: []const u8 =
     \\    const char *trace_path = getenv("COREX_ORACLE_TRACE_FILE");
     \\    if (trace_path != NULL && trace_path[0] != '\0') {
     \\        _cx_rt_trace_append("TRAP:1\n");
-    \\        (void)fflush(stdout);
-    \\        (void)fflush(stderr);
-    \\        _exit(101);
     \\    }
-    \\#if defined(__GNUC__) || defined(__clang__)
-    \\    __builtin_trap();
-    \\#else
-    \\    abort();
-    \\#endif
+    \\    (void)fflush(stdout);
+    \\    (void)fflush(stderr);
+    \\    _exit(101);
     \\}
     \\
     \\static intptr_t _cx_rt_sys_write(int32_t fd_num, const uint8_t *buf_ptr, size_t buf_len) {
@@ -2962,12 +2935,27 @@ fn indexModuleEntities(emitter: *CModuleEmitter) !void {
     }.lessThan);
 }
 
+/// Unwraps up to 8 `use_alias_sym` hops to return the canonical `SymbolIndex`.
+fn unwrapCanonicalSymC(sym_table: *const SymbolTable, raw_sym: SymbolIndex) SymbolIndex {
+    var cur_sym = raw_sym;
+    var hops: u8 = 0;
+    while (!cur_sym.isNone() and cur_sym.asInt() < sym_table.symbols.items.len and hops < 8) : (hops += 1) {
+        const cur_rec = sym_table.getSymbol(cur_sym).*;
+        if (cur_rec.kind != .use_alias_sym or cur_rec.target_symbol.isNone() or cur_rec.target_symbol == cur_sym) {
+            break;
+        }
+        cur_sym = cur_rec.target_symbol;
+    }
+    return cur_sym;
+}
+
 /// Records an `extern` function or `extern static` global symbol when referenced without a local `MirBody`.
 fn maybeRegisterExternSymbol(
     emitter: *CModuleEmitter,
     def_id: DefId,
-    sym_idx: SymbolIndex,
+    raw_sym_idx: SymbolIndex,
 ) !void {
+    const sym_idx = unwrapCanonicalSymC(emitter.input.sym_table, raw_sym_idx);
     if (resolveBodyIndex(emitter, def_id, sym_idx) != null) return;
     if (sym_idx.isNone() or sym_idx.asInt() >= emitter.input.sym_table.symbols.items.len) return;
     const sym_rec = emitter.input.sym_table.getSymbol(sym_idx).*;
@@ -4447,14 +4435,35 @@ fn appendEscapedCStringContents(emitter: *CModuleEmitter, raw_text: []const u8) 
     }
 }
 
+/// Returns `true` if any referenced `extern` symbol links to `_cx_rt_get_argc` or `_cx_rt_get_argv`.
+fn hasReferencedRtProcessArgs(emitter: *const CModuleEmitter) bool {
+    for (emitter.extern_syms.items) |sym_idx| {
+        const sym_rec = emitter.input.sym_table.getSymbol(sym_idx).*;
+        const ffi_meta = extractSymFfiMeta(emitter, sym_idx);
+        const ext_name = if (ffi_meta.link_name.len > 0) ffi_meta.link_name else sym_rec.name_text;
+        if (std.mem.eql(u8, ext_name, "_cx_rt_get_argc") or std.mem.eql(u8, ext_name, "_cx_rt_get_argv")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// Emits extern declarations, `MirBody` prototypes, `--dev` GOT table, closure thunks, drops, and eq helpers.
 fn emitCallablePrototypesAndDrops(emitter: *CModuleEmitter) !void {
+    if (hasReferencedRtProcessArgs(emitter)) {
+        try emitter.writeAll(
+            "static int32_t _cx_rt_argc = 0;\n" ++
+                "static uint8_t **_cx_rt_argv = (uint8_t **)0;\n" ++
+                "int32_t _cx_rt_get_argc(void) { return _cx_rt_argc; }\n" ++
+                "uint8_t **_cx_rt_get_argv(void) { return _cx_rt_argv; }\n",
+        );
+    }
     for (emitter.extern_syms.items) |sym_idx| {
         const sym_rec = emitter.input.sym_table.getSymbol(sym_idx).*;
         const sig = emitter.input.pool.getFnSignatureView(sym_rec.type_id) orelse continue;
         const ffi_meta = extractSymFfiMeta(emitter, sym_idx);
         const ext_name = if (ffi_meta.link_name.len > 0) ffi_meta.link_name else sym_rec.name_text;
-        const is_wasi_import = emitter.cfg.target.os == .wasi and WASI_PREVIEW1_IMPORT_SET.has(ext_name);
+        const is_wasi_import = emitter.cfg.target.os == .wasi and codegen_abi.WASI_PREVIEW1_IMPORT_SET.has(ext_name);
         const has_wasm_attr = emitter.cfg.target.isWasm() and
             (ffi_meta.wasm_import_module.len > 0 or
                 ffi_meta.wasm_import_name.len > 0 or
@@ -4466,6 +4475,20 @@ fn emitCallablePrototypesAndDrops(emitter: *CModuleEmitter) !void {
         else
             try formatCType(emitter, abi_ext_ret_ty);
         defer emitter.allocator.free(ret_c);
+        if (std.mem.eql(u8, ext_name, "_cx_rt_get_argc")) {
+            try emitter.print(
+                "static inline {s} _cx_ext_{d}(void) {{ return ({s})_cx_rt_get_argc(); }}\n",
+                .{ ret_c, sym_idx.asInt(), ret_c },
+            );
+            continue;
+        }
+        if (std.mem.eql(u8, ext_name, "_cx_rt_get_argv")) {
+            try emitter.print(
+                "static inline {s} _cx_ext_{d}(void) {{ return ({s})_cx_rt_get_argv(); }}\n",
+                .{ ret_c, sym_idx.asInt(), ret_c },
+            );
+            continue;
+        }
         if (has_wasm_attr) {
             const mod_name = if (ffi_meta.wasm_import_module.len > 0)
                 ffi_meta.wasm_import_module
@@ -7267,6 +7290,38 @@ fn emitAsyncCoroPollBodyC(emitter: *CModuleEmitter, body_idx: u32, body: *const 
     try emitter.writeAll("}\n\n");
 }
 
+/// Assigns `rhs_expr` (`rhs_raw_ty`) into `lhs_expr` (`lhs_raw_ty`), coercing layout-identical C typedefs via `memcpy`.
+fn emitTypedValueAssignC(
+    emitter: *CModuleEmitter,
+    indent: []const u8,
+    lhs_expr: []const u8,
+    lhs_raw_ty: TypeId,
+    rhs_expr: []const u8,
+    rhs_raw_ty: TypeId,
+) !void {
+    const lhs_ty = emitter.input.pool.unwrapUnderlyingType(lhs_raw_ty);
+    const rhs_ty = emitter.input.pool.unwrapUnderlyingType(rhs_raw_ty);
+    if (lhs_ty == rhs_ty) {
+        try emitter.print("{s}{s} = {s};\n", .{ indent, lhs_expr, rhs_expr });
+        return;
+    }
+    const lhs_c = try formatCType(emitter, lhs_ty);
+    defer emitter.allocator.free(lhs_c);
+    const rhs_c = try formatCType(emitter, rhs_ty);
+    defer emitter.allocator.free(rhs_c);
+    if (std.mem.eql(u8, lhs_c, rhs_c)) {
+        try emitter.print("{s}{s} = {s};\n", .{ indent, lhs_expr, rhs_expr });
+    } else if (lhs_c.len > 0 and rhs_c.len > 0 and lhs_c[lhs_c.len - 1] == '*' and rhs_c[rhs_c.len - 1] == '*') {
+        try emitter.print("{s}{s} = ({s})({s});\n", .{ indent, lhs_expr, lhs_c, rhs_expr });
+    } else {
+        const tmp_id = emitter.nextTempId();
+        try emitter.print(
+            "{s}{{ {s} _asg_{d} = {s}; memcpy(&({s}), &_asg_{d}, sizeof({s})); }}\n",
+            .{ indent, rhs_c, tmp_id, rhs_expr, lhs_expr, tmp_id, lhs_expr },
+        );
+    }
+}
+
 /// Emits C99 statements evaluating a single non-ghost `MirInst` into `_v_<val_id>`.
 fn emitMirInstC(
     emitter: *CModuleEmitter,
@@ -7456,7 +7511,12 @@ fn emitMirInstC(
         },
         .copy_val => {
             if (!(try isZeroSizedType(emitter, inst.type_id))) {
-                try emitter.print("    _v_{d} = _v_{d};\n", .{ dst_raw, inst.operands.lhs });
+                const src_val = MirValueId.fromInt(inst.operands.lhs);
+                const lhs_str = try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{dst_raw});
+                defer emitter.allocator.free(lhs_str);
+                const rhs_str = try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{inst.operands.lhs});
+                defer emitter.allocator.free(rhs_str);
+                try emitTypedValueAssignC(emitter, "    ", lhs_str, inst.type_id, rhs_str, body.getInst(src_val).type_id);
             }
         },
         .bin_op => {
@@ -7821,11 +7881,16 @@ fn emitMirInstC(
             } else if (!target_sym.isNone() and
                 target_sym.asInt() < emitter.input.sym_table.symbols.items.len)
             {
-                const sym_rec = emitter.input.sym_table.getSymbol(target_sym).*;
+                const canon_sym = unwrapCanonicalSymC(emitter.input.sym_table, target_sym);
+                const sym_rec = emitter.input.sym_table.getSymbol(canon_sym).*;
                 if (sym_rec.kind == .const_sym) {
                     const resolved_def = if (!target_def.isNone()) target_def else sym_rec.def_id;
                     if (emitter.input.const_rodata_map) |crm| {
-                        if (crm.get(resolved_def.asInt())) |r_idx| {
+                        const rodata_idx_opt = if (!resolved_def.isNone())
+                            crm.get(resolved_def.asInt())
+                        else
+                            crm.get(0x8000_0000 | canon_sym.asInt());
+                        if (rodata_idx_opt) |r_idx| {
                             const sym_ty = emitter.input.pool.unwrapUnderlyingType(sym_rec.type_id);
                             const inst_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
                             const inst_node = emitter.input.pool.getNode(inst_ty);
@@ -7845,8 +7910,8 @@ fn emitMirInstC(
                         }
                     }
                 }
-                if (emitter.extern_global_sym_set.contains(target_sym.asInt())) {
-                    const glob_rec = emitter.input.sym_table.getSymbol(target_sym).*;
+                if (emitter.extern_global_sym_set.contains(canon_sym.asInt())) {
+                    const glob_rec = emitter.input.sym_table.getSymbol(canon_sym).*;
                     const sym_ty = emitter.input.pool.unwrapUnderlyingType(glob_rec.type_id);
                     const inst_ty = emitter.input.pool.unwrapUnderlyingType(inst.type_id);
                     const inst_node = emitter.input.pool.getNode(inst_ty);
@@ -7854,16 +7919,16 @@ fn emitMirInstC(
                         emitter.input.pool.unwrapUnderlyingType(TypeId.fromInt(inst_node.lhs)) == sym_ty;
                     if (!is_addr_of_sym) {
                         if (!(try isZeroSizedType(emitter, inst.type_id))) {
-                            try emitter.print("    _v_{d} = _cx_ext_glob_{d};\n", .{ dst_raw, target_sym.asInt() });
+                            try emitter.print("    _v_{d} = _cx_ext_glob_{d};\n", .{ dst_raw, canon_sym.asInt() });
                         }
                     } else {
                         try emitter.print(
                             "    _v_{d} = ({s})(&_cx_ext_glob_{d});\n",
-                            .{ dst_raw, fn_c, target_sym.asInt() },
+                            .{ dst_raw, fn_c, canon_sym.asInt() },
                         );
                     }
                 } else {
-                    try emitter.print("    _v_{d} = ({s})_cx_ext_{d};\n", .{ dst_raw, fn_c, target_sym.asInt() });
+                    try emitter.print("    _v_{d} = ({s})_cx_ext_{d};\n", .{ dst_raw, fn_c, canon_sym.asInt() });
                 }
             }
         },
@@ -7877,18 +7942,23 @@ fn emitMirInstC(
                 },
                 .lvalue_expr => |lv| {
                     defer emitter.allocator.free(lv.expr_str);
-                    try emitter.print("    _v_{d} = {s};\n", .{ dst_raw, lv.expr_str });
+                    const lhs_str = try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{dst_raw});
+                    defer emitter.allocator.free(lhs_str);
+                    try emitTypedValueAssignC(emitter, "    ", lhs_str, inst.type_id, lv.expr_str, lv.pointee_ty);
                 },
             }
         },
         .place_store => {
             const rhs_val = MirValueId.fromInt(inst.operands.rhs);
-            if (try isZeroSizedType(emitter, body.getInst(rhs_val).type_id)) return;
+            const rhs_ty = body.getInst(rhs_val).type_id;
+            if (try isZeroSizedType(emitter, rhs_ty)) return;
             switch (try lowerPlaceC(emitter, body, PlaceId.fromInt(inst.operands.lhs))) {
                 .const_len => {},
                 .lvalue_expr => |lv| {
                     defer emitter.allocator.free(lv.expr_str);
-                    try emitter.print("    {s} = _v_{d};\n", .{ lv.expr_str, rhs_val.asInt() });
+                    const rhs_str = try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{rhs_val.asInt()});
+                    defer emitter.allocator.free(rhs_str);
+                    try emitTypedValueAssignC(emitter, "    ", lv.expr_str, lv.pointee_ty, rhs_str, rhs_ty);
                 },
             }
         },
@@ -9165,15 +9235,20 @@ fn emitAggregateMakeC(
                     );
                 };
                 defer emitter.allocator.free(data_expr);
+                const fmt_fn_c: []u8 = if (hole_ty.isError() or hole_ty == .never_ty)
+                    try emitter.allocator.dupe(u8, "NULL")
+                else
+                    try std.fmt.allocPrint(emitter.allocator, "_cx_fmt_fn_ty_{d}", .{hole_ty.toU32()});
+                defer emitter.allocator.free(fmt_fn_c);
                 try emitter.print(
                     "    _fmt_a_{d}[{d}u].data = {s}; " ++
-                        "_fmt_a_{d}[{d}u].fmt_fn = _cx_fmt_fn_ty_{d}; " ++
+                        "_fmt_a_{d}[{d}u].fmt_fn = {s}; " ++
                         "_fmt_a_{d}[{d}u].spec.flags_and_fill = (uint32_t)_v_{d}; " ++
                         "_fmt_a_{d}[{d}u].spec.width_or_none = (uint16_t)(((uint32_t)_v_{d}) & 0xFFFFu); " ++
                         "_fmt_a_{d}[{d}u].spec.precision_or_none = (uint16_t)(((uint32_t)_v_{d}) >> 16);\n",
                     .{
                         dst_raw, hole_j, data_expr,
-                        dst_raw, hole_j, hole_ty.toU32(),
+                        dst_raw, hole_j, fmt_fn_c,
                         dst_raw, hole_j, spec_lo_raw,
                         dst_raw, hole_j, spec_hi_raw,
                         dst_raw, hole_j, spec_hi_raw,
@@ -10068,9 +10143,7 @@ fn emitIntrinsicOpC(
             }
         },
         .panic => {
-            if (emitter.cfg.target.isFreestanding() or
-                (emitter.is_in_c_abi_body and !emitter.input.is_oracle_trace_enabled))
-            {
+            if (emitter.cfg.target.isFreestanding()) {
                 try emitter.writeAll("    __builtin_trap();\n");
             } else if (args.len >= 1) {
                 const msg_ty = emitter.input.pool.unwrapUnderlyingType(
@@ -10086,9 +10159,7 @@ fn emitIntrinsicOpC(
             }
         },
         .trap => {
-            if (emitter.cfg.target.isFreestanding() or
-                (emitter.is_in_c_abi_body and !emitter.input.is_oracle_trace_enabled))
-            {
+            if (emitter.cfg.target.isFreestanding()) {
                 try emitter.writeAll("    __builtin_trap();\n");
             } else {
                 try emitter.writeAll("    _cx_rt_trap(0u);\n");
@@ -10609,7 +10680,9 @@ fn lookupCustomFmtBodyIndexC(emitter: *const CModuleEmitter, ty: TypeId, is_debu
                 for (emitter.input.sym_table.getScopeMembers(nom_sym.target_scope)) |mem_idx| {
                     const mem_sym = emitter.input.sym_table.getSymbol(mem_idx).*;
                     if (mem_sym.kind == .fn_sym and std.mem.eql(u8, mem_sym.name_text, target_method)) {
+                        if (is_debug and mem_sym.is_derived) continue;
                         if (resolveBodyIndex(emitter, mem_sym.def_id, mem_idx)) |found_b| {
+                            if (is_debug and emitter.input.bodies[found_b].is_derived) continue;
                             if (emitter.input.bodies[found_b].param_count == 3) return found_b;
                         }
                     }
@@ -10619,6 +10692,7 @@ fn lookupCustomFmtBodyIndexC(emitter: *const CModuleEmitter, ty: TypeId, is_debu
     }
     const dot_suffix = if (is_debug) ".fmt_debug" else ".fmt";
     for (emitter.input.bodies, 0..) |*cand_b, b_idx| {
+        if (is_debug and cand_b.is_derived) continue;
         if (cand_b.param_count != 3 or cand_b.locals.items.len < 4) continue;
         const fn_name = emitter.input.interner.get(cand_b.name);
         if (!std.mem.eql(u8, fn_name, target_method) and !std.mem.endsWith(u8, fn_name, dot_suffix)) continue;
@@ -10708,19 +10782,27 @@ fn emitFmtWriteOpC(
                 const is_ptr_self = db_body.locals.items[1].mode() == .inout_mode or
                     ((p1_tag == .ref_ty or p1_tag == .mut_ref_ty or p1_tag == .raw_ptr_ty) and
                         !emitter.input.pool.isSliceRefType(p1_ty));
+                const p2_ty = emitter.input.pool.unwrapUnderlyingType(db_body.locals.items[2].type_id);
+                const p2_tag = emitter.input.pool.getNode(p2_ty).tag;
+                const out_arg_pfx: []const u8 = if (db_body.locals.items[2].mode() == .inout_mode and
+                    (p2_tag == .ref_ty or p2_tag == .mut_ref_ty or p2_tag == .raw_ptr_ty) and
+                    !emitter.input.pool.isSliceRefType(p2_ty))
+                    "&"
+                else
+                    "";
                 const cand_c = try formatCType(emitter, cand_ty);
                 defer emitter.allocator.free(cand_c);
                 try emitter.print("                    if (_vb_{d} == 0u && _de_{d} == 0u) {{\n", .{ tmp_id, tmp_id });
                 if (is_ptr_self) {
                     try emitter.print(
-                        "                        _v_{d} = {s}(({s} *)_fa_{d}.data, _v_{d}, _fa_{d}.spec);\n",
-                        .{ dst_raw, emitter.body_c_names.items[db_idx], cand_c, tmp_id, args[0], tmp_id },
+                        "                        _v_{d} = {s}(({s} *)_fa_{d}.data, {s}_v_{d}, _fa_{d}.spec);\n",
+                        .{ dst_raw, emitter.body_c_names.items[db_idx], cand_c, tmp_id, out_arg_pfx, args[0], tmp_id },
                     );
                 } else {
                     try emitter.print(
                         "                        {s} _self_v; memcpy(&_self_v, _fa_{d}.data, sizeof(_self_v));\n" ++
-                            "                        _v_{d} = {s}(_self_v, _v_{d}, _fa_{d}.spec);\n",
-                        .{ cand_c, tmp_id, dst_raw, emitter.body_c_names.items[db_idx], args[0], tmp_id },
+                            "                        _v_{d} = {s}(_self_v, {s}_v_{d}, _fa_{d}.spec);\n",
+                        .{ cand_c, tmp_id, dst_raw, emitter.body_c_names.items[db_idx], out_arg_pfx, args[0], tmp_id },
                     );
                 }
                 try emitter.print(
@@ -10737,19 +10819,27 @@ fn emitFmtWriteOpC(
                 const is_ptr_self = gb_body.locals.items[1].mode() == .inout_mode or
                     ((p1_tag == .ref_ty or p1_tag == .mut_ref_ty or p1_tag == .raw_ptr_ty) and
                         !emitter.input.pool.isSliceRefType(p1_ty));
+                const p2_ty = emitter.input.pool.unwrapUnderlyingType(gb_body.locals.items[2].type_id);
+                const p2_tag = emitter.input.pool.getNode(p2_ty).tag;
+                const out_arg_pfx: []const u8 = if (gb_body.locals.items[2].mode() == .inout_mode and
+                    (p2_tag == .ref_ty or p2_tag == .mut_ref_ty or p2_tag == .raw_ptr_ty) and
+                    !emitter.input.pool.isSliceRefType(p2_ty))
+                    "&"
+                else
+                    "";
                 const cand_c = try formatCType(emitter, cand_ty);
                 defer emitter.allocator.free(cand_c);
                 try emitter.print("                    if (!_handled_{d} && (_vb_{d} == 1u || _de_{d} != 0u)) {{\n", .{ tmp_id, tmp_id, tmp_id });
                 if (is_ptr_self) {
                     try emitter.print(
-                        "                        _v_{d} = {s}(({s} *)_fa_{d}.data, _v_{d}, _fa_{d}.spec);\n",
-                        .{ dst_raw, emitter.body_c_names.items[gb_idx], cand_c, tmp_id, args[0], tmp_id },
+                        "                        _v_{d} = {s}(({s} *)_fa_{d}.data, {s}_v_{d}, _fa_{d}.spec);\n",
+                        .{ dst_raw, emitter.body_c_names.items[gb_idx], cand_c, tmp_id, out_arg_pfx, args[0], tmp_id },
                     );
                 } else {
                     try emitter.print(
                         "                        {s} _self_v; memcpy(&_self_v, _fa_{d}.data, sizeof(_self_v));\n" ++
-                            "                        _v_{d} = {s}(_self_v, _v_{d}, _fa_{d}.spec);\n",
-                        .{ cand_c, tmp_id, dst_raw, emitter.body_c_names.items[gb_idx], args[0], tmp_id },
+                            "                        _v_{d} = {s}(_self_v, {s}_v_{d}, _fa_{d}.spec);\n",
+                        .{ cand_c, tmp_id, dst_raw, emitter.body_c_names.items[gb_idx], out_arg_pfx, args[0], tmp_id },
                     );
                 }
                 try emitter.print(
@@ -10769,17 +10859,17 @@ fn emitFmtWriteOpC(
                 "                    _fa_{d}.fmt_fn(&_hb_{d}, _fa_{d}.data, _fa_{d}.spec.flags_and_fill, _shi_{d});\n" ++
                 "                    if (_hb_{d}.len > 0u) {{\n" ++
                 "                        {s} _hws_{d}; _hws_{d}.ptr = _hb_{d}.data; _hws_{d}.len = (uintptr_t)_hb_{d}.len;\n" ++
-                "                        _v_{d} = _v_{d}->_f1(_v_{d}->_f0, _hws_{d});\n" ++
+                "                        _v_{d} = _v_{d}->_f1(_v_{d}->_f0, {s}_hws_{d});\n" ++
                 "                    }}\n" ++
                 "                    free(_hb_{d}.data);\n" ++
                 "                    if (({s}) != 0u) goto _fw_done_{d};\n" ++
                 "                }}\n",
             .{
-                tmp_id,     tmp_id,  tmp_id,  tmp_id, tmp_id, tmp_id,
-                tmp_id,     tmp_id,  tmp_id,  tmp_id, tmp_id, tmp_id,
-                u8_slice_c, tmp_id,  tmp_id,  tmp_id, tmp_id, tmp_id,
-                dst_raw,    args[0], args[0], tmp_id, tmp_id, discr_expr,
-                tmp_id,
+                tmp_id,     tmp_id,         tmp_id,  tmp_id,     tmp_id, tmp_id,
+                tmp_id,     tmp_id,         tmp_id,  tmp_id,     tmp_id, tmp_id,
+                u8_slice_c, tmp_id,         tmp_id,  tmp_id,     tmp_id, tmp_id,
+                dst_raw,    args[0],        args[0], chunk_pass_pfx, tmp_id,
+                tmp_id,     discr_expr,     tmp_id,
             },
         );
     }
@@ -11470,13 +11560,27 @@ fn emitStd01IntrinsicOpC(
             if (args.len < 1) return;
             const lay = try emitter.resolver.resolveType(inst.type_id);
             const n: usize = @intCast(@min(lay.size_bytes, 16));
+            const span_e = try formatWireByteSpanExprs(
+                emitter,
+                body.getInst(MirValueId.fromInt(args[0])).type_id,
+                MirValueId.fromInt(args[0]),
+            );
+            defer emitter.allocator.free(span_e.ptr_expr);
+            defer emitter.allocator.free(span_e.len_expr);
+            try emitter.print(
+                "    if (({s}) < {d}u) _cx_rt_trap({d}u);\n",
+                .{ span_e.len_expr, n, @intFromEnum(mir.MirTrapReason.bounds_check) },
+            );
             if (kind == .from_le_bytes) {
-                try emitter.print("    memcpy(&_v_{d}, &_v_{d}._elems[0], {d}u);\n", .{ dst_raw, args[0], n });
+                try emitter.print("    memcpy(&_v_{d}, {s}, {d}u);\n", .{ dst_raw, span_e.ptr_expr, n });
             } else {
                 const tmp_id = emitter.nextTempId();
-                try emitter.print("    {{ uint8_t _fb_{d}[16];\n", .{tmp_id});
+                try emitter.print(
+                    "    {{ const uint8_t *_fbs_{d} = {s}; uint8_t _fb_{d}[16];\n",
+                    .{ tmp_id, span_e.ptr_expr, tmp_id },
+                );
                 for (0..n) |bi| {
-                    try emitter.print("      _fb_{d}[{d}u] = _v_{d}._elems[{d}u];\n", .{ tmp_id, bi, args[0], n - 1 - bi });
+                    try emitter.print("      _fb_{d}[{d}u] = _fbs_{d}[{d}u];\n", .{ tmp_id, bi, tmp_id, n - 1 - bi });
                 }
                 try emitter.print("      memcpy(&_v_{d}, _fb_{d}, {d}u); }}\n", .{ dst_raw, tmp_id, n });
             }
@@ -11955,9 +12059,19 @@ fn emitEdgeParallelMovesAndGotoC(
     for (0..move_count) |param_k| {
         const param_ty = body.getInst(dst_params[param_k]).type_id;
         if (try isZeroSizedType(emitter, param_ty)) continue;
+        const arg_ty = body.getInst(MirValueId.fromInt(args[param_k])).type_id;
         const param_c = try formatCType(emitter, param_ty);
         defer emitter.allocator.free(param_c);
-        try emitter.print("        {s} _phi_{d} = _v_{d};\n", .{ param_c, param_k, args[param_k] });
+        if (emitter.input.pool.unwrapUnderlyingType(param_ty) == emitter.input.pool.unwrapUnderlyingType(arg_ty)) {
+            try emitter.print("        {s} _phi_{d} = _v_{d};\n", .{ param_c, param_k, args[param_k] });
+        } else {
+            try emitter.print("        {s} _phi_{d};\n", .{ param_c, param_k });
+            const phi_lhs = try std.fmt.allocPrint(emitter.allocator, "_phi_{d}", .{param_k});
+            defer emitter.allocator.free(phi_lhs);
+            const phi_rhs = try std.fmt.allocPrint(emitter.allocator, "_v_{d}", .{args[param_k]});
+            defer emitter.allocator.free(phi_rhs);
+            try emitTypedValueAssignC(emitter, "        ", phi_lhs, param_ty, phi_rhs, arg_ty);
+        }
     }
     for (0..move_count) |param_k| {
         const param_ty = body.getInst(dst_params[param_k]).type_id;
@@ -11977,18 +12091,14 @@ fn emitMirTerminatorC(
 ) !void {
     switch (term.kind) {
         .unreachable_term => {
-            if (emitter.cfg.target.isFreestanding() or
-                (emitter.is_in_c_abi_body and !emitter.input.is_oracle_trace_enabled))
-            {
+            if (emitter.cfg.target.isFreestanding()) {
                 try emitter.writeAll("    __builtin_trap();\n");
             } else {
                 try emitter.writeAll("    _cx_rt_trap(0u);\n");
             }
         },
         .trap => {
-            if (emitter.cfg.target.isFreestanding() or
-                (emitter.is_in_c_abi_body and !emitter.input.is_oracle_trace_enabled))
-            {
+            if (emitter.cfg.target.isFreestanding()) {
                 try emitter.writeAll("    __builtin_trap();\n");
             } else {
                 try emitter.print("    _cx_rt_trap({d}u);\n", .{term.aux_u8});
@@ -12074,6 +12184,22 @@ fn emitMirTerminatorC(
                 const unwrapped_ret_expr = try formatUnwrapTransparentExprC(emitter, body.ret_ty, ret_expr, 0);
                 defer emitter.allocator.free(unwrapped_ret_expr);
                 try emitter.print("    return {s};\n", .{unwrapped_ret_expr});
+            } else if (term.cond_or_val != mir.NONE_U32 and
+                emitter.input.pool.unwrapUnderlyingType(body.ret_ty) !=
+                    emitter.input.pool.unwrapUnderlyingType(body.getInst(MirValueId.fromInt(term.cond_or_val)).type_id))
+            {
+                const ret_c = try formatCType(emitter, body.ret_ty);
+                defer emitter.allocator.free(ret_c);
+                try emitter.print("    {{ {s} _ret_asg;\n", .{ret_c});
+                try emitTypedValueAssignC(
+                    emitter,
+                    "      ",
+                    "_ret_asg",
+                    body.ret_ty,
+                    ret_expr,
+                    body.getInst(MirValueId.fromInt(term.cond_or_val)).type_id,
+                );
+                try emitter.writeAll("      return _ret_asg; }\n");
             } else {
                 try emitter.print("    return {s};\n", .{ret_expr});
             }
@@ -12495,7 +12621,16 @@ fn emitMainEntrypointWrapper(emitter: *CModuleEmitter) !void {
         return;
     }
 
-    try emitter.writeAll("int main(void) {\n    _cx_rt_init();\n");
+    if (hasReferencedRtProcessArgs(emitter) and !emitter.cfg.target.isWasm()) {
+        try emitter.writeAll(
+            "int main(int _cx_argc, char **_cx_argv) {\n" ++
+                "    _cx_rt_argc = (int32_t)_cx_argc;\n" ++
+                "    _cx_rt_argv = (uint8_t **)_cx_argv;\n" ++
+                "    _cx_rt_init();\n",
+        );
+    } else {
+        try emitter.writeAll("int main(void) {\n    _cx_rt_init();\n");
+    }
     if (emitter.input.sim_seed != 0) {
         try emitter.print(
             "    {{ uint64_t _sim_seed = {d}ull; memcpy(&_cx_tls_ctx[{d}u], &_sim_seed, 8u); }}\n",

@@ -74,7 +74,9 @@ pub struct VaList {
 }
 
 /| Single-pointer C `va_list` storage wrapper (`windows`, `aarch64-apple-darwin`, and `wasm32`).
-@cfg(target.os == "windows" or (target.arch == "aarch64" and target.os == "macos") or target.arch == "wasm32")
+@cfg(target.os == "windows"
+    or (target.arch == "aarch64" and target.os == "macos")
+    or target.arch == "wasm32")
 @repr(C)
 @not_send
 pub struct VaList {

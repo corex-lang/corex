@@ -17,7 +17,7 @@ It serves two roles:
 
 ## 2. Cross-Language Capability Matrix
 
-Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `stage0/` + `core/` + `stdlib/cx/` + `vscode-ext-corex` (`Phases 0–11.1c`); **`[v0.0.1]`** = scheduled in `Phases 11.2–12` prior to initial release; **`[0.x]`** = scheduled in `Phase 13.0–13.4` prior to `v1.0.0`.
+Status legend inside CoreX cells: **`[Live]`** = implemented and verified in `stage0/` + `core/` + `stdlib/cx/` + `vscode-ext-corex` (`Phases 0–11.2a`); **`[v0.0.1]`** = scheduled in `Phases 11.2b–12` prior to initial release; **`[0.x]`** = scheduled in `Phase 13.0–13.4` prior to `v1.0.0`.
 
 | Dimension | CoreX | Rust | Zig | C23 / C++23 | Go | Python |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -510,5 +510,36 @@ pub fn write_status(out: &mut Writer, hdr: FrameHeader?, node: str) -> unit!IoEr
 @expect(unused-pkg-visibility, reason: "reserved for sibling wire codec")
 pub(pkg) fn encode_varint_tail(word: u64) -> u8 {
     (word & 0x7F_u64) as u8
+}
+```
+
+### Showcase 13: Zero-Memset `OutBuf`, Capability-Jailed `Dir` & `BatBadBut`-Safe `Command` (`[Live]`)
+
+```cx
+/# Leak-Proof `@linear` OS Descriptors, Confined Opens, and Hardened Process Spawning (`STD-02`)
+
+use cx.fs.Dir;
+use cx.io.{BufReader, IoError};
+use cx.path.Path;
+use cx.process.{Command, Output, Stdio};
+
+/| Reads the first line of `rel_cfg` confined strictly beneath `sandbox_root` (`openat2` / `NtCreateFile`)
+/| using a zero-`memset` `&out` stack buffer, then invokes `tool_exe` (`CVE-2024-24576` `.bat`/`.cmd` blocked).
+pub fn run_sandboxed_tool(sandbox_root: Path, rel_cfg: str, tool_exe: Path) -> Output!IoError {
+    let root_dir = Dir.open(sandbox_root)?;
+    defer root_dir.close();
+
+    var cfg_file = root_dir.open_file_beneath(rel_cfg)?;
+    defer cfg_file.close();
+
+    var raw_buf: [u8; 4_096];
+    var reader = BufReader.over_uninit(cfg_file.as_reader(), &out raw_buf);
+    let flag_line = reader.next_line()? orelse "--check";
+
+    Command
+        .new(tool_exe)
+        .arg(flag_line)
+        .stdout(Stdio.piped())
+        .output()
 }
 ```

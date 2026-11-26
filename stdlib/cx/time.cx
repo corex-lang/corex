@@ -1,0 +1,1484 @@
+/# Overflow-Free Monotonic Clocks, Durations, and System Time (`cx.time`)
+/#
+/# Implements 64-bit nanosecond `Duration` and monotonic `Instant` values, 16-byte signed Unix-epoch
+/# `SystemTime` timestamps, overflow-free `u128` hardware counter scaling, and `sleep` (`STD-02` §2.4).
+/#
+/# Clock queries and sleeps route through `context.reactor` (`ReactorVTable`) for zero-latency
+/# deterministic `corex test --sim` execution before falling back to native OS and WASI clock syscalls.
+
+use cx.async.{
+    IoSubmission,
+    Reactor,
+    ReactorCtx,
+    SIM_OP_SLEEP_NS,
+    SIM_UNHANDLED_SENTINEL,
+};
+
+// ---------------------------------------- TYPES ----------------------------------------
+/| Sub-second nanosecond range refinement (`0..=999_999_999`) shared by `SystemTime`.
+type SubsecNanos = u32 is 0..=999_999_999;
+
+/| Typed C-ABI callback overlay matching the first four words of `ReactorVTable`.
+@repr(C)
+struct TimeReactorSlots {
+    /| Optional monotonic nanosecond clock callback (`word 0`: `monotonic_ns`).
+    monotonic_ns: (extern "C" fn(*mut opaque) -> u64)?,
+    /| Optional signed Unix-epoch nanosecond wall-clock callback (`word 1`: `wall_epoch_ns`).
+    wall_epoch_ns: (extern "C" fn(*mut opaque) -> i64)?,
+    /| Unused PRNG byte-fill slot (`word 2`: `fill_rng`).
+    fill_rng: usize,
+    /| Optional synchronous/simulated I/O and sleep submission callback (`word 3`: `submit_io`).
+    submit_io: (extern "C" fn(*mut opaque, *IoSubmission) -> i64)?,
+}
+
+/| Unsigned 64-bit nanosecond time span (`0 ns .. ~584.5 years`, `8 B`).
+@repr(C) @derive(Copy, Equatable, Comparable, Hash, Default)
+pub struct Duration {
+    /| Total duration in nanoseconds (`0` by default).
+    nanos: u64 = 0,
+}
+
+/| Monotonic non-decreasing timestamp (`8 B` nanosecond counter).
+@repr(C) @derive(Copy, Equatable, Comparable, Hash)
+pub struct Instant {
+    /| Monotonic nanoseconds relative to an arbitrary boot or process origin.
+    mono_ns: u64,
+}
+
+/| Failure reason returned by fallible `SystemTime` interval calculations.
+@derive(Copy, Equatable, Debug)
+pub enum TimeError: u8 {
+    /| Target `SystemTime` precedes the `earlier` reference timestamp (`0`).
+    SystemClockBeforeEarlier = 0,
+    /| Elapsed interval exceeds `Duration.MAX` (`u64.MAX` nanoseconds, `1`).
+    TimestampOverflow = 1,
+}
+
+/| Signed Unix-epoch wall-clock timestamp (`16 B`: `i64` seconds + `0..=999_999_999` nanoseconds).
+@repr(C) @derive(Copy, Equatable, Comparable, Hash)
+pub struct SystemTime {
+    /| Signed whole seconds relative to `1970-01-01T00:00:00Z` (`< 0` before 1970).
+    pub secs: i64,
+    /| Non-negative sub-second nanosecond offset within `[0, 999_999_999]`.
+    pub subsec_nanos: u32 is 0..=999_999_999,
+    /| Explicit trailing alignment padding (`0`, keeping `sizeof(SystemTime) == 16 B`).
+    _pad: u32 = 0,
+}
+
+// --------------------------------------- CONSTS ----------------------------------------
+/| Number of nanoseconds in one microsecond (`1_000`).
+pub const NANOS_PER_MICRO: u64 = 1_000;
+
+/| Number of nanoseconds in one millisecond (`1_000_000`).
+pub const NANOS_PER_MILLI: u64 = 1_000_000;
+
+/| Number of nanoseconds in one second (`1_000_000_000`).
+pub const NANOS_PER_SEC: u64 = 1_000_000_000;
+
+/| Number of microseconds in one second (`1_000_000`).
+pub const MICROS_PER_SEC: u64 = 1_000_000;
+
+/| Number of milliseconds in one second (`1_000`).
+pub const MILLIS_PER_SEC: u64 = 1_000;
+
+/| Multiplier converting `u64` nanoseconds to IEEE-754 `f64` seconds (`1e-9`).
+const NANOS_TO_SECS_F64: f64 = 1.0e-9;
+
+/| Maximum whole seconds representable inside `Duration` (`u64.MAX / 1_000_000_000`).
+const MAX_DURATION_SECS: u64 = 18_446_744_073;
+
+/| Maximum remaining nanoseconds when `whole_secs == MAX_DURATION_SECS` (`u64.MAX % 1_000_000_000`).
+const MAX_DURATION_REM_NANOS: u64 = 709_551_615;
+
+/| Standard Windows 10/11 `QueryPerformanceFrequency` tick rate (`10 MHz`).
+const FREQ_10_MHZ: u64 = 10_000_000;
+
+/| Apple Silicon hardware counter tick rate (`24 MHz`).
+const FREQ_24_MHZ: u64 = 24_000_000;
+
+/| Direct nanosecond tick rate (`1 GHz`).
+const FREQ_1_GHZ: u64 = 1_000_000_000;
+
+/| Dedicated `u64` word index (`offset 248`) inside `256 B` `@tls_alloc_state()` caching QPC / Mach rates.
+const TLS_CLOCK_CACHE_WORD_IDX: usize = 31;
+
+/| Number of 100-ns Win32 `FILETIME` ticks per second (`10_000_000`).
+const FILETIME_TICKS_PER_SEC: u64 = 10_000_000;
+
+/| Unsigned 100-ns ticks between `1601-01-01T00:00:00Z` and `1970-01-01T00:00:00Z`.
+const WIN32_TO_UNIX_EPOCH_TICKS_U64: u64 = 116_444_736_000_000_000;
+
+/| Maximum Win32 `Sleep` chunk (`2_147_483_647 ms`, avoiding `INFINITE = 0xFFFF_FFFF`).
+const WIN32_SLEEP_MAX_CHUNK_MS: u32 = 0x7FFF_FFFF;
+
+/| WASI Preview 1 `ERRNO_INTR` (`27`) returned when `poll_oneoff` is interrupted by signal delivery.
+@cfg(target.os == "wasi")
+const WASI_ERRNO_INTR_CODE: u16 = 27;
+
+// -------------------------------------- INTERNALS --------------------------------------
+// ------------------------ Time Scaling ------------------------
+/| Scales `ticks` at `freq_hz` to nanoseconds with zero `u64` overflow across `584.5` years.
+fn scale_ticks_to_nanos_hz_inner(ticks: u64, freq_hz: u64, /) -> u64 {
+    if freq_hz == 0_u64 {
+        return 0_u64;
+    }
+    if freq_hz == FREQ_10_MHZ {
+        return ticks *| 100_u64;
+    }
+    if freq_hz == FREQ_24_MHZ {
+        let scaled_24m: u128 = ((ticks as u128) *% 125_u128) / 3_u128;
+        return if scaled_24m > (u64.MAX as u128) => u64.MAX else scaled_24m as u64;
+    }
+    if freq_hz == FREQ_1_GHZ {
+        return ticks;
+    }
+    let whole_secs: u64 = ticks / freq_hz;
+    let rem_ticks: u64 = ticks % freq_hz;
+    let rem_nanos = (((rem_ticks as u128) *% 1_000_000_000_u128) / (freq_hz as u128)) as u64;
+    (whole_secs *| NANOS_PER_SEC) +| rem_nanos
+}
+
+/| Scales Darwin Mach `ticks` by `(numer / denom)` to saturating `u64` nanoseconds.
+fn scale_mach_ticks_to_nanos_inner(ticks: u64, numer: u32, denom: u32, /) -> u64 {
+    if denom == 0_u32 {
+        return 0_u64;
+    }
+    if numer == denom {
+        return ticks;
+    }
+    let scaled: u128 = ((ticks as u128) *% (numer as u128)) / (denom as u128);
+    if scaled > (u64.MAX as u128) => u64.MAX else scaled as u64
+}
+
+/| Extracts the active `TimeReactorSlots` pointer from `context.reactor` (`null` when unset).
+fn active_reactor_slots() -> *TimeReactorSlots {
+    let reactor_handle: Reactor = context.reactor;
+    reactor_handle.vtable as *TimeReactorSlots
+}
+
+/| Extracts the active mutable state pointer from `context.reactor_ctx` (`null` when unset).
+fn active_reactor_ctx() -> *mut opaque {
+    let reactor_ctx: ReactorCtx = context.reactor_ctx;
+    reactor_ctx.state
+}
+
+/| Converts signed Unix-epoch nanoseconds `epoch_ns` into Euclidean `(secs, subsec_nanos)`.
+fn system_time_from_epoch_nanos_i64(epoch_ns: i64, /) -> SystemTime {
+    if epoch_ns >= 0 {
+        let pos_ns = epoch_ns as u64;
+        let whole_secs = (pos_ns / NANOS_PER_SEC) as i64;
+        let rem_u32 = (pos_ns % NANOS_PER_SEC) as u32;
+        if rem_u32 <= 999_999_999_u32 {
+            return SystemTime {
+                secs: whole_secs,
+                subsec_nanos: rem_u32.narrow[SubsecNanos](),
+                _pad: 0,
+            };
+        }
+        return SystemTime.UNIX_EPOCH;
+    }
+    let mag_ns: u64 = 0_u64 -% (epoch_ns as u64);
+    let quot_u64: u64 = mag_ns / NANOS_PER_SEC;
+    let rem_u64: u64 = mag_ns % NANOS_PER_SEC;
+    if rem_u64 == 0_u64 {
+        return SystemTime {
+            secs: 0_i64 -% (quot_u64 as i64),
+            subsec_nanos: 0,
+            _pad: 0,
+        };
+    }
+    let subsec_u32 = (NANOS_PER_SEC -% rem_u64) as u32;
+    if subsec_u32 <= 999_999_999_u32 {
+        return SystemTime {
+            secs: 0_i64 -% ((quot_u64 +% 1_u64) as i64),
+            subsec_nanos: subsec_u32.narrow[SubsecNanos](),
+            _pad: 0,
+        };
+    }
+    SystemTime.UNIX_EPOCH
+}
+
+/| Normalizes POSIX `(tv_sec, tv_nsec)` into Euclidean `SystemTime` (`subsec_nanos in 0..=999_999_999`).
+fn system_time_from_posix_timespec(tv_sec: i64, tv_nsec: i64, /) -> SystemTime {
+    if tv_nsec >= 0 and tv_nsec <= 999_999_999 {
+        let nsec_u32 = tv_nsec as u32;
+        if nsec_u32 <= 999_999_999_u32 {
+            return SystemTime {
+                secs: tv_sec,
+                subsec_nanos: nsec_u32.narrow[SubsecNanos](),
+                _pad: 0,
+            };
+        }
+    }
+    if tv_nsec > 999_999_999 {
+        let extra_ns = tv_nsec as u64;
+        let add_secs = (extra_ns / NANOS_PER_SEC) as i64;
+        let rem_u32 = (extra_ns % NANOS_PER_SEC) as u32;
+        if rem_u32 <= 999_999_999_u32 {
+            return SystemTime {
+                secs: tv_sec +| add_secs,
+                subsec_nanos: rem_u32.narrow[SubsecNanos](),
+                _pad: 0,
+            };
+        }
+    }
+    let mag_ns: u64 = 0_u64 -% (tv_nsec as u64);
+    let borrow_secs: u64 = mag_ns / NANOS_PER_SEC;
+    let rem_ns: u64 = mag_ns % NANOS_PER_SEC;
+    if rem_ns == 0_u64 {
+        return SystemTime {
+            secs: tv_sec -| (borrow_secs as i64),
+            subsec_nanos: 0,
+            _pad: 0,
+        };
+    }
+    let subsec_u32 = (NANOS_PER_SEC -% rem_ns) as u32;
+    if subsec_u32 <= 999_999_999_u32 {
+        return SystemTime {
+            secs: tv_sec -| ((borrow_secs +% 1_u64) as i64),
+            subsec_nanos: subsec_u32.narrow[SubsecNanos](),
+            _pad: 0,
+        };
+    }
+    SystemTime.UNIX_EPOCH
+}
+
+/| Converts Win32 100-ns `FILETIME` ticks since `1601-01-01T00:00:00Z` into Euclidean `SystemTime`.
+fn system_time_from_win32_filetime(filetime_ticks: u64, /) -> SystemTime {
+    if filetime_ticks >= WIN32_TO_UNIX_EPOCH_TICKS_U64 {
+        let unix_ticks: u64 = filetime_ticks -% WIN32_TO_UNIX_EPOCH_TICKS_U64;
+        let whole_secs = (unix_ticks / FILETIME_TICKS_PER_SEC) as i64;
+        let subsec_u32 = ((unix_ticks % FILETIME_TICKS_PER_SEC) *% 100_u64) as u32;
+        if subsec_u32 <= 999_999_999_u32 {
+            return SystemTime {
+                secs: whole_secs,
+                subsec_nanos: subsec_u32.narrow[SubsecNanos](),
+                _pad: 0,
+            };
+        }
+        return SystemTime.UNIX_EPOCH;
+    }
+    let deficit_ticks: u64 = WIN32_TO_UNIX_EPOCH_TICKS_U64 -% filetime_ticks;
+    let quot_secs: u64 = deficit_ticks / FILETIME_TICKS_PER_SEC;
+    let rem_ticks: u64 = deficit_ticks % FILETIME_TICKS_PER_SEC;
+    if rem_ticks == 0_u64 {
+        return SystemTime {
+            secs: 0_i64 -% (quot_secs as i64),
+            subsec_nanos: 0,
+            _pad: 0,
+        };
+    }
+    let subsec_u32 = ((FILETIME_TICKS_PER_SEC -% rem_ticks) *% 100_u64) as u32;
+    if subsec_u32 <= 999_999_999_u32 {
+        return SystemTime {
+            secs: 0_i64 -% ((quot_secs +% 1_u64) as i64),
+            subsec_nanos: subsec_u32.narrow[SubsecNanos](),
+            _pad: 0,
+        };
+    }
+    SystemTime.UNIX_EPOCH
+}
+
+// -------------------- Duration Formatting ---------------------
+/| Writes `byte_val` into `out_buf` at `pos` when in bounds.
+fn set_ascii_byte(out_buf: &mut [u8], pos: usize, byte_val: u8, /) {
+    if pos < out_buf.len() {
+        out_buf[pos] = byte_val;
+    }
+}
+
+/| Appends `byte_val` to `out_buf` at `pos` when in bounds, returning the updated cursor.
+fn push_ascii_byte(out_buf: &mut [u8], pos: usize, byte_val: u8, /) -> usize {
+    if pos < out_buf.len() {
+        out_buf[pos] = byte_val;
+        return pos +% 1_usize;
+    }
+    pos
+}
+
+/| Reads the byte at `pos` from `in_buf` when in bounds (`0` otherwise).
+fn read_ascii_byte(in_buf: &[u8], pos: usize, /) -> u8 {
+    if pos < in_buf.len() {
+        return in_buf[pos];
+    }
+    0_u8
+}
+
+/| Appends unsigned decimal `val` into `out_buf` starting at `start_pos`, returning the updated cursor.
+fn append_u64_decimal(out_buf: &mut [u8], start_pos: usize, val: u64, /) -> usize {
+    if val == 0_u64 {
+        return push_ascii_byte(out_buf, start_pos, b'0');
+    }
+    var rev_digits: [u8; 20] = [0_u8; 20];
+    var dig_count: usize = 0;
+    var rem: u64 = val;
+    while rem > 0_u64 and dig_count < 20_usize {
+        let next_quo: u64 = rem / 10_u64;
+        let digit = (rem -% (next_quo *% 10_u64)) as u8;
+        dig_count = push_ascii_byte(&mut rev_digits, dig_count, b'0' +% digit);
+        rem = next_quo;
+    }
+    var pos: usize = start_pos;
+    var idx: usize = dig_count;
+    while idx > 0_usize {
+        let read_idx: usize = idx -% 1_usize;
+        idx = read_idx;
+        pos = push_ascii_byte(out_buf, pos, read_ascii_byte(&rev_digits, read_idx));
+    }
+    pos
+}
+
+/| Formats `nanos` into stack `out_buf` (`<= 23 B`) using human-readable `ns` / `us` / `ms` / `s` units.
+fn format_duration_human(
+    out_buf: &mut [u8],
+    nanos: u64,
+    precision_opt: u16?,
+    /,
+) -> usize {
+    var whole_val: u64 = nanos;
+    var frac_val: u64 = 0;
+    var frac_width: usize = 0;
+    var unit_first = b'n';
+    var has_two_char_unit = true;
+
+    if nanos >= NANOS_PER_SEC {
+        whole_val = nanos / NANOS_PER_SEC;
+        frac_val = nanos % NANOS_PER_SEC;
+        frac_width = 9;
+        unit_first = b's';
+        has_two_char_unit = false;
+    } else if nanos >= NANOS_PER_MILLI {
+        whole_val = nanos / NANOS_PER_MILLI;
+        frac_val = nanos % NANOS_PER_MILLI;
+        frac_width = 6;
+        unit_first = b'm';
+    } else if nanos >= NANOS_PER_MICRO {
+        whole_val = nanos / NANOS_PER_MICRO;
+        frac_val = nanos % NANOS_PER_MICRO;
+        frac_width = 3;
+        unit_first = b'u';
+    }
+
+    var pos: usize = append_u64_decimal(out_buf, 0, whole_val);
+    var frac_digits: [u8; 9] = [b'0'; 9];
+    if frac_width > 0_usize {
+        var rem_frac: u64 = frac_val;
+        var fill_i: usize = frac_width;
+        while fill_i > 0_usize {
+            let slot_i: usize = fill_i -% 1_usize;
+            fill_i = slot_i;
+            let next_fq: u64 = rem_frac / 10_u64;
+            let fdig = (rem_frac -% (next_fq *% 10_u64)) as u8;
+            set_ascii_byte(&mut frac_digits, slot_i, b'0' +% fdig);
+            rem_frac = next_fq;
+        }
+    }
+
+    var emit_frac_len: usize = 0;
+    if precision_opt is .Some(prec_u16) {
+        emit_frac_len = if prec_u16 > 9_u16 => 9_usize else prec_u16 as usize;
+    } else if frac_width > 0_usize {
+        var trimmed: usize = if frac_width > 9_usize => 9_usize else frac_width;
+        while trimmed > 0_usize {
+            let prev_idx: usize = trimmed -% 1_usize;
+            if read_ascii_byte(&frac_digits, prev_idx) == b'0' {
+                trimmed = prev_idx;
+            } else {
+                break;
+            }
+        }
+        emit_frac_len = trimmed;
+    }
+
+    if emit_frac_len > 0_usize {
+        pos = push_ascii_byte(out_buf, pos, b'.');
+        var frac_i: usize = 0;
+        while frac_i < emit_frac_len and frac_i < 9_usize {
+            pos = push_ascii_byte(out_buf, pos, read_ascii_byte(&frac_digits, frac_i));
+            frac_i += 1_usize;
+        }
+    }
+
+    pos = push_ascii_byte(out_buf, pos, unit_first);
+    if has_two_char_unit {
+        pos = push_ascii_byte(out_buf, pos, b's');
+    }
+    pos
+}
+
+// ----------------- OS Clock & Sleep Backends ------------------
+/| Queries `CLOCK_MONOTONIC` on Linux and converts to saturating `u64` nanoseconds.
+@cfg(target.os == "linux")
+fn host_monotonic_nanos() -> u64 {
+    var ts = core.sys.linux.PosixTimespec { tv_sec: 0, tv_nsec: 0 };
+    let rc: i32 = unsafe {
+        core.sys.linux.linux_clock_gettime(core.sys.linux.CLOCK_MONOTONIC, &raw mut ts)
+    };
+    if rc != 0 or ts.tv_sec < 0 or ts.tv_nsec < 0 {
+        return 0_u64;
+    }
+    return ((ts.tv_sec as u64) *| NANOS_PER_SEC) +| (ts.tv_nsec as u64);
+}
+
+/| Queries `mach_continuous_time()` on macOS and scales via atomic-cached `mach_timebase_info`.
+@cfg(target.os == "macos")
+fn host_monotonic_nanos() -> u64 {
+    let raw_ticks: u64 = unsafe {
+        core.sys.macos.darwin_mach_continuous_time()
+    };
+    let tls_raw: *mut opaque = @tls_alloc_state();
+    if not tls_raw.is_null() {
+        let cache_slot: *mut u64 = unsafe {
+            (tls_raw as *mut u64).add(TLS_CLOCK_CACHE_WORD_IDX)
+        };
+        let cached: u64 = unsafe {
+            @atomic_load(cache_slot as *u64, 2_u8)
+        };
+        if cached != 0_u64 {
+            let cached_numer = (cached >> 32_u64) as u32;
+            let cached_denom = (cached & 0xFFFF_FFFF_u64) as u32;
+            if cached_denom != 0_u32 {
+                return scale_mach_ticks_to_nanos_inner(raw_ticks, cached_numer, cached_denom);
+            }
+        }
+        var info = core.sys.macos.DarwinMachTimebaseInfo { numer: 1, denom: 1 };
+        unsafe {
+            _ = core.sys.macos.darwin_mach_timebase_info(&raw mut info);
+        }
+        let safe_numer: u32 = if info.numer == 0_u32 => 1_u32 else info.numer;
+        let safe_denom: u32 = if info.denom == 0_u32 => 1_u32 else info.denom;
+        let packed: u64 = ((safe_numer as u64) << 32_u64) | (safe_denom as u64);
+        unsafe {
+            @atomic_store(cache_slot, packed, 3_u8);
+        }
+        return scale_mach_ticks_to_nanos_inner(raw_ticks, safe_numer, safe_denom);
+    }
+    var fallback_info = core.sys.macos.DarwinMachTimebaseInfo { numer: 1, denom: 1 };
+    unsafe {
+        _ = core.sys.macos.darwin_mach_timebase_info(&raw mut fallback_info);
+    }
+    let fb_numer: u32 = if fallback_info.numer == 0_u32 => 1_u32 else fallback_info.numer;
+    let fb_denom: u32 = if fallback_info.denom == 0_u32 => 1_u32 else fallback_info.denom;
+    scale_mach_ticks_to_nanos_inner(raw_ticks, fb_numer, fb_denom)
+}
+
+/| Queries `QueryPerformanceCounter` on Windows and scales via atomic-cached `QueryPerformanceFrequency`.
+@cfg(target.os == "windows")
+fn host_monotonic_nanos() -> u64 {
+    var raw_counter: i64 = 0;
+    let ok_cnt: i32 = unsafe {
+        core.sys.windows.win32_query_performance_counter(&raw mut raw_counter)
+    };
+    if ok_cnt == 0 or raw_counter <= 0 {
+        return 0_u64;
+    }
+    let tls_raw: *mut opaque = @tls_alloc_state();
+    if not tls_raw.is_null() {
+        let cache_slot: *mut u64 = unsafe {
+            (tls_raw as *mut u64).add(TLS_CLOCK_CACHE_WORD_IDX)
+        };
+        let cached_hz: u64 = unsafe {
+            @atomic_load(cache_slot as *u64, 2_u8)
+        };
+        if cached_hz != 0_u64 {
+            return scale_ticks_to_nanos_hz_inner(raw_counter as u64, cached_hz);
+        }
+        var raw_freq: i64 = 0;
+        let ok_freq: i32 = unsafe {
+            core.sys.windows.win32_query_performance_frequency(&raw mut raw_freq)
+        };
+        let resolved_hz: u64 = if ok_freq != 0 and raw_freq > 0 => raw_freq as u64 else FREQ_10_MHZ;
+        unsafe {
+            @atomic_store(cache_slot, resolved_hz, 3_u8);
+        }
+        return scale_ticks_to_nanos_hz_inner(raw_counter as u64, resolved_hz);
+    }
+    var fallback_freq: i64 = 0;
+    let ok_fb: i32 = unsafe {
+        core.sys.windows.win32_query_performance_frequency(&raw mut fallback_freq)
+    };
+    let fb_hz: u64 = if ok_fb != 0 and fallback_freq > 0 => fallback_freq as u64 else FREQ_10_MHZ;
+    scale_ticks_to_nanos_hz_inner(raw_counter as u64, fb_hz)
+}
+
+/| Queries `WASI_CLOCKID_MONOTONIC` (`precision = 1 ns`) on `wasm32-wasi`.
+@cfg(target.os == "wasi")
+fn host_monotonic_nanos() -> u64 {
+    var out_ns: u64 = 0;
+    let errno_rc: u16 = unsafe {
+        core.sys.wasi.wasi_clock_time_get(
+            core.sys.wasi.WASI_CLOCKID_MONOTONIC,
+            1_u64,
+            &raw mut out_ns,
+        )
+    };
+    if errno_rc == core.sys.wasi.WASI_ERRNO_SUCCESS => out_ns else 0_u64
+}
+
+/| Returns `0` on freestanding targets lacking an OS monotonic clock.
+@cfg(target.os == "freestanding")
+fn host_monotonic_nanos() -> u64 = 0_u64;
+
+/| Queries `CLOCK_REALTIME` on Linux and normalizes to `SystemTime`.
+@cfg(target.os == "linux")
+fn host_system_time_now() -> SystemTime {
+    var ts = core.sys.linux.PosixTimespec { tv_sec: 0, tv_nsec: 0 };
+    let rc: i32 = unsafe {
+        core.sys.linux.linux_clock_gettime(core.sys.linux.CLOCK_REALTIME, &raw mut ts)
+    };
+    if rc != 0 {
+        return SystemTime.UNIX_EPOCH;
+    }
+    system_time_from_posix_timespec(ts.tv_sec, ts.tv_nsec)
+}
+
+/| Queries `CLOCK_REALTIME` on macOS and normalizes to `SystemTime`.
+@cfg(target.os == "macos")
+fn host_system_time_now() -> SystemTime {
+    var ts = core.sys.macos.PosixTimespec { tv_sec: 0, tv_nsec: 0 };
+    let rc: i32 = unsafe {
+        core.sys.macos.darwin_clock_gettime(core.sys.macos.CLOCK_REALTIME, &raw mut ts)
+    };
+    if rc != 0 {
+        return SystemTime.UNIX_EPOCH;
+    }
+    system_time_from_posix_timespec(ts.tv_sec, ts.tv_nsec)
+}
+
+/| Queries `GetSystemTimePreciseAsFileTime` on Windows and converts to Unix-epoch `SystemTime`.
+@cfg(target.os == "windows")
+fn host_system_time_now() -> SystemTime {
+    var ft = core.sys.windows.Win32FileTime { low_date_time: 0, high_date_time: 0 };
+    unsafe {
+        core.sys.windows.win32_get_system_time_precise_as_file_time(&raw mut ft);
+    }
+    let raw_ticks: u64 = (ft.low_date_time as u64) | ((ft.high_date_time as u64) << 32_u64);
+    system_time_from_win32_filetime(raw_ticks)
+}
+
+/| Queries `WASI_CLOCKID_REALTIME` (`precision = 1_000 ns`) on `wasm32-wasi`.
+@cfg(target.os == "wasi")
+fn host_system_time_now() -> SystemTime {
+    var out_ns: u64 = 0;
+    let errno_rc: u16 = unsafe {
+        core.sys.wasi.wasi_clock_time_get(
+            core.sys.wasi.WASI_CLOCKID_REALTIME,
+            1_000_u64,
+            &raw mut out_ns,
+        )
+    };
+    if errno_rc != core.sys.wasi.WASI_ERRNO_SUCCESS {
+        return SystemTime.UNIX_EPOCH;
+    }
+    let whole_secs = (out_ns / NANOS_PER_SEC) as i64;
+    let rem_u32 = (out_ns % NANOS_PER_SEC) as u32;
+    if rem_u32 <= 999_999_999_u32 {
+        return SystemTime {
+            secs: whole_secs,
+            subsec_nanos: rem_u32.narrow[SubsecNanos](),
+            _pad: 0,
+        };
+    }
+    SystemTime.UNIX_EPOCH
+}
+
+/| Returns `SystemTime.UNIX_EPOCH` on freestanding targets lacking an OS wall clock.
+@cfg(target.os == "freestanding")
+fn host_system_time_now() -> SystemTime = SystemTime.UNIX_EPOCH;
+
+/| Sleeps for non-zero `dur` on Linux via `nanosleep`, recomputing monotonic `deadline` remainder on `EINTR`.
+@cfg(target.os == "linux")
+fn host_sleep_nonzero(dur: Duration, /) {
+    let deadline: Instant = Instant.now().saturating_add(dur);
+    var remaining: Duration = dur;
+    while not remaining.is_zero() {
+        let req = core.sys.linux.PosixTimespec {
+            tv_sec: (remaining.nanos / NANOS_PER_SEC) as i64,
+            tv_nsec: (remaining.nanos % NANOS_PER_SEC) as i64,
+        };
+        var rem = core.sys.linux.PosixTimespec { tv_sec: 0, tv_nsec: 0 };
+        let rc: i32 = unsafe {
+            core.sys.linux.linux_nanosleep(&raw req, &raw mut rem)
+        };
+        if rc == 0 {
+            return;
+        }
+        let err_ptr = unsafe {
+            core.sys.linux.linux_errno_location()
+        };
+        if err_ptr.is_null() {
+            return;
+        }
+        let err_code: i32 = unsafe {
+            err_ptr.*
+        };
+        if err_code != core.sys.linux.EINTR {
+            return;
+        }
+        remaining = deadline.duration_since(Instant.now());
+    }
+}
+
+/| Sleeps for non-zero `dur` on macOS via `nanosleep`, recomputing monotonic `deadline` remainder on `EINTR`.
+@cfg(target.os == "macos")
+fn host_sleep_nonzero(dur: Duration, /) {
+    let deadline: Instant = Instant.now().saturating_add(dur);
+    var remaining: Duration = dur;
+    while not remaining.is_zero() {
+        let req = core.sys.macos.PosixTimespec {
+            tv_sec: (remaining.nanos / NANOS_PER_SEC) as i64,
+            tv_nsec: (remaining.nanos % NANOS_PER_SEC) as i64,
+        };
+        var rem = core.sys.macos.PosixTimespec { tv_sec: 0, tv_nsec: 0 };
+        let rc: i32 = unsafe {
+            core.sys.macos.darwin_nanosleep(&raw req, &raw mut rem)
+        };
+        if rc == 0 {
+            return;
+        }
+        let err_ptr = unsafe {
+            core.sys.macos.darwin_errno_location()
+        };
+        if err_ptr.is_null() {
+            return;
+        }
+        let err_code: i32 = unsafe {
+            err_ptr.*
+        };
+        if err_code != core.sys.macos.EINTR {
+            return;
+        }
+        remaining = deadline.duration_since(Instant.now());
+    }
+}
+
+/| Sleeps for non-zero `dur` on Windows in `<= 0x7FFF_FFFF ms` chunks with sub-ms ceiling rounding.
+@cfg(target.os == "windows")
+fn host_sleep_nonzero(dur: Duration, /) {
+    let whole_ms: u64 = dur.nanos / NANOS_PER_MILLI;
+    let sub_ms_ns: u64 = dur.nanos % NANOS_PER_MILLI;
+    var rem_ms: u64 = if sub_ms_ns > 0_u64 => whole_ms +| 1_u64 else whole_ms;
+    let max_chunk = WIN32_SLEEP_MAX_CHUNK_MS as u64;
+    while rem_ms > 0_u64 {
+        let chunk_ms: u32 = if rem_ms > max_chunk => WIN32_SLEEP_MAX_CHUNK_MS else rem_ms as u32;
+        unsafe {
+            core.sys.windows.win32_sleep(chunk_ms);
+        }
+        rem_ms -= chunk_ms as u64;
+    }
+}
+
+/| Sleeps for non-zero `dur` on `wasm32-wasi` via `poll_oneoff`, recomputing monotonic `deadline` remainder on `EINTR`.
+@cfg(target.os == "wasi")
+fn host_sleep_nonzero(dur: Duration, /) {
+    let deadline: Instant = Instant.now().saturating_add(dur);
+    var remaining: Duration = dur;
+    while not remaining.is_zero() {
+        let sub = core.sys.wasi.WasiSubscription {
+            userdata: 0_u64,
+            event_tag: core.sys.wasi.WASI_EVENTTYPE_CLOCK,
+            pad0: [0_u8; 7],
+            clock_or_fd: core.sys.wasi.WasiSubscriptionClock {
+                clock_id: core.sys.wasi.WASI_CLOCKID_MONOTONIC,
+                pad0: 0_u32,
+                timeout: remaining.nanos,
+                precision: 1_000_u64,
+                flags: 0_u16,
+                pad1: [0_u16; 3],
+            },
+        };
+        var evt = core.sys.wasi.WasiEvent {
+            userdata: 0_u64,
+            error_code: 0_u16,
+            event_type: 0_u8,
+            pad0: [0_u8; 5],
+            nbytes: 0_u64,
+            rw_flags: 0_u16,
+            pad1: [0_u16; 3],
+        };
+        var nevents: usize = 0;
+        let poll_rc: u16 = unsafe {
+            core.sys.wasi.wasi_poll_oneoff(&raw sub, &raw mut evt, 1_usize, &raw mut nevents)
+        };
+        if poll_rc != WASI_ERRNO_INTR_CODE
+            and (
+                poll_rc != core.sys.wasi.WASI_ERRNO_SUCCESS
+                    or nevents == 0_usize
+                    or evt.error_code != WASI_ERRNO_INTR_CODE
+            ) {
+            return;
+        }
+        remaining = deadline.duration_since(Instant.now());
+    }
+}
+
+/| No-op sleep stub on freestanding targets.
+@cfg(target.os == "freestanding")
+fn host_sleep_nonzero(dur: Duration, /) {
+    _ = dur;
+}
+
+// ------------------------------------- PUBLIC API --------------------------------------
+// -------------------------- Duration --------------------------
+impl Duration {
+    /| Zero-length duration (`0 ns`).
+    pub const ZERO: Duration = Duration { nanos: 0 };
+
+    /| Maximum representable `Duration` (`u64.MAX` nanoseconds, `~584.5` years).
+    pub const MAX: Duration = Duration { nanos: u64.MAX };
+
+    /| Constructs a `Duration` from exact `nanos` nanoseconds.
+    @no_alloc @no_panic
+    pub fn from_nanos(nanos: u64, /) -> Duration = Duration { nanos };
+
+    /| Constructs a `Duration` from `micros` microseconds, saturating at `Duration.MAX`.
+    @no_alloc @no_panic
+    pub fn from_micros(micros: u64, /) -> Duration = Duration { nanos: micros *| NANOS_PER_MICRO };
+
+    /| Constructs a `Duration` from `millis` milliseconds, saturating at `Duration.MAX`.
+    @no_alloc @no_panic
+    pub fn from_millis(millis: u64, /) -> Duration = Duration { nanos: millis *| NANOS_PER_MILLI };
+
+    /| Constructs a `Duration` from `secs` whole seconds, saturating at `Duration.MAX`.
+    @no_alloc @no_panic
+    pub fn from_secs(secs: u64, /) -> Duration = Duration { nanos: secs *| NANOS_PER_SEC };
+
+    /| Returns the total number of nanoseconds in `self`.
+    @no_alloc @no_panic
+    pub fn as_nanos(self) -> u64 = self.nanos;
+
+    /| Returns the total number of whole microseconds in `self` (`nanos / 1_000`).
+    @no_alloc @no_panic
+    pub fn as_micros(self) -> u64 = self.nanos / NANOS_PER_MICRO;
+
+    /| Returns the total number of whole milliseconds in `self` (`nanos / 1_000_000`).
+    @no_alloc @no_panic
+    pub fn as_millis(self) -> u64 = self.nanos / NANOS_PER_MILLI;
+
+    /| Returns the total number of whole seconds in `self` (`nanos / 1_000_000_000`).
+    @no_alloc @no_panic
+    pub fn as_secs(self) -> u64 = self.nanos / NANOS_PER_SEC;
+
+    /| Returns the fractional nanosecond part of `self` in `0..=999_999_999`.
+    @no_alloc @no_panic
+    pub fn subsec_nanos(self) -> u32 = (self.nanos % NANOS_PER_SEC) as u32;
+
+    /| Returns the fractional microsecond part of `self` in `0..=999_999`.
+    @no_alloc @no_panic
+    pub fn subsec_micros(self) -> u32 = ((self.nanos % NANOS_PER_SEC) / NANOS_PER_MICRO) as u32;
+
+    /| Returns the fractional millisecond part of `self` in `0..=999`.
+    @no_alloc @no_panic
+    pub fn subsec_millis(self) -> u32 = ((self.nanos % NANOS_PER_SEC) / NANOS_PER_MILLI) as u32;
+
+    /| Converts `self` to floating-point seconds (`nanos * 1e-9`).
+    @no_alloc @no_panic
+    pub fn as_secs_f64(self) -> f64 = (self.nanos as f64) * NANOS_TO_SECS_F64;
+
+    /| Returns `true` iff `self` equals `Duration.ZERO`.
+    @no_alloc @no_panic
+    pub fn is_zero(self) -> bool = self.nanos == 0_u64;
+
+    /| Computes `self + rhs`, returning `.None` on `u64` nanosecond overflow.
+    @inline @no_alloc @no_panic
+    pub fn checked_add(self, rhs: Duration, /) -> Duration? {
+        let sum_ns: u64 = self.nanos +% rhs.nanos;
+        if sum_ns < self.nanos => .None else .Some(Duration { nanos: sum_ns })
+    }
+
+    /| Computes `self - rhs`, returning `.None` when `self < rhs`.
+    @inline @no_alloc @no_panic
+    pub fn checked_sub(self, rhs: Duration, /) -> Duration? {
+        if self.nanos < rhs.nanos => .None else .Some(Duration { nanos: self.nanos -% rhs.nanos })
+    }
+
+    /| Computes `self + rhs`, saturating at `Duration.MAX` on overflow.
+    @no_alloc @no_panic
+    pub fn saturating_add(self, rhs: Duration, /) -> Duration =
+        Duration { nanos: self.nanos +| rhs.nanos };
+
+    /| Computes `self - rhs`, saturating at `Duration.ZERO` when `self < rhs`.
+    @no_alloc @no_panic
+    pub fn saturating_sub(self, rhs: Duration, /) -> Duration =
+        Duration { nanos: self.nanos -| rhs.nanos };
+
+    /| Multiplies `self` by scalar `factor`, saturating at `Duration.MAX` on overflow.
+    @no_alloc @no_panic
+    pub fn saturating_mul(self, factor: u32, /) -> Duration =
+        Duration { nanos: self.nanos *| (factor as u64) };
+}
+
+impl Display for Duration {
+    /| Formats `self` as a zero-allocation human-readable unit string (`450ns`, `12.345ms`, `1.5s`).
+    @no_alloc
+    pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        var raw_buf: [u8; 32] = [0_u8; 32];
+        let written: usize = format_duration_human(&mut raw_buf, self.*.nanos, spec.precision());
+        if written <= 32_usize {
+            return out.write_padded(raw_buf[0..written], spec);
+        }
+        .Ok(())
+    }
+}
+
+impl Debug for Duration {
+    /| Formats `self` in developer debug output using its human-readable unit representation.
+    @no_alloc
+    pub fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        self.fmt(out, spec)
+    }
+}
+
+impl TrivialDrop for Duration {}
+
+// -------------------------- Instant ---------------------------
+impl Instant {
+    /| Queries the active `context.reactor` virtual clock or host OS monotonic clock (`@no_alloc @no_panic`).
+    @std_cap_boundary(emits: [clock], clears: [
+        ffi,
+        unsafe_op,
+        indirect_opaque,
+        alloc,
+        may_panic,
+        blocking_sync,
+    ],)
+    @inline @no_alloc @no_panic
+    pub fn now() -> Instant {
+        // [1] Route through `context.reactor` when a virtual/proactor clock hook is installed:
+        let slots_ptr: *TimeReactorSlots = active_reactor_slots();
+        if not slots_ptr.is_null() {
+            let mono_opt = unsafe {
+                slots_ptr.*.monotonic_ns
+            };
+            if mono_opt is .Some(mono_cb) {
+                let virtual_ns: u64 = unsafe {
+                    mono_cb(active_reactor_ctx())
+                };
+                return Instant { mono_ns: virtual_ns };
+            }
+        }
+
+        // [2] Query host OS or WASI monotonic hardware clock:
+        Instant { mono_ns: host_monotonic_nanos() }
+    }
+
+    /| Constructs an `Instant` directly from raw monotonic nanoseconds (`cx` package internal).
+    @expect(unused-pkg-visibility, reason: "used by cx.fs and cx.bench in Phase 11.2a–11.3")
+    pub(pkg) fn from_raw_nanos(mono_ns: u64, /) -> Instant = Instant { mono_ns };
+
+    /| Extracts the raw monotonic nanosecond count (`cx` package internal).
+    @expect(unused-pkg-visibility, reason: "used by cx.fs and cx.bench in Phase 11.2a–11.3")
+    pub(pkg) fn as_raw_nanos(self) -> u64 = self.mono_ns;
+
+    /| Returns the time elapsed from `earlier` to `self`, saturating to `Duration.ZERO` if `self < earlier`.
+    @no_alloc @no_panic
+    pub fn duration_since(self, earlier: Instant, /) -> Duration =
+        Duration { nanos: self.mono_ns -| earlier.mono_ns };
+
+    /| Returns the time elapsed from `earlier` to `self`, or `.None` if `self < earlier`.
+    @inline @no_alloc @no_panic
+    pub fn checked_duration_since(self, earlier: Instant, /) -> Duration? {
+        if self.mono_ns < earlier.mono_ns {
+            return .None;
+        }
+        .Some(Duration { nanos: self.mono_ns -% earlier.mono_ns })
+    }
+
+    /| Returns the monotonic `Duration` elapsed since `self` was captured (`Instant.now() - self`).
+    @no_alloc @no_panic
+    pub fn elapsed(self) -> Duration = Instant.now().duration_since(self);
+
+    /| Advances `self` by `dur`, returning `.None` on `u64` nanosecond overflow.
+    @inline @no_alloc @no_panic
+    pub fn checked_add(self, dur: Duration, /) -> Instant? {
+        let sum_ns: u64 = self.mono_ns +% dur.nanos;
+        if sum_ns < self.mono_ns => .None else .Some(Instant { mono_ns: sum_ns })
+    }
+
+    /| Rewinds `self` by `dur`, returning `.None` on underflow below monotonic origin `0`.
+    @inline @no_alloc @no_panic
+    pub fn checked_sub(self, dur: Duration, /) -> Instant? {
+        if self.mono_ns < dur.nanos {
+            return .None;
+        }
+        .Some(Instant { mono_ns: self.mono_ns -% dur.nanos })
+    }
+
+    /| Advances `self` by `dur`, saturating at `u64.MAX` nanoseconds.
+    @no_alloc @no_panic
+    pub fn saturating_add(self, dur: Duration, /) -> Instant =
+        Instant { mono_ns: self.mono_ns +| dur.nanos };
+
+    /| Rewinds `self` by `dur`, saturating at `0` nanoseconds.
+    @no_alloc @no_panic
+    pub fn saturating_sub(self, dur: Duration, /) -> Instant =
+        Instant { mono_ns: self.mono_ns -| dur.nanos };
+}
+
+impl Debug for Instant {
+    /| Formats `self` as `Instant(<mono_ns>ns)` into `out`.
+    @no_alloc
+    pub fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        _ = spec;
+        @fmt_write(out, f"Instant({self.*.mono_ns}ns)")
+    }
+}
+
+impl TrivialDrop for Instant {}
+
+// ------------------- SystemTime & TimeError -------------------
+impl Display for TimeError {
+    /| Streams a concise human-readable description of `self` into `out`.
+    @no_alloc
+    pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        let msg: str = match self.* {
+            .SystemClockBeforeEarlier => "system clock timestamp precedes earlier reference timestamp",
+            .TimestampOverflow => "system clock timestamp arithmetic overflowed representable range",
+        };
+        out.write_padded(msg.as_bytes(), spec)
+    }
+}
+
+impl TrivialDrop for TimeError {}
+
+impl SystemTime {
+    /| Canonical Unix epoch anchor (`1970-01-01T00:00:00Z`).
+    pub const UNIX_EPOCH: SystemTime = SystemTime {
+        secs: 0,
+        subsec_nanos: 0,
+        _pad: 0,
+    };
+
+    /| Constructs a `SystemTime` from signed Unix `secs` and `subsec_nanos` (`None` if `>= 1_000_000_000`).
+    @inline @no_alloc @no_panic
+    pub fn from_unix_timestamp(secs: i64, subsec_nanos: u32, /) -> SystemTime? {
+        if subsec_nanos <= 999_999_999_u32 {
+            return .Some(
+                SystemTime {
+                    secs,
+                    subsec_nanos: subsec_nanos.narrow[SubsecNanos](),
+                    _pad: 0,
+                },
+            );
+        }
+        .None
+    }
+
+    /| Queries the active `context.reactor` virtual wall clock or host OS real-time clock (`@no_alloc @no_panic`).
+    @std_cap_boundary(emits: [clock], clears: [
+        ffi,
+        unsafe_op,
+        indirect_opaque,
+        alloc,
+        may_panic,
+        blocking_sync,
+    ],)
+    @inline @no_alloc @no_panic
+    pub fn now() -> SystemTime {
+        // [1] Route through `context.reactor` when a virtual wall-clock hook is installed:
+        let slots_ptr: *TimeReactorSlots = active_reactor_slots();
+        if not slots_ptr.is_null() {
+            let wall_opt = unsafe {
+                slots_ptr.*.wall_epoch_ns
+            };
+            if wall_opt is .Some(wall_cb) {
+                let epoch_ns: i64 = unsafe {
+                    wall_cb(active_reactor_ctx())
+                };
+                return system_time_from_epoch_nanos_i64(epoch_ns);
+            }
+        }
+
+        // [2] Query host OS or WASI real-time wall clock:
+        host_system_time_now()
+    }
+
+    /| Computes `self - earlier`, returning `.Err(.SystemClockBeforeEarlier)` on clock regression or `.Err(.TimestampOverflow)`.
+    @inline @no_alloc @no_panic
+    pub fn duration_since(self, earlier: SystemTime, /) -> Duration!TimeError {
+        let self_sub: u32 = self.subsec_nanos;
+        let earlier_sub: u32 = earlier.subsec_nanos;
+        if self.secs < earlier.secs or (self.secs == earlier.secs and self_sub < earlier_sub) {
+            return .Err(.SystemClockBeforeEarlier);
+        }
+        let raw_sec_diff: u64 = (self.secs as u64) -% (earlier.secs as u64);
+        var whole_secs: u64 = raw_sec_diff;
+        var rem_nanos: u64 = 0;
+        if self_sub >= earlier_sub {
+            rem_nanos = (self_sub -% earlier_sub) as u64;
+        } else {
+            whole_secs = raw_sec_diff -% 1_u64;
+            rem_nanos = (NANOS_PER_SEC +% (self_sub as u64)) -% (earlier_sub as u64);
+        }
+        if whole_secs > MAX_DURATION_SECS
+            or (whole_secs == MAX_DURATION_SECS and rem_nanos > MAX_DURATION_REM_NANOS) {
+            return .Err(.TimestampOverflow);
+        }
+        .Ok(Duration { nanos: (whole_secs *% NANOS_PER_SEC) +% rem_nanos })
+    }
+
+    /| Computes the wall-clock `Duration` elapsed since `self` (`SystemTime.now().duration_since(self)`).
+    @no_alloc @no_panic
+    pub fn elapsed(self) -> Duration!TimeError = SystemTime.now().duration_since(self);
+
+    /| Advances `self` by `dur`, returning `.None` if `secs` overflows `i64.MAX`.
+    @inline @no_alloc @no_panic
+    pub fn checked_add(self, dur: Duration, /) -> SystemTime? {
+        let add_secs_u64: u64 = dur.nanos / NANOS_PER_SEC;
+        let add_nanos_u32 = (dur.nanos % NANOS_PER_SEC) as u32;
+        let raw_subsec: u32 = (self.subsec_nanos as u32) +% add_nanos_u32;
+        var carry_sec: i64 = 0;
+        var norm_subsec: u32 = raw_subsec;
+        if raw_subsec >= 1_000_000_000_u32 {
+            carry_sec = 1;
+            norm_subsec = raw_subsec -% 1_000_000_000_u32;
+        }
+        let delta_secs: i64 = (add_secs_u64 as i64) +% carry_sec;
+        if self.secs > i64.MAX -% delta_secs {
+            return .None;
+        }
+        if norm_subsec <= 999_999_999_u32 {
+            return .Some(
+                SystemTime {
+                    secs: self.secs +% delta_secs,
+                    subsec_nanos: norm_subsec.narrow[SubsecNanos](),
+                    _pad: 0,
+                },
+            );
+        }
+        .None
+    }
+
+    /| Rewinds `self` by `dur`, returning `.None` if `secs` underflows `i64.MIN`.
+    @inline @no_alloc @no_panic
+    pub fn checked_sub(self, dur: Duration, /) -> SystemTime? {
+        let sub_secs_u64: u64 = dur.nanos / NANOS_PER_SEC;
+        let sub_nanos_u32 = (dur.nanos % NANOS_PER_SEC) as u32;
+        let cur_subsec: u32 = self.subsec_nanos;
+        var borrow_sec: i64 = 0;
+        var norm_subsec: u32 = 0;
+        if cur_subsec < sub_nanos_u32 {
+            borrow_sec = 1;
+            norm_subsec = (cur_subsec +% 1_000_000_000_u32) -% sub_nanos_u32;
+        } else {
+            norm_subsec = cur_subsec -% sub_nanos_u32;
+        }
+        let delta_secs: i64 = (sub_secs_u64 as i64) +% borrow_sec;
+        if self.secs < i64.MIN +% delta_secs {
+            return .None;
+        }
+        if norm_subsec <= 999_999_999_u32 {
+            return .Some(
+                SystemTime {
+                    secs: self.secs -% delta_secs,
+                    subsec_nanos: norm_subsec.narrow[SubsecNanos](),
+                    _pad: 0,
+                },
+            );
+        }
+        .None
+    }
+
+    /| Returns signed nanoseconds relative to `SystemTime.UNIX_EPOCH` (`secs * 10^9 + subsec_nanos`).
+    @no_alloc @no_panic
+    pub fn unix_epoch_nanos(self) -> i128 =
+        ((self.secs as i128) *% 1_000_000_000_i128) +% (self.subsec_nanos as i128);
+}
+
+impl Debug for SystemTime {
+    /| Formats `self` structurally as `SystemTime { secs: <secs>, subsec_nanos: <ns> }`.
+    @no_alloc
+    pub fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        _ = spec;
+        @fmt_write(
+            out,
+            f"SystemTime {{ secs: {self.*.secs}, subsec_nanos: {self.*.subsec_nanos} }}",
+        )
+    }
+}
+
+impl TrivialDrop for SystemTime {}
+
+// ------------------- Clock Scaling & Sleep --------------------
+/| Scales `ticks` at `freq_hz` to nanoseconds with zero `u64` overflow across `584.5` years (`STD-02` §3.5A).
+@expect(unused-pkg-visibility, reason: "tested across all host OSes and shared with cx.bench in Phase 11.3")
+pub(pkg) fn scale_ticks_to_nanos_hz(ticks: u64, freq_hz: u64, /) -> u64 =
+    scale_ticks_to_nanos_hz_inner(ticks, freq_hz);
+
+/| Scales Darwin Mach `ticks` by `(numer / denom)` to saturating `u64` nanoseconds (`STD-02` §3.5A).
+@expect(unused-pkg-visibility, reason: "tested across all host OSes and shared with cx.bench in Phase 11.3")
+pub(pkg) fn scale_mach_ticks_to_nanos(ticks: u64, numer: u32, denom: u32, /) -> u64 =
+    scale_mach_ticks_to_nanos_inner(ticks, numer, denom);
+
+/| Suspends the current thread (or advances `SimReactor` virtual time in `0 ns`) for at least `dur`.
+@std_cap_boundary(emits: [clock, blocking_sync], clears: [ffi, unsafe_op, indirect_opaque])
+pub fn sleep(dur: Duration, /) {
+    // [1] Consult `context.reactor` first so `--sim` virtual clocks observe even zero-duration sleeps:
+    let slots_ptr: *TimeReactorSlots = active_reactor_slots();
+    if not slots_ptr.is_null() {
+        let submit_opt = unsafe {
+            slots_ptr.*.submit_io
+        };
+        if submit_opt is .Some(submit_cb) {
+            var sub = IoSubmission {
+                kind: SIM_OP_SLEEP_NS,
+                flags: 0_u8,
+                worker_id: 0_u16,
+                fd_or_handle: -1,
+                offset_or_ns: dur.nanos,
+                buf_ptr: @default_init[*mut u8](),
+                buf_len: 0_u32,
+                slot_index: 0_u32,
+            };
+            let sim_rc: i64 = unsafe {
+                submit_cb(active_reactor_ctx(), &raw mut sub)
+            };
+            if sim_rc != SIM_UNHANDLED_SENTINEL {
+                return;
+            }
+        }
+    }
+
+    // [2] Return immediately on zero duration or sleep on the host OS clock:
+    if dur.is_zero() {
+        return;
+    }
+    host_sleep_nonzero(dur);
+}
+
+// ---------------------------------------- TESTS ----------------------------------------
+/| Deterministic simulation clock state used by inline `context.reactor` unit tests.
+@repr(C)
+struct MockSimClockState {
+    /| Current virtual monotonic nanosecond timestamp.
+    mono_ns: u64,
+    /| Current virtual signed Unix-epoch nanosecond timestamp.
+    wall_ns: i64,
+    /| Count of `SIM_OP_SLEEP_NS` submissions observed by `mock_submit_io`.
+    sleep_calls: u32,
+}
+
+/| Full 8-word C-ABI reactor table layout used by `context.reactor` unit tests.
+@repr(C)
+struct MockFullReactorVTable {
+    /| Slot `0`: `monotonic_ns` callback.
+    monotonic_ns: (extern "C" fn(*mut opaque) -> u64)?,
+    /| Slot `1`: `wall_epoch_ns` callback.
+    wall_epoch_ns: (extern "C" fn(*mut opaque) -> i64)?,
+    /| Slot `2`: `fill_rng` placeholder (`0`).
+    fill_rng: usize,
+    /| Slot `3`: `submit_io` callback.
+    submit_io: (extern "C" fn(*mut opaque, *IoSubmission) -> i64)?,
+    /| Slots `4..7`: Unused async proactor callbacks (`[0; 4]`).
+    tail_slots: [usize; 4],
+}
+
+/| Mock C-ABI `monotonic_ns` callback reading `MockSimClockState.mono_ns`.
+extern "C" fn mock_mono_ns_cb(ctx_raw: *mut opaque) -> u64 {
+    let state_ptr = ctx_raw as *MockSimClockState;
+    if state_ptr.is_null() {
+        return 0_u64;
+    }
+    unsafe {
+        state_ptr.*.mono_ns
+    }
+}
+
+/| Mock C-ABI `wall_epoch_ns` callback reading `MockSimClockState.wall_ns`.
+extern "C" fn mock_wall_ns_cb(ctx_raw: *mut opaque) -> i64 {
+    let state_ptr = ctx_raw as *MockSimClockState;
+    if state_ptr.is_null() {
+        return 0_i64;
+    }
+    unsafe {
+        state_ptr.*.wall_ns
+    }
+}
+
+/| Mock C-ABI `submit_io` callback intercepting `SIM_OP_SLEEP_NS` in zero real host time.
+extern "C" fn mock_submit_io_cb(
+    ctx_raw: *mut opaque,
+    sub_ptr: *IoSubmission,
+) -> i64 {
+    let state_ptr = ctx_raw as *mut MockSimClockState;
+    if state_ptr.is_null() {
+        return SIM_UNHANDLED_SENTINEL;
+    }
+    if sub_ptr.is_null() {
+        return SIM_UNHANDLED_SENTINEL;
+    }
+    let op_kind: u8 = unsafe {
+        sub_ptr.*.kind
+    };
+    if op_kind != SIM_OP_SLEEP_NS {
+        return SIM_UNHANDLED_SENTINEL;
+    }
+    let delta_ns: u64 = unsafe {
+        sub_ptr.*.offset_or_ns
+    };
+    unsafe {
+        state_ptr.*.mono_ns = state_ptr.*.mono_ns +| delta_ns;
+        state_ptr.*.wall_ns = state_ptr.*.wall_ns +| (delta_ns as i64);
+        state_ptr.*.sleep_calls += 1_u32;
+    }
+    0_i64
+}
+
+test "Duration constants, comptime constructors, subsec accessors, and arithmetic" {
+    assert(NANOS_PER_MICRO == 1_000_u64);
+    assert(NANOS_PER_MILLI == 1_000_000_u64);
+    assert(NANOS_PER_SEC == 1_000_000_000_u64);
+    assert(MICROS_PER_SEC == 1_000_000_u64);
+    assert(MILLIS_PER_SEC == 1_000_u64);
+    assert(@size_of[Duration]() == 8_usize);
+    assert(@implements[Duration, TrivialDrop]());
+
+    let comptime_dur: Duration = comptime Duration.from_millis(1_250);
+    assert(comptime_dur.as_nanos() == 1_250_000_000_u64);
+    assert(comptime_dur.as_micros() == 1_250_000_u64);
+    assert(comptime_dur.as_millis() == 1_250_u64);
+    assert(comptime_dur.as_secs() == 1_u64);
+    assert(comptime_dur.subsec_nanos() == 250_000_000_u32);
+    assert(comptime_dur.subsec_micros() == 250_000_u32);
+    assert(comptime_dur.subsec_millis() == 250_u32);
+    assert(Duration.default().is_zero());
+    assert(Duration.ZERO.is_zero());
+    assert(not comptime_dur.is_zero());
+
+    let fine_dur = Duration.from_nanos(3_004_005_006);
+    assert(fine_dur.as_secs() == 3_u64);
+    assert(fine_dur.subsec_millis() == 4_u32);
+    assert(fine_dur.subsec_micros() == 4_005_u32);
+    assert(fine_dur.subsec_nanos() == 4_005_006_u32);
+    assert(cx.math.approx_eq_abs(Duration.from_millis(1_500).as_secs_f64(), 1.5, tol: 1.0e-12));
+
+    assert(Duration.from_secs(u64.MAX) == Duration.MAX);
+    assert(Duration.from_millis(u64.MAX) == Duration.MAX);
+    assert(Duration.from_micros(u64.MAX) == Duration.MAX);
+
+    assert(
+        Duration.from_secs(2).checked_add(Duration.from_millis(500))
+            == .Some(
+                Duration.from_millis(2_500),
+            ),
+    );
+    assert(Duration.MAX.checked_add(Duration.from_nanos(1)) == .None);
+    assert(
+        Duration.from_secs(2).checked_sub(Duration.from_millis(500))
+            == .Some(
+                Duration.from_millis(1_500),
+            ),
+    );
+    assert(Duration.from_millis(500).checked_sub(Duration.from_secs(2)) == .None);
+    assert(Duration.MAX.saturating_add(Duration.from_secs(10)) == Duration.MAX);
+    assert(Duration.from_millis(10).saturating_sub(Duration.from_secs(1)) == Duration.ZERO);
+    assert(Duration.from_millis(250).saturating_mul(6) == Duration.from_millis(1_500));
+    assert(Duration.MAX.saturating_mul(2) == Duration.MAX);
+    assert(Duration.from_millis(10) < Duration.from_millis(20));
+}
+
+test "Duration Display, Debug, and TimeError zero-allocation formatting" {
+    var buf: [u8; 96] = [0_u8; 96];
+    assert((cx.str.format_into(&mut buf, f"{Duration.ZERO}") catch "") == "0ns");
+    assert((cx.str.format_into(&mut buf, f"{Duration.from_nanos(450)}") catch "") == "450ns");
+    assert((cx.str.format_into(&mut buf, f"{Duration.from_nanos(1_500)}") catch "") == "1.5us");
+    assert((cx.str.format_into(&mut buf, f"{Duration.from_micros(250)}") catch "") == "250us");
+    assert((cx.str.format_into(&mut buf, f"{Duration.from_micros(12_345)}") catch "") == "12.345ms");
+    assert((cx.str.format_into(&mut buf, f"{Duration.from_millis(1_500)}") catch "") == "1.5s");
+    assert((cx.str.format_into(&mut buf, f"{Duration.from_secs(42)}") catch "") == "42s");
+    assert((cx.str.format_into(&mut buf, f"{Duration.MAX}") catch "") == "18446744073.709551615s");
+    assert((cx.str.format_into(&mut buf, f"{Duration.from_millis(1_500):.3}") catch "") == "1.500s");
+    assert((cx.str.format_into(&mut buf, f"{Duration.from_nanos(450):>8}") catch "") == "   450ns");
+    assert(
+        (cx.str.format_into(&mut buf, f"{Duration.from_micros(12_345):?}") catch "") == "12.345ms",
+    );
+
+    let earlier_err: TimeError = .SystemClockBeforeEarlier;
+    let ovf_err: TimeError = .TimestampOverflow;
+    assert(
+        (cx.str.format_into(&mut buf, f"{earlier_err}") catch "")
+            == "system clock timestamp precedes earlier reference timestamp",
+    );
+    assert(
+        (cx.str.format_into(&mut buf, f"{ovf_err}") catch "")
+            == "system clock timestamp arithmetic overflowed representable range",
+    );
+}
+
+test "scale_ticks_to_nanos_hz and scale_mach_ticks_to_nanos 500-year overflow-free precision" {
+    let secs_500_years: u64 = 500_u64 * 365_u64 * 86_400_u64;
+    let expected_500y_ns: u64 = secs_500_years * NANOS_PER_SEC;
+
+    // [1] Fast-path 10 MHz (Windows QPC), 24 MHz (Apple Silicon), and 1 GHz:
+    assert(
+        scale_ticks_to_nanos_hz(secs_500_years * 10_000_000_u64 + 7_u64, 10_000_000_u64)
+            == expected_500y_ns + 700_u64,
+    );
+    assert(
+        scale_ticks_to_nanos_hz(secs_500_years * 24_000_000_u64 + 6_u64, 24_000_000_u64)
+            == expected_500y_ns + 250_u64,
+    );
+    assert(
+        scale_ticks_to_nanos_hz(expected_500y_ns + 999_u64, 1_000_000_000_u64)
+            == expected_500y_ns + 999_u64,
+    );
+
+    // [2] Arbitrary / prime frequencies and zero-divisor safety:
+    let prime_freq = 19_200_007_u64;
+    let prime_ticks: u64 = secs_500_years * prime_freq + (prime_freq / 2_u64);
+    let scaled_prime: u64 = scale_ticks_to_nanos_hz(prime_ticks, prime_freq);
+    assert(scaled_prime >= expected_500y_ns + 499_999_900_u64);
+    assert(scaled_prime <= expected_500y_ns + 500_000_100_u64);
+    assert(scale_ticks_to_nanos_hz(123_456_u64, 0_u64) == 0_u64);
+    assert(scale_ticks_to_nanos_hz(u64.MAX, 24_000_000_u64) == u64.MAX);
+
+    // [3] Darwin Mach timebase scaling (`1/1`, `125/3` Apple Silicon, saturation, and `denom == 0`):
+    assert(
+        scale_mach_ticks_to_nanos(expected_500y_ns + 42_u64, 1_u32, 1_u32)
+            == expected_500y_ns + 42_u64,
+    );
+    assert(
+        scale_mach_ticks_to_nanos(secs_500_years * 24_000_000_u64 + 6_u64, 125_u32, 3_u32)
+            == expected_500y_ns + 250_u64,
+    );
+    assert(scale_mach_ticks_to_nanos(u64.MAX, 125_u32, 3_u32) == u64.MAX);
+    assert(scale_mach_ticks_to_nanos(999_u64, 125_u32, 0_u32) == 0_u64);
+}
+
+test "Instant monotonic queries, checked/saturating arithmetic, and Context.reactor hook" {
+    assert(@size_of[Instant]() == 8_usize);
+    assert(@implements[Instant, TrivialDrop]());
+
+    let first_now = Instant.now();
+    let second_now = Instant.now();
+    assert(second_now >= first_now);
+    assert(second_now.checked_duration_since(first_now) is .Some(_));
+    _ = first_now.elapsed();
+
+    let base = Instant.from_raw_nanos(5_000_000_000);
+    let later = Instant.from_raw_nanos(7_500_000_000);
+    assert(base.as_raw_nanos() == 5_000_000_000_u64);
+    assert(later.duration_since(base) == Duration.from_millis(2_500));
+    assert(base.duration_since(later) == Duration.ZERO);
+    assert(base.checked_duration_since(later) == .None);
+    assert(base.checked_add(Duration.from_secs(3)) == .Some(Instant.from_raw_nanos(8_000_000_000)));
+    assert(Instant.from_raw_nanos(u64.MAX).checked_add(Duration.from_nanos(1)) == .None);
+    assert(base.checked_sub(Duration.from_secs(2)) == .Some(Instant.from_raw_nanos(3_000_000_000)));
+    assert(base.checked_sub(Duration.from_secs(6)) == .None);
+    assert(
+        Instant.from_raw_nanos(u64.MAX).saturating_add(Duration.from_secs(1))
+            == Instant.from_raw_nanos(
+                u64.MAX,
+            ),
+    );
+    assert(base.saturating_sub(Duration.from_secs(9)) == Instant.from_raw_nanos(0));
+
+    var dbg_buf: [u8; 64] = [0_u8; 64];
+    assert((cx.str.format_into(&mut dbg_buf, f"{base:?}") catch "") == "Instant(5000000000ns)");
+
+    var sim_state = MockSimClockState {
+        mono_ns: 42_000_000_000,
+        wall_ns: 1_700_000_000_000_000_000,
+        sleep_calls: 0,
+    };
+    let sim_vtable = MockFullReactorVTable {
+        monotonic_ns: .Some(mock_mono_ns_cb),
+        wall_epoch_ns: .Some(mock_wall_ns_cb),
+        fill_rng: 0,
+        submit_io: .Some(mock_submit_io_cb),
+        tail_slots: [0; 4],
+    };
+    let sim_reactor = Reactor {
+        vtable: (&raw sim_vtable) as *cx.async.ReactorVTable,
+    };
+    let sim_ctx = ReactorCtx { state: (&raw mut sim_state) as *mut opaque };
+    with context.reactor = sim_reactor {
+        with context.reactor_ctx = sim_ctx {
+            let sim_t0 = Instant.now();
+            assert(sim_t0.as_raw_nanos() == 42_000_000_000_u64);
+            sleep(Duration.ZERO);
+            assert(sim_state.sleep_calls == 1_u32);
+            sleep(Duration.from_secs(3_600));
+            assert(sim_state.sleep_calls == 2_u32);
+            assert(sim_t0.elapsed() == Duration.from_secs(3_600));
+        }
+    }
+}
+
+test "SystemTime Euclidean pre-1970 normalization, arithmetic, and host/virtual wall clocks" {
+    assert(@size_of[SystemTime]() == 16_usize);
+    assert(@implements[SystemTime, TrivialDrop]());
+    assert(SystemTime.UNIX_EPOCH.unix_epoch_nanos() == 0_i128);
+    assert(SystemTime.from_unix_timestamp(10, 1_000_000_000) == .None);
+
+    let pre_1970 = SystemTime.from_unix_timestamp(-1, 999_999_999) orelse SystemTime.UNIX_EPOCH;
+    assert(pre_1970.unix_epoch_nanos() == -1_i128);
+    assert(pre_1970 < SystemTime.UNIX_EPOCH);
+    assert(
+        (SystemTime.UNIX_EPOCH.duration_since(pre_1970) catch Duration.ZERO)
+            == Duration.from_nanos(
+                1,
+            ),
+    );
+    assert(pre_1970.duration_since(SystemTime.UNIX_EPOCH) == .Err(.SystemClockBeforeEarlier));
+    assert(SystemTime.UNIX_EPOCH.checked_sub(Duration.from_nanos(1)) == .Some(pre_1970));
+    assert(pre_1970.checked_add(Duration.from_nanos(1)) == .Some(SystemTime.UNIX_EPOCH));
+
+    let far_future = SystemTime.from_unix_timestamp(i64.MAX, 999_999_999)
+        orelse SystemTime.UNIX_EPOCH;
+    let far_past = SystemTime.from_unix_timestamp(i64.MIN, 0) orelse SystemTime.UNIX_EPOCH;
+    assert(far_future.duration_since(SystemTime.UNIX_EPOCH) == .Err(.TimestampOverflow));
+    assert(far_future.duration_since(far_past) == .Err(.TimestampOverflow));
+    assert(far_future.checked_add(Duration.from_nanos(1)) == .None);
+    assert(far_past.checked_sub(Duration.from_nanos(1)) == .None);
+
+    let win_1601 = system_time_from_win32_filetime(0);
+    assert(win_1601.secs == -11_644_473_600_i64);
+    assert(win_1601.subsec_nanos == 0_u32);
+    let win_pre_1970 = system_time_from_win32_filetime(116_444_735_999_999_999);
+    assert(win_pre_1970.secs == -1_i64);
+    assert(win_pre_1970.subsec_nanos == 999_999_900_u32);
+    let posix_pre_1970 = system_time_from_posix_timespec(-5, 250_000_000);
+    assert(posix_pre_1970.secs == -5_i64);
+    assert(posix_pre_1970.subsec_nanos == 250_000_000_u32);
+
+    let host_wall = SystemTime.now();
+    assert(host_wall.secs > 1_577_836_800_i64);
+    assert(host_wall.elapsed() is .Ok(_));
+
+    var dbg_buf: [u8; 80] = [0_u8; 80];
+    assert(
+        (cx.str.format_into(&mut dbg_buf, f"{pre_1970:?}") catch "")
+            == "SystemTime { secs: -1, subsec_nanos: 999999999 }",
+    );
+
+    var sim_state = MockSimClockState {
+        mono_ns: 1_000,
+        wall_ns: -1_250_000_000,
+        sleep_calls: 0,
+    };
+    let sim_vtable = MockFullReactorVTable {
+        monotonic_ns: .Some(mock_mono_ns_cb),
+        wall_epoch_ns: .Some(mock_wall_ns_cb),
+        fill_rng: 0,
+        submit_io: .Some(mock_submit_io_cb),
+        tail_slots: [0; 4],
+    };
+    let sim_reactor = Reactor {
+        vtable: (&raw sim_vtable) as *cx.async.ReactorVTable,
+    };
+    let sim_ctx = ReactorCtx { state: (&raw mut sim_state) as *mut opaque };
+    with context.reactor = sim_reactor {
+        with context.reactor_ctx = sim_ctx {
+            let sim_wall = SystemTime.now();
+            assert(sim_wall.secs == -2_i64);
+            assert(sim_wall.subsec_nanos == 750_000_000_u32);
+            assert(sim_wall.unix_epoch_nanos() == -1_250_000_000_i128);
+        }
+    }
+
+    sleep(Duration.ZERO);
+    let before_sleep = Instant.now();
+    sleep(Duration.from_micros(100));
+    assert(Instant.now() >= before_sleep);
+}

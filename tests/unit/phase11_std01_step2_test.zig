@@ -43,13 +43,19 @@ const CORE_MODULE_PATHS = [_][]const u8{
     "core/async.cx",
 };
 
-/// Canonical Phase 11.1 (`STD-01` Step 2) `stdlib/cx/` source file paths (`5` files).
+/// Canonical mounted `stdlib/cx/` source file paths (`11` files).
 const CX_STDLIB_PATHS = [_][]const u8{
     "stdlib/cx/mod.cx",
     "stdlib/cx/mem.cx",
     "stdlib/cx/math.cx",
     "stdlib/cx/col.cx",
     "stdlib/cx/str.cx",
+    "stdlib/cx/io.cx",
+    "stdlib/cx/path.cx",
+    "stdlib/cx/time.cx",
+    "stdlib/cx/env.cx",
+    "stdlib/cx/fs.cx",
+    "stdlib/cx/process.cx",
 };
 
 // -------------------------------------- INTERNALS --------------------------------------
@@ -156,7 +162,7 @@ fn mountStdCoreAndCxIntoDb(
             io,
             cx_path,
             allocator,
-            .limited(2 * 1024 * 1024),
+            .limited(4 * 1024 * 1024),
         );
         defer allocator.free(raw_bytes);
         const norm_bytes = try normalizeLfAlloc(allocator, raw_bytes);
@@ -176,6 +182,12 @@ fn mountStdCoreAndCxIntoDb(
     try db.bindExternalModule(cx_mod_fid, "math", cx_fids[2]);
     try db.bindExternalModule(cx_mod_fid, "col", cx_fids[3]);
     try db.bindExternalModule(cx_mod_fid, "str", cx_fids[4]);
+    try db.bindExternalModule(cx_mod_fid, "io", cx_fids[5]);
+    try db.bindExternalModule(cx_mod_fid, "path", cx_fids[6]);
+    try db.bindExternalModule(cx_mod_fid, "time", cx_fids[7]);
+    try db.bindExternalModule(cx_mod_fid, "env", cx_fids[8]);
+    try db.bindExternalModule(cx_mod_fid, "fs", cx_fids[9]);
+    try db.bindExternalModule(cx_mod_fid, "process", cx_fids[10]);
 
     return cx_fids;
 }
@@ -230,7 +242,7 @@ test "test_step2_stdlib_cx_files_format_style_and_sast_strict_clean" {
             io,
             cx_path,
             allocator,
-            .limited(2 * 1024 * 1024),
+            .limited(4 * 1024 * 1024),
         );
         defer allocator.free(raw_bytes);
         const norm_bytes = try normalizeLfAlloc(allocator, raw_bytes);

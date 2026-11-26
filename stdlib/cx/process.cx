@@ -1,0 +1,4390 @@
+/# Injection-Hardened Child Process Spawning, Pipes, and Exit Status (cx.process)
+/#
+/# Provides `@linear` child process handles (`ChildProcess`, `ChildStdin`, `ChildStdout`, `Stdio`),
+/# deadlock-free concurrent pipe draining, `ExitStatus` decoding, and `BatBadBut`-hardened `Command`
+/# builders across Windows (`CreateProcessW`), Linux/macOS (`posix_spawn`), and WASI (`STD-02` §2.6).
+/#
+/# Implicit `.bat`/`.cmd` execution is rejected fail-closed (`CVE-2024-24576`) unless opted in via
+/# `Command.cmd_script`, and Windows handle inheritance allowlists only deduplicated stdio handles.
+
+use core.async.{
+    IoSubmission,
+    SIM_OP_PROC_OP,
+    SIM_UNHANDLED_SENTINEL,
+};
+use core.sys;
+use cx.col.Vec;
+use cx.fs.{File, RawOsFd};
+use cx.io.{IoError, IoOp, OutBuf, Reader, Writer};
+use cx.path.{Path, PathBuf, encode_wtf8_to_wtf16};
+use cx.str.String;
+
+// ---------------------------------------- TYPES ----------------------------------------
+// --------------------- Stdio & ExitStatus ---------------------
+/| C-ABI callback signature for `ReactorVTable.submit_io` (`slot 3` inside `context.reactor`).
+type ReactorSubmitFn = extern "C" fn(*mut opaque, *IoSubmission) -> i64;
+
+/| Child standard-stream attachment mode (`STD-02` §2.6).
+@derive(Copy, Equatable, Hash, Clone, Debug)
+pub enum StdioKind: u8 {
+    /| Inherit the parent process's corresponding standard stream (`0`).
+    Inherit = 0,
+    /| Create a unidirectional OS pipe between parent and child (`1`).
+    Piped = 1,
+    /| Attach the child stream to the OS null device (`NUL` / `/dev/null`, `2`).
+    Null = 2,
+    /| Transfer an owned `File` descriptor into the child stream (`3`).
+    Fd = 3,
+}
+
+/| `@linear` child standard-stream configuration preventing leaked `.Fd` descriptors (`STD-02` §2.6).
+@linear
+pub struct Stdio {
+    /| Selected stream attachment mode.
+    pub(pkg) kind: StdioKind,
+    /| Owned OS file descriptor or `HANDLE` when `kind == .Fd` (invalid sentinel otherwise).
+    @expect(unused-pkg-visibility, reason: "inspected by cx.test SimReactor and process tests")
+    pub(pkg) owned_fd: RawOsFd,
+}
+
+/| Internal `AutoDrop` wrapper holding a configured `Stdio` slot inside `Command` prior to `spawn`.
+struct OwnedStdioSlot {
+    /| Selected stream attachment mode.
+    kind: StdioKind,
+    /| Owned OS descriptor closed automatically if `Command` drops before spawning.
+    owned_fd: RawOsFd,
+}
+
+/| Single environment variable mutation queued on a `Command` builder.
+struct EnvOverride {
+    /| Environment variable name (`UTF-8`, without `'='` or NUL bytes).
+    key: String,
+    /| Replacement value when `.Some(val)`, or `.None` to unset `key` in the child environment.
+    val: String?,
+}
+
+/| Decoded child process termination status (`waitpid` `wstatus` on POSIX, exit `DWORD` on Windows).
+@repr(C) @derive(Copy, Equatable, Hash)
+pub struct ExitStatus {
+    /| Raw platform status word (`waitpid` bitmask on Linux/macOS; 32-bit exit code on Windows/WASI).
+    raw_status: i32,
+}
+
+/| Captured exit status and standard output/error byte buffers returned by `wait_with_output` (`STD-02` §2.6).
+pub struct Output {
+    /| Final process exit status or terminating signal.
+    pub status: ExitStatus,
+    /| Captured standard output bytes.
+    pub stdout: Vec[u8],
+    /| Captured standard error bytes.
+    pub stderr: Vec[u8],
+}
+
+// ------------------ Child Handles & Command -------------------
+/| `@linear` writable pipe connected to a spawned child process's standard input (`fd 0`).
+@linear
+pub struct ChildStdin {
+    /| Underlying OS pipe write handle.
+    file: File,
+}
+
+/| `@linear` readable pipe connected to a spawned child process's standard output (`fd 1`) or error (`fd 2`).
+@linear
+pub struct ChildStdout {
+    /| Underlying OS pipe read handle.
+    file: File,
+}
+
+/| `@linear` readable pipe alias connected to a spawned child process's standard error (`fd 2`).
+pub type ChildStderr = ChildStdout;
+
+/| `@linear` handle to a running or exited child process requiring explicit reap or detach (`E0304`).
+@linear
+pub struct ChildProcess {
+    /| OS or simulated child process identifier (`PID`).
+    pub pid: u32,
+    /| Process `HANDLE` on Windows (invalid sentinel `-1` on POSIX/WASI).
+    os_handle: RawOsFd,
+    /| Optional parent-writable pipe attached to child `stdin` (`.Some` when `Stdio.piped()`).
+    pub stdin: ChildStdin?,
+    /| Optional parent-readable pipe attached to child `stdout` (`.Some` when `Stdio.piped()`).
+    pub stdout: ChildStdout?,
+    /| Optional parent-readable pipe attached to child `stderr` (`.Some` when `Stdio.piped()`).
+    pub stderr: ChildStderr?,
+    /| Cached `ExitStatus` once `try_wait` observes process exit (preventing `ECHILD` double-wait).
+    reaped_status: ExitStatus?,
+    /| `true` when spawned through `context.reactor` (`SimReactor`) rather than the host kernel.
+    is_sim_child: bool,
+}
+
+/| Injection-hardened child process builder (`AutoDrop`; rejects implicit `.bat`/`.cmd` per `CVE-2024-24576`).
+pub struct Command {
+    /| Target executable path/name (or batch script path when `allow_windows_batch` is `true`).
+    program_path: PathBuf,
+    /| Ordered command-line arguments excluding `argv[0]`.
+    arg_list: Vec[PathBuf],
+    /| Ordered environment variable additions, replacements, and removals.
+    env_list: Vec[EnvOverride],
+    /| Optional working directory for the child process.
+    cwd_path: PathBuf?,
+    /| Child `stdin` attachment configuration.
+    stdin_slot: OwnedStdioSlot,
+    /| Child `stdout` attachment configuration.
+    stdout_slot: OwnedStdioSlot,
+    /| Child `stderr` attachment configuration.
+    stderr_slot: OwnedStdioSlot,
+    /| `true` when `env_clear()` was called to start from an empty environment block.
+    env_clear_all: bool,
+    /| `true` only when constructed via `Command.cmd_script` (`false` blocks `.bat`/`.cmd` targets).
+    allow_windows_batch: bool,
+    /| `true` when `Command.new` detected a `.bat` or `.cmd` extension on `program_path`.
+    has_rejected_script_ext: bool,
+}
+
+// -------------------- SimReactor Protocol ---------------------
+/| `@repr(C)` spawn payload passed via `IoSubmission.buf_ptr` for `SIM_OP_PROC_OP` (`PROC_SIM_SPAWN`).
+@repr(C)
+struct SimProcSpawnPayload {
+    /| Pointer to UTF-8 / WTF-8 `program` bytes.
+    program_ptr: *u8,
+    /| Byte length of `program_ptr`.
+    program_len: usize,
+    /| Pointer to optional working directory bytes (`null` when `cwd` is `.None`).
+    cwd_ptr: *u8,
+    /| Byte length of `cwd_ptr` (`0` when `cwd` is `.None`).
+    cwd_len: usize,
+    /| Number of command-line arguments in `Command.args`.
+    arg_count: u32,
+    /| Encoded `StdioKind` for `stdin` (`0..=3`).
+    stdin_kind: u8,
+    /| Encoded `StdioKind` for `stdout` (`0..=3`).
+    stdout_kind: u8,
+    /| Encoded `StdioKind` for `stderr` (`0..=3`).
+    stderr_kind: u8,
+    /| `1` when constructed via `Command.cmd_script`, `0` otherwise.
+    is_cmd_script: u8,
+    /| Populated by `SimReactor` with the virtual child PID on success.
+    out_pid: u32,
+    /| Populated by `SimReactor` with virtual parent `stdin` write fd (`-1` when none).
+    out_stdin_fd: i32,
+    /| Populated by `SimReactor` with virtual parent `stdout` read fd (`-1` when none).
+    out_stdout_fd: i32,
+    /| Populated by `SimReactor` with virtual parent `stderr` read fd (`-1` when none).
+    out_stderr_fd: i32,
+}
+
+/| Windows `FSCTL_PIPE_PEEK` (`FILE_PIPE_PEEK_BUFFER`) header + 16-byte sample buffer (`32 B`).
+@cfg(target.os == "windows") @repr(C)
+struct Win32PipePeekBuf {
+    /| Pipe state flags (`NamedPipeState`).
+    pipe_state: u32,
+    /| Total unread bytes queued in the kernel pipe buffer (`ReadDataAvailable`).
+    read_data_available: u32,
+    /| Number of queued messages (`NumberOfMessages`).
+    message_count: u32,
+    /| Head message byte length (`MessageLength`).
+    message_length: u32,
+    /| First 8 bytes of the trailing 16-byte sample window.
+    sample_lo: u64,
+    /| Second 8 bytes of the trailing 16-byte sample window.
+    sample_hi: u64,
+}
+
+// --------------------------------------- CONSTS ----------------------------------------
+// --------------------- Platform Constants ---------------------
+/| Default `wait_with_output` / `Command.output` combined pipe capture ceiling (`64 MiB`).
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 67_108_864;
+
+/| Stack read chunk size used when draining child `stdout` and `stderr` pipes (`8 KiB`).
+const PIPE_READ_CHUNK_BYTES: usize = 8_192;
+
+/| `SIM_OP_PROC_OP` sub-opcode for `Command.spawn` (`0`).
+const PROC_SIM_SPAWN: u8 = 0;
+
+/| `SIM_OP_PROC_OP` sub-opcode for blocking `ChildProcess.wait` (`1`).
+const PROC_SIM_WAIT: u8 = 1;
+
+/| `SIM_OP_PROC_OP` sub-opcode for non-blocking `ChildProcess.try_wait` (`2`).
+const PROC_SIM_TRY_WAIT: u8 = 2;
+
+/| `SIM_OP_PROC_OP` sub-opcode for `ChildProcess.kill_and_wait` (`3`).
+const PROC_SIM_KILL_WAIT: u8 = 3;
+
+/| `SIM_OP_PROC_OP` sub-opcode for `ChildProcess.detach` (`4`).
+const PROC_SIM_DETACH: u8 = 4;
+
+/| `SIM_OP_PROC_OP` sub-opcode for `cx.process.exit` (`5`).
+const PROC_SIM_EXIT: u8 = 5;
+
+/| Return value from `SimReactor` `PROC_SIM_TRY_WAIT` indicating the virtual child is still running.
+const PROC_SIM_STILL_RUNNING: i64 = 0x1_0000_0000;
+
+/| UTF-16 `%%cd:~,%` sequence neutralizing `%` expansion in `cmd.exe /d /v:off /e:on /c`.
+const CMD_PERCENT_ESCAPE_UTF16: [u16; 8] = [
+    0x0025,
+    0x0025,
+    0x0063,
+    0x0064,
+    0x003A,
+    0x007E,
+    0x002C,
+    0x0025,
+];
+
+/| UTF-16 `/d /v:off /e:on /c "` prefix passed to `cmd.exe` in `Command.cmd_script`.
+const CMD_SCRIPT_SWITCHES_UTF16: [u16; 20] = [
+    0x002F, 0x0064, 0x0020, 0x002F, 0x0076, 0x003A, 0x006F, 0x0066,
+    0x0066, 0x0020, 0x002F, 0x0065, 0x003A, 0x006F, 0x006E, 0x0020,
+    0x002F, 0x0063, 0x0020, 0x0022,
+];
+
+/| `O(1)` ASCII `0..63` bitset for MSVCRT quote triggers (`\t`, `\n`, `\v`, `\r`, `' '`, `'"'`).
+const MSVCRT_QUOTE_LO_MASK: u64 = 0x0000_0005_0000_2E00;
+
+/| `O(1)` ASCII `0..63` bitset for `cmd.exe` metacharacters (`!`, `&`, `(`, `)`, `<`, `>`).
+const CMD_METACHAR_LO_MASK: u64 = 0x5000_0342_0000_0000;
+
+/| `O(1)` ASCII `64..127` bitset for `cmd.exe` metacharacters (`^` at `94`, `|` at `124`).
+const CMD_METACHAR_HI_MASK: u64 = 0x1000_0000_4000_0000;
+
+/| `O(1)` ASCII `0..63` bitset for `cmd.exe` argument delimiters (`\t`, `\v`, `' '`, `'"'`, `,`, `;`, `=`).
+const CMD_DELIM_LO_MASK: u64 = 0x2800_1005_0000_0A00;
+
+/| Windows `FSCTL_PIPE_PEEK` `DeviceIoControl` code (`CTL_CODE(FILE_DEVICE_NAMED_PIPE, 3, METHOD_BUFFERED, FILE_READ_DATA)`).
+@cfg(target.os == "windows")
+const WIN32_FSCTL_PIPE_PEEK: u32 = 0x0011_400C;
+
+/| Windows pipe buffer allocation hint (`64 KiB`) reducing context switches on compiler/linker output.
+@cfg(target.os == "windows")
+const WIN32_PIPE_BUF_HINT: u32 = 65_536;
+
+/| NUL-terminated UTF-16 `.exe\0` extension enforced by `SearchPathW` in `Command.new`.
+@cfg(target.os == "windows")
+const WIN32_DOT_EXE_UTF16: [u16; 5] = [0x002E, 0x0065, 0x0078, 0x0065, 0x0000];
+
+/| NUL-terminated UTF-16 `NUL\0` device path for `Stdio.null()` on Windows.
+@cfg(target.os == "windows")
+const WIN32_NUL_DEV_UTF16: [u16; 4] = [0x004E, 0x0055, 0x004C, 0x0000];
+
+/| NUL-terminated UTF-16 `SystemRoot\0` environment variable name used to locate `System32\cmd.exe`.
+@cfg(target.os == "windows")
+const WIN32_SYSTEM_ROOT_KEY_UTF16: [u16; 11] = [
+    0x0053, 0x0079, 0x0073, 0x0074, 0x0065, 0x006D, 0x0052, 0x006F,
+    0x006F, 0x0074, 0x0000,
+];
+
+/| UTF-16 `\System32\cmd.exe` suffix appended to `%SystemRoot%` (`17` code units).
+@cfg(target.os == "windows")
+const WIN32_SYS32_CMD_SUFFIX_UTF16: [u16; 17] = [
+    0x005C, 0x0053, 0x0079, 0x0073, 0x0074, 0x0065, 0x006D, 0x0033,
+    0x0032, 0x005C, 0x0063, 0x006D, 0x0064, 0x002E, 0x0065, 0x0078,
+    0x0065,
+];
+
+/| Fallback NUL-terminated UTF-16 `C:\Windows\System32\cmd.exe\0` path when `%SystemRoot%` is unset.
+@cfg(target.os == "windows")
+const WIN32_FALLBACK_CMD_UTF16: [u16; 28] = [
+    0x0043, 0x003A, 0x005C, 0x0057, 0x0069, 0x006E, 0x0064, 0x006F,
+    0x0077, 0x0073, 0x005C, 0x0053, 0x0079, 0x0073, 0x0074, 0x0065,
+    0x006D, 0x0033, 0x0032, 0x005C, 0x0063, 0x006D, 0x0064, 0x002E,
+    0x0065, 0x0078, 0x0065, 0x0000,
+];
+
+/| NUL-terminated UTF-16 `PATH\0` environment variable name used for safe Win32 executable lookup.
+@cfg(target.os == "windows")
+const WIN32_PATH_KEY_UTF16: [u16; 5] = [0x0050, 0x0041, 0x0054, 0x0048, 0x0000];
+
+/| UTF-16 `\System32` directory suffix appended to `%SystemRoot%` (`9` code units).
+@cfg(target.os == "windows")
+const WIN32_SYS32_DIR_SUFFIX_UTF16: [u16; 9] = [
+    0x005C, 0x0053, 0x0079, 0x0073, 0x0074, 0x0065, 0x006D, 0x0033,
+    0x0032,
+];
+
+/| Fallback UTF-16 `C:\Windows\System32;C:\Windows` system search path when `%SystemRoot%` is unset.
+@cfg(target.os == "windows")
+const WIN32_FALLBACK_SYS_DIRS_UTF16: [u16; 30] = [
+    0x0043, 0x003A, 0x005C, 0x0057, 0x0069, 0x006E, 0x0064, 0x006F,
+    0x0077, 0x0073, 0x005C, 0x0053, 0x0079, 0x0073, 0x0074, 0x0065,
+    0x006D, 0x0033, 0x0032, 0x003B, 0x0043, 0x003A, 0x005C, 0x0057,
+    0x0069, 0x006E, 0x0064, 0x006F, 0x0077, 0x0073,
+];
+
+/| POSIX `poll` invalid-descriptor revents bit (`POLLNVAL = 0x0020`).
+@cfg(target.os == "linux" or target.os == "macos")
+const POSIX_POLLNVAL: i16 = 0x0020;
+
+/| Linux `F_DUPFD_CLOEXEC` `fcntl` command (`1030`) shifting low descriptors above `STDERR_FILENO`.
+@cfg(target.os == "linux")
+const LINUX_F_DUPFD_CLOEXEC: i32 = 1030;
+
+/| Linux `x86_64` `SYS_fcntl` syscall number (`72`).
+@cfg(target.os == "linux" and not (target.arch == "aarch64"))
+const LINUX_SYS_FCNTL: i64 = 72;
+
+/| Linux `aarch64` `SYS_fcntl` syscall number (`25`).
+@cfg(target.os == "linux" and target.arch == "aarch64")
+const LINUX_SYS_FCNTL: i64 = 25;
+
+/| Darwin `fcntl` `F_SETFD` command (`2`) setting descriptor flags (`FD_CLOEXEC`).
+@cfg(target.os == "macos")
+const DARWIN_F_SETFD: i32 = 2;
+
+/| Darwin `FD_CLOEXEC` descriptor flag (`1`).
+@cfg(target.os == "macos")
+const DARWIN_FD_CLOEXEC: i32 = 1;
+
+/| Darwin `fcntl` `F_DUPFD_CLOEXEC` command (`67`) shifting low descriptors above `STDERR_FILENO`.
+@cfg(target.os == "macos")
+const DARWIN_F_DUPFD_CLOEXEC: i32 = 67;
+
+// -------------------------------------- INTERNALS --------------------------------------
+// ------------------- Slice & Handle Helpers -------------------
+/| Returns the invalid `RawOsFd` sentinel on Windows (`INVALID_HANDLE_VALUE`).
+@cfg(target.os == "windows")
+fn invalid_raw_os_fd() -> RawOsFd {
+    (sys.windows.INVALID_HANDLE_BITS as usize) as *mut opaque
+}
+
+/| Returns the invalid `RawOsFd` sentinel on POSIX and WASI (`-1`).
+@cfg(not (target.os == "windows"))
+fn invalid_raw_os_fd() -> RawOsFd {
+    -1_i32
+}
+
+/| Returns `true` when `raw_fd` is a non-null, non-`INVALID_HANDLE_VALUE` Windows `HANDLE`.
+@cfg(target.os == "windows")
+fn is_valid_raw_os_fd(raw_fd: RawOsFd, /) -> bool {
+    not raw_fd.is_null() and (raw_fd as isize) != sys.windows.INVALID_HANDLE_BITS
+}
+
+/| Returns `true` when `raw_fd` is a non-negative POSIX or WASI file descriptor (`>= 0`).
+@cfg(not (target.os == "windows"))
+fn is_valid_raw_os_fd(raw_fd: RawOsFd, /) -> bool {
+    raw_fd >= 0_i32
+}
+
+/| Closes `raw_fd` via `File.from_raw_fd(raw_fd).close()` iff `is_valid_raw_os_fd(raw_fd)`.
+fn close_raw_fd_if_valid(raw_fd: RawOsFd, /) {
+    if is_valid_raw_os_fd(raw_fd) {
+        File.from_raw_fd(raw_fd).close();
+    }
+}
+
+/| Constructs an `.Inherit` `OwnedStdioSlot` with an invalid descriptor sentinel.
+fn default_stdio_slot() -> OwnedStdioSlot {
+    OwnedStdioSlot {
+        kind: .Inherit,
+        owned_fd: invalid_raw_os_fd(),
+    }
+}
+
+/| Replaces `slot` with `next_cfg`, closing any previously owned `.Fd` descriptor on `slot`.
+fn replace_stdio_slot(slot: &mut OwnedStdioSlot, next_cfg: own Stdio, /) {
+    if slot.kind == .Fd {
+        close_raw_fd_if_valid(slot.owned_fd);
+    }
+    let Stdio { kind, owned_fd } = own next_cfg;
+    slot.kind = kind;
+    slot.owned_fd = owned_fd;
+}
+
+/| Extracts `(kind, owned_fd)` from `slot` and resets `slot` to `.Inherit` so `AutoDrop` is a no-op.
+fn take_stdio_slot_raw(slot: &mut OwnedStdioSlot, /) -> (StdioKind, RawOsFd) {
+    let cur_kind: StdioKind = slot.kind;
+    let cur_fd: RawOsFd = slot.owned_fd;
+    slot.kind = .Inherit;
+    slot.owned_fd = invalid_raw_os_fd();
+    (cur_kind, cur_fd)
+}
+
+/| Closes `opt_in` when `.Some(child_in)`.
+fn close_opt_stdin(opt_in: own ChildStdin?, /) {
+    if (own opt_in) is .Some(child_in) {
+        (own child_in).close();
+    }
+}
+
+/| Closes `opt_out` when `.Some(child_out)`.
+fn close_opt_stdout(opt_out: own ChildStdout?, /) {
+    if (own opt_out) is .Some(child_out) {
+        (own child_out).close();
+    }
+}
+
+/| Bounds-checked byte read returning `0` when `pos >= data.len()`.
+fn byte_at_u8(data: &[u8], pos: usize, /) -> u8 {
+    if pos < data.len() {
+        return data[pos];
+    }
+    0_u8
+}
+
+/| Bounds-checked UTF-16 read returning `0` when `pos >= units.len()`.
+fn unit_at_u16(units: &[u16], pos: usize, /) -> u16 {
+    if pos < units.len() {
+        return units[pos];
+    }
+    0_u16
+}
+
+/| Converts ASCII `a..=z` byte to uppercase `A..=Z`.
+fn ascii_upper_u8(ch: u8, /) -> u8 {
+    if ch >= b'a' and ch <= b'z' => ch & ~0x20_u8 else ch
+}
+
+/| Converts ASCII `a..=z` UTF-16 code unit to uppercase `A..=Z`.
+fn ascii_upper_u16(ch: u16, /) -> u16 {
+    if ch >= 0x0061_u16 and ch <= 0x007A_u16 => ch & ~0x0020_u16 else ch
+}
+
+// ------------------ BatBadBut & Cmd Escaping ------------------
+/| Returns `true` if raw path bytes resolve to a `.bat` or `.cmd` extension under Win32 rules (`CVE-2024-24576`).
+fn is_windows_batch_bytes(raw: &[u8], /) -> bool {
+    let total: usize = raw.len();
+    if total < 4_usize {
+        return false;
+    }
+
+    // [1] Isolate the final filename component after any `/` or `\` separator (or leading `X:` drive):
+    var comp_start: usize = 0;
+    var scan_idx: usize = 0;
+    while scan_idx < total {
+        let cur: u8 = byte_at_u8(raw, scan_idx);
+        if cur == b'\\' or cur == b'/' {
+            comp_start = scan_idx +% 1_usize;
+        }
+        scan_idx += 1_usize;
+    }
+    if comp_start == 0_usize and total >= 2_usize and byte_at_u8(raw, 1) == b':' {
+        let drv: u8 = ascii_upper_u8(byte_at_u8(raw, 0));
+        if drv >= b'A' and drv <= b'Z' {
+            comp_start = 2_usize;
+        }
+    }
+
+    // [2] Strip NTFS `:stream` suffix and trailing Win32 spaces/dots so `evil.bat .::$DATA` cannot bypass check:
+    var comp_end: usize = total;
+    var colon_idx: usize = comp_start;
+    while colon_idx < total {
+        if byte_at_u8(raw, colon_idx) == b':' {
+            comp_end = colon_idx;
+            break;
+        }
+        colon_idx += 1_usize;
+    }
+    while comp_end > comp_start {
+        let tail_b: u8 = byte_at_u8(raw, comp_end -% 1_usize);
+        if tail_b == b' ' or tail_b == b'.' {
+            comp_end = comp_end -% 1_usize;
+        } else {
+            break;
+        }
+    }
+    if comp_end -| comp_start < 4_usize {
+        return false;
+    }
+    if byte_at_u8(raw, comp_end -% 4_usize) != b'.' {
+        return false;
+    }
+    let ext1: u8 = ascii_upper_u8(byte_at_u8(raw, comp_end -% 3_usize));
+    let ext2: u8 = ascii_upper_u8(byte_at_u8(raw, comp_end -% 2_usize));
+    let ext3: u8 = ascii_upper_u8(byte_at_u8(raw, comp_end -% 1_usize));
+    (ext1 == b'B' and ext2 == b'A' and ext3 == b'T')
+        or (ext1 == b'C' and ext2 == b'M' and ext3 == b'D')
+}
+
+/| Returns `true` if UTF-16 `wpath` ends with `.bat` or `.cmd` under Win32 space/dot/ADS stripping rules.
+@cfg(target.os == "windows")
+fn is_windows_batch_wtf16(wpath: &[u16], /) -> bool {
+    let total: usize = wpath.len();
+    if total < 4_usize {
+        return false;
+    }
+    var comp_start: usize = 0;
+    var scan_idx: usize = 0;
+    while scan_idx < total {
+        let cur: u16 = unit_at_u16(wpath, scan_idx);
+        if cur == 0x005C_u16 or cur == 0x002F_u16 {
+            comp_start = scan_idx +% 1_usize;
+        }
+        scan_idx += 1_usize;
+    }
+    if comp_start == 0_usize and total >= 2_usize and unit_at_u16(wpath, 1) == 0x003A_u16 {
+        let drv: u16 = ascii_upper_u16(unit_at_u16(wpath, 0));
+        if drv >= 0x0041_u16 and drv <= 0x005A_u16 {
+            comp_start = 2_usize;
+        }
+    }
+    var comp_end: usize = total;
+    var colon_idx: usize = comp_start;
+    while colon_idx < total {
+        if unit_at_u16(wpath, colon_idx) == 0x003A_u16 {
+            comp_end = colon_idx;
+            break;
+        }
+        colon_idx += 1_usize;
+    }
+    while comp_end > comp_start {
+        let tail_u16: u16 = unit_at_u16(wpath, comp_end -% 1_usize);
+        if tail_u16 == 0x0020_u16 or tail_u16 == 0x002E_u16 {
+            comp_end = comp_end -% 1_usize;
+        } else {
+            break;
+        }
+    }
+    if comp_end -| comp_start < 4_usize {
+        return false;
+    }
+    if unit_at_u16(wpath, comp_end -% 4_usize) != 0x002E_u16 {
+        return false;
+    }
+    let ext1: u16 = ascii_upper_u16(unit_at_u16(wpath, comp_end -% 3_usize));
+    let ext2: u16 = ascii_upper_u16(unit_at_u16(wpath, comp_end -% 2_usize));
+    let ext3: u16 = ascii_upper_u16(unit_at_u16(wpath, comp_end -% 1_usize));
+    (ext1 == 0x0042_u16 and ext2 == 0x0041_u16 and ext3 == 0x0054_u16)
+        or (ext1 == 0x0043_u16 and ext2 == 0x004D_u16 and ext3 == 0x0044_u16)
+}
+
+/| Returns `true` if `candidate` (`str`, `&[u8]`, or `Path`) targets a Windows `.bat` or `.cmd` batch file.
+@expect(unused-pkg-visibility, reason: "used by cross-OS BatBadBut security tests")
+pub(pkg) fn is_windows_batch_path[P: str | &[u8] | Path](candidate: P, /) -> bool {
+    is_windows_batch_bytes(candidate.as_bytes())
+}
+
+/| Grows `out_vec` to at least `target_len` zero-initialized `u16` elements.
+fn grow_zeroed_u16(out_vec: &mut Vec[u16], target_len: usize, /) {
+    if out_vec.len() >= target_len {
+        return;
+    }
+    let add_n: usize = target_len -% out_vec.len();
+    out_vec.reserve(add_n);
+    let zeros: [u16; 64] = [0_u16; 64];
+    var rem: usize = add_n;
+    while rem >= 64_usize {
+        out_vec.extend_from_slice(&zeros);
+        rem = rem -% 64_usize;
+    }
+    if rem > 0_usize and rem <= 64_usize {
+        out_vec.extend_from_slice(zeros[0..rem]);
+    }
+}
+
+/| Transcodes WTF-8 `src` into `out_u16` (using a 512-unit stack fast path), rejecting interior NULs and invalid WTF-8.
+fn append_wtf8_as_wtf16(src: &[u8], out_u16: &mut Vec[u16], /) -> unit!IoError {
+    if src.is_empty() {
+        return .Ok(());
+    }
+    if src.len() <= 512_usize {
+        var stack_buf: [u16; 512] = [0_u16; 512];
+        let written: usize = encode_wtf8_to_wtf16(src, &mut stack_buf) catch {
+            return .Err(IoError.from_kind(.InvalidInput, op: .Spawn));
+        };
+        if written <= 512_usize {
+            out_u16.extend_from_slice(stack_buf[0..written]);
+        }
+        return .Ok(());
+    }
+    var dyn_buf = Vec[u16].new();
+    grow_zeroed_u16(&mut dyn_buf, src.len());
+    let written: usize = encode_wtf8_to_wtf16(src, dyn_buf.as_mut_slice()) catch {
+        return .Err(IoError.from_kind(.InvalidInput, op: .Spawn));
+    };
+    let dyn_slice: &[u16] = dyn_buf.as_slice();
+    if written <= dyn_slice.len() {
+        out_u16.extend_from_slice(dyn_slice[0..written]);
+    }
+    .Ok(())
+}
+
+/| Appends `count` copies of `unit_val` into `out`.
+fn push_repeated_u16(out: &mut Vec[u16], unit_val: u16, count: usize, /) {
+    var k: usize = 0;
+    while k < count {
+        out.push(unit_val);
+        k += 1_usize;
+    }
+}
+
+/| Appends `arg_wtf16` to `out` using exact MSVCRT / `CommandLineToArgvW` `2n` / `2n + 1` backslash quoting (`STD-02` §3.5B).
+fn quote_msvcrt_arg_wtf16(arg_wtf16: &[u16], out: &mut Vec[u16], /) -> unit!IoError {
+    let arg_len: usize = arg_wtf16.len();
+    var needs_quotes: bool = arg_len == 0_usize;
+    var scan_i: usize = 0;
+    while scan_i < arg_len {
+        let ch: u16 = unit_at_u16(arg_wtf16, scan_i);
+        if ch == 0x0000_u16 {
+            return .Err(IoError.from_kind(.InvalidInput, op: .Spawn));
+        }
+        if ch < 64_u16 and ((MSVCRT_QUOTE_LO_MASK >> (ch as u64)) & 1_u64) != 0_u64 {
+            needs_quotes = true;
+        }
+        scan_i += 1_usize;
+    }
+
+    if not needs_quotes {
+        out.extend_from_slice(arg_wtf16);
+        return .Ok(());
+    }
+
+    out.reserve(arg_len +% 4_usize);
+    out.push(0x0022_u16);
+    var backslash_run: usize = 0;
+    var idx: usize = 0;
+    while idx < arg_len {
+        let ch: u16 = unit_at_u16(arg_wtf16, idx);
+        if ch == 0x005C_u16 {
+            backslash_run = backslash_run +% 1_usize;
+        } else if ch == 0x0022_u16 {
+            push_repeated_u16(out, 0x005C_u16, (backslash_run *% 2_usize) +% 1_usize);
+            out.push(0x0022_u16);
+            backslash_run = 0_usize;
+        } else {
+            if backslash_run > 0_usize {
+                push_repeated_u16(out, 0x005C_u16, backslash_run);
+                backslash_run = 0_usize;
+            }
+            out.push(ch);
+        }
+        idx += 1_usize;
+    }
+    if backslash_run > 0_usize {
+        push_repeated_u16(out, 0x005C_u16, backslash_run *% 2_usize);
+    }
+    out.push(0x0022_u16);
+    .Ok(())
+}
+
+/| Returns `true` if UTF-16 `ch` is a `cmd.exe` shell metacharacter (`&|<>()^!`) via `O(1)` bitset lookup.
+fn is_cmd_metachar_u16(ch: u16, /) -> bool {
+    if ch < 64_u16 {
+        return ((CMD_METACHAR_LO_MASK >> (ch as u64)) & 1_u64) != 0_u64;
+    }
+    if ch < 128_u16 {
+        return ((CMD_METACHAR_HI_MASK >> ((ch -% 64_u16) as u64)) & 1_u64) != 0_u64;
+    }
+    false
+}
+
+/| Returns `true` if UTF-16 `ch` is a `cmd.exe` delimiter or metacharacter requiring double-quoting so `%*` / `%1` re-expansion stays quoted.
+fn needs_cmd_quotes_u16(ch: u16, /) -> bool {
+    if ch < 64_u16 and ((CMD_DELIM_LO_MASK >> (ch as u64)) & 1_u64) != 0_u64 {
+        return true;
+    }
+    is_cmd_metachar_u16(ch)
+}
+
+/| Appends one `cmd.exe`-escaped argument (`%%cd:~,%`, doubled trailing `\`, `^` outside quotes; `\0`/`\r`/`\n`/`"` rejected).
+fn append_cmd_escaped_token_wtf16(
+    token_u16: &[u16],
+    force_quotes: bool,
+    forbid_quotes: bool,
+    out: &mut Vec[u16],
+    /,
+) -> unit!IoError {
+    let token_len: usize = token_u16.len();
+    var use_quotes: bool = force_quotes or token_len == 0_usize;
+    var scan_i: usize = 0;
+    while scan_i < token_len {
+        let ch: u16 = unit_at_u16(token_u16, scan_i);
+        if ch == 0x0000_u16 or ch == 0x000A_u16 or ch == 0x000D_u16 {
+            return .Err(IoError.from_kind(.InvalidInput, op: .Spawn));
+        }
+        if forbid_quotes and ch == 0x0022_u16 {
+            return .Err(IoError.from_kind(.InvalidInput, op: .Spawn));
+        }
+        if needs_cmd_quotes_u16(ch) {
+            use_quotes = true;
+        }
+        scan_i += 1_usize;
+    }
+
+    if use_quotes {
+        out.push(0x0022_u16);
+        var backslash_run: usize = 0;
+        var idx: usize = 0;
+        while idx < token_len {
+            let ch: u16 = unit_at_u16(token_u16, idx);
+            match ch {
+                0x005C_u16 => {
+                    backslash_run = backslash_run +% 1_usize;
+                    out.push(0x005C_u16);
+                },
+                0x0025_u16 => {
+                    backslash_run = 0_usize;
+                    out.extend_from_slice(&CMD_PERCENT_ESCAPE_UTF16);
+                },
+                0x0022_u16 => {
+                    if backslash_run > 0_usize {
+                        push_repeated_u16(out, 0x005C_u16, backslash_run);
+                        backslash_run = 0_usize;
+                    }
+                    out.push(0x0022_u16);
+                    out.push(0x0022_u16);
+                },
+                _ => {
+                    backslash_run = 0_usize;
+                    out.push(ch);
+                },
+            }
+            idx += 1_usize;
+        }
+        // Double any trailing `\` run before the closing `"` so `%*` downstream MSVCRT parsing stays balanced:
+        if backslash_run > 0_usize {
+            push_repeated_u16(out, 0x005C_u16, backslash_run);
+        }
+        out.push(0x0022_u16);
+        return .Ok(());
+    }
+
+    var idx: usize = 0;
+    while idx < token_len {
+        let ch: u16 = unit_at_u16(token_u16, idx);
+        if ch == 0x0025_u16 {
+            out.extend_from_slice(&CMD_PERCENT_ESCAPE_UTF16);
+        } else {
+            if is_cmd_metachar_u16(ch) {
+                out.push(0x005E_u16);
+            }
+            out.push(ch);
+        }
+        idx += 1_usize;
+    }
+    .Ok(())
+}
+
+/| Appends `/d /v:off /e:on /c ""batch_path" …"` into `out`, neutralizing `%`, trailing `\`, and `&|<>()^!` while rejecting `\0`/`\r`/`\n`/`"`.
+fn escape_cmd_exe_script_line(
+    batch_path: Path,
+    args_slice: &[PathBuf],
+    out: &mut Vec[u16],
+    /,
+) -> unit!IoError {
+    let batch_bytes: &[u8] = batch_path.as_bytes();
+    if batch_bytes.is_empty() {
+        return .Err(IoError.from_kind(.InvalidInput, op: .Spawn));
+    }
+    var scratch_u16 = Vec[u16].new();
+    append_wtf8_as_wtf16(batch_bytes, &mut scratch_u16)?;
+
+    // [1] Emit `/d /v:off /e:on /c "` outer wrapper and always-quoted `batch_path`:
+    out.extend_from_slice(&CMD_SCRIPT_SWITCHES_UTF16);
+    append_cmd_escaped_token_wtf16(scratch_u16.as_slice(), true, true, out)?;
+
+    // [2] Emit each escaped argument separated by ASCII space (`forbid_quotes: true` blocks `%~1` `BatBadBut` breakout):
+    for &arg_buf in args_slice {
+        out.push(0x0020_u16);
+        scratch_u16.clear();
+        append_wtf8_as_wtf16(arg_buf.as_bytes(), &mut scratch_u16)?;
+        append_cmd_escaped_token_wtf16(scratch_u16.as_slice(), false, true, out)?;
+    }
+
+    // [3] Emit outer closing `"` matching `/c "`:
+    out.push(0x0022_u16);
+    .Ok(())
+}
+
+/| Validates all `Command` inputs (`program`, `args`, `cwd`, `env_overrides`) for interior NULs and valid env keys.
+fn validate_command_common(
+    program_bytes: &[u8],
+    args_slice: &[PathBuf],
+    cwd_opt: &PathBuf?,
+    env_overrides: &[EnvOverride],
+    allow_windows_batch: bool,
+    /,
+) -> unit!IoError {
+    if program_bytes.is_empty() or contains_nul_byte(program_bytes) {
+        return .Err(IoError.from_kind(.InvalidInput, op: .Spawn));
+    }
+    if allow_windows_batch and contains_crlf_or_quote(program_bytes, true) {
+        return .Err(IoError.from_kind(.InvalidInput, op: .Spawn));
+    }
+    for &arg_buf in args_slice {
+        let raw_arg: &[u8] = arg_buf.as_bytes();
+        if contains_nul_byte(raw_arg) {
+            return .Err(IoError.from_kind(.InvalidInput, op: .Spawn));
+        }
+        if allow_windows_batch and contains_crlf_or_quote(raw_arg, true) {
+            return .Err(IoError.from_kind(.InvalidInput, op: .Spawn));
+        }
+    }
+    if cwd_opt.* is .Some(&cwd_buf) {
+        let cwd_bytes: &[u8] = cwd_buf.as_bytes();
+        if cwd_bytes.is_empty() or contains_nul_byte(cwd_bytes) {
+            return .Err(IoError.from_kind(.InvalidInput, op: .Spawn));
+        }
+    }
+    for &ovr in env_overrides {
+        let key_bytes: &[u8] = ovr.key.as_bytes();
+        if key_bytes.is_empty() or contains_nul_or_eq(key_bytes) {
+            return .Err(IoError.from_kind(.InvalidInput, op: .Spawn));
+        }
+        if ovr.val is .Some(&val_str) and contains_nul_byte(val_str.as_bytes()) {
+            return .Err(IoError.from_kind(.InvalidInput, op: .Spawn));
+        }
+    }
+    .Ok(())
+}
+
+/| Returns `true` if `bytes` contains an embedded `0x00` NUL byte.
+fn contains_nul_byte(bytes: &[u8], /) -> bool {
+    for b_val in bytes {
+        if b_val == 0_u8 {
+            return true;
+        }
+    }
+    false
+}
+
+/| Returns `true` if `bytes` contains `0x00` or `'='`.
+fn contains_nul_or_eq(bytes: &[u8], /) -> bool {
+    for b_val in bytes {
+        if b_val == 0_u8 or b_val == b'=' {
+            return true;
+        }
+    }
+    false
+}
+
+/| Returns `true` if `bytes` contains `\r`, `\n`, or (when `reject_quote` is `true`) `"`.
+fn contains_crlf_or_quote(bytes: &[u8], reject_quote: bool, /) -> bool {
+    for b_val in bytes {
+        if b_val == b'\r' or b_val == b'\n' or (reject_quote and b_val == b'"') {
+            return true;
+        }
+    }
+    false
+}
+
+// -------------------- SimReactor Dispatch ---------------------
+/| Submits a `SIM_OP_PROC_OP` descriptor to `context.reactor.vtable.submit_io` (`SIM_UNHANDLED_SENTINEL` when inactive).
+@std_cap_boundary(clears: [ffi, unsafe_op, indirect_opaque])
+fn submit_reactor_proc_op(
+    sub_op: u8,
+    fd_or_pid: i32,
+    payload_ptr: *mut u8,
+    payload_len: usize,
+    /,
+) -> i64 {
+    let reactor_slot = context.reactor;
+    let vt_ptr: *u8 = unsafe {
+        (&raw reactor_slot as **u8).*
+    };
+    if vt_ptr.is_null() {
+        return SIM_UNHANDLED_SENTINEL;
+    }
+    let slot_ptr: *(ReactorSubmitFn?) = unsafe {
+        vt_ptr.add(3_usize * @size_of[usize]()) as *(ReactorSubmitFn?)
+    };
+    if slot_ptr.is_null() {
+        return SIM_UNHANDLED_SENTINEL;
+    }
+    let opt_submit: ReactorSubmitFn? = unsafe {
+        slot_ptr.*
+    };
+    let submit_cb: ReactorSubmitFn = opt_submit orelse return SIM_UNHANDLED_SENTINEL;
+    let clamped_len: u32 = if payload_len > (u32.MAX as usize) => u32.MAX else payload_len as u32;
+    let sub = IoSubmission {
+        kind: SIM_OP_PROC_OP,
+        flags: sub_op,
+        worker_id: 0_u16,
+        fd_or_handle: fd_or_pid,
+        offset_or_ns: 0_u64,
+        buf_ptr: payload_ptr,
+        buf_len: clamped_len,
+        slot_index: 0_u32,
+    };
+    let reactor_ctx_slot = context.reactor_ctx;
+    let state_ptr: *mut opaque = unsafe {
+        (&raw reactor_ctx_slot as **mut opaque).*
+    };
+    unsafe {
+        submit_cb(state_ptr, &raw sub)
+    }
+}
+
+/| Encodes a portable simulated exit code into target-native `ExitStatus` so `code()` returns `.Some(sim_code)`.
+@cfg(target.os == "linux" or target.os == "macos")
+fn exit_status_from_sim_code(sim_code: i32, /) -> ExitStatus {
+    ExitStatus { raw_status: (sim_code & 0xFF) << 8 }
+}
+
+/| Encodes a portable simulated exit code into target-native `ExitStatus` on Windows and WASI.
+@cfg(not (target.os == "linux" or target.os == "macos"))
+fn exit_status_from_sim_code(sim_code: i32, /) -> ExitStatus {
+    ExitStatus { raw_status: sim_code }
+}
+
+/| Wraps a simulated virtual pipe descriptor `sim_fd` (`>= 0`) into `RawOsFd` on Windows.
+@cfg(target.os == "windows")
+fn sim_fd_to_raw_os_fd(sim_fd: i32, /) -> RawOsFd {
+    (sim_fd as usize) as *mut opaque
+}
+
+/| Wraps a simulated virtual pipe descriptor `sim_fd` (`>= 0`) into `RawOsFd` on POSIX and WASI.
+@cfg(not (target.os == "windows"))
+fn sim_fd_to_raw_os_fd(sim_fd: i32, /) -> RawOsFd {
+    sim_fd
+}
+
+/| Attempts to spawn `Command` via `context.reactor` (`SIM_OP_PROC_OP`), returning `.None` when unhandled.
+fn try_sim_spawn_child(
+    program_bytes: &[u8],
+    cwd_opt: &PathBuf?,
+    arg_count: usize,
+    is_cmd_script: bool,
+    in_kind: StdioKind,
+    out_kind: StdioKind,
+    err_kind: StdioKind,
+    /,
+) -> (ChildProcess!IoError)? {
+    var cwd_ptr: *u8 = @default_init[*u8]();
+    var cwd_len: usize = 0;
+    if cwd_opt.* is .Some(&cwd_pb) {
+        let cwd_slice: &[u8] = cwd_pb.as_bytes();
+        cwd_ptr = cwd_slice.as_ptr();
+        cwd_len = cwd_slice.len();
+    }
+    var req = SimProcSpawnPayload {
+        program_ptr: program_bytes.as_ptr(),
+        program_len: program_bytes.len(),
+        cwd_ptr,
+        cwd_len,
+        arg_count: if arg_count > (u32.MAX as usize) => u32.MAX else arg_count as u32,
+        stdin_kind: in_kind as u8,
+        stdout_kind: out_kind as u8,
+        stderr_kind: err_kind as u8,
+        is_cmd_script: if is_cmd_script => 1_u8 else 0_u8,
+        out_pid: 0_u32,
+        out_stdin_fd: -1_i32,
+        out_stdout_fd: -1_i32,
+        out_stderr_fd: -1_i32,
+    };
+    let sim_rc: i64 = submit_reactor_proc_op(
+        PROC_SIM_SPAWN,
+        -1_i32,
+        (&raw mut req) as *mut u8,
+        @size_of[SimProcSpawnPayload](),
+    );
+    if sim_rc == SIM_UNHANDLED_SENTINEL {
+        return .None;
+    }
+    if sim_rc < 0_i64 {
+        let fault_code = (0_i64 -% sim_rc) as i32;
+        return .Some(.Err(IoError.from_raw_os(fault_code, domain: .SimFault, op: .Spawn)));
+    }
+    let child_in: ChildStdin? = if req.out_stdin_fd >= 0_i32 {
+        .Some(ChildStdin { file: File.from_raw_fd(sim_fd_to_raw_os_fd(req.out_stdin_fd)) })
+    } else {
+        .None
+    };
+    let child_out: ChildStdout? = if req.out_stdout_fd >= 0_i32 {
+        .Some(ChildStdout { file: File.from_raw_fd(sim_fd_to_raw_os_fd(req.out_stdout_fd)) })
+    } else {
+        .None
+    };
+    let child_err: ChildStderr? = if req.out_stderr_fd >= 0_i32 {
+        .Some(ChildStdout { file: File.from_raw_fd(sim_fd_to_raw_os_fd(req.out_stderr_fd)) })
+    } else {
+        .None
+    };
+    .Some(
+        .Ok(
+            ChildProcess {
+                pid: req.out_pid,
+                os_handle: invalid_raw_os_fd(),
+                stdin: own child_in,
+                stdout: own child_out,
+                stderr: own child_err,
+                reaped_status: .None,
+                is_sim_child: true,
+            },
+        ),
+    )
+}
+
+/| Waits on a simulated child `pid` via `SIM_OP_PROC_OP` (`PROC_SIM_WAIT` or `PROC_SIM_KILL_WAIT`).
+fn sim_wait_or_kill_child(pid: u32, sub_op: u8, /) -> ExitStatus!IoError {
+    let sim_rc: i64 = submit_reactor_proc_op(
+        sub_op,
+        @bit_cast[i32](pid),
+        @default_init[*mut u8](),
+        0_usize,
+    );
+    if sim_rc == SIM_UNHANDLED_SENTINEL {
+        return .Err(IoError.from_kind(.Unsupported, op: .Wait));
+    }
+    if sim_rc < 0_i64 {
+        let fault_code = (0_i64 -% sim_rc) as i32;
+        return .Err(IoError.from_raw_os(fault_code, domain: .SimFault, op: .Wait));
+    }
+    .Ok(exit_status_from_sim_code((sim_rc & 0xFFFF_FFFF_i64) as i32))
+}
+
+/| Polls a simulated child `pid` via `SIM_OP_PROC_OP` (`PROC_SIM_TRY_WAIT`).
+fn sim_try_wait_child(pid: u32, /) -> ExitStatus?!IoError {
+    let sim_rc: i64 = submit_reactor_proc_op(
+        PROC_SIM_TRY_WAIT,
+        @bit_cast[i32](pid),
+        @default_init[*mut u8](),
+        0_usize,
+    );
+    if sim_rc == SIM_UNHANDLED_SENTINEL {
+        return .Err(IoError.from_kind(.Unsupported, op: .Wait));
+    }
+    if sim_rc == PROC_SIM_STILL_RUNNING {
+        return .Ok(.None);
+    }
+    if sim_rc < 0_i64 {
+        let fault_code = (0_i64 -% sim_rc) as i32;
+        return .Err(IoError.from_raw_os(fault_code, domain: .SimFault, op: .Wait));
+    }
+    .Ok(.Some(exit_status_from_sim_code((sim_rc & 0xFFFF_FFFF_i64) as i32)))
+}
+
+// ---------------------- Windows Backend -----------------------
+/| Transcodes WTF-8 `src` into a NUL-terminated `Vec[u16]` on Windows.
+@cfg(target.os == "windows")
+fn encode_win32_wide_z(src: &[u8], /) -> Vec[u16]!IoError {
+    var out_w = Vec[u16].with_capacity(src.len() +% 1_usize);
+    append_wtf8_as_wtf16(src, &mut out_w)?;
+    out_w.push(0_u16);
+    .Ok(own out_w)
+}
+
+/| Grows `out_vec` to at least `target_len` zero-initialized `u64` elements.
+@cfg(target.os == "windows")
+fn grow_zeroed_u64(out_vec: &mut Vec[u64], target_len: usize, /) {
+    while out_vec.len() < target_len {
+        out_vec.push(0_u64);
+    }
+}
+
+/| Computes UTF-16 C-string length of `wstr_ptr` bounded at `max_units`.
+@cfg(target.os == "windows") @std_cap_boundary(clears: [unsafe_op])
+fn bounded_wstr_len(wstr_ptr: *u16, max_units: usize, /) -> usize {
+    if wstr_ptr.is_null() {
+        return 0_usize;
+    }
+    var n: usize = 0;
+    while n < max_units {
+        if unsafe {
+            wstr_ptr.add(n).read()
+        }
+            == 0_u16 {
+            break;
+        }
+        n += 1_usize;
+    }
+    n
+}
+
+/| Returns `true` if `wpath` contains `\`, `/`, or `:`.
+@cfg(target.os == "windows")
+fn has_win32_sep_or_colon(wpath: &[u16], /) -> bool {
+    var i: usize = 0;
+    while i < wpath.len() {
+        let cur: u16 = unit_at_u16(wpath, i);
+        if cur == 0x005C_u16 or cur == 0x002F_u16 or cur == 0x003A_u16 {
+            return true;
+        }
+        i += 1_usize;
+    }
+    false
+}
+
+/| Returns `true` if `wpath` starts with `\`/`/` or a drive prefix `X:`.
+@cfg(target.os == "windows")
+fn is_win32_rooted_or_drive(wpath: &[u16], /) -> bool {
+    if wpath.is_empty() {
+        return false;
+    }
+    let first: u16 = unit_at_u16(wpath, 0);
+    if first == 0x005C_u16 or first == 0x002F_u16 {
+        return true;
+    }
+    wpath.len() >= 2_usize and unit_at_u16(wpath, 1) == 0x003A_u16
+}
+
+/| Returns `true` when the final filename stem of `wpath` contains `.` without a `.exe`/`.com` suffix (`"python3.12"`, `"ld.lld"`).
+@cfg(target.os == "windows")
+fn should_probe_explicit_exe(wpath: &[u16], /) -> bool {
+    let total: usize = wpath.len();
+    var comp_start: usize = 0;
+    var idx: usize = 0;
+    while idx < total {
+        let cur: u16 = unit_at_u16(wpath, idx);
+        if cur == 0x005C_u16 or cur == 0x002F_u16 or cur == 0x003A_u16 {
+            comp_start = idx +% 1_usize;
+        }
+        idx += 1_usize;
+    }
+    var has_dot = false;
+    var scan_i: usize = comp_start;
+    while scan_i < total {
+        if unit_at_u16(wpath, scan_i) == 0x002E_u16 {
+            has_dot = true;
+            break;
+        }
+        scan_i += 1_usize;
+    }
+    if not has_dot {
+        return false;
+    }
+    if total -| comp_start >= 4_usize and unit_at_u16(wpath, total -% 4_usize) == 0x002E_u16 {
+        let ext1: u16 = ascii_upper_u16(unit_at_u16(wpath, total -% 3_usize));
+        let ext2: u16 = ascii_upper_u16(unit_at_u16(wpath, total -% 2_usize));
+        let ext3: u16 = ascii_upper_u16(unit_at_u16(wpath, total -% 1_usize));
+        if (ext1 == 0x0045_u16 and ext2 == 0x0058_u16 and ext3 == 0x0045_u16)
+            or (ext1 == 0x0043_u16 and ext2 == 0x004F_u16 and ext3 == 0x004D_u16) {
+            return false;
+        }
+    }
+    true
+}
+
+/| Builds a NUL-terminated UTF-16 `%PATH%;%SystemRoot%\System32;%SystemRoot%` search list excluding parent CWD.
+@cfg(target.os == "windows") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn build_win32_safe_search_path() -> Vec[u16] {
+    var out = Vec[u16].new();
+    let path_key: &[u16] = &WIN32_PATH_KEY_UTF16;
+    var stack_path: [u16; 1_024] = [0_u16; 1_024];
+    let path_len1: u32 = unsafe {
+        sys.windows.win32_get_environment_variable_w(
+            path_key.as_ptr(),
+            &raw mut stack_path[0],
+            1_024_u32,
+        )
+    };
+    if path_len1 > 0_u32 and path_len1 < 1_024_u32 {
+        out.extend_from_slice(stack_path[0..(path_len1 as usize)]);
+    } else if path_len1 >= 1_024_u32 and path_len1 <= 32_767_u32 {
+        let cap: usize = (path_len1 as usize) +% 1_usize;
+        grow_zeroed_u16(&mut out, cap);
+        let path_len2: u32 = unsafe {
+            sys.windows.win32_get_environment_variable_w(
+                path_key.as_ptr(),
+                out.as_mut_ptr(),
+                cap as u32,
+            )
+        };
+        if path_len2 > 0_u32 and (path_len2 as usize) < cap {
+            out.truncate(path_len2 as usize);
+        } else {
+            out.clear();
+        }
+    }
+
+    if not out.is_empty() {
+        out.push(0x003B_u16);
+    }
+    let sys_root_key: &[u16] = &WIN32_SYSTEM_ROOT_KEY_UTF16;
+    var root_buf: [u16; 264] = [0_u16; 264];
+    let root_len: u32 = unsafe {
+        sys.windows.win32_get_environment_variable_w(
+            sys_root_key.as_ptr(),
+            &raw mut root_buf[0],
+            264_u32,
+        )
+    };
+    if root_len > 0_u32 and root_len < 264_u32 {
+        let root_slice: &[u16] = root_buf[0..(root_len as usize)];
+        out.extend_from_slice(root_slice);
+        out.extend_from_slice(&WIN32_SYS32_DIR_SUFFIX_UTF16);
+        out.push(0x003B_u16);
+        out.extend_from_slice(root_slice);
+    } else {
+        out.extend_from_slice(&WIN32_FALLBACK_SYS_DIRS_UTF16);
+    }
+    out.push(0_u16);
+    out
+}
+
+/| Runs a single bounded `SearchPathW` probe into `resolved` (growing once up to `32,767` UTF-16 units).
+@cfg(target.os == "windows") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn win32_search_once(
+    search_dir_opt: *u16,
+    file_z_ptr: *u16,
+    ext_opt: *u16,
+    resolved: &mut Vec[u16],
+    /,
+) -> u32 {
+    grow_zeroed_u16(resolved, 520_usize);
+    var res_len: u32 = unsafe {
+        sys.windows.win32_search_path_w(
+            search_dir_opt,
+            file_z_ptr,
+            ext_opt,
+            resolved.len() as u32,
+            resolved.as_mut_ptr(),
+            @default_init[*mut *mut u16](),
+        )
+    };
+    if res_len >= (resolved.len() as u32) and res_len <= 32_767_u32 {
+        let need_cap: usize = (res_len as usize) +% 2_usize;
+        grow_zeroed_u16(resolved, need_cap);
+        res_len = unsafe {
+            sys.windows.win32_search_path_w(
+                search_dir_opt,
+                file_z_ptr,
+                ext_opt,
+                need_cap as u32,
+                resolved.as_mut_ptr(),
+                @default_init[*mut *mut u16](),
+            )
+        };
+    }
+    if res_len > 0_u32 and (res_len as usize) < resolved.len() {
+        return res_len;
+    }
+    0_u32
+}
+
+/| Probes `<prog>.exe` first when `prog_exe_opt` is non-null (dotted stems), then `prog_z` with `dot_exe_ptr`.
+@cfg(target.os == "windows")
+fn win32_probe_program_in(
+    search_dir_opt: *u16,
+    prog_z_ptr: *u16,
+    prog_exe_opt: *u16,
+    dot_exe_ptr: *u16,
+    resolved: &mut Vec[u16],
+    /,
+) -> u32 {
+    if not prog_exe_opt.is_null() {
+        let exe_len: u32 = win32_search_once(
+            search_dir_opt,
+            prog_exe_opt,
+            @default_init[*u16](),
+            resolved,
+        );
+        if exe_len > 0_u32 {
+            return exe_len;
+        }
+    }
+    win32_search_once(search_dir_opt, prog_z_ptr, dot_exe_ptr, resolved)
+}
+
+/| Resolves `prog_z` strictly (`cwd_z_opt` first when set, dotted-stem `.exe` support, never `.bat`/`.cmd`).
+@cfg(target.os == "windows") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn win32_resolve_exe_strict(prog_z: &[u16], cwd_z_opt: *u16, /) -> Vec[u16]!IoError {
+    let dot_exe_slice: &[u16] = &WIN32_DOT_EXE_UTF16;
+    let dot_exe_ptr: *u16 = dot_exe_slice.as_ptr();
+    let prog_no_nul: usize = prog_z.len() -| 1_usize;
+    let prog_stem: &[u16] = if prog_no_nul <= prog_z.len() => prog_z[0..prog_no_nul] else prog_z;
+    var resolved = Vec[u16].new();
+    var res_len: u32 = 0;
+
+    if has_win32_sep_or_colon(prog_stem) {
+        var target_z = Vec[u16].new();
+        if not cwd_z_opt.is_null() and not is_win32_rooted_or_drive(prog_stem) {
+            let cwd_len: usize = bounded_wstr_len(cwd_z_opt, 32_768_usize);
+            if cwd_len > 0_usize {
+                let cwd_slice: &[u16] = unsafe {
+                    @slice_from_raw_parts(cwd_z_opt, cwd_len)
+                };
+                target_z.extend_from_slice(cwd_slice);
+                let tail_ch: u16 = unit_at_u16(cwd_slice, cwd_len -% 1_usize);
+                if tail_ch != 0x005C_u16 and tail_ch != 0x002F_u16 {
+                    target_z.push(0x005C_u16);
+                }
+            }
+            target_z.extend_from_slice(prog_stem);
+            target_z.push(0_u16);
+        } else {
+            target_z.extend_from_slice(prog_z);
+        }
+        let target_slice: &[u16] = target_z.as_slice();
+        let target_no_nul: usize = target_slice.len() -| 1_usize;
+        var target_exe_z = Vec[u16].new();
+        var target_exe_ptr: *u16 = @default_init[*u16]();
+        if target_no_nul <= target_slice.len()
+            and should_probe_explicit_exe(target_slice[0..target_no_nul]) {
+            target_exe_z.extend_from_slice(target_slice[0..target_no_nul]);
+            target_exe_z.extend_from_slice(dot_exe_slice);
+            target_exe_ptr = target_exe_z.as_ptr();
+        }
+        res_len = win32_probe_program_in(
+            @default_init[*u16](),
+            target_z.as_ptr(),
+            target_exe_ptr,
+            dot_exe_ptr,
+            &mut resolved,
+        );
+    } else {
+        var prog_exe_z = Vec[u16].new();
+        var prog_exe_ptr: *u16 = @default_init[*u16]();
+        if should_probe_explicit_exe(prog_stem) {
+            prog_exe_z.extend_from_slice(prog_stem);
+            prog_exe_z.extend_from_slice(dot_exe_slice);
+            prog_exe_ptr = prog_exe_z.as_ptr();
+        }
+        if not cwd_z_opt.is_null() {
+            res_len = win32_probe_program_in(
+                cwd_z_opt,
+                prog_z.as_ptr(),
+                prog_exe_ptr,
+                dot_exe_ptr,
+                &mut resolved,
+            );
+        }
+        if res_len == 0_u32 {
+            let safe_dirs: Vec[u16] = build_win32_safe_search_path();
+            res_len = win32_probe_program_in(
+                safe_dirs.as_ptr(),
+                prog_z.as_ptr(),
+                prog_exe_ptr,
+                dot_exe_ptr,
+                &mut resolved,
+            );
+        }
+        if res_len == 0_u32 and cwd_z_opt.is_null() {
+            res_len = win32_probe_program_in(
+                @default_init[*u16](),
+                prog_z.as_ptr(),
+                prog_exe_ptr,
+                dot_exe_ptr,
+                &mut resolved,
+            );
+        }
+    }
+
+    if res_len == 0_u32 or (res_len as usize) >= resolved.len() {
+        let win_err: u32 = unsafe {
+            sys.windows.win32_get_last_error()
+        };
+        let eff_err: u32 = if win_err == 0_u32 => sys.windows.ERROR_FILE_NOT_FOUND else win_err;
+        return .Err(IoError.from_raw_os(@bit_cast[i32](eff_err), domain: .Win32Error, op: .Spawn));
+    }
+    resolved.truncate((res_len as usize) +% 1_usize);
+    let no_nul_len = res_len as usize;
+    let res_slice: &[u16] = resolved.as_slice();
+    if no_nul_len <= res_slice.len() and is_windows_batch_wtf16(res_slice[0..no_nul_len]) {
+        return .Err(IoError.from_kind(.InvalidScriptExtension, op: .Spawn));
+    }
+    .Ok(own resolved)
+}
+
+/| Resolves `%SystemRoot%\System32\cmd.exe` as a NUL-terminated `Vec[u16]` for `Command.cmd_script`.
+@cfg(target.os == "windows") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn win32_resolve_system_cmd_exe() -> Vec[u16] {
+    let sys_root_key: &[u16] = &WIN32_SYSTEM_ROOT_KEY_UTF16;
+    var root_buf: [u16; 264] = [0_u16; 264];
+    let root_len: u32 = unsafe {
+        sys.windows.win32_get_environment_variable_w(
+            sys_root_key.as_ptr(),
+            &raw mut root_buf[0],
+            264_u32,
+        )
+    };
+    if root_len > 0_u32 and root_len < 264_u32 {
+        var rlen = root_len as usize;
+        while rlen > 0_usize
+            and (
+                unit_at_u16(&root_buf, rlen -% 1_usize) == 0x005C_u16
+                    or unit_at_u16(
+                        &root_buf,
+                        rlen -% 1_usize,
+                    )
+                        == 0x002F_u16
+            ) {
+            rlen = rlen -% 1_usize;
+        }
+        var out_cmd = Vec[u16].with_capacity(rlen +% 18_usize);
+        if rlen <= 264_usize {
+            out_cmd.extend_from_slice(root_buf[0..rlen]);
+        }
+        out_cmd.extend_from_slice(&WIN32_SYS32_CMD_SUFFIX_UTF16);
+        out_cmd.push(0_u16);
+        return out_cmd;
+    }
+    Vec[u16].from_slice(&WIN32_FALLBACK_CMD_UTF16)
+}
+
+/| Compares two UTF-16 environment keys ASCII-case-insensitively (`< 0`, `0`, `> 0`) for Win32 block sorting.
+@cfg(target.os == "windows")
+fn cmp_utf16_env_key(lhs: &[u16], rhs: &[u16], /) -> i32 {
+    let min_len: usize = if lhs.len() < rhs.len() => lhs.len() else rhs.len();
+    var i: usize = 0;
+    while i < min_len {
+        let lu: u16 = ascii_upper_u16(unit_at_u16(lhs, i));
+        let ru: u16 = ascii_upper_u16(unit_at_u16(rhs, i));
+        if lu != ru {
+            return if lu < ru => -1_i32 else 1_i32;
+        }
+        i += 1_usize;
+    }
+    if lhs.len() == rhs.len() {
+        return 0_i32;
+    }
+    if lhs.len() < rhs.len() => -1_i32 else 1_i32
+}
+
+/| Builds a sorted, double-NUL-terminated UTF-16 environment block on Windows (`STD-02` §3.5B).
+@cfg(target.os == "windows") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn build_win32_env_block_utf16(
+    env_clear_all: bool,
+    env_overrides: &[EnvOverride],
+    /,
+) -> Vec[u16]!IoError {
+    var keys = Vec[Vec[u16]].new();
+    var vals = Vec[Vec[u16]].new();
+
+    // [1] Snapshot parent UTF-16 environment unless `env_clear()` was requested:
+    if not env_clear_all {
+        let raw_env: *mut u16 = unsafe {
+            sys.windows.win32_get_environment_strings_w()
+        };
+        if not raw_env.is_null() {
+            var cur_off: usize = 0;
+            while cur_off < 1_048_576_usize {
+                let first_ptr: *mut u16 = unsafe {
+                    raw_env.add(cur_off)
+                };
+                if first_ptr.is_null() {
+                    break;
+                }
+                let first_u16: u16 = unsafe {
+                    first_ptr.*
+                };
+                if first_u16 == 0_u16 {
+                    break;
+                }
+                var entry_len: usize = 0;
+                while cur_off +% entry_len < 1_048_576_usize {
+                    let ch_ptr: *mut u16 = unsafe {
+                        raw_env.add(cur_off +% entry_len)
+                    };
+                    if ch_ptr.is_null() {
+                        break;
+                    }
+                    let ch_u16: u16 = unsafe {
+                        ch_ptr.*
+                    };
+                    if ch_u16 == 0_u16 {
+                        break;
+                    }
+                    entry_len += 1_usize;
+                }
+                let entry_slice: &[u16] = unsafe {
+                    @slice_from_raw_parts(first_ptr as *u16, entry_len)
+                };
+                var eq_pos = 1_usize;
+                while eq_pos < entry_slice.len() {
+                    if unit_at_u16(entry_slice, eq_pos) == 0x003D_u16 {
+                        break;
+                    }
+                    eq_pos += 1_usize;
+                }
+                if eq_pos < entry_slice.len() {
+                    keys.push(Vec[u16].from_slice(entry_slice[0..eq_pos]));
+                    let val_start: usize = eq_pos +% 1_usize;
+                    if val_start <= entry_slice.len() {
+                        vals.push(Vec[u16].from_slice(entry_slice[val_start..entry_slice.len()]));
+                    }
+                }
+                cur_off = cur_off +% entry_len +% 1_usize;
+            }
+            unsafe {
+                _ = sys.windows.win32_free_environment_strings_w(raw_env);
+            }
+        }
+    }
+
+    // [2] Apply queued `env` / `env_remove` overrides case-insensitively:
+    for &ovr in env_overrides {
+        var ovr_key = Vec[u16].new();
+        append_wtf8_as_wtf16(ovr.key.as_bytes(), &mut ovr_key)?;
+        var existing_idx: usize? = .None;
+        var scan_k: usize = 0;
+        while scan_k < keys.len() {
+            if cmp_utf16_env_key(keys[scan_k].as_slice(), ovr_key.as_slice()) == 0_i32 {
+                existing_idx = .Some(scan_k);
+                break;
+            }
+            scan_k += 1_usize;
+        }
+        if ovr.val is .Some(&val_str) {
+            var ovr_val = Vec[u16].new();
+            append_wtf8_as_wtf16(val_str.as_bytes(), &mut ovr_val)?;
+            if existing_idx is .Some(idx_found) {
+                if idx_found < vals.len() {
+                    vals[idx_found] = own ovr_val;
+                }
+            } else {
+                keys.push(own ovr_key);
+                vals.push(own ovr_val);
+            }
+        } else if existing_idx is .Some(idx_rem) {
+            _ = keys.remove(idx_rem);
+            _ = vals.remove(idx_rem);
+        }
+    }
+
+    // [3] Sort keys case-insensitively per Win32 `CreateProcessW` environment invariant:
+    let count: usize = keys.len();
+    var order = Vec[usize].with_capacity(count);
+    var init_i: usize = 0;
+    while init_i < count {
+        order.push(init_i);
+        init_i += 1_usize;
+    }
+    var ins_i = 1_usize;
+    while ins_i < order.len() {
+        let cur_idx: usize = order[ins_i];
+        var j: usize = ins_i;
+        while j > 0_usize and j <= order.len() {
+            let prev_slot: usize = j -% 1_usize;
+            if prev_slot >= order.len() {
+                break;
+            }
+            let prev_idx: usize = order[prev_slot];
+            if prev_idx >= keys.len() or cur_idx >= keys.len() {
+                break;
+            }
+            if cmp_utf16_env_key(keys[prev_idx].as_slice(), keys[cur_idx].as_slice()) <= 0_i32 {
+                break;
+            }
+            if j < order.len() {
+                order[j] = prev_idx;
+            }
+            j = prev_slot;
+        }
+        if j < order.len() {
+            order[j] = cur_idx;
+        }
+        ins_i += 1_usize;
+    }
+
+    // [4] Flatten sorted `KEY=VAL\0…\0` UTF-16 block:
+    var block = Vec[u16].new();
+    var out_i: usize = 0;
+    while out_i < order.len() {
+        let idx_k: usize = order[out_i];
+        if idx_k < keys.len() and idx_k < vals.len() {
+            block.extend_from_slice(keys[idx_k].as_slice());
+            block.push(0x003D_u16);
+            block.extend_from_slice(vals[idx_k].as_slice());
+            block.push(0_u16);
+        }
+        out_i += 1_usize;
+    }
+    if block.is_empty() {
+        block.push(0_u16);
+    }
+    block.push(0_u16);
+    .Ok(own block)
+}
+
+/| Opens an inheritable `NUL` handle on Windows (returning raw `usize` bits) for `Stdio.null()`.
+@cfg(target.os == "windows") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn open_win32_nul_inheritable() -> usize!IoError {
+    let nul_dev: [u16; 4] = WIN32_NUL_DEV_UTF16;
+    let sa = sys.windows.Win32SecurityAttributes {
+        byte_length: @size_of[sys.windows.Win32SecurityAttributes]() as u32,
+        security_descriptor: @default_init[*mut opaque](),
+        inherit_handle: 1,
+    };
+    let nul_h: *mut opaque = unsafe {
+        sys.windows.win32_create_file_w(
+            &raw nul_dev[0],
+            sys.windows.GENERIC_READ | sys.windows.GENERIC_WRITE,
+            sys.windows.FILE_SHARE_ALL,
+            &raw sa,
+            sys.windows.OPEN_EXISTING,
+            sys.windows.FILE_ATTRIBUTE_NORMAL,
+            @default_init[*mut opaque](),
+        )
+    };
+    if not is_valid_raw_os_fd(nul_h) {
+        let win_err: u32 = unsafe {
+            sys.windows.win32_get_last_error()
+        };
+        return .Err(IoError.from_raw_os(@bit_cast[i32](win_err), domain: .Win32Error, op: .Spawn));
+    }
+    .Ok(nul_h as usize)
+}
+
+/| Creates a `(read_handle, write_handle)` pipe on Windows with only the child's side marked inheritable.
+@cfg(target.os == "windows") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn create_win32_stdio_pipe(child_reads: bool, /) -> (*mut opaque, *mut opaque)!IoError {
+    let sa = sys.windows.Win32SecurityAttributes {
+        byte_length: @size_of[sys.windows.Win32SecurityAttributes]() as u32,
+        security_descriptor: @default_init[*mut opaque](),
+        inherit_handle: 1,
+    };
+    var rd_h = invalid_raw_os_fd();
+    var wr_h = invalid_raw_os_fd();
+    let ok_pipe: i32 = unsafe {
+        sys.windows.win32_create_pipe(&raw mut rd_h, &raw mut wr_h, &raw sa, WIN32_PIPE_BUF_HINT)
+    };
+    if ok_pipe == 0 {
+        let win_err: u32 = unsafe {
+            sys.windows.win32_get_last_error()
+        };
+        return .Err(IoError.from_raw_os(@bit_cast[i32](win_err), domain: .Win32Error, op: .Spawn));
+    }
+    let parent_end: *mut opaque = if child_reads => wr_h else rd_h;
+    let ok_inh: i32 = unsafe {
+        sys.windows.win32_set_handle_information(parent_end, sys.windows.HANDLE_FLAG_INHERIT, 0_u32)
+    };
+    if ok_inh == 0 {
+        let win_err: u32 = unsafe {
+            sys.windows.win32_get_last_error()
+        };
+        close_raw_fd_if_valid(rd_h);
+        close_raw_fd_if_valid(wr_h);
+        return .Err(IoError.from_raw_os(@bit_cast[i32](win_err), domain: .Win32Error, op: .Spawn));
+    }
+    .Ok((rd_h, wr_h))
+}
+
+/| Reads `GetLastError()` on Windows and wraps it into an `IoError` (`ERROR_GEN_FAILURE = 31` fallback if `0`).
+@cfg(target.os == "windows") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn last_win32_io_error(op: IoOp, /) -> IoError {
+    let win_err: u32 = unsafe {
+        sys.windows.win32_get_last_error()
+    };
+    let eff_err: u32 = if win_err == 0_u32 => 31_u32 else win_err;
+    IoError.from_raw_os(@bit_cast[i32](eff_err), domain: .Win32Error, op: op)
+}
+
+/| Clears `HANDLE_FLAG_INHERIT` (`0`) on `handles[0..count]` whose inheritance flag was temporarily enabled for `CreateProcessW`.
+@cfg(target.os == "windows") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn restore_win32_handle_inherit_flags(handles: &[*mut opaque; 3], count: usize, /) {
+    var i: usize = 0;
+    while i < count and i < 3_usize {
+        let handle_val: *mut opaque = handles[i];
+        if is_valid_raw_os_fd(handle_val) {
+            unsafe {
+                _ = sys.windows.win32_set_handle_information(
+                    handle_val,
+                    sys.windows.HANDLE_FLAG_INHERIT,
+                    0_u32,
+                );
+            }
+        }
+        i += 1_usize;
+    }
+}
+
+/| Deduplicates inheritable stdio handles for `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, recording temporarily toggled flags.
+@cfg(target.os == "windows") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn collect_win32_inheritable_handles(
+    h_in: *mut opaque,
+    h_out: *mut opaque,
+    h_err: *mut opaque,
+    unique_out: &mut [*mut opaque; 3],
+    toggled_out: &mut [*mut opaque; 3],
+    toggled_cnt_out: &mut usize,
+    /,
+) -> usize!IoError {
+    let candidates: [*mut opaque; 3] = [h_in, h_out, h_err];
+    var local_toggled: [*mut opaque; 3] = [invalid_raw_os_fd(); 3];
+    var local_toggled_cnt: usize = 0;
+    var count: usize = 0;
+    var i: usize = 0;
+    while i < 3_usize {
+        let cand: *mut opaque = candidates[i];
+        i += 1_usize;
+        if not is_valid_raw_os_fd(cand) {
+            continue;
+        }
+        var is_dup = false;
+        var j: usize = 0;
+        while j < count and j < 3_usize {
+            if unique_out[j] == cand {
+                is_dup = true;
+                break;
+            }
+            j += 1_usize;
+        }
+        if is_dup {
+            continue;
+        }
+        let is_old_console_pseudo: bool = (((cand as usize) & 3_usize) == 3_usize)
+            and unsafe {
+                sys.windows.win32_get_file_type(cand) == sys.windows.FILE_TYPE_CHAR
+            };
+        if is_old_console_pseudo {
+            continue;
+        }
+        var h_flags: u32 = 0;
+        let ok_info: i32 = unsafe {
+            sys.windows.win32_get_handle_information(cand, &raw mut h_flags)
+        };
+        if ok_info == 0 {
+            continue;
+        }
+        if (h_flags & sys.windows.HANDLE_FLAG_INHERIT) == 0_u32 {
+            let ok_set: i32 = unsafe {
+                sys.windows.win32_set_handle_information(
+                    cand,
+                    sys.windows.HANDLE_FLAG_INHERIT,
+                    sys.windows.HANDLE_FLAG_INHERIT,
+                )
+            };
+            if ok_set == 0 {
+                restore_win32_handle_inherit_flags(&local_toggled, local_toggled_cnt);
+                return .Err(last_win32_io_error(.Spawn));
+            }
+            if local_toggled_cnt < 3_usize {
+                local_toggled[local_toggled_cnt] = cand;
+                local_toggled_cnt += 1_usize;
+            }
+        }
+        if count < 3_usize {
+            unique_out[count] = cand;
+            count += 1_usize;
+        }
+    }
+    toggled_out.* = local_toggled;
+    toggled_cnt_out.* = local_toggled_cnt;
+    .Ok(count)
+}
+
+/| Appends `handle_val` to `handles[0..6]` when in bounds.
+@cfg(target.os == "windows")
+fn push_win32_cleanup_handle(
+    handles: &mut [*mut opaque; 6],
+    count: &mut usize,
+    handle_val: *mut opaque,
+    /,
+) {
+    let cur_n: usize = count.*;
+    if cur_n < 6_usize {
+        handles[cur_n] = handle_val;
+        count.* = cur_n +% 1_usize;
+    }
+}
+
+/| Closes all valid handles inside `handles[0..count]`.
+@cfg(target.os == "windows")
+fn close_win32_handle_array(handles: &[*mut opaque; 6], count: usize, /) {
+    var i: usize = 0;
+    while i < count and i < 6_usize {
+        close_raw_fd_if_valid(handles[i]);
+        i += 1_usize;
+    }
+}
+
+/| Spawns a hardened Win32 child process via `CreateProcessW` + `STARTUPINFOEXW` (`STD-02` §3.5B).
+@cfg(target.os == "windows") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn host_spawn_child(
+    program: &PathBuf,
+    args_slice: &[PathBuf],
+    cwd_opt: &PathBuf?,
+    env_clear_all: bool,
+    env_overrides: &[EnvOverride],
+    allow_windows_batch: bool,
+    in_kind: StdioKind,
+    in_owned_fd: RawOsFd,
+    out_kind: StdioKind,
+    out_owned_fd: RawOsFd,
+    err_kind: StdioKind,
+    err_owned_fd: RawOsFd,
+    /,
+) -> ChildProcess!IoError {
+    var owned_cleanup: [*mut opaque; 6] = [invalid_raw_os_fd(); 6];
+    var cleanup_n: usize = 0;
+    if in_kind == .Fd {
+        push_win32_cleanup_handle(&mut owned_cleanup, &mut cleanup_n, in_owned_fd);
+    }
+    if out_kind == .Fd {
+        push_win32_cleanup_handle(&mut owned_cleanup, &mut cleanup_n, out_owned_fd);
+    }
+    if err_kind == .Fd {
+        push_win32_cleanup_handle(&mut owned_cleanup, &mut cleanup_n, err_owned_fd);
+    }
+
+    // [1] Encode optional working directory and resolve executable + command line:
+    var cwd_w = Vec[u16].new();
+    var cwd_ptr: *u16 = @default_init[*u16]();
+    if cwd_opt.* is .Some(&cwd_pb) {
+        cwd_w = encode_win32_wide_z(cwd_pb.as_bytes()) catch |err| {
+            close_win32_handle_array(&owned_cleanup, cleanup_n);
+            return .Err(err);
+        };
+        cwd_ptr = cwd_w.as_ptr();
+    }
+
+    var resolved_app = Vec[u16].new();
+    var cmd_line = Vec[u16].new();
+    if allow_windows_batch {
+        resolved_app = win32_resolve_system_cmd_exe();
+        let app_slice: &[u16] = resolved_app.as_slice();
+        let app_no_nul: usize = app_slice.len() -| 1_usize;
+        if app_no_nul <= app_slice.len() {
+            quote_msvcrt_arg_wtf16(app_slice[0..app_no_nul], &mut cmd_line) catch |err| {
+                close_win32_handle_array(&owned_cleanup, cleanup_n);
+                return .Err(err);
+            };
+        }
+        cmd_line.push(0x0020_u16);
+        escape_cmd_exe_script_line(program.as_path(), args_slice, &mut cmd_line) catch |err| {
+            close_win32_handle_array(&owned_cleanup, cleanup_n);
+            return .Err(err);
+        };
+        cmd_line.push(0_u16);
+    } else {
+        let prog_w: Vec[u16] = encode_win32_wide_z(program.as_bytes()) catch |err| {
+            close_win32_handle_array(&owned_cleanup, cleanup_n);
+            return .Err(err);
+        };
+        let prog_slice: &[u16] = prog_w.as_slice();
+        let prog_no_nul: usize = prog_slice.len() -| 1_usize;
+        if prog_no_nul <= prog_slice.len() and is_windows_batch_wtf16(prog_slice[0..prog_no_nul]) {
+            close_win32_handle_array(&owned_cleanup, cleanup_n);
+            return .Err(IoError.from_kind(.InvalidScriptExtension, op: .Spawn));
+        }
+        resolved_app = win32_resolve_exe_strict(prog_slice, cwd_ptr) catch |err| {
+            close_win32_handle_array(&owned_cleanup, cleanup_n);
+            return .Err(err);
+        };
+        let app_slice: &[u16] = resolved_app.as_slice();
+        let app_no_nul: usize = app_slice.len() -| 1_usize;
+        if app_no_nul <= app_slice.len() {
+            quote_msvcrt_arg_wtf16(app_slice[0..app_no_nul], &mut cmd_line) catch |err| {
+                close_win32_handle_array(&owned_cleanup, cleanup_n);
+                return .Err(err);
+            };
+        }
+        var arg_w = Vec[u16].new();
+        for &arg_buf in args_slice {
+            cmd_line.push(0x0020_u16);
+            arg_w.clear();
+            append_wtf8_as_wtf16(arg_buf.as_bytes(), &mut arg_w) catch |err| {
+                close_win32_handle_array(&owned_cleanup, cleanup_n);
+                return .Err(err);
+            };
+            quote_msvcrt_arg_wtf16(arg_w.as_slice(), &mut cmd_line) catch |err| {
+                close_win32_handle_array(&owned_cleanup, cleanup_n);
+                return .Err(err);
+            };
+        }
+        cmd_line.push(0_u16);
+    }
+
+    // [2] Build optional UTF-16 environment block:
+    var env_block = Vec[u16].new();
+    var env_ptr: *opaque = @default_init[*opaque]();
+    if env_clear_all or not env_overrides.is_empty() {
+        env_block = build_win32_env_block_utf16(env_clear_all, env_overrides) catch |err| {
+            close_win32_handle_array(&owned_cleanup, cleanup_n);
+            return .Err(err);
+        };
+        env_ptr = env_block.as_ptr() as *opaque;
+    }
+
+    // [3] Create pipes / `NUL` handles for child `stdin`, `stdout`, and `stderr`:
+    var parent_pipes: [*mut opaque; 3] = [invalid_raw_os_fd(); 3];
+    let child_in_h: *mut opaque = match in_kind {
+        .Inherit => unsafe {
+            sys.windows.win32_get_std_handle(sys.windows.STD_INPUT_HANDLE)
+        },
+        .Null => {
+            let nul_bits: usize = open_win32_nul_inheritable() catch |err| {
+                close_win32_handle_array(&owned_cleanup, cleanup_n);
+                return .Err(err);
+            };
+            let nul_h = nul_bits as *mut opaque;
+            push_win32_cleanup_handle(&mut owned_cleanup, &mut cleanup_n, nul_h);
+            nul_h
+        },
+        .Piped => {
+            let (rd_h, wr_h) = create_win32_stdio_pipe(true) catch |err| {
+                close_win32_handle_array(&owned_cleanup, cleanup_n);
+                return .Err(err);
+            };
+            push_win32_cleanup_handle(&mut owned_cleanup, &mut cleanup_n, rd_h);
+            parent_pipes[0] = wr_h;
+            rd_h
+        },
+        .Fd => in_owned_fd,
+    };
+
+    let child_out_h: *mut opaque = match out_kind {
+        .Inherit => unsafe {
+            sys.windows.win32_get_std_handle(sys.windows.STD_OUTPUT_HANDLE)
+        },
+        .Null => {
+            let nul_bits: usize = open_win32_nul_inheritable() catch |err| {
+                close_win32_handle_array(&owned_cleanup, cleanup_n);
+                close_raw_fd_if_valid(parent_pipes[0]);
+                return .Err(err);
+            };
+            let nul_h = nul_bits as *mut opaque;
+            push_win32_cleanup_handle(&mut owned_cleanup, &mut cleanup_n, nul_h);
+            nul_h
+        },
+        .Piped => {
+            let (rd_h, wr_h) = create_win32_stdio_pipe(false) catch |err| {
+                close_win32_handle_array(&owned_cleanup, cleanup_n);
+                close_raw_fd_if_valid(parent_pipes[0]);
+                return .Err(err);
+            };
+            push_win32_cleanup_handle(&mut owned_cleanup, &mut cleanup_n, wr_h);
+            parent_pipes[1] = rd_h;
+            wr_h
+        },
+        .Fd => out_owned_fd,
+    };
+
+    let child_err_h: *mut opaque = match err_kind {
+        .Inherit => unsafe {
+            sys.windows.win32_get_std_handle(sys.windows.STD_ERROR_HANDLE)
+        },
+        .Null => {
+            let nul_bits: usize = open_win32_nul_inheritable() catch |err| {
+                close_win32_handle_array(&owned_cleanup, cleanup_n);
+                close_raw_fd_if_valid(parent_pipes[0]);
+                close_raw_fd_if_valid(parent_pipes[1]);
+                return .Err(err);
+            };
+            let nul_h = nul_bits as *mut opaque;
+            push_win32_cleanup_handle(&mut owned_cleanup, &mut cleanup_n, nul_h);
+            nul_h
+        },
+        .Piped => {
+            let (rd_h, wr_h) = create_win32_stdio_pipe(false) catch |err| {
+                close_win32_handle_array(&owned_cleanup, cleanup_n);
+                close_raw_fd_if_valid(parent_pipes[0]);
+                close_raw_fd_if_valid(parent_pipes[1]);
+                return .Err(err);
+            };
+            push_win32_cleanup_handle(&mut owned_cleanup, &mut cleanup_n, wr_h);
+            parent_pipes[2] = rd_h;
+            wr_h
+        },
+        .Fd => err_owned_fd,
+    };
+
+    // [4] Populate deduplicated `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (`0x0002_0002`, fail-closed):
+    var unique_handles: [*mut opaque; 3] = [invalid_raw_os_fd(); 3];
+    var toggled_handles: [*mut opaque; 3] = [invalid_raw_os_fd(); 3];
+    var toggled_cnt: usize = 0;
+    let unique_cnt: usize = collect_win32_inheritable_handles(
+        child_in_h,
+        child_out_h,
+        child_err_h,
+        &mut unique_handles,
+        &mut toggled_handles,
+        &mut toggled_cnt,
+    ) catch |inh_err| {
+        close_win32_handle_array(&owned_cleanup, cleanup_n);
+        close_raw_fd_if_valid(parent_pipes[0]);
+        close_raw_fd_if_valid(parent_pipes[1]);
+        close_raw_fd_if_valid(parent_pipes[2]);
+        return .Err(inh_err);
+    };
+
+    var si_ex = @default_init[sys.windows.Win32StartupInfoExW]();
+    si_ex.startup_info.flags = sys.windows.STARTF_USESTDHANDLES;
+    si_ex.startup_info.std_input = child_in_h;
+    si_ex.startup_info.std_output = child_out_h;
+    si_ex.startup_info.std_error = child_err_h;
+
+    var attr_words: [u64; 24] = [0_u64; 24];
+    var dyn_attr = Vec[u64].new();
+    var has_attr_list = false;
+    var inherit_flag = 0_i32;
+    var creation_flags: u32 = sys.windows.CREATE_UNICODE_ENVIRONMENT;
+
+    if unique_cnt > 0_usize {
+        var req_attr_bytes: usize = 0;
+        unsafe {
+            _ = sys.windows.win32_initialize_proc_thread_attribute_list(
+                @default_init[*mut opaque](),
+                1_u32,
+                0_u32,
+                &raw mut req_attr_bytes,
+            );
+        }
+        if req_attr_bytes == 0_usize {
+            let size_err: IoError = last_win32_io_error(.Spawn);
+            restore_win32_handle_inherit_flags(&toggled_handles, toggled_cnt);
+            close_win32_handle_array(&owned_cleanup, cleanup_n);
+            close_raw_fd_if_valid(parent_pipes[0]);
+            close_raw_fd_if_valid(parent_pipes[1]);
+            close_raw_fd_if_valid(parent_pipes[2]);
+            return .Err(size_err);
+        }
+        let attr_ptr: *mut opaque = if req_attr_bytes <= 192_usize {
+            (&raw mut attr_words[0]) as *mut opaque
+        } else {
+            let word_cnt: usize = (req_attr_bytes +% 7_usize) / 8_usize;
+            grow_zeroed_u64(&mut dyn_attr, word_cnt);
+            dyn_attr.as_mut_ptr() as *mut opaque
+        };
+        var actual_bytes: usize = if req_attr_bytes <= 192_usize => 192_usize else req_attr_bytes;
+        let ok_init: i32 = unsafe {
+            sys.windows.win32_initialize_proc_thread_attribute_list(
+                attr_ptr,
+                1_u32,
+                0_u32,
+                &raw mut actual_bytes,
+            )
+        };
+        if ok_init == 0 {
+            let init_err: IoError = last_win32_io_error(.Spawn);
+            restore_win32_handle_inherit_flags(&toggled_handles, toggled_cnt);
+            close_win32_handle_array(&owned_cleanup, cleanup_n);
+            close_raw_fd_if_valid(parent_pipes[0]);
+            close_raw_fd_if_valid(parent_pipes[1]);
+            close_raw_fd_if_valid(parent_pipes[2]);
+            return .Err(init_err);
+        }
+        let ok_upd: i32 = unsafe {
+            sys.windows.win32_update_proc_thread_attribute(
+                attr_ptr,
+                0_u32,
+                sys.windows.PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                (&raw mut unique_handles[0]) as *mut opaque,
+                unique_cnt *% @size_of[*mut opaque](),
+                @default_init[*mut opaque](),
+                @default_init[*mut usize](),
+            )
+        };
+        if ok_upd == 0 {
+            let upd_err: IoError = last_win32_io_error(.Spawn);
+            unsafe {
+                sys.windows.win32_delete_proc_thread_attribute_list(attr_ptr);
+            }
+            restore_win32_handle_inherit_flags(&toggled_handles, toggled_cnt);
+            close_win32_handle_array(&owned_cleanup, cleanup_n);
+            close_raw_fd_if_valid(parent_pipes[0]);
+            close_raw_fd_if_valid(parent_pipes[1]);
+            close_raw_fd_if_valid(parent_pipes[2]);
+            return .Err(upd_err);
+        }
+        has_attr_list = true;
+        si_ex.attribute_list = attr_ptr;
+        si_ex.startup_info.struct_bytes = @size_of[sys.windows.Win32StartupInfoExW]() as u32;
+        inherit_flag = 1_i32;
+        creation_flags |= sys.windows.EXTENDED_STARTUPINFO_PRESENT;
+    } else {
+        si_ex.startup_info.struct_bytes = @size_of[sys.windows.Win32StartupInfoW]() as u32;
+    }
+
+    // [5] Invoke `CreateProcessW` with non-null `lpApplicationName`, restore parent handle flags, and close child handles:
+    var proc_info = @default_init[sys.windows.Win32ProcessInformation]();
+    let ok_spawn: i32 = unsafe {
+        sys.windows.win32_create_process_w(
+            resolved_app.as_ptr(),
+            cmd_line.as_mut_ptr(),
+            @default_init[*sys.windows.Win32SecurityAttributes](),
+            @default_init[*sys.windows.Win32SecurityAttributes](),
+            inherit_flag,
+            creation_flags,
+            env_ptr,
+            cwd_ptr,
+            (&raw mut si_ex) as *sys.windows.Win32StartupInfoW,
+            &raw mut proc_info,
+        )
+    };
+    let spawn_err: u32 = if ok_spawn == 0 {
+        unsafe {
+            sys.windows.win32_get_last_error()
+        }
+    } else {
+        0_u32
+    };
+
+    restore_win32_handle_inherit_flags(&toggled_handles, toggled_cnt);
+    if has_attr_list {
+        unsafe {
+            sys.windows.win32_delete_proc_thread_attribute_list(si_ex.attribute_list);
+        }
+    }
+    close_win32_handle_array(&owned_cleanup, cleanup_n);
+
+    if ok_spawn == 0 {
+        close_raw_fd_if_valid(parent_pipes[0]);
+        close_raw_fd_if_valid(parent_pipes[1]);
+        close_raw_fd_if_valid(parent_pipes[2]);
+        let eff_err: u32 = if spawn_err == 0_u32 => sys.windows.ERROR_FILE_NOT_FOUND else spawn_err;
+        return .Err(IoError.from_raw_os(@bit_cast[i32](eff_err), domain: .Win32Error, op: .Spawn));
+    }
+
+    close_raw_fd_if_valid(proc_info.thread_handle);
+    let out_stdin: ChildStdin? = if is_valid_raw_os_fd(parent_pipes[0]) {
+        .Some(ChildStdin { file: File.from_raw_fd(parent_pipes[0]) })
+    } else {
+        .None
+    };
+    let out_stdout: ChildStdout? = if is_valid_raw_os_fd(parent_pipes[1]) {
+        .Some(ChildStdout { file: File.from_raw_fd(parent_pipes[1]) })
+    } else {
+        .None
+    };
+    let out_stderr: ChildStderr? = if is_valid_raw_os_fd(parent_pipes[2]) {
+        .Some(ChildStdout { file: File.from_raw_fd(parent_pipes[2]) })
+    } else {
+        .None
+    };
+
+    .Ok(
+        ChildProcess {
+            pid: proc_info.process_id,
+            os_handle: proc_info.process_handle,
+            stdin: own out_stdin,
+            stdout: own out_stdout,
+            stderr: own out_stderr,
+            reaped_status: .None,
+            is_sim_child: false,
+        },
+    )
+}
+
+/| Waits indefinitely for Win32 `os_handle` to exit, reads `GetExitCodeProcess`, and closes `os_handle`.
+@cfg(target.os == "windows") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn host_wait_child(pid: u32, os_handle: RawOsFd, /) -> ExitStatus!IoError {
+    _ = pid;
+    if not is_valid_raw_os_fd(os_handle) {
+        return .Err(IoError.from_kind(.InvalidInput, op: .Wait));
+    }
+    let wait_rc: u32 = unsafe {
+        sys.windows.win32_wait_for_single_object(os_handle, sys.windows.INFINITE_TIMEOUT)
+    };
+    if wait_rc != sys.windows.WAIT_OBJECT_0 {
+        let win_err: u32 = unsafe {
+            sys.windows.win32_get_last_error()
+        };
+        close_raw_fd_if_valid(os_handle);
+        return .Err(IoError.from_raw_os(@bit_cast[i32](win_err), domain: .Win32Error, op: .Wait));
+    }
+    var exit_dword: u32 = 0;
+    let ok_code: i32 = unsafe {
+        sys.windows.win32_get_exit_code_process(os_handle, &raw mut exit_dword)
+    };
+    let code_err: u32 = if ok_code == 0 {
+        unsafe {
+            sys.windows.win32_get_last_error()
+        }
+    } else {
+        0_u32
+    };
+    close_raw_fd_if_valid(os_handle);
+    if ok_code == 0 {
+        return .Err(IoError.from_raw_os(@bit_cast[i32](code_err), domain: .Win32Error, op: .Wait));
+    }
+    .Ok(ExitStatus { raw_status: @bit_cast[i32](exit_dword) })
+}
+
+/| Checks non-blockingly (`timeout = 0`) whether Win32 `os_handle` has exited, closing `os_handle` on completion.
+@cfg(target.os == "windows") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn host_try_wait_child(pid: u32, os_handle: &mut RawOsFd, /) -> ExitStatus?!IoError {
+    _ = pid;
+    let cur_h: RawOsFd = os_handle.*;
+    if not is_valid_raw_os_fd(cur_h) {
+        return .Err(IoError.from_kind(.InvalidInput, op: .Wait));
+    }
+    let wait_rc: u32 = unsafe {
+        sys.windows.win32_wait_for_single_object(cur_h, 0_u32)
+    };
+    if wait_rc == sys.windows.WAIT_TIMEOUT {
+        return .Ok(.None);
+    }
+    if wait_rc != sys.windows.WAIT_OBJECT_0 {
+        let win_err: u32 = unsafe {
+            sys.windows.win32_get_last_error()
+        };
+        return .Err(IoError.from_raw_os(@bit_cast[i32](win_err), domain: .Win32Error, op: .Wait));
+    }
+    var exit_dword: u32 = 0;
+    let ok_code: i32 = unsafe {
+        sys.windows.win32_get_exit_code_process(cur_h, &raw mut exit_dword)
+    };
+    let code_err: u32 = if ok_code == 0 {
+        unsafe {
+            sys.windows.win32_get_last_error()
+        }
+    } else {
+        0_u32
+    };
+    close_raw_fd_if_valid(cur_h);
+    os_handle.* = invalid_raw_os_fd();
+    if ok_code == 0 {
+        return .Err(IoError.from_raw_os(@bit_cast[i32](code_err), domain: .Win32Error, op: .Wait));
+    }
+    .Ok(.Some(ExitStatus { raw_status: @bit_cast[i32](exit_dword) }))
+}
+
+/| Terminates Win32 `os_handle` (`TerminateProcess(1)`) and reaps its exit status, tolerating already-exited races.
+@cfg(target.os == "windows") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn host_kill_and_wait_child(pid: u32, os_handle: RawOsFd, /) -> ExitStatus!IoError {
+    if not is_valid_raw_os_fd(os_handle) {
+        return .Err(IoError.from_kind(.InvalidInput, op: .Wait));
+    }
+    let ok_term: i32 = unsafe {
+        sys.windows.win32_terminate_process(os_handle, 1_u32)
+    };
+    if ok_term == 0 {
+        let term_err: u32 = unsafe {
+            sys.windows.win32_get_last_error()
+        };
+        let already_done: bool = unsafe {
+            sys.windows.win32_wait_for_single_object(os_handle, 0_u32) == sys.windows.WAIT_OBJECT_0
+        };
+        if not already_done and term_err != sys.windows.ERROR_ACCESS_DENIED {
+            close_raw_fd_if_valid(os_handle);
+            return .Err(
+                IoError.from_raw_os(@bit_cast[i32](term_err), domain: .Win32Error, op: .Wait),
+            );
+        }
+    }
+    host_wait_child(pid, os_handle)
+}
+
+/| Returns `true` when Win32 `pipe_handle` has `>= 1` queued bytes or reached EOF (`FSCTL_PIPE_PEEK`).
+@cfg(target.os == "windows") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn win32_pipe_has_data_or_eof(pipe_handle: RawOsFd, /) -> bool {
+    if not is_valid_raw_os_fd(pipe_handle) {
+        return true;
+    }
+    var peek_buf = @default_init[Win32PipePeekBuf]();
+    var bytes_ret: u32 = 0;
+    let ok_peek: i32 = unsafe {
+        sys.windows.win32_device_io_control(
+            pipe_handle,
+            WIN32_FSCTL_PIPE_PEEK,
+            @default_init[*opaque](),
+            0_u32,
+            (&raw mut peek_buf) as *mut opaque,
+            @size_of[Win32PipePeekBuf]() as u32,
+            &raw mut bytes_ret,
+            @default_init[*mut sys.windows.Win32Overlapped](),
+        )
+    };
+    if ok_peek != 0 {
+        return bytes_ret >= 8_u32 and peek_buf.read_data_available > 0_u32;
+    }
+    // `ERROR_MORE_DATA`, `ERROR_BROKEN_PIPE`, `ERROR_HANDLE_EOF`, or closed/non-pipe handle -> wake reader:
+    true
+}
+
+// -------------------- POSIX Spawn Backend ---------------------
+/| Reads current thread `errno` on Linux (`EIO` fallback if null).
+@cfg(target.os == "linux") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn posix_last_errno() -> i32 {
+    let ptr: *mut i32 = unsafe {
+        sys.linux.linux_errno_location()
+    };
+    if ptr.is_null() {
+        return sys.linux.EIO;
+    }
+    unsafe {
+        ptr.*
+    }
+}
+
+/| Reads current thread `errno` on macOS Darwin (`EIO` fallback if null).
+@cfg(target.os == "macos") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn posix_last_errno() -> i32 {
+    let ptr: *mut i32 = unsafe {
+        sys.macos.darwin_errno_location()
+    };
+    if ptr.is_null() {
+        return sys.macos.EIO;
+    }
+    unsafe {
+        ptr.*
+    }
+}
+
+/| Returns POSIX `EINTR` (`4` on both Linux and macOS).
+@cfg(target.os == "linux")
+fn posix_eintr_code() -> i32 {
+    sys.linux.EINTR
+}
+
+/| Returns POSIX `EINTR` (`4` on macOS).
+@cfg(target.os == "macos")
+fn posix_eintr_code() -> i32 {
+    sys.macos.EINTR
+}
+
+/| Returns POSIX `ESRCH` (`3` on both Linux and macOS).
+@cfg(target.os == "linux")
+fn posix_esrch_code() -> i32 {
+    sys.linux.ESRCH
+}
+
+/| Returns POSIX `ESRCH` (`3` on macOS).
+@cfg(target.os == "macos")
+fn posix_esrch_code() -> i32 {
+    sys.macos.ESRCH
+}
+
+/| Opens `/dev/null` with `O_RDWR | O_CLOEXEC` on Linux.
+@cfg(target.os == "linux") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn posix_open_dev_null() -> i32!IoError {
+    let fd: i32 = unsafe {
+        sys.linux.linux_openat_mode(
+            sys.linux.AT_FDCWD,
+            b"/dev/null\0".as_ptr(),
+            sys.linux.O_RDWR | sys.linux.O_CLOEXEC,
+            0_u32,
+        )
+    };
+    if fd < 0_i32 {
+        return .Err(IoError.from_raw_os(posix_last_errno(), domain: .PosixErrno, op: .Spawn));
+    }
+    .Ok(fd)
+}
+
+/| Opens `/dev/null` with `O_RDWR | O_CLOEXEC` on macOS.
+@cfg(target.os == "macos") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn posix_open_dev_null() -> i32!IoError {
+    let fd: i32 = unsafe {
+        sys.macos.darwin_openat_mode(
+            sys.macos.AT_FDCWD,
+            b"/dev/null\0".as_ptr(),
+            sys.macos.O_RDWR | sys.macos.O_CLOEXEC,
+            0_u32,
+        )
+    };
+    if fd < 0_i32 {
+        return .Err(IoError.from_raw_os(posix_last_errno(), domain: .PosixErrno, op: .Spawn));
+    }
+    .Ok(fd)
+}
+
+/| Creates an atomic `O_CLOEXEC` `(read_fd, write_fd)` pipe pair on Linux.
+@cfg(target.os == "linux") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn posix_create_cloexec_pipe() -> (i32, i32)!IoError {
+    var fds: [i32; 2] = [-1_i32, -1_i32];
+    let rc: i32 = unsafe {
+        sys.linux.linux_pipe2(&raw mut fds[0], sys.linux.O_CLOEXEC)
+    };
+    if rc != 0_i32 {
+        return .Err(IoError.from_raw_os(posix_last_errno(), domain: .PosixErrno, op: .Spawn));
+    }
+    .Ok((fds[0], fds[1]))
+}
+
+/| Creates a `(read_fd, write_fd)` pipe pair with `FD_CLOEXEC` set on both ends on macOS.
+@cfg(target.os == "macos") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn posix_create_cloexec_pipe() -> (i32, i32)!IoError {
+    var fds: [i32; 2] = [-1_i32, -1_i32];
+    let rc: i32 = unsafe {
+        sys.macos.darwin_pipe(&raw mut fds[0])
+    };
+    if rc != 0_i32 {
+        return .Err(IoError.from_raw_os(posix_last_errno(), domain: .PosixErrno, op: .Spawn));
+    }
+    let rc0: i32 = unsafe {
+        sys.macos.darwin_fcntl_int(fds[0], DARWIN_F_SETFD, DARWIN_FD_CLOEXEC)
+    };
+    let rc1: i32 = unsafe {
+        sys.macos.darwin_fcntl_int(fds[1], DARWIN_F_SETFD, DARWIN_FD_CLOEXEC)
+    };
+    if rc0 < 0_i32 or rc1 < 0_i32 {
+        let err_code: i32 = posix_last_errno();
+        close_raw_fd_if_valid(fds[0]);
+        close_raw_fd_if_valid(fds[1]);
+        return .Err(IoError.from_raw_os(err_code, domain: .PosixErrno, op: .Spawn));
+    }
+    .Ok((fds[0], fds[1]))
+}
+
+/| Duplicates `src_fd` to `>= 3` with `FD_CLOEXEC` on Linux so `dup2(src, 0..2)` always clears `FD_CLOEXEC`.
+@cfg(target.os == "linux") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn posix_dup_above_stderr(src_fd: i32, /) -> i32!IoError {
+    let rc: isize = unsafe {
+        sys.linux.linux_syscall(LINUX_SYS_FCNTL, src_fd, LINUX_F_DUPFD_CLOEXEC, 3_i32)
+    };
+    if rc < 0_isize {
+        return .Err(IoError.from_raw_os(posix_last_errno(), domain: .PosixErrno, op: .Spawn));
+    }
+    .Ok(rc as i32)
+}
+
+/| Duplicates `src_fd` to `>= 3` with `FD_CLOEXEC` on macOS so `dup2(src, 0..2)` always clears `FD_CLOEXEC`.
+@cfg(target.os == "macos") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn posix_dup_above_stderr(src_fd: i32, /) -> i32!IoError {
+    let rc: i32 = unsafe {
+        sys.macos.darwin_fcntl_int(src_fd, DARWIN_F_DUPFD_CLOEXEC, 3_i32)
+    };
+    if rc < 0_i32 {
+        return .Err(IoError.from_raw_os(posix_last_errno(), domain: .PosixErrno, op: .Spawn));
+    }
+    .Ok(rc)
+}
+
+/| Appends `fd_val` into `fds[0..16]` when in bounds.
+@cfg(target.os == "linux" or target.os == "macos")
+fn push_posix_cleanup_fd(fds: &mut [i32; 16], count: &mut usize, fd_val: i32, /) {
+    let cur_n: usize = count.*;
+    if cur_n < 16_usize {
+        fds[cur_n] = fd_val;
+        count.* = cur_n +% 1_usize;
+    }
+}
+
+/| Appends deduplicated `fd_val >= 3` into `fds[0..6]` when in bounds.
+@cfg(target.os == "linux" or target.os == "macos")
+fn push_posix_extra_close_fd(fds: &mut [i32; 6], count: &mut usize, fd_val: i32, /) {
+    if fd_val < 3_i32 {
+        return;
+    }
+    let cur_n: usize = count.*;
+    var idx: usize = 0;
+    while idx < cur_n and idx < 6_usize {
+        if fds[idx] == fd_val {
+            return;
+        }
+        idx += 1_usize;
+    }
+    if cur_n < 6_usize {
+        fds[cur_n] = fd_val;
+        count.* = cur_n +% 1_usize;
+    }
+}
+
+/| Closes all valid descriptors in `fds[0..count]`.
+@cfg(target.os == "linux" or target.os == "macos")
+fn close_posix_fd_array(fds: &[i32; 16], count: usize, /) {
+    var i: usize = 0;
+    while i < count and i < 16_usize {
+        close_raw_fd_if_valid(fds[i]);
+        i += 1_usize;
+    }
+}
+
+/| Computes C-string length of non-null `cstr_ptr` bounded at `max_bytes`.
+@cfg(target.os == "linux" or target.os == "macos") @std_cap_boundary(clears: [unsafe_op])
+fn bounded_cstr_len(cstr_ptr: *u8, max_bytes: usize, /) -> usize {
+    if cstr_ptr.is_null() {
+        return 0_usize;
+    }
+    var n: usize = 0;
+    while n < max_bytes {
+        let elem_ptr: *u8 = unsafe {
+            cstr_ptr.add(n)
+        };
+        if elem_ptr.is_null() {
+            break;
+        }
+        let cur: u8 = unsafe {
+            elem_ptr.*
+        };
+        if cur == 0_u8 {
+            break;
+        }
+        n += 1_usize;
+    }
+    n
+}
+
+/| Applies `(env_clear_all, env_overrides)` onto `entries` (`KEY=VAL` byte vectors without NUL).
+@cfg(target.os == "linux" or target.os == "macos")
+fn apply_posix_env_overrides(entries: &mut Vec[Vec[u8]], env_overrides: &[EnvOverride], /) {
+    for &ovr in env_overrides {
+        let key_bytes: &[u8] = ovr.key.as_bytes();
+        let klen: usize = key_bytes.len();
+        var match_idx: usize? = .None;
+        var scan_i: usize = 0;
+        while scan_i < entries.len() {
+            let cand: &[u8] = entries[scan_i].as_slice();
+            if klen < cand.len() and byte_at_u8(cand, klen) == b'=' and cand[0..klen] == key_bytes {
+                match_idx = .Some(scan_i);
+                break;
+            }
+            scan_i += 1_usize;
+        }
+        if ovr.val is .Some(&val_str) {
+            let val_bytes: &[u8] = val_str.as_bytes();
+            var line = Vec[u8].with_capacity(klen +% 1_usize +% val_bytes.len());
+            line.extend_from_slice(key_bytes);
+            line.push(b'=');
+            line.extend_from_slice(val_bytes);
+            if match_idx is .Some(found_i) {
+                if found_i < entries.len() {
+                    entries[found_i] = own line;
+                }
+            } else {
+                entries.push(own line);
+            }
+        } else if match_idx is .Some(rem_i) {
+            _ = entries.remove(rem_i);
+        }
+    }
+}
+
+/| Process-global POSIX `char **environ` pointer on Linux (`glibc` and `musl`).
+@cfg(target.os == "linux") @link(name: "environ")
+extern "C" static mut linux_environ: *mut *mut u8;
+
+/| Snapshots active `KEY=VAL` environment entries on Linux via POSIX `environ`.
+@cfg(target.os == "linux") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn collect_posix_parent_env(entries: &mut Vec[Vec[u8]], /) {
+    let env_vec: *mut *mut u8 = unsafe {
+        linux_environ
+    };
+    if env_vec.is_null() {
+        return;
+    }
+    var idx: usize = 0;
+    while idx < 65_536_usize {
+        let slot_ptr: *mut *mut u8 = unsafe {
+            env_vec.add(idx)
+        };
+        if slot_ptr.is_null() {
+            break;
+        }
+        let item_ptr: *mut u8 = unsafe {
+            slot_ptr.*
+        };
+        if item_ptr.is_null() {
+            break;
+        }
+        let item_len: usize = bounded_cstr_len(item_ptr as *u8, 1_048_576_usize);
+        let item_slice: &[u8] = unsafe {
+            @slice_from_raw_parts(item_ptr as *u8, item_len)
+        };
+        entries.push(Vec[u8].from_slice(item_slice));
+        idx += 1_usize;
+    }
+}
+
+/| Snapshots active `KEY=VAL` environment entries on macOS via `_NSGetEnviron()`.
+@cfg(target.os == "macos") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn collect_posix_parent_env(entries: &mut Vec[Vec[u8]], /) {
+    let env_slot: *mut *mut *mut u8 = unsafe {
+        sys.macos.darwin_ns_get_environ()
+    };
+    if env_slot.is_null() {
+        return;
+    }
+    let env_vec: *mut *mut u8 = unsafe {
+        env_slot.*
+    };
+    if env_vec.is_null() {
+        return;
+    }
+    var idx: usize = 0;
+    while idx < 65_536_usize {
+        let slot_ptr: *mut *mut u8 = unsafe {
+            env_vec.add(idx)
+        };
+        if slot_ptr.is_null() {
+            break;
+        }
+        let item_ptr: *mut u8 = unsafe {
+            slot_ptr.*
+        };
+        if item_ptr.is_null() {
+            break;
+        }
+        let item_len: usize = bounded_cstr_len(item_ptr as *u8, 1_048_576_usize);
+        let item_slice: &[u8] = unsafe {
+            @slice_from_raw_parts(item_ptr as *u8, item_len)
+        };
+        entries.push(Vec[u8].from_slice(item_slice));
+        idx += 1_usize;
+    }
+}
+
+/| Packs NUL-terminated strings into a single immutable-address `slab` + `ptrs` vector ending with `null`.
+@cfg(target.os == "linux" or target.os == "macos") @std_cap_boundary(clears: [unsafe_op])
+fn pack_cstr_pointer_table(
+    items: &[Vec[u8]],
+    slab_out: &mut Vec[u8],
+    ptrs_out: &mut Vec[*mut u8],
+    /,
+) {
+    var total_bytes = 1_usize;
+    for &item in items {
+        total_bytes = total_bytes +% item.len() +% 1_usize;
+    }
+    slab_out.clear();
+    slab_out.reserve(total_bytes);
+    for &item in items {
+        slab_out.extend_from_slice(item.as_slice());
+        slab_out.push(0_u8);
+    }
+    ptrs_out.clear();
+    ptrs_out.reserve(items.len() +% 1_usize);
+    let base_ptr: *mut u8 = slab_out.as_mut_ptr();
+    var off: usize = 0;
+    for &item in items {
+        let elem_ptr: *mut u8 = unsafe {
+            base_ptr.add(off)
+        };
+        ptrs_out.push(elem_ptr);
+        off = off +% item.len() +% 1_usize;
+    }
+    ptrs_out.push(@default_init[*mut u8]());
+}
+
+/| Invokes `posix_spawn` / `posix_spawnp` with `PosixSpawnFileActions` on Linux.
+@cfg(target.os == "linux") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn exec_posix_spawn_actions(
+    prog_cstr: *u8,
+    has_slash: bool,
+    cwd_cstr: *u8,
+    dup_srcs: &[i32; 3],
+    extra_closes: &[i32; 6],
+    extra_close_n: usize,
+    argv_ptrs: *mut *mut u8,
+    envp_ptrs: *mut *mut u8,
+    pid_out: &mut i32,
+    /,
+) -> i32 {
+    var actions = @default_init[sys.linux.PosixSpawnFileActions]();
+    let init_rc: i32 = unsafe {
+        sys.linux.linux_spawn_file_actions_init(&raw mut actions)
+    };
+    if init_rc != 0_i32 {
+        return init_rc;
+    }
+    var target_fd: i32 = 0;
+    while target_fd < 3_i32 {
+        let src_fd: i32 = dup_srcs[target_fd as usize];
+        if src_fd >= 0_i32 {
+            let dup_rc: i32 = unsafe {
+                sys.linux.linux_spawn_file_actions_adddup2(&raw mut actions, src_fd, target_fd)
+            };
+            if dup_rc != 0_i32 {
+                unsafe {
+                    _ = sys.linux.linux_spawn_file_actions_destroy(&raw mut actions);
+                }
+                return dup_rc;
+            }
+        }
+        target_fd += 1_i32;
+    }
+    var cl_i: usize = 0;
+    while cl_i < extra_close_n and cl_i < 6_usize {
+        let close_fd: i32 = extra_closes[cl_i];
+        if close_fd >= 3_i32 {
+            let cl_rc: i32 = unsafe {
+                sys.linux.linux_spawn_file_actions_addclose(&raw mut actions, close_fd)
+            };
+            if cl_rc != 0_i32 {
+                unsafe {
+                    _ = sys.linux.linux_spawn_file_actions_destroy(&raw mut actions);
+                }
+                return cl_rc;
+            }
+        }
+        cl_i += 1_usize;
+    }
+    if not cwd_cstr.is_null() {
+        let chdir_rc: i32 = unsafe {
+            sys.linux.linux_spawn_file_actions_addchdir_np(&raw mut actions, cwd_cstr)
+        };
+        if chdir_rc != 0_i32 {
+            unsafe {
+                _ = sys.linux.linux_spawn_file_actions_destroy(&raw mut actions);
+            }
+            return chdir_rc;
+        }
+    }
+    let spawn_rc: i32 = if has_slash {
+        unsafe {
+            sys.linux.linux_posix_spawn(
+                &raw mut pid_out.*,
+                prog_cstr,
+                &raw actions,
+                @default_init[*sys.linux.PosixSpawnAttr](),
+                argv_ptrs,
+                envp_ptrs,
+            )
+        }
+    } else {
+        unsafe {
+            sys.linux.linux_posix_spawnp(
+                &raw mut pid_out.*,
+                prog_cstr,
+                &raw actions,
+                @default_init[*sys.linux.PosixSpawnAttr](),
+                argv_ptrs,
+                envp_ptrs,
+            )
+        }
+    };
+    unsafe {
+        _ = sys.linux.linux_spawn_file_actions_destroy(&raw mut actions);
+    }
+    spawn_rc
+}
+
+/| Invokes `posix_spawn` / `posix_spawnp` with `PosixSpawnFileActions` on macOS Darwin.
+@cfg(target.os == "macos") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn exec_posix_spawn_actions(
+    prog_cstr: *u8,
+    has_slash: bool,
+    cwd_cstr: *u8,
+    dup_srcs: &[i32; 3],
+    extra_closes: &[i32; 6],
+    extra_close_n: usize,
+    argv_ptrs: *mut *mut u8,
+    envp_ptrs: *mut *mut u8,
+    pid_out: &mut i32,
+    /,
+) -> i32 {
+    var actions = @default_init[sys.macos.PosixSpawnFileActions]();
+    let init_rc: i32 = unsafe {
+        sys.macos.darwin_spawn_file_actions_init(&raw mut actions)
+    };
+    if init_rc != 0_i32 {
+        return init_rc;
+    }
+    var target_fd: i32 = 0;
+    while target_fd < 3_i32 {
+        let src_fd: i32 = dup_srcs[target_fd as usize];
+        if src_fd >= 0_i32 {
+            let dup_rc: i32 = unsafe {
+                sys.macos.darwin_spawn_file_actions_adddup2(&raw mut actions, src_fd, target_fd)
+            };
+            if dup_rc != 0_i32 {
+                unsafe {
+                    _ = sys.macos.darwin_spawn_file_actions_destroy(&raw mut actions);
+                }
+                return dup_rc;
+            }
+        }
+        target_fd += 1_i32;
+    }
+    var cl_i: usize = 0;
+    while cl_i < extra_close_n and cl_i < 6_usize {
+        let close_fd: i32 = extra_closes[cl_i];
+        if close_fd >= 3_i32 {
+            let cl_rc: i32 = unsafe {
+                sys.macos.darwin_spawn_file_actions_addclose(&raw mut actions, close_fd)
+            };
+            if cl_rc != 0_i32 {
+                unsafe {
+                    _ = sys.macos.darwin_spawn_file_actions_destroy(&raw mut actions);
+                }
+                return cl_rc;
+            }
+        }
+        cl_i += 1_usize;
+    }
+    if not cwd_cstr.is_null() {
+        let chdir_rc: i32 = unsafe {
+            sys.macos.darwin_spawn_file_actions_addchdir_np(&raw mut actions, cwd_cstr)
+        };
+        if chdir_rc != 0_i32 {
+            unsafe {
+                _ = sys.macos.darwin_spawn_file_actions_destroy(&raw mut actions);
+            }
+            return chdir_rc;
+        }
+    }
+    let spawn_rc: i32 = if has_slash {
+        unsafe {
+            sys.macos.darwin_posix_spawn(
+                &raw mut pid_out.*,
+                prog_cstr,
+                &raw actions,
+                @default_init[*sys.macos.PosixSpawnAttr](),
+                argv_ptrs,
+                envp_ptrs,
+            )
+        }
+    } else {
+        unsafe {
+            sys.macos.darwin_posix_spawnp(
+                &raw mut pid_out.*,
+                prog_cstr,
+                &raw actions,
+                @default_init[*sys.macos.PosixSpawnAttr](),
+                argv_ptrs,
+                envp_ptrs,
+            )
+        }
+    };
+    unsafe {
+        _ = sys.macos.darwin_spawn_file_actions_destroy(&raw mut actions);
+    }
+    spawn_rc
+}
+
+/| Spawns a POSIX child process on Linux or macOS (`O_CLOEXEC` pipes + `posix_spawn` / `posix_spawnp`).
+@cfg(target.os == "linux" or target.os == "macos") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn host_spawn_child(
+    program: &PathBuf,
+    args_slice: &[PathBuf],
+    cwd_opt: &PathBuf?,
+    env_clear_all: bool,
+    env_overrides: &[EnvOverride],
+    allow_windows_batch: bool,
+    in_kind: StdioKind,
+    in_owned_fd: RawOsFd,
+    out_kind: StdioKind,
+    out_owned_fd: RawOsFd,
+    err_kind: StdioKind,
+    err_owned_fd: RawOsFd,
+    /,
+) -> ChildProcess!IoError {
+    _ = allow_windows_batch;
+    var cleanup_fds: [i32; 16] = [-1_i32; 16];
+    var cleanup_n: usize = 0;
+    var extra_closes: [i32; 6] = [-1_i32; 6];
+    var extra_close_n: usize = 0;
+
+    if in_kind == .Fd {
+        push_posix_cleanup_fd(&mut cleanup_fds, &mut cleanup_n, in_owned_fd);
+        push_posix_extra_close_fd(&mut extra_closes, &mut extra_close_n, in_owned_fd);
+    }
+    if out_kind == .Fd {
+        push_posix_cleanup_fd(&mut cleanup_fds, &mut cleanup_n, out_owned_fd);
+        push_posix_extra_close_fd(&mut extra_closes, &mut extra_close_n, out_owned_fd);
+    }
+    if err_kind == .Fd {
+        push_posix_cleanup_fd(&mut cleanup_fds, &mut cleanup_n, err_owned_fd);
+        push_posix_extra_close_fd(&mut extra_closes, &mut extra_close_n, err_owned_fd);
+    }
+
+    // [1] Prepare `/dev/null` and `O_CLOEXEC` pipes, shifting any fd `< 3` above `STDERR_FILENO` so `dup2(0..2)` never clobbers:
+    var shared_null_fd: i32 = -1;
+    if in_kind == .Null or out_kind == .Null or err_kind == .Null {
+        let raw_null: i32 = posix_open_dev_null() catch |err| {
+            close_posix_fd_array(&cleanup_fds, cleanup_n);
+            return .Err(err);
+        };
+        if raw_null < 3_i32 {
+            let shifted: i32 = posix_dup_above_stderr(raw_null) catch |err| {
+                close_raw_fd_if_valid(raw_null);
+                close_posix_fd_array(&cleanup_fds, cleanup_n);
+                return .Err(err);
+            };
+            close_raw_fd_if_valid(raw_null);
+            shared_null_fd = shifted;
+        } else {
+            shared_null_fd = raw_null;
+        }
+        push_posix_cleanup_fd(&mut cleanup_fds, &mut cleanup_n, shared_null_fd);
+    }
+
+    var parent_pipes: [i32; 3] = [-1_i32; 3];
+    var dup_srcs: [i32; 3] = [-1_i32; 3];
+
+    // Configure child `stdin` (`fd 0`):
+    match in_kind {
+        .Inherit => {},
+        .Null => {
+            dup_srcs[0] = shared_null_fd;
+        },
+        .Piped => {
+            let (rd_fd, wr_fd) = posix_create_cloexec_pipe() catch |err| {
+                close_posix_fd_array(&cleanup_fds, cleanup_n);
+                return .Err(err);
+            };
+            var child_rd: i32 = rd_fd;
+            if child_rd >= 0_i32 and child_rd < 3_i32 {
+                child_rd = posix_dup_above_stderr(rd_fd) catch |err| {
+                    close_raw_fd_if_valid(rd_fd);
+                    close_raw_fd_if_valid(wr_fd);
+                    close_posix_fd_array(&cleanup_fds, cleanup_n);
+                    return .Err(err);
+                };
+                close_raw_fd_if_valid(rd_fd);
+            }
+            var parent_wr: i32 = wr_fd;
+            if parent_wr >= 0_i32 and parent_wr < 3_i32 {
+                parent_wr = posix_dup_above_stderr(wr_fd) catch |err| {
+                    close_raw_fd_if_valid(child_rd);
+                    close_raw_fd_if_valid(wr_fd);
+                    close_posix_fd_array(&cleanup_fds, cleanup_n);
+                    return .Err(err);
+                };
+                close_raw_fd_if_valid(wr_fd);
+            }
+            push_posix_cleanup_fd(&mut cleanup_fds, &mut cleanup_n, child_rd);
+            parent_pipes[0] = parent_wr;
+            dup_srcs[0] = child_rd;
+        },
+        .Fd => {
+            if in_owned_fd >= 0_i32 and in_owned_fd < 3_i32 {
+                let shifted: i32 = posix_dup_above_stderr(in_owned_fd) catch |err| {
+                    close_posix_fd_array(&cleanup_fds, cleanup_n);
+                    return .Err(err);
+                };
+                push_posix_cleanup_fd(&mut cleanup_fds, &mut cleanup_n, shifted);
+                dup_srcs[0] = shifted;
+            } else {
+                dup_srcs[0] = in_owned_fd;
+            }
+        },
+    }
+
+    // Configure child `stdout` (`fd 1`):
+    match out_kind {
+        .Inherit => {},
+        .Null => {
+            dup_srcs[1] = shared_null_fd;
+        },
+        .Piped => {
+            let (rd_fd, wr_fd) = posix_create_cloexec_pipe() catch |err| {
+                close_raw_fd_if_valid(parent_pipes[0]);
+                close_posix_fd_array(&cleanup_fds, cleanup_n);
+                return .Err(err);
+            };
+            var child_wr: i32 = wr_fd;
+            if child_wr >= 0_i32 and child_wr < 3_i32 {
+                child_wr = posix_dup_above_stderr(wr_fd) catch |err| {
+                    close_raw_fd_if_valid(rd_fd);
+                    close_raw_fd_if_valid(wr_fd);
+                    close_raw_fd_if_valid(parent_pipes[0]);
+                    close_posix_fd_array(&cleanup_fds, cleanup_n);
+                    return .Err(err);
+                };
+                close_raw_fd_if_valid(wr_fd);
+            }
+            var parent_rd: i32 = rd_fd;
+            if parent_rd >= 0_i32 and parent_rd < 3_i32 {
+                parent_rd = posix_dup_above_stderr(rd_fd) catch |err| {
+                    close_raw_fd_if_valid(rd_fd);
+                    close_raw_fd_if_valid(child_wr);
+                    close_raw_fd_if_valid(parent_pipes[0]);
+                    close_posix_fd_array(&cleanup_fds, cleanup_n);
+                    return .Err(err);
+                };
+                close_raw_fd_if_valid(rd_fd);
+            }
+            push_posix_cleanup_fd(&mut cleanup_fds, &mut cleanup_n, child_wr);
+            parent_pipes[1] = parent_rd;
+            dup_srcs[1] = child_wr;
+        },
+        .Fd => {
+            if out_owned_fd >= 0_i32 and out_owned_fd < 3_i32 {
+                let shifted: i32 = posix_dup_above_stderr(out_owned_fd) catch |err| {
+                    close_raw_fd_if_valid(parent_pipes[0]);
+                    close_posix_fd_array(&cleanup_fds, cleanup_n);
+                    return .Err(err);
+                };
+                push_posix_cleanup_fd(&mut cleanup_fds, &mut cleanup_n, shifted);
+                dup_srcs[1] = shifted;
+            } else {
+                dup_srcs[1] = out_owned_fd;
+            }
+        },
+    }
+
+    // Configure child `stderr` (`fd 2`):
+    match err_kind {
+        .Inherit => {},
+        .Null => {
+            dup_srcs[2] = shared_null_fd;
+        },
+        .Piped => {
+            let (rd_fd, wr_fd) = posix_create_cloexec_pipe() catch |err| {
+                close_raw_fd_if_valid(parent_pipes[0]);
+                close_raw_fd_if_valid(parent_pipes[1]);
+                close_posix_fd_array(&cleanup_fds, cleanup_n);
+                return .Err(err);
+            };
+            var child_wr: i32 = wr_fd;
+            if child_wr >= 0_i32 and child_wr < 3_i32 {
+                child_wr = posix_dup_above_stderr(wr_fd) catch |err| {
+                    close_raw_fd_if_valid(rd_fd);
+                    close_raw_fd_if_valid(wr_fd);
+                    close_raw_fd_if_valid(parent_pipes[0]);
+                    close_raw_fd_if_valid(parent_pipes[1]);
+                    close_posix_fd_array(&cleanup_fds, cleanup_n);
+                    return .Err(err);
+                };
+                close_raw_fd_if_valid(wr_fd);
+            }
+            var parent_rd: i32 = rd_fd;
+            if parent_rd >= 0_i32 and parent_rd < 3_i32 {
+                parent_rd = posix_dup_above_stderr(rd_fd) catch |err| {
+                    close_raw_fd_if_valid(rd_fd);
+                    close_raw_fd_if_valid(child_wr);
+                    close_raw_fd_if_valid(parent_pipes[0]);
+                    close_raw_fd_if_valid(parent_pipes[1]);
+                    close_posix_fd_array(&cleanup_fds, cleanup_n);
+                    return .Err(err);
+                };
+                close_raw_fd_if_valid(rd_fd);
+            }
+            push_posix_cleanup_fd(&mut cleanup_fds, &mut cleanup_n, child_wr);
+            parent_pipes[2] = parent_rd;
+            dup_srcs[2] = child_wr;
+        },
+        .Fd => {
+            if err_owned_fd >= 0_i32 and err_owned_fd < 3_i32 {
+                let shifted: i32 = posix_dup_above_stderr(err_owned_fd) catch |err| {
+                    close_raw_fd_if_valid(parent_pipes[0]);
+                    close_raw_fd_if_valid(parent_pipes[1]);
+                    close_posix_fd_array(&cleanup_fds, cleanup_n);
+                    return .Err(err);
+                };
+                push_posix_cleanup_fd(&mut cleanup_fds, &mut cleanup_n, shifted);
+                dup_srcs[2] = shifted;
+            } else {
+                dup_srcs[2] = err_owned_fd;
+            }
+        },
+    }
+
+    // [2] Pack `argv`, optional `cwd`, and `envp` C-string pointer tables:
+    let prog_bytes: &[u8] = program.as_bytes();
+    var has_slash = false;
+    for b_val in prog_bytes {
+        if b_val == b'/' {
+            has_slash = true;
+            break;
+        }
+    }
+    var argv_items = Vec[Vec[u8]].with_capacity(args_slice.len() +% 1_usize);
+    argv_items.push(Vec[u8].from_slice(prog_bytes));
+    for &arg_buf in args_slice {
+        argv_items.push(Vec[u8].from_slice(arg_buf.as_bytes()));
+    }
+    var argv_slab = Vec[u8].new();
+    var argv_ptrs = Vec[*mut u8].new();
+    pack_cstr_pointer_table(argv_items.as_slice(), &mut argv_slab, &mut argv_ptrs);
+
+    var cwd_z = Vec[u8].new();
+    var cwd_ptr: *u8 = @default_init[*u8]();
+    if cwd_opt.* is .Some(&cwd_pb) {
+        let cwd_bytes: &[u8] = cwd_pb.as_bytes();
+        cwd_z.reserve(cwd_bytes.len() +% 1_usize);
+        cwd_z.extend_from_slice(cwd_bytes);
+        cwd_z.push(0_u8);
+        cwd_ptr = cwd_z.as_ptr();
+    }
+
+    var env_entries = Vec[Vec[u8]].new();
+    if not env_clear_all {
+        collect_posix_parent_env(&mut env_entries);
+    }
+    if not env_overrides.is_empty() {
+        apply_posix_env_overrides(&mut env_entries, env_overrides);
+    }
+    var env_slab = Vec[u8].new();
+    var env_ptrs = Vec[*mut u8].new();
+    pack_cstr_pointer_table(env_entries.as_slice(), &mut env_slab, &mut env_ptrs);
+
+    // [3] Execute `posix_spawn` / `posix_spawnp` and close all child-side fds in parent:
+    let prog_cstr: *u8 = argv_slab.as_ptr();
+    var spawned_pid: i32 = -1;
+    let spawn_rc: i32 = exec_posix_spawn_actions(
+        prog_cstr,
+        has_slash,
+        cwd_ptr,
+        &dup_srcs,
+        &extra_closes,
+        extra_close_n,
+        argv_ptrs.as_mut_ptr(),
+        env_ptrs.as_mut_ptr(),
+        &mut spawned_pid,
+    );
+    close_posix_fd_array(&cleanup_fds, cleanup_n);
+
+    if spawn_rc != 0_i32 {
+        close_raw_fd_if_valid(parent_pipes[0]);
+        close_raw_fd_if_valid(parent_pipes[1]);
+        close_raw_fd_if_valid(parent_pipes[2]);
+        return .Err(IoError.from_raw_os(spawn_rc, domain: .PosixErrno, op: .Spawn));
+    }
+
+    let out_stdin: ChildStdin? = if parent_pipes[0] >= 0_i32 {
+        .Some(ChildStdin { file: File.from_raw_fd(parent_pipes[0]) })
+    } else {
+        .None
+    };
+    let out_stdout: ChildStdout? = if parent_pipes[1] >= 0_i32 {
+        .Some(ChildStdout { file: File.from_raw_fd(parent_pipes[1]) })
+    } else {
+        .None
+    };
+    let out_stderr: ChildStderr? = if parent_pipes[2] >= 0_i32 {
+        .Some(ChildStdout { file: File.from_raw_fd(parent_pipes[2]) })
+    } else {
+        .None
+    };
+
+    .Ok(
+        ChildProcess {
+            pid: @bit_cast[u32](spawned_pid),
+            os_handle: -1_i32,
+            stdin: own out_stdin,
+            stdout: own out_stdout,
+            stderr: own out_stderr,
+            reaped_status: .None,
+            is_sim_child: false,
+        },
+    )
+}
+
+/| Calls `waitpid` on Linux (`options = 0` or `WNOHANG`), retrying transparently on `EINTR`.
+@cfg(target.os == "linux") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn posix_waitpid_retry(child_pid: i32, wait_opts: i32, status_out: &mut i32, /) -> i32!IoError {
+    while true {
+        let rc: i32 = unsafe {
+            sys.linux.linux_waitpid(child_pid, &raw mut status_out.*, wait_opts)
+        };
+        if rc >= 0_i32 {
+            return .Ok(rc);
+        }
+        let err_code: i32 = posix_last_errno();
+        if err_code == posix_eintr_code() {
+            continue;
+        }
+        return .Err(IoError.from_raw_os(err_code, domain: .PosixErrno, op: .Wait));
+    }
+    .Ok(0_i32)
+}
+
+/| Calls `waitpid` on macOS (`options = 0` or `WNOHANG`), retrying transparently on `EINTR`.
+@cfg(target.os == "macos") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn posix_waitpid_retry(child_pid: i32, wait_opts: i32, status_out: &mut i32, /) -> i32!IoError {
+    while true {
+        let rc: i32 = unsafe {
+            sys.macos.darwin_waitpid(child_pid, &raw mut status_out.*, wait_opts)
+        };
+        if rc >= 0_i32 {
+            return .Ok(rc);
+        }
+        let err_code: i32 = posix_last_errno();
+        if err_code == posix_eintr_code() {
+            continue;
+        }
+        return .Err(IoError.from_raw_os(err_code, domain: .PosixErrno, op: .Wait));
+    }
+    .Ok(0_i32)
+}
+
+/| Reaps POSIX `pid` blockingly (`waitpid(…, 0)`).
+@cfg(target.os == "linux" or target.os == "macos")
+fn host_wait_child(pid: u32, os_handle: RawOsFd, /) -> ExitStatus!IoError {
+    _ = os_handle;
+    var raw_st: i32 = 0;
+    _ = posix_waitpid_retry(@bit_cast[i32](pid), 0_i32, &mut raw_st)?;
+    .Ok(ExitStatus { raw_status: raw_st })
+}
+
+/| Polls POSIX `pid` non-blockingly (`waitpid(…, WNOHANG = 1)`).
+@cfg(target.os == "linux" or target.os == "macos")
+fn host_try_wait_child(pid: u32, os_handle: &mut RawOsFd, /) -> ExitStatus?!IoError {
+    _ = os_handle;
+    var raw_st: i32 = 0;
+    let rc: i32 = posix_waitpid_retry(@bit_cast[i32](pid), 1_i32, &mut raw_st)?;
+    if rc == 0_i32 {
+        return .Ok(.None);
+    }
+    .Ok(.Some(ExitStatus { raw_status: raw_st }))
+}
+
+/| Sends `SIGKILL` (`9`) on Linux and reaps `pid` via `waitpid`.
+@cfg(target.os == "linux") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn host_kill_and_wait_child(pid: u32, os_handle: RawOsFd, /) -> ExitStatus!IoError {
+    let target_pid = @bit_cast[i32](pid);
+    let kill_rc: i32 = unsafe {
+        sys.linux.linux_kill(target_pid, sys.linux.SIGKILL)
+    };
+    if kill_rc != 0_i32 {
+        let err_code: i32 = posix_last_errno();
+        if err_code != posix_esrch_code() {
+            return .Err(IoError.from_raw_os(err_code, domain: .PosixErrno, op: .Wait));
+        }
+    }
+    host_wait_child(pid, os_handle)
+}
+
+/| Sends `SIGKILL` (`9`) on macOS and reaps `pid` via `waitpid`.
+@cfg(target.os == "macos") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn host_kill_and_wait_child(pid: u32, os_handle: RawOsFd, /) -> ExitStatus!IoError {
+    let target_pid = @bit_cast[i32](pid);
+    let kill_rc: i32 = unsafe {
+        sys.macos.darwin_kill(target_pid, sys.macos.SIGKILL)
+    };
+    if kill_rc != 0_i32 {
+        let err_code: i32 = posix_last_errno();
+        if err_code != posix_esrch_code() {
+            return .Err(IoError.from_raw_os(err_code, domain: .PosixErrno, op: .Wait));
+        }
+    }
+    host_wait_child(pid, os_handle)
+}
+
+// -------------------- WASI & Stub Backend ---------------------
+/| Releases any owned `.Fd` descriptors and fails with `.Unsupported` on WASI and freestanding targets.
+@cfg(not (target.os == "windows" or target.os == "linux" or target.os == "macos"))
+fn host_spawn_child(
+    program: &PathBuf,
+    args_slice: &[PathBuf],
+    cwd_opt: &PathBuf?,
+    env_clear_all: bool,
+    env_overrides: &[EnvOverride],
+    allow_windows_batch: bool,
+    in_kind: StdioKind,
+    in_owned_fd: RawOsFd,
+    out_kind: StdioKind,
+    out_owned_fd: RawOsFd,
+    err_kind: StdioKind,
+    err_owned_fd: RawOsFd,
+    /,
+) -> ChildProcess!IoError {
+    _ = program;
+    _ = args_slice;
+    _ = cwd_opt;
+    _ = env_clear_all;
+    _ = env_overrides;
+    _ = allow_windows_batch;
+    if in_kind == .Fd {
+        close_raw_fd_if_valid(in_owned_fd);
+    }
+    if out_kind == .Fd {
+        close_raw_fd_if_valid(out_owned_fd);
+    }
+    if err_kind == .Fd {
+        close_raw_fd_if_valid(err_owned_fd);
+    }
+    .Err(IoError.from_kind(.Unsupported, op: .Spawn))
+}
+
+/| Host `wait` stub returning `.Unsupported` on WASI and freestanding targets.
+@cfg(not (target.os == "windows" or target.os == "linux" or target.os == "macos"))
+fn host_wait_child(pid: u32, os_handle: RawOsFd, /) -> ExitStatus!IoError {
+    _ = pid;
+    close_raw_fd_if_valid(os_handle);
+    .Err(IoError.from_kind(.Unsupported, op: .Wait))
+}
+
+/| Host `try_wait` stub returning `.Unsupported` on WASI and freestanding targets.
+@cfg(not (target.os == "windows" or target.os == "linux" or target.os == "macos"))
+fn host_try_wait_child(pid: u32, os_handle: &mut RawOsFd, /) -> ExitStatus?!IoError {
+    _ = pid;
+    _ = os_handle;
+    .Err(IoError.from_kind(.Unsupported, op: .Wait))
+}
+
+/| Host `kill_and_wait` stub returning `.Unsupported` on WASI and freestanding targets.
+@cfg(not (target.os == "windows" or target.os == "linux" or target.os == "macos"))
+fn host_kill_and_wait_child(pid: u32, os_handle: RawOsFd, /) -> ExitStatus!IoError {
+    _ = pid;
+    close_raw_fd_if_valid(os_handle);
+    .Err(IoError.from_kind(.Unsupported, op: .Wait))
+}
+
+// ------------------- Concurrent Pipe Drain --------------------
+/| Reads a single `8 KiB` stack chunk from `pipe_ref` into `dst`, returning `true` when EOF (`0` bytes) is reached.
+fn read_single_pipe_step(
+    pipe_ref: &mut ChildStdout,
+    dst: &mut Vec[u8],
+    total_bytes: &mut usize,
+    max_output_bytes: usize,
+    /,
+) -> bool!IoError {
+    var chunk: [u8; PIPE_READ_CHUNK_BYTES];
+    while true {
+        var out_buf = OutBuf.over_uninit(&out chunk);
+        let read_n: usize = pipe_ref.read_out(&mut out_buf) catch |err| {
+            if err.is_interrupted() {
+                continue;
+            }
+            return .Err(err);
+        };
+        if read_n == 0_usize {
+            return .Ok(true);
+        }
+        if read_n > max_output_bytes -| total_bytes.* {
+            return .Err(IoError.from_kind(.StreamTooLong, op: .Read));
+        }
+        total_bytes.* = total_bytes.* +% read_n;
+        dst.extend_from_slice(out_buf.filled());
+        return .Ok(false);
+    }
+    .Ok(true)
+}
+
+/| Drains `pipe_ref` to EOF into `dst` while enforcing `max_output_bytes`.
+fn drain_pipe_until_eof(
+    pipe_ref: &mut ChildStdout,
+    dst: &mut Vec[u8],
+    total_bytes: &mut usize,
+    max_output_bytes: usize,
+    /,
+) -> unit!IoError {
+    while true {
+        let is_eof: bool = read_single_pipe_step(pipe_ref, dst, total_bytes, max_output_bytes)?;
+        if is_eof {
+            return .Ok(());
+        }
+    }
+    .Ok(())
+}
+
+/| Polls two open POSIX pipe descriptors (`poll(fds, 2, -1)`) on Linux, retrying on `EINTR`.
+@cfg(target.os == "linux") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn posix_poll_two_pipes(fd0: i32, fd1: i32, /) -> (i16, i16)!IoError {
+    var fds: [sys.linux.PosixPollFd; 2] = [
+        sys.linux.PosixPollFd { file_desc: fd0, events: sys.linux.POLLIN, revents: 0 },
+        sys.linux.PosixPollFd { file_desc: fd1, events: sys.linux.POLLIN, revents: 0 },
+    ];
+    while true {
+        fds[0].revents = 0;
+        fds[1].revents = 0;
+        let rc: i32 = unsafe {
+            sys.linux.linux_poll(&raw mut fds[0], 2_u64, -1_i32)
+        };
+        if rc >= 0_i32 {
+            return .Ok((fds[0].revents, fds[1].revents));
+        }
+        let err_code: i32 = posix_last_errno();
+        if err_code == posix_eintr_code() {
+            continue;
+        }
+        return .Err(IoError.from_raw_os(err_code, domain: .PosixErrno, op: .Read));
+    }
+    .Ok((0_i16, 0_i16))
+}
+
+/| Polls two open POSIX pipe descriptors (`poll(fds, 2, -1)`) on macOS, retrying on `EINTR`.
+@cfg(target.os == "macos") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn posix_poll_two_pipes(fd0: i32, fd1: i32, /) -> (i16, i16)!IoError {
+    var fds: [sys.macos.PosixPollFd; 2] = [
+        sys.macos.PosixPollFd { file_desc: fd0, events: sys.macos.POLLIN, revents: 0 },
+        sys.macos.PosixPollFd { file_desc: fd1, events: sys.macos.POLLIN, revents: 0 },
+    ];
+    while true {
+        fds[0].revents = 0;
+        fds[1].revents = 0;
+        let rc: i32 = unsafe {
+            sys.macos.darwin_poll(&raw mut fds[0], 2_u32, -1_i32)
+        };
+        if rc >= 0_i32 {
+            return .Ok((fds[0].revents, fds[1].revents));
+        }
+        let err_code: i32 = posix_last_errno();
+        if err_code == posix_eintr_code() {
+            continue;
+        }
+        return .Err(IoError.from_raw_os(err_code, domain: .PosixErrno, op: .Read));
+    }
+    .Ok((0_i16, 0_i16))
+}
+
+/| Drains `out_pipe` and `err_pipe` concurrently without deadlock on Windows (`FSCTL_PIPE_PEEK` + 1 ms `WaitForSingleObject`).
+@cfg(target.os == "windows") @std_cap_boundary(clears: [ffi, unsafe_op])
+fn drain_dual_pipes_host(
+    os_handle: RawOsFd,
+    out_pipe: &mut ChildStdout,
+    err_pipe: &mut ChildStdout,
+    stdout_vec: &mut Vec[u8],
+    stderr_vec: &mut Vec[u8],
+    total_bytes: &mut usize,
+    max_output_bytes: usize,
+    /,
+) -> unit!IoError {
+    var out_eof = false;
+    var err_eof = false;
+    while not out_eof and not err_eof {
+        var made_progress = false;
+        if win32_pipe_has_data_or_eof(out_pipe.file.as_raw_fd()) {
+            out_eof = read_single_pipe_step(out_pipe, stdout_vec, total_bytes, max_output_bytes)?;
+            made_progress = true;
+        }
+        if win32_pipe_has_data_or_eof(err_pipe.file.as_raw_fd()) {
+            err_eof = read_single_pipe_step(err_pipe, stderr_vec, total_bytes, max_output_bytes)?;
+            made_progress = true;
+        }
+        if not made_progress and is_valid_raw_os_fd(os_handle) {
+            unsafe {
+                _ = sys.windows.win32_wait_for_single_object(os_handle, 1_u32);
+            }
+        }
+    }
+    if not out_eof {
+        drain_pipe_until_eof(out_pipe, stdout_vec, total_bytes, max_output_bytes)?;
+    }
+    if not err_eof {
+        drain_pipe_until_eof(err_pipe, stderr_vec, total_bytes, max_output_bytes)?;
+    }
+    .Ok(())
+}
+
+/| Drains `out_pipe` and `err_pipe` concurrently without deadlock on Linux and macOS via `poll`.
+@cfg(target.os == "linux" or target.os == "macos")
+fn drain_dual_pipes_host(
+    os_handle: RawOsFd,
+    out_pipe: &mut ChildStdout,
+    err_pipe: &mut ChildStdout,
+    stdout_vec: &mut Vec[u8],
+    stderr_vec: &mut Vec[u8],
+    total_bytes: &mut usize,
+    max_output_bytes: usize,
+    /,
+) -> unit!IoError {
+    _ = os_handle;
+    var out_eof = false;
+    var err_eof = false;
+    while not out_eof and not err_eof {
+        let (rev0, rev1) = posix_poll_two_pipes(
+            out_pipe.file.as_raw_fd(),
+            err_pipe.file.as_raw_fd(),
+        )?;
+        if (rev0 & POSIX_POLLNVAL) != 0_i16 {
+            out_eof = true;
+        } else if rev0 != 0_i16 {
+            out_eof = read_single_pipe_step(out_pipe, stdout_vec, total_bytes, max_output_bytes)?;
+        }
+        if (rev1 & POSIX_POLLNVAL) != 0_i16 {
+            err_eof = true;
+        } else if rev1 != 0_i16 {
+            err_eof = read_single_pipe_step(err_pipe, stderr_vec, total_bytes, max_output_bytes)?;
+        }
+    }
+    if not out_eof {
+        drain_pipe_until_eof(out_pipe, stdout_vec, total_bytes, max_output_bytes)?;
+    }
+    if not err_eof {
+        drain_pipe_until_eof(err_pipe, stderr_vec, total_bytes, max_output_bytes)?;
+    }
+    .Ok(())
+}
+
+/| Sequential fallback dual-pipe drain on WASI and freestanding targets (used only under `SimReactor`).
+@cfg(not (target.os == "windows" or target.os == "linux" or target.os == "macos"))
+fn drain_dual_pipes_host(
+    os_handle: RawOsFd,
+    out_pipe: &mut ChildStdout,
+    err_pipe: &mut ChildStdout,
+    stdout_vec: &mut Vec[u8],
+    stderr_vec: &mut Vec[u8],
+    total_bytes: &mut usize,
+    max_output_bytes: usize,
+    /,
+) -> unit!IoError {
+    _ = os_handle;
+    drain_pipe_until_eof(out_pipe, stdout_vec, total_bytes, max_output_bytes)?;
+    drain_pipe_until_eof(err_pipe, stderr_vec, total_bytes, max_output_bytes)
+}
+
+/| Terminates and reaps an in-flight child on pipe-drain failure (e.g., `StreamTooLong`) so no zombies or handles leak.
+fn abort_child_after_drain_error(
+    pid: u32,
+    os_handle: RawOsFd,
+    reaped_status: ExitStatus?,
+    is_sim_child: bool,
+    /,
+) {
+    if reaped_status is .Some(_) {
+        if not is_sim_child {
+            close_raw_fd_if_valid(os_handle);
+        }
+        return;
+    }
+    if is_sim_child {
+        _ = sim_wait_or_kill_child(pid, PROC_SIM_KILL_WAIT) catch {
+            return;
+        };
+    } else {
+        _ = host_kill_and_wait_child(pid, os_handle) catch {
+            return;
+        };
+    }
+}
+
+// ------------------------------------- PUBLIC API --------------------------------------
+// --------------------- Stdio & ExitStatus ---------------------
+impl AutoDrop for OwnedStdioSlot {
+    /| Closes `owned_fd` if `self` holds an unconsumed `.Fd` descriptor when `Command` drops.
+    pub fn drop(&mut self) {
+        if self.kind == .Fd {
+            close_raw_fd_if_valid(self.owned_fd);
+            self.kind = .Inherit;
+            self.owned_fd = invalid_raw_os_fd();
+        }
+    }
+}
+
+impl Stdio {
+    /| Configures the child stream to inherit the parent process's corresponding stream.
+    @inline @no_alloc @no_panic
+    pub fn inherit() -> Stdio {
+        Stdio {
+            kind: .Inherit,
+            owned_fd: invalid_raw_os_fd(),
+        }
+    }
+
+    /| Configures a unidirectional pipe connecting parent and child.
+    @inline @no_alloc @no_panic
+    pub fn piped() -> Stdio {
+        Stdio {
+            kind: .Piped,
+            owned_fd: invalid_raw_os_fd(),
+        }
+    }
+
+    /| Redirects the child stream to the OS null device (`NUL` on Windows, `/dev/null` on POSIX).
+    @inline @no_alloc @no_panic
+    pub fn null() -> Stdio {
+        Stdio {
+            kind: .Null,
+            owned_fd: invalid_raw_os_fd(),
+        }
+    }
+
+    /| Transfers ownership of `file` into `Stdio` (`O(1)` descriptor move).
+    @inline @no_alloc @no_panic
+    pub fn from_file(file: own File, /) -> Stdio {
+        Stdio {
+            kind: .Fd,
+            owned_fd: (own file).into_raw_fd(),
+        }
+    }
+
+    /| Consumes an unused `@linear Stdio`, closing `owned_fd` iff `kind == .Fd`.
+    @std_cap_boundary(emits: [fs, blocking_sync], clears: [ffi, unsafe_op, indirect_opaque])
+    pub fn discard_unused(own self) {
+        let Stdio { kind, owned_fd } = own self;
+        if kind == .Fd {
+            close_raw_fd_if_valid(owned_fd);
+        }
+    }
+}
+
+impl TrivialDrop for ExitStatus {}
+
+impl ExitStatus {
+    /| Wraps a platform-raw status word (`waitpid` status on POSIX, exit `DWORD` on Windows) into `ExitStatus`.
+    @expect(unused-pkg-visibility, reason: "used by cx.test SimReactor and cross-OS unit tests")
+    pub(pkg) fn from_raw(raw_status: i32, /) -> ExitStatus {
+        ExitStatus { raw_status }
+    }
+
+    /| Returns `true` iff the child exited normally with exit code `0`.
+    @inline @no_alloc @no_panic
+    pub fn is_success(self) -> bool {
+        self.code() == .Some(0)
+    }
+
+    /| Returns `.Some(exit_code)` on normal POSIX exit (`WIFEXITED`), or `.None` when terminated by a signal.
+    @cfg(target.os == "linux" or target.os == "macos") @inline @no_alloc @no_panic
+    pub fn code(self) -> i32? {
+        if (self.raw_status & 0x7F) == 0 {
+            return .Some((self.raw_status >> 8) & 0xFF);
+        }
+        .None
+    }
+
+    /| Returns `.Some(exit_code)` on Windows and WASI targets.
+    @cfg(not (target.os == "linux" or target.os == "macos")) @inline @no_alloc @no_panic
+    pub fn code(self) -> i32? {
+        .Some(self.raw_status)
+    }
+
+    /| Returns `.Some(signal_num)` when terminated by an uncaught POSIX signal (`WIFSIGNALED`), or `.None`.
+    @cfg(target.os == "linux" or target.os == "macos") @inline @no_alloc @no_panic
+    pub fn term_signal(self) -> i32? {
+        let low_bits: i32 = self.raw_status & 0x7F;
+        if low_bits != 0 and low_bits != 0x7F {
+            return .Some(low_bits);
+        }
+        .None
+    }
+
+    /| Returns `.None` on Windows and WASI targets (which have no POSIX termination signals).
+    @cfg(not (target.os == "linux" or target.os == "macos")) @inline @no_alloc @no_panic
+    pub fn term_signal(self) -> i32? {
+        _ = self;
+        .None
+    }
+}
+
+impl Display for ExitStatus {
+    /| Formats `self` as `exit status: <code>` or `signal: <sig>`.
+    @no_alloc
+    pub fn fmt(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        _ = spec;
+        let status: ExitStatus = self.*;
+        if status.code() is .Some(exit_code) {
+            return @fmt_write(out, f"exit status: {exit_code}");
+        }
+        if status.term_signal() is .Some(sig_num) {
+            return @fmt_write(out, f"signal: {sig_num}");
+        }
+        @fmt_write(out, f"raw wait status: {status.raw_status}")
+    }
+}
+
+impl Debug for ExitStatus {
+    /| Formats structural `ExitStatus` fields (`raw`, `code`, `signal`) into `out`.
+    @no_alloc
+    pub fn fmt_debug(&self, out: &mut FmtWriter, spec: FmtSpec, /) -> unit!FmtError {
+        _ = spec;
+        let status: ExitStatus = self.*;
+        @fmt_write(
+            out,
+            f"ExitStatus {{ raw: {status.raw_status}, code: {status.code():?}, signal: {status.term_signal():?} }}",
+        )
+    }
+}
+
+// ------------------ Child Handles & Command -------------------
+impl ChildStdin {
+    /| Writes a non-empty prefix of `buf` to the child's `stdin` pipe and returns bytes accepted.
+    @std_cap_boundary(emits: [fs, blocking_sync], clears: [ffi, unsafe_op, indirect_opaque])
+    pub fn write(&mut self, buf: &[u8], /) -> usize!IoError {
+        self.file.write(buf)
+    }
+
+    /| Writes all bytes in `buf` to the child's `stdin` pipe.
+    @std_cap_boundary(emits: [fs, blocking_sync], clears: [ffi, unsafe_op, indirect_opaque])
+    pub fn write_all(&mut self, buf: &[u8], /) -> unit!IoError {
+        self.file.write_all(buf)
+    }
+
+    /| Borrows `self` as a zero-allocation 16-byte `Writer` handle (`MVS`-tracked exclusive loan).
+    @no_alloc @no_panic
+    pub fn as_writer(&mut self) -> Writer = self.file.as_writer();
+
+    /| Closes the parent write end of the child's `stdin` pipe so the child observes EOF.
+    @std_cap_boundary(emits: [fs, blocking_sync], clears: [ffi, unsafe_op, indirect_opaque])
+    pub fn close(own self) {
+        let ChildStdin { file } = own self;
+        (own file).close();
+    }
+}
+
+impl ChildStdout {
+    /| Reads available bytes from the child pipe into uninitialized `out` without `memset` (`0` = EOF).
+    @std_cap_boundary(emits: [fs, blocking_sync], clears: [ffi, unsafe_op, indirect_opaque])
+    pub fn read_out(&mut self, out: &mut OutBuf, /) -> usize!IoError {
+        self.file.read_out(out)
+    }
+
+    /| Reads available bytes from the child pipe into `buf` (`0` = EOF).
+    @std_cap_boundary(emits: [fs, blocking_sync], clears: [ffi, unsafe_op, indirect_opaque])
+    pub fn read(&mut self, buf: &mut [u8], /) -> usize!IoError {
+        if buf.is_empty() {
+            return .Ok(0_usize);
+        }
+        var out = OutBuf.over_slice(buf);
+        self.file.read_out(&mut out)
+    }
+
+    /| Borrows `self` as a zero-allocation 16-byte `Reader` handle (`MVS`-tracked exclusive loan).
+    @no_alloc @no_panic
+    pub fn as_reader(&mut self) -> Reader = self.file.as_reader();
+
+    /| Closes the parent read end of the child pipe.
+    @std_cap_boundary(emits: [fs, blocking_sync], clears: [ffi, unsafe_op, indirect_opaque])
+    pub fn close(own self) {
+        let ChildStdout { file } = own self;
+        (own file).close();
+    }
+}
+
+impl ChildProcess {
+    /| Closes remaining stdio handles and waits blockingly for the child to exit (`STD-02` §2.6).
+    @std_cap_boundary(emits: [process, blocking_sync], clears: [ffi, unsafe_op, indirect_opaque])
+    pub fn wait(own self) -> ExitStatus!IoError {
+        let ChildProcess {
+            pid,
+            os_handle,
+            stdin,
+            stdout,
+            stderr,
+            reaped_status,
+            is_sim_child,
+        } = own self;
+        close_opt_stdin(own stdin);
+        close_opt_stdout(own stdout);
+        close_opt_stdout(own stderr);
+        if reaped_status is .Some(cached_status) {
+            if not is_sim_child {
+                close_raw_fd_if_valid(os_handle);
+            }
+            return .Ok(cached_status);
+        }
+        if is_sim_child {
+            return sim_wait_or_kill_child(pid, PROC_SIM_WAIT);
+        }
+        host_wait_child(pid, os_handle)
+    }
+
+    /| Checks whether the child has exited without blocking, caching `ExitStatus` once reaped.
+    @std_cap_boundary(emits: [process], clears: [ffi, unsafe_op, indirect_opaque])
+    pub fn try_wait(&mut self) -> ExitStatus?!IoError {
+        if self.reaped_status is .Some(cached_status) {
+            return .Ok(.Some(cached_status));
+        }
+        if self.is_sim_child {
+            let opt_sim: ExitStatus? = sim_try_wait_child(self.pid)?;
+            if opt_sim is .Some(sim_st) {
+                self.reaped_status = .Some(sim_st);
+            }
+            return .Ok(opt_sim);
+        }
+        let opt_host: ExitStatus? = host_try_wait_child(self.pid, &mut self.os_handle)?;
+        if opt_host is .Some(host_st) {
+            self.reaped_status = .Some(host_st);
+        }
+        .Ok(opt_host)
+    }
+
+    /| Closes `stdin`, drains `stdout` and `stderr` concurrently without deadlock, and reaps `ExitStatus`.
+    @std_cap_boundary(emits: [process, fs, alloc, blocking_sync], clears: [
+        ffi,
+        unsafe_op,
+        indirect_opaque,
+    ])
+    pub fn wait_with_output(
+        own self,
+        *,
+        max_output_bytes: usize = DEFAULT_MAX_OUTPUT_BYTES,
+    ) -> Output!IoError {
+        let ChildProcess {
+            pid,
+            os_handle,
+            stdin,
+            var stdout,
+            var stderr,
+            reaped_status,
+            is_sim_child,
+        } = own self;
+
+        // [1] Close `stdin` immediately so a child reading until EOF never blocks pipe draining:
+        close_opt_stdin(own stdin);
+
+        // [2] Drain `stdout` and `stderr` concurrently within `max_output_bytes`:
+        var stdout_vec = Vec[u8].new();
+        var stderr_vec = Vec[u8].new();
+        var total_bytes: usize = 0;
+
+        let drain_res: unit!IoError = match (&mut stdout, &mut stderr) {
+            (.Some(&mut out_p), .Some(&mut err_p)) => {
+                if is_sim_child {
+                    let first_res: unit!IoError = drain_pipe_until_eof(
+                        out_p,
+                        &mut stdout_vec,
+                        &mut total_bytes,
+                        max_output_bytes,
+                    );
+                    if first_res is .Err(first_err) {
+                        .Err(first_err)
+                    } else {
+                        drain_pipe_until_eof(
+                            err_p,
+                            &mut stderr_vec,
+                            &mut total_bytes,
+                            max_output_bytes,
+                        )
+                    }
+                } else {
+                    drain_dual_pipes_host(
+                        os_handle,
+                        out_p,
+                        err_p,
+                        &mut stdout_vec,
+                        &mut stderr_vec,
+                        &mut total_bytes,
+                        max_output_bytes,
+                    )
+                }
+            },
+            (.Some(&mut out_only), .None) => drain_pipe_until_eof(
+                out_only,
+                &mut stdout_vec,
+                &mut total_bytes,
+                max_output_bytes,
+            ),
+            (.None, .Some(&mut err_only)) => drain_pipe_until_eof(
+                err_only,
+                &mut stderr_vec,
+                &mut total_bytes,
+                max_output_bytes,
+            ),
+            (.None, .None) => .Ok(()),
+        };
+
+        close_opt_stdout(own stdout);
+        close_opt_stdout(own stderr);
+
+        if drain_res is .Err(drain_err) {
+            abort_child_after_drain_error(pid, os_handle, reaped_status, is_sim_child);
+            return .Err(drain_err);
+        }
+
+        // [3] Reap final child `ExitStatus`:
+        let final_status: ExitStatus = if reaped_status is .Some(cached_st) {
+            if not is_sim_child {
+                close_raw_fd_if_valid(os_handle);
+            }
+            cached_st
+        } else if is_sim_child {
+            sim_wait_or_kill_child(pid, PROC_SIM_WAIT)?
+        } else {
+            host_wait_child(pid, os_handle)?
+        };
+
+        .Ok(
+            Output {
+                status: final_status,
+                stdout: own stdout_vec,
+                stderr: own stderr_vec,
+            },
+        )
+    }
+
+    /| Forcefully terminates the child (`SIGKILL` / `TerminateProcess`) and reaps its `ExitStatus`.
+    @std_cap_boundary(emits: [process, blocking_sync], clears: [ffi, unsafe_op, indirect_opaque])
+    pub fn kill_and_wait(own self) -> ExitStatus!IoError {
+        let ChildProcess {
+            pid,
+            os_handle,
+            stdin,
+            stdout,
+            stderr,
+            reaped_status,
+            is_sim_child,
+        } = own self;
+        close_opt_stdin(own stdin);
+        close_opt_stdout(own stdout);
+        close_opt_stdout(own stderr);
+        if reaped_status is .Some(cached_status) {
+            if not is_sim_child {
+                close_raw_fd_if_valid(os_handle);
+            }
+            return .Ok(cached_status);
+        }
+        if is_sim_child {
+            return sim_wait_or_kill_child(pid, PROC_SIM_KILL_WAIT);
+        }
+        host_kill_and_wait_child(pid, os_handle)
+    }
+
+    /| Releases parent pipe/process handles without terminating or waiting on the child process.
+    @std_cap_boundary(emits: [process], clears: [ffi, unsafe_op, indirect_opaque])
+    pub fn detach(own self) {
+        let ChildProcess {
+            pid,
+            os_handle,
+            stdin,
+            stdout,
+            stderr,
+            reaped_status,
+            is_sim_child,
+        } = own self;
+        _ = reaped_status;
+        close_opt_stdin(own stdin);
+        close_opt_stdout(own stdout);
+        close_opt_stdout(own stderr);
+        if is_sim_child {
+            _ = submit_reactor_proc_op(
+                PROC_SIM_DETACH,
+                @bit_cast[i32](pid),
+                @default_init[*mut u8](),
+                0_usize,
+            );
+            return;
+        }
+        close_raw_fd_if_valid(os_handle);
+    }
+}
+
+// ------------------- Command & Process Exit -------------------
+impl Command {
+    /| Creates an infallible builder for `program`, flagging `.bat`/`.cmd` targets for fail-closed `InvalidScriptExtension` rejection.
+    pub fn new[P: str | Path](program: P, /) -> Command {
+        let raw_bytes: &[u8] = program.as_bytes();
+        Command {
+            program_path: PathBuf.from(raw_bytes),
+            arg_list: Vec[PathBuf].new(),
+            env_list: Vec[EnvOverride].new(),
+            cwd_path: .None,
+            stdin_slot: default_stdio_slot(),
+            stdout_slot: default_stdio_slot(),
+            stderr_slot: default_stdio_slot(),
+            env_clear_all: false,
+            allow_windows_batch: false,
+            has_rejected_script_ext: is_windows_batch_bytes(raw_bytes),
+        }
+    }
+
+    /| Explicit opt-in constructor for Windows `.bat`/`.cmd` scripts (`%SystemRoot%\System32\cmd.exe /d /v:off /e:on /c` escaped).
+    pub fn cmd_script[P: str | Path](batch_path: P, /) -> Command {
+        let raw_bytes: &[u8] = batch_path.as_bytes();
+        Command {
+            program_path: PathBuf.from(raw_bytes),
+            arg_list: Vec[PathBuf].new(),
+            env_list: Vec[EnvOverride].new(),
+            cwd_path: .None,
+            stdin_slot: default_stdio_slot(),
+            stdout_slot: default_stdio_slot(),
+            stderr_slot: default_stdio_slot(),
+            env_clear_all: false,
+            allow_windows_batch: true,
+            has_rejected_script_ext: false,
+        }
+    }
+
+    /| Appends a single command-line argument `item` and returns `self` for fluent chaining.
+    pub fn arg[S: str | Path](var self: own Command, item: S, /) -> Command {
+        self.arg_list.push(PathBuf.from(item.as_bytes()));
+        own self
+    }
+
+    /| Appends all command-line arguments in `items` in order and returns `self` for fluent chaining.
+    pub fn args[S: str | Path](var self: own Command, items: &[S], /) -> Command {
+        self.arg_list.reserve(items.len());
+        var i: usize = 0;
+        while i < items.len() {
+            self.arg_list.push(PathBuf.from(items[i].as_bytes()));
+            i += 1_usize;
+        }
+        own self
+    }
+
+    /| Sets the working directory for the spawned child process and returns `self` for fluent chaining.
+    pub fn current_dir[P: str | Path](var self: own Command, dir: P, /) -> Command {
+        self.cwd_path = .Some(PathBuf.from(dir.as_bytes()));
+        own self
+    }
+
+    /| Inserts or overrides environment variable `key` with `val` and returns `self` for fluent chaining.
+    pub fn env(var self: own Command, key: str, val: str, /) -> Command {
+        self.env_list.push(
+            EnvOverride {
+                key: String.from_str(key),
+                val: .Some(String.from_str(val)),
+            },
+        );
+        own self
+    }
+
+    /| Removes environment variable `key` from the child environment and returns `self` for fluent chaining.
+    pub fn env_remove(var self: own Command, key: str, /) -> Command {
+        self.env_list.push(
+            EnvOverride {
+                key: String.from_str(key),
+                val: .None,
+            },
+        );
+        own self
+    }
+
+    /| Clears all inherited parent environment variables and returns `self` for fluent chaining.
+    @no_alloc @no_panic
+    pub fn env_clear(var self: own Command) -> Command {
+        self.env_clear_all = true;
+        self.env_list.clear();
+        own self
+    }
+
+    /| Configures the child's standard input (`fd 0`), consuming `cfg`, and returns `self`.
+    pub fn stdin(var self: own Command, cfg: own Stdio, /) -> Command {
+        replace_stdio_slot(&mut self.stdin_slot, own cfg);
+        own self
+    }
+
+    /| Configures the child's standard output (`fd 1`), consuming `cfg`, and returns `self`.
+    pub fn stdout(var self: own Command, cfg: own Stdio, /) -> Command {
+        replace_stdio_slot(&mut self.stdout_slot, own cfg);
+        own self
+    }
+
+    /| Configures the child's standard error (`fd 2`), consuming `cfg`, and returns `self`.
+    pub fn stderr(var self: own Command, cfg: own Stdio, /) -> Command {
+        replace_stdio_slot(&mut self.stderr_slot, own cfg);
+        own self
+    }
+
+    /| Spawns the configured child process and returns a `@linear ChildProcess` handle (`STD-02` §2.6).
+    @std_cap_boundary(emits: [process, fs, env, blocking_sync], clears: [
+        ffi,
+        unsafe_op,
+        alloc,
+        indirect_opaque,
+    ])
+    pub fn spawn(own self) -> ChildProcess!IoError {
+        let Command {
+            program_path,
+            arg_list,
+            env_list,
+            cwd_path,
+            var stdin_slot,
+            var stdout_slot,
+            var stderr_slot,
+            env_clear_all,
+            allow_windows_batch,
+            has_rejected_script_ext,
+        } = own self;
+
+        // [1] Enforce `BatBadBut` (`CVE-2024-24576`) `.bat`/`.cmd` rejection and input hygiene across all targets + `--sim`:
+        if not allow_windows_batch and has_rejected_script_ext {
+            return .Err(IoError.from_kind(.InvalidScriptExtension, op: .Spawn));
+        }
+        validate_command_common(
+            program_path.as_bytes(),
+            arg_list.as_slice(),
+            &cwd_path,
+            env_list.as_slice(),
+            allow_windows_batch,
+        )?;
+
+        // [2] Route through `context.reactor` (`SimReactor`) when active before touching the host kernel:
+        if try_sim_spawn_child(
+            program_path.as_bytes(),
+            &cwd_path,
+            arg_list.len(),
+            allow_windows_batch,
+            stdin_slot.kind,
+            stdout_slot.kind,
+            stderr_slot.kind,
+        ) is .Some(sim_res) {
+            return sim_res;
+        }
+
+        // [3] Extract owned `.Fd` slots and dispatch to the target OS spawner:
+        let (in_kind, in_fd) = take_stdio_slot_raw(&mut stdin_slot);
+        let (out_kind, out_fd) = take_stdio_slot_raw(&mut stdout_slot);
+        let (err_kind, err_fd) = take_stdio_slot_raw(&mut stderr_slot);
+
+        host_spawn_child(
+            &program_path,
+            arg_list.as_slice(),
+            &cwd_path,
+            env_clear_all,
+            env_list.as_slice(),
+            allow_windows_batch,
+            in_kind,
+            in_fd,
+            out_kind,
+            out_fd,
+            err_kind,
+            err_fd,
+        )
+    }
+
+    /| Spawns `self` and waits blockingly for its `ExitStatus`.
+    @std_cap_boundary(emits: [process, fs, env, blocking_sync], clears: [
+        ffi,
+        unsafe_op,
+        alloc,
+        indirect_opaque,
+    ])
+    pub fn status(own self) -> ExitStatus!IoError {
+        let child: ChildProcess = (own self).spawn()?;
+        (own child).wait()
+    }
+
+    /| Forces `stdout` and `stderr` to `Stdio.piped()` (defaulting `stdin` to `Stdio.null()` when inherited), spawns `self`, and collects `Output`.
+    @std_cap_boundary(emits: [process, fs, env, alloc, blocking_sync], clears: [
+        ffi,
+        unsafe_op,
+        indirect_opaque,
+    ])
+    pub fn output(
+        var self: own Command,
+        *,
+        max_output_bytes: usize = DEFAULT_MAX_OUTPUT_BYTES,
+    ) -> Output!IoError {
+        if self.stdin_slot.kind == .Inherit {
+            replace_stdio_slot(&mut self.stdin_slot, Stdio.null());
+        }
+        replace_stdio_slot(&mut self.stdout_slot, Stdio.piped());
+        replace_stdio_slot(&mut self.stderr_slot, Stdio.piped());
+        let child: ChildProcess = (own self).spawn()?;
+        (own child).wait_with_output(max_output_bytes: max_output_bytes)
+    }
+}
+
+/| Terminates the current process immediately with `code` (notifying `SimReactor` first when active).
+@std_cap_boundary(emits: [process], clears: [ffi, unsafe_op, alloc, indirect_opaque])
+@cold @no_alloc
+pub fn exit(code: i32, /) -> never {
+    _ = submit_reactor_proc_op(PROC_SIM_EXIT, code, @default_init[*mut u8](), 0_usize);
+    @sys_exit(code);
+}
+
+// ---------------------------------------- TESTS ----------------------------------------
+/| 8-word C-ABI `ReactorVTable` layout used by deterministic `SIM_OP_PROC_OP` unit tests.
+@repr(C)
+struct MockProcReactorVTable {
+    /| Slots `0..2`: Unused clock and RNG callbacks (`[0; 3]`).
+    head_slots: [usize; 3],
+    /| Slot `3`: `submit_io` callback.
+    submit_io: ReactorSubmitFn?,
+    /| Slots `4..7`: Unused async proactor callbacks (`[0; 4]`).
+    tail_slots: [usize; 4],
+}
+
+/| Stateful mock `SimReactor` tracking virtual child spawns, `try_wait` polls, waits, kills, and detaches.
+struct MockProcSimState {
+    /| Next virtual PID assigned on `PROC_SIM_SPAWN`.
+    next_pid: u32,
+    /| Number of `PROC_SIM_SPAWN` submissions observed.
+    spawn_calls: usize,
+    /| Number of `PROC_SIM_TRY_WAIT` polls remaining before child reports completion.
+    pending_polls: usize,
+    /| Simulated child exit code returned on completion.
+    exit_code: i32,
+    /| Number of `PROC_SIM_KILL_WAIT` submissions observed.
+    kill_calls: usize,
+    /| Number of `PROC_SIM_DETACH` submissions observed.
+    detach_calls: usize,
+}
+
+/| C-ABI `ReactorVTable.submit_io` callback servicing `SIM_OP_PROC_OP` in cross-OS unit tests.
+@std_cap_boundary(clears: [unsafe_op])
+extern "C" fn mock_proc_submit_io(ctx: *mut opaque, sub_ptr: *IoSubmission) -> i64 {
+    if ctx.is_null() {
+        return SIM_UNHANDLED_SENTINEL;
+    }
+    if sub_ptr.is_null() {
+        return SIM_UNHANDLED_SENTINEL;
+    }
+    let sub: IoSubmission = unsafe {
+        sub_ptr.*
+    };
+    if sub.kind != SIM_OP_PROC_OP {
+        return SIM_UNHANDLED_SENTINEL;
+    }
+    let state_ptr = ctx as *mut MockProcSimState;
+    if state_ptr.is_null() {
+        return SIM_UNHANDLED_SENTINEL;
+    }
+    let state: &mut MockProcSimState = unsafe {
+        &mut state_ptr.*
+    };
+    let sub_op: u8 = sub.flags;
+    if sub_op == PROC_SIM_SPAWN {
+        if sub.buf_ptr.is_null() or (sub.buf_len as usize) < @size_of[SimProcSpawnPayload]() {
+            return -22_i64;
+        }
+        let req_ptr = sub.buf_ptr as *mut SimProcSpawnPayload;
+        if req_ptr.is_null() {
+            return -22_i64;
+        }
+        let req: &mut SimProcSpawnPayload = unsafe {
+            &mut req_ptr.*
+        };
+        let assigned_pid: u32 = state.next_pid;
+        state.next_pid = assigned_pid +% 1_u32;
+        state.spawn_calls = state.spawn_calls +% 1_usize;
+        req.out_pid = assigned_pid;
+        req.out_stdin_fd = -1;
+        req.out_stdout_fd = -1;
+        req.out_stderr_fd = -1;
+        return assigned_pid as i64;
+    }
+    if sub_op == PROC_SIM_TRY_WAIT {
+        if state.pending_polls > 0_usize {
+            state.pending_polls = state.pending_polls -% 1_usize;
+            return PROC_SIM_STILL_RUNNING;
+        }
+        return (state.exit_code as u32) as i64;
+    }
+    if sub_op == PROC_SIM_WAIT {
+        return (state.exit_code as u32) as i64;
+    }
+    if sub_op == PROC_SIM_KILL_WAIT {
+        state.kill_calls = state.kill_calls +% 1_usize;
+        return 137_i64;
+    }
+    if sub_op == PROC_SIM_DETACH {
+        state.detach_calls = state.detach_calls +% 1_usize;
+        return 0_i64;
+    }
+    SIM_UNHANDLED_SENTINEL
+}
+
+test "BatBadBut script detection, MSVCRT quoting, and cmd.exe escaping" {
+    assert(is_windows_batch_path(Path.new("evil.bat")));
+    assert(is_windows_batch_path(Path.new("C:\\scripts\\BUILD.CMD")));
+    assert(is_windows_batch_path(Path.new("evil.bat . .   ")));
+    assert(is_windows_batch_path(Path.new("evil.cmd:$DATA")));
+    assert(not is_windows_batch_path(Path.new("tool.exe")));
+    assert(not is_windows_batch_path(Path.new("tool.bat.exe")));
+    assert(not is_windows_batch_path(Path.new("bat")));
+
+    // Verify `Command.new` 1-line fluent chains reject `.bat`/`.cmd` fail-closed across all OS targets:
+    let bad_spawn = Command.new("deploy.bat").arg("--prod").spawn();
+    if bad_spawn is .Err(err) {
+        assert(err.kind() == .InvalidScriptExtension);
+        assert(err.op() == .Spawn);
+    } else {
+        let leaked = bad_spawn catch unreachable;
+        leaked.detach();
+        panic("Command.new must reject .bat");
+    }
+
+    let bad_output = Command.new("evil.CMD . .  ").stdout(Stdio.piped()).output();
+    if bad_output is .Err(err) {
+        assert(err.kind() == .InvalidScriptExtension);
+    } else {
+        panic("Command.new must reject .CMD with trailing dots/spaces");
+    }
+
+    // MSVCRT `2n` / `2n + 1` backslash quoting:
+    var quoted = Vec[u16].new();
+    let empty_arg: [u16; 0] = [];
+    quote_msvcrt_arg_wtf16(&empty_arg, &mut quoted) catch unreachable;
+    let exp_empty: &[u16] = &[0x0022_u16, 0x0022_u16];
+    assert(quoted.as_slice() == exp_empty);
+
+    quoted.clear();
+    let quote_arg: [u16; 4] = [0x0061, 0x005C, 0x0022, 0x0062];
+    quote_msvcrt_arg_wtf16(&quote_arg, &mut quoted) catch unreachable;
+    let exp_quote: &[u16] = &[
+        0x0022_u16,
+        0x0061_u16,
+        0x005C_u16,
+        0x005C_u16,
+        0x005C_u16,
+        0x0022_u16,
+        0x0062_u16,
+        0x0022_u16,
+    ];
+    assert(quoted.as_slice() == exp_quote);
+
+    quoted.clear();
+    let nul_arg: [u16; 2] = [0x0061, 0x0000];
+    let nul_res = quote_msvcrt_arg_wtf16(&nul_arg, &mut quoted);
+    assert(nul_res is .Err(_));
+
+    // `cmd.exe` script-line neutralization (`%%cd:~,%`, `&|<>()^!`, doubled trailing `\`, quote & CRLF rejection):
+    var script_line = Vec[u16].new();
+    let script_args: [PathBuf; 3] = [
+        PathBuf.from("%PATH%"),
+        PathBuf.from("safe&calc|(x)^!"),
+        PathBuf.from("C:\\Program Files\\"),
+    ];
+    escape_cmd_exe_script_line(Path.new("task.bat"), &script_args, &mut script_line)
+        catch unreachable;
+    let line_slice: &[u16] = script_line.as_slice();
+    assert(line_slice.len() > 48_usize);
+    // Closing sequence of `"C:\Program Files\\""` (doubled trailing `\` + argument `"` + outer `/c "`):
+    let line_len: usize = line_slice.len();
+    assert(unit_at_u16(line_slice, line_len -% 4_usize) == 0x005C_u16);
+    assert(unit_at_u16(line_slice, line_len -% 3_usize) == 0x005C_u16);
+    assert(unit_at_u16(line_slice, line_len -% 2_usize) == 0x0022_u16);
+    assert(unit_at_u16(line_slice, line_len -% 1_usize) == 0x0022_u16);
+
+    script_line.clear();
+    let bad_quote_args: [PathBuf; 1] = [PathBuf.from("foo\\\"&whoami")];
+    let quote_res = escape_cmd_exe_script_line(
+        Path.new("task.bat"),
+        &bad_quote_args,
+        &mut script_line,
+    );
+    if quote_res is .Err(err) {
+        assert(err.kind() == .InvalidInput);
+    } else {
+        panic("embedded quote must be rejected in cmd_script");
+    }
+
+    let bad_cmd_quote = Command.cmd_script("task.bat").arg("foo\"bar").spawn();
+    if bad_cmd_quote is .Err(err) {
+        assert(err.kind() == .InvalidInput);
+    } else {
+        let leaked_q = bad_cmd_quote catch unreachable;
+        leaked_q.detach();
+        panic("Command.cmd_script must reject embedded double quotes");
+    }
+
+    script_line.clear();
+    let bad_crlf: [PathBuf; 1] = [PathBuf.from("line1\r\nline2")];
+    let crlf_res = escape_cmd_exe_script_line(Path.new("task.bat"), &bad_crlf, &mut script_line);
+    if crlf_res is .Err(err) {
+        assert(err.kind() == .InvalidInput);
+    } else {
+        panic("CRLF must be rejected in cmd_script");
+    }
+}
+
+test "ExitStatus predicates, Stdio linear cleanup, and SimReactor lifecycle" {
+    let ok_st = ExitStatus.from_raw(0);
+    assert(ok_st.is_success());
+    assert(ok_st.code() == .Some(0));
+    assert(String.fmt(f"{ok_st}").as_str() == "exit status: 0");
+
+    let unused_stdio = Stdio.piped();
+    unused_stdio.discard_unused();
+
+    var sim_state = MockProcSimState {
+        next_pid: 4_100,
+        spawn_calls: 0,
+        pending_polls: 1,
+        exit_code: 23,
+        kill_calls: 0,
+        detach_calls: 0,
+    };
+    let vtable = MockProcReactorVTable {
+        head_slots: [0_usize; 3],
+        submit_io: .Some(mock_proc_submit_io),
+        tail_slots: [0_usize; 4],
+    };
+
+    with context.reactor = &raw vtable {
+        with context.reactor_ctx = (&raw mut sim_state) as *mut opaque {
+            let extra_flags: [str; 2] = ["--verbose", "--json"];
+            let extra_slice: &[str] = &extra_flags;
+            var child_one: ChildProcess = Command
+                .new("mock-worker")
+                .arg("--check")
+                .args(extra_slice)
+                .current_dir("/workspace")
+                .env_clear()
+                .env("MODE", "sim")
+                .env_remove("LEGACY")
+                .stdin(Stdio.null())
+                .stdout(Stdio.null())
+                .stderr(Stdio.null())
+                .spawn() catch unreachable;
+            assert(child_one.pid == 4_100_u32);
+            assert((child_one.try_wait() catch unreachable) == .None);
+            let polled: ExitStatus? = child_one.try_wait() catch unreachable;
+            assert(polled is .Some(_));
+            let waited: ExitStatus = (own child_one).wait() catch unreachable;
+            assert(waited.code() == .Some(23));
+            assert(not waited.is_success());
+
+            let child_two: ChildProcess = Command
+                .new("mock-worker")
+                .arg("--kill-me")
+                .spawn() catch unreachable;
+            let killed: ExitStatus = (own child_two).kill_and_wait() catch unreachable;
+            assert(killed.code() == .Some(137));
+            assert(sim_state.kill_calls == 1_usize);
+
+            let out_three: Output = Command
+                .new("mock-worker")
+                .arg("--capture")
+                .output() catch unreachable;
+            assert(out_three.status.code() == .Some(23));
+
+            let child_four: ChildProcess = Command
+                .new("mock-worker")
+                .arg("--daemon")
+                .spawn() catch unreachable;
+            (own child_four).detach();
+            assert(sim_state.detach_calls == 1_usize);
+            assert(sim_state.spawn_calls == 4_usize);
+        }
+    }
+}
+
+@cfg(target.os == "windows")
+test "Windows SearchPathW dotted-stem detection and rooted path predicates" {
+    var wbuf = Vec[u16].new();
+    append_wtf8_as_wtf16(b"python3.12", &mut wbuf) catch unreachable;
+    assert(should_probe_explicit_exe(wbuf.as_slice()));
+    assert(not has_win32_sep_or_colon(wbuf.as_slice()));
+
+    wbuf.clear();
+    append_wtf8_as_wtf16(b"bin\\ld.lld", &mut wbuf) catch unreachable;
+    assert(should_probe_explicit_exe(wbuf.as_slice()));
+    assert(has_win32_sep_or_colon(wbuf.as_slice()));
+    assert(not is_win32_rooted_or_drive(wbuf.as_slice()));
+
+    wbuf.clear();
+    append_wtf8_as_wtf16(b"C:\\Python\\python3.12.EXE", &mut wbuf) catch unreachable;
+    assert(not should_probe_explicit_exe(wbuf.as_slice()));
+    assert(is_win32_rooted_or_drive(wbuf.as_slice()));
+
+    wbuf.clear();
+    append_wtf8_as_wtf16(b"git", &mut wbuf) catch unreachable;
+    assert(not should_probe_explicit_exe(wbuf.as_slice()));
+}

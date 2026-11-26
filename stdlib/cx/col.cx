@@ -790,7 +790,8 @@ impl RawTableInner {
                     if first_avail is .Some(slot) {
                         let was_empty: bool = unsafe {
                             self.ctrl.add(slot).read()
-                        } == CTRL_EMPTY;
+                        }
+                            == CTRL_EMPTY;
                         if not (was_empty and self.growth_left() == 0) {
                             if was_empty {
                                 self.growth_left_mut().* -= 1;
@@ -811,7 +812,8 @@ impl RawTableInner {
         let slot: usize = self.find_first_avail_slot(hash_val);
         if unsafe {
             self.ctrl.add(slot).read()
-        } == CTRL_EMPTY {
+        }
+            == CTRL_EMPTY {
             self.growth_left_mut().* -= 1;
         }
         self.set_ctrl(slot, (hash_val & 0x7F_u64) as u8);
@@ -838,7 +840,8 @@ impl RawTableInner {
                 } as *u8,
             )
             .match_empty();
-        let use_tombstone: bool = (empty_before.leading_zeros() +% empty_after.trailing_zeros()) >= GROUP_WIDTH;
+        let use_tombstone: bool = (empty_before.leading_zeros() +% empty_after.trailing_zeros())
+            >= GROUP_WIDTH;
         if use_tombstone {
             self.set_ctrl(idx, CTRL_DELETED);
         } else {
@@ -875,16 +878,16 @@ impl RawTableInner {
         while idx < buckets {
             while unsafe {
                 self.ctrl.add(idx).read()
-            } == CTRL_DELETED {
+            }
+                == CTRL_DELETED {
                 let cur_ptr: *mut u8 = self.bucket_ptr(idx, elem_size, elem_align);
                 let hash_val: u64 = hash_bucket(seed, cur_ptr as *u8);
                 let h2 = (hash_val & 0x7F_u64) as u8;
                 let h1_pos: usize = ((hash_val >> 7_u64) as usize) & mask;
                 let target_idx: usize = self.find_first_avail_slot(hash_val);
 
-                if (((idx -% h1_pos) & mask) / GROUP_WIDTH) == (
-                    ((target_idx -% h1_pos) & mask) / GROUP_WIDTH
-                ) {
+                if (((idx -% h1_pos) & mask) / GROUP_WIDTH)
+                    == (((target_idx -% h1_pos) & mask) / GROUP_WIDTH) {
                     self.set_ctrl(idx, h2);
                     break;
                 }
@@ -1171,14 +1174,15 @@ impl[T] SliceOps[T] {
                     }
                 }
             }
-            while hole_idx > 0 and less(
-                &hole_val,
-                self.ptr_ref(
-                    unsafe {
-                        base.add(hole_idx -% 1) as *T
-                    },
-                ),
-            ) {
+            while hole_idx > 0
+                and less(
+                    &hole_val,
+                    self.ptr_ref(
+                        unsafe {
+                            base.add(hole_idx -% 1) as *T
+                        },
+                    ),
+                ) {
                 unsafe {
                     @ptr_copy_nonoverlapping(base.add(hole_idx -% 1) as *T, base.add(hole_idx), 1);
                 }
@@ -1207,18 +1211,19 @@ impl[T] SliceOps[T] {
             if child >= heap_len {
                 return;
             }
-            if child +% 1 < heap_len and less(
-                self.ptr_ref(
-                    unsafe {
-                        base.add(child) as *T
-                    },
-                ),
-                self.ptr_ref(
-                    unsafe {
-                        base.add(child +% 1) as *T
-                    },
-                ),
-            ) {
+            if child +% 1 < heap_len
+                and less(
+                    self.ptr_ref(
+                        unsafe {
+                            base.add(child) as *T
+                        },
+                    ),
+                    self.ptr_ref(
+                        unsafe {
+                            base.add(child +% 1) as *T
+                        },
+                    ),
+                ) {
                 child = child +% 1;
             }
             if not less(
@@ -1409,14 +1414,15 @@ impl[T] SliceOps[T] {
             depth_limit -= 1_u32;
 
             let piv_idx: usize = self.choose_pivot_ninther(base as *T, n, less);
-            if ancestor_pivot is .Some(anc_ptr) and not less(
-                self.ptr_ref(anc_ptr),
-                self.ptr_ref(
-                    unsafe {
-                        base.add(piv_idx) as *T
-                    },
-                ),
-            ) {
+            if ancestor_pivot is .Some(anc_ptr)
+                and not less(
+                    self.ptr_ref(anc_ptr),
+                    self.ptr_ref(
+                        unsafe {
+                            base.add(piv_idx) as *T
+                        },
+                    ),
+                ) {
                 self.swap_at(base, 0, piv_idx);
                 let eq_len: usize = self.partition_lomuto_branchless_cyclic(
                     unsafe {
@@ -1479,18 +1485,19 @@ impl[T] SliceOps[T] {
                 },
             ),
         ) {
-            while end_idx < n and less(
-                self.ptr_ref(
-                    unsafe {
-                        base.add(end_idx) as *T
-                    },
-                ),
-                self.ptr_ref(
-                    unsafe {
-                        base.add(end_idx -% 1) as *T
-                    },
-                ),
-            ) {
+            while end_idx < n
+                and less(
+                    self.ptr_ref(
+                        unsafe {
+                            base.add(end_idx) as *T
+                        },
+                    ),
+                    self.ptr_ref(
+                        unsafe {
+                            base.add(end_idx -% 1) as *T
+                        },
+                    ),
+                ) {
                 end_idx = end_idx +% 1;
             }
             self.reverse(
@@ -1499,18 +1506,19 @@ impl[T] SliceOps[T] {
                 },
             );
         } else {
-            while end_idx < n and not less(
-                self.ptr_ref(
-                    unsafe {
-                        base.add(end_idx) as *T
-                    },
-                ),
-                self.ptr_ref(
-                    unsafe {
-                        base.add(end_idx -% 1) as *T
-                    },
-                ),
-            ) {
+            while end_idx < n
+                and not less(
+                    self.ptr_ref(
+                        unsafe {
+                            base.add(end_idx) as *T
+                        },
+                    ),
+                    self.ptr_ref(
+                        unsafe {
+                            base.add(end_idx -% 1) as *T
+                        },
+                    ),
+                ) {
                 end_idx = end_idx +% 1;
             }
         }
@@ -2295,9 +2303,10 @@ impl[T: Equatable] Equatable for Vec[T] {
             let count_zst = self.elem_len as usize;
             var z_idx: usize = 0;
             while z_idx < count_zst {
-                if (SliceOps[T] {}).ptr_ref(self.ptr as *T).* != (SliceOps[T] {}).ptr_ref(
-                    other.ptr as *T,
-                ).* {
+                if (SliceOps[T] {}).ptr_ref(self.ptr as *T).*
+                    != (SliceOps[T] {}).ptr_ref(
+                        other.ptr as *T,
+                    ).* {
                     return false;
                 }
                 z_idx = z_idx +% 1;
@@ -2311,11 +2320,12 @@ impl[T: Equatable] Equatable for Vec[T] {
                 unsafe {
                     self.ptr.add(i) as *T
                 },
-            ).* != (SliceOps[T] {}).ptr_ref(
-                unsafe {
-                    other.ptr.add(i) as *T
-                },
-            ).* {
+            ).*
+                != (SliceOps[T] {}).ptr_ref(
+                    unsafe {
+                        other.ptr.add(i) as *T
+                    },
+                ).* {
                 return false;
             }
             i = i +% 1;
@@ -3396,8 +3406,10 @@ impl[K, V] SlotMap[K, V] {
         let next_gen: u32 = (
             unsafe {
                 gens.add(idx_usz).read()
-            } +% 1_u32
-        ) | 1_u32;
+            }
+                +% 1_u32
+        )
+            | 1_u32;
         unsafe {
             gens.add(idx_usz).write(next_gen);
             @ptr_write(&raw mut slot_ref.value, own val);
@@ -3456,7 +3468,9 @@ impl[K, V] SlotMap[K, V] {
     pub fn get_disjoint_mut(&mut self, key_a: K, key_b: K, /) -> (&mut V, &mut V)? {
         let raw_a: RawSlotKey = unpack_slot_key(&key_a);
         let raw_b: RawSlotKey = unpack_slot_key(&key_b);
-        if raw_a.index == raw_b.index or not self.is_live_slot(raw_a) or not self.is_live_slot(raw_b) {
+        if raw_a.index == raw_b.index
+            or not self.is_live_slot(raw_a)
+            or not self.is_live_slot(raw_b) {
             return .None;
         }
         let slots: *mut SlotUnion[V] = self.slots_ptr();
@@ -3601,22 +3615,25 @@ pub fn wyhash_bytes(bytes: &[u8], seed: u64, /) -> u64 {
         if total_len >= 4 {
             let half_off: usize = (total_len >> 3_usize) << 2_usize;
             let tail_off: usize = total_len -% 4;
-            a_word = (wy_read_u32_le(base) << 32_u64) | wy_read_u32_le(
-                unsafe {
-                    base.add(half_off)
-                },
-            );
+            a_word = (wy_read_u32_le(base) << 32_u64)
+                | wy_read_u32_le(
+                    unsafe {
+                        base.add(half_off)
+                    },
+                );
             b_word = (
                 wy_read_u32_le(
                     unsafe {
                         base.add(tail_off)
                     },
-                ) << 32_u64
-            ) | wy_read_u32_le(
-                unsafe {
-                    base.add(tail_off -% half_off)
-                },
-            );
+                )
+                    << 32_u64
+            )
+                | wy_read_u32_le(
+                    unsafe {
+                        base.add(tail_off -% half_off)
+                    },
+                );
         } else if total_len > 0 {
             let byte0 = bytes[0] as u64;
             let byte_mid = bytes[total_len >> 1_usize] as u64;
@@ -3636,31 +3653,36 @@ pub fn wyhash_bytes(bytes: &[u8], seed: u64, /) -> u64 {
                         unsafe {
                             cursor.add(8_usize)
                         },
-                    ) ^ cur_seed,
+                    )
+                        ^ cur_seed,
                 );
                 see1 = wy_mix(
                     wy_read_u64_le(
                         unsafe {
                             cursor.add(16_usize)
                         },
-                    ) ^ WY_P2,
+                    )
+                        ^ WY_P2,
                     wy_read_u64_le(
                         unsafe {
                             cursor.add(24_usize)
                         },
-                    ) ^ see1,
+                    )
+                        ^ see1,
                 );
                 see2 = wy_mix(
                     wy_read_u64_le(
                         unsafe {
                             cursor.add(32_usize)
                         },
-                    ) ^ WY_P3,
+                    )
+                        ^ WY_P3,
                     wy_read_u64_le(
                         unsafe {
                             cursor.add(40_usize)
                         },
-                    ) ^ see2,
+                    )
+                        ^ see2,
                 );
                 cursor = unsafe {
                     cursor.add(48_usize)
@@ -3676,7 +3698,8 @@ pub fn wyhash_bytes(bytes: &[u8], seed: u64, /) -> u64 {
                     unsafe {
                         cursor.add(8_usize)
                     },
-                ) ^ cur_seed,
+                )
+                    ^ cur_seed,
             );
             cursor = unsafe {
                 cursor.add(16_usize)
@@ -3942,20 +3965,21 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
     pub fn get_or_insert_with(&mut self, key: own K, default_fn: || -> V, /) -> &mut V {
         let hash_val: u64 = hash_key_seeded[K, H](self.seed, &key);
         let target_ptr: *K = &raw key;
-        if self.raw.items != 0_u32 and (
-            self.raw.find_raw(
-                hash_val,
-                @size_of[MapBucket[K, V]](),
-                @align_of[MapBucket[K, V]](),
-                |bucket_raw: *u8| -> bool {
-                    let target_ref: &K = (SliceOps[K] {}).ptr_ref(target_ptr);
-                    let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(
-                        bucket_raw as *MapBucket[K, V],
-                    );
-                    target_ref.* == bucket_ref.key
-                },
-            ) is .Some(existing_idx)
-        ) {
+        if self.raw.items != 0_u32
+            and (
+                self.raw.find_raw(
+                    hash_val,
+                    @size_of[MapBucket[K, V]](),
+                    @align_of[MapBucket[K, V]](),
+                    |bucket_raw: *u8| -> bool {
+                        let target_ref: &K = (SliceOps[K] {}).ptr_ref(target_ptr);
+                        let bucket_ref: &MapBucket[K, V] = (SliceOps[MapBucket[K, V]] {}).ptr_ref(
+                            bucket_raw as *MapBucket[K, V],
+                        );
+                        target_ref.* == bucket_ref.key
+                    },
+                ) is .Some(existing_idx)
+            ) {
             let existing_ptr: *mut MapBucket[K, V] = self.raw.bucket_ptr(
                 existing_idx,
                 @size_of[MapBucket[K, V]](),
@@ -4119,8 +4143,10 @@ impl[K: Equatable + Hash, V, H: Hasher] Map[K, V, H] {
             if (
                 unsafe {
                     self.raw.ctrl.add(idx).read()
-                } & 0x80_u8
-            ) == 0_u8 {
+                }
+                    & 0x80_u8
+            )
+                == 0_u8 {
                 let bucket_ptr: *mut MapBucket[K, V] = self.raw.bucket_ptr(
                     idx,
                     @size_of[MapBucket[K, V]](),
@@ -4184,8 +4210,10 @@ impl[K, V] MapIter[K, V] {
             if (
                 unsafe {
                     self.ctrl.add(idx).read()
-                } & 0x80_u8
-            ) == 0_u8 {
+                }
+                    & 0x80_u8
+            )
+                == 0_u8 {
                 self.remaining = self.remaining -% 1;
                 let bucket_ptr: *MapBucket[K, V] = if stride == 0 {
                     self.buckets_base as *MapBucket[K, V]
@@ -4536,7 +4564,8 @@ pub fn binary_search[T: Comparable](slice: &[T], target: &T, /) -> usize!usize {
                 unsafe {
                     ptr.add(mid)
                 },
-            ).* <= target.*
+            ).*
+                <= target.*
         };
         if go_right {
             base = mid;
@@ -4644,11 +4673,12 @@ pub fn dedup_slice[T: Equatable](slice: &mut [T], /) -> usize {
             unsafe {
                 base.add(read_idx) as *T
             },
-        ).* != (SliceOps[T] {}).ptr_ref(
-            unsafe {
-                base.add(write_idx -% 1) as *T
-            },
-        ).* {
+        ).*
+            != (SliceOps[T] {}).ptr_ref(
+                unsafe {
+                    base.add(write_idx -% 1) as *T
+                },
+            ).* {
             (SliceOps[T] {}).swap_at(base, write_idx, read_idx);
             write_idx = write_idx +% 1;
         }

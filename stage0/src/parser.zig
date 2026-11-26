@@ -10489,6 +10489,11 @@ pub const Parser = struct {
                 }
 
                 if (cur_kind == .lbracket) {
+                    if (self.is_in_stmt_lhs and
+                        (self.has_last_expr_block_body or self.isBlockBodiedExprNode(lhs_node)))
+                    {
+                        break;
+                    }
                     self.pushState(.expr_pratt_loop, lhs_cst_start) catch |err| switch (err) {
                         error.ParseDepthExceeded => {
                             _ = try self.precedeNode(
@@ -10517,6 +10522,11 @@ pub const Parser = struct {
                 }
 
                 if (cur_kind == .lparen) {
+                    if (self.is_in_stmt_lhs and
+                        (self.has_last_expr_block_body or self.isBlockBodiedExprNode(lhs_node)))
+                    {
+                        break;
+                    }
                     self.pushState(.expr_pratt_loop, lhs_cst_start) catch |err| switch (err) {
                         error.ParseDepthExceeded => {
                             _ = try self.precedeNode(

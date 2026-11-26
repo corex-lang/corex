@@ -53,6 +53,27 @@ pub struct TaskHeader {
     pub state_and_flags: u64,
 }
 
+/| C-ABI proactor and `--sim` `SimReactor` submission descriptor passed to `ReactorVTable.submit_io` (`STD-02`).
+@repr(C) @derive(Copy)
+pub struct IoSubmission {
+    /| Canonical `SIM_OP_*` operation opcode (`IoOpKind`).
+    pub kind: u8,
+    /| Operation-specific flags (`DurabilityMode`, `LockMode`, `OpenFlags` sub-selector, etc.).
+    pub flags: u8,
+    /| Owning executor worker index (`0` for synchronous/single-threaded submission).
+    pub worker_id: u16,
+    /| Target virtual or host file descriptor / handle slot (`-1` when unused).
+    pub fd_or_handle: i32,
+    /| Byte offset, nanosecond duration, or packed auxiliary 64-bit operand.
+    pub offset_or_ns: u64,
+    /| Payload or structured request/response buffer pointer (`null` when unused).
+    pub buf_ptr: *mut u8,
+    /| Byte length of `buf_ptr` (`0` when unused).
+    pub buf_len: u32,
+    /| Proactor `CompletionReaper` slot index or secondary 32-bit operand.
+    pub slot_index: u32,
+}
+
 /| Dispatch vtable routed through `context.reactor` (`slot 8`, `DR-08` §5.3, `DR-18` §2.1).
 @repr(C)
 pub struct ReactorVTable {
@@ -117,6 +138,85 @@ pub const TASK_HEADER_BYTES_64: usize = 32;
 
 /| Compile-time inline `async` coroutine state-machine frame cap (`16 KiB`, `DR-17` §3.2, `E0317`).
 pub const ASYNC_INLINE_CAP_BYTES: usize = 16_384;
+
+/| Sentinel returned by `DEFAULT_NOOP_REACTOR_VTABLE.submit_io` (`i64.MIN`) when no `SimReactor` intercepts the op.
+pub const SIM_UNHANDLED_SENTINEL: i64 = i64.MIN;
+
+// ------------------- `IoOpKind` Sim Opcodes -------------------
+/| No-op proactor submission (`IoOpKind.nop = 0`).
+pub const SIM_OP_NOP: u8 = 0;
+
+/| Asynchronous stream/socket read (`IoOpKind.read = 1`).
+pub const SIM_OP_READ: u8 = 1;
+
+/| Asynchronous stream/socket write (`IoOpKind.write = 2`).
+pub const SIM_OP_WRITE: u8 = 2;
+
+/| Asynchronous listener accept (`IoOpKind.accept = 3`).
+pub const SIM_OP_ACCEPT: u8 = 3;
+
+/| Asynchronous socket connect (`IoOpKind.connect = 4`).
+pub const SIM_OP_CONNECT: u8 = 4;
+
+/| Asynchronous deadline timer (`IoOpKind.timer = 5`).
+pub const SIM_OP_TIMER: u8 = 5;
+
+/| Asynchronous descriptor close (`IoOpKind.close = 6`).
+pub const SIM_OP_CLOSE: u8 = 6;
+
+/| Simulated standard stream (`stdin`/`stdout`/`stderr`) read/write (`IoOpKind.stdio_rw = 7`).
+pub const SIM_OP_STDIO_RW: u8 = 7;
+
+/| Simulated file or directory open (`IoOpKind.fs_open = 8`).
+pub const SIM_OP_FS_OPEN: u8 = 8;
+
+/| Simulated capability-jailed relative `*_beneath` operation (`IoOpKind.fs_op_beneath = 9`).
+pub const SIM_OP_FS_OP_BENEATH: u8 = 9;
+
+/| Simulated file read/write/pread/pwrite/vectored/set_len (`IoOpKind.fs_rw = 10`).
+pub const SIM_OP_FS_RW: u8 = 10;
+
+/| Simulated file cursor seek (`IoOpKind.fs_seek = 11`).
+pub const SIM_OP_FS_SEEK: u8 = 11;
+
+/| Simulated file/symlink/handle metadata query (`IoOpKind.fs_stat = 12`).
+pub const SIM_OP_FS_STAT: u8 = 12;
+
+/| Simulated `DurabilityMode` barrier sync or permissions update (`IoOpKind.fs_sync = 13`).
+pub const SIM_OP_FS_SYNC: u8 = 13;
+
+/| Simulated `File` or `Dir` close (`IoOpKind.fs_close = 14`).
+pub const SIM_OP_FS_CLOSE: u8 = 14;
+
+/| Simulated read-only `Mmap` map/unmap (`IoOpKind.fs_mmap = 15`).
+pub const SIM_OP_FS_MMAP: u8 = 15;
+
+/| Simulated physical `resolve_path` / `resolve_or_create_path` (`IoOpKind.fs_resolve = 16`).
+pub const SIM_OP_FS_RESOLVE: u8 = 16;
+
+/| Simulated `UnlinkAndReplace` atomic publish (`IoOpKind.fs_rename_atomic = 17`).
+pub const SIM_OP_FS_RENAME_ATOMIC: u8 = 17;
+
+/| Simulated 3-tier CoW `materialize_file` (`IoOpKind.fs_materialize = 18`).
+pub const SIM_OP_FS_MATERIALIZE: u8 = 18;
+
+/| Simulated directory creation, removal, or `DirIter` read (`IoOpKind.fs_dir_op = 19`).
+pub const SIM_OP_FS_DIR_OP: u8 = 19;
+
+/| Simulated advisory `FileLock` acquire/unlock (`IoOpKind.fs_lock = 20`).
+pub const SIM_OP_FS_LOCK: u8 = 20;
+
+/| Simulated `FsWatcher` registration or event poll (`IoOpKind.fs_watch_poll = 21`).
+pub const SIM_OP_FS_WATCH_POLL: u8 = 21;
+
+/| Simulated zero-latency virtual clock sleep (`IoOpKind.sleep_ns = 22`).
+pub const SIM_OP_SLEEP_NS: u8 = 22;
+
+/| Simulated hermetic `cx.env` variable, `argv`, or standard directory op (`IoOpKind.env_op = 23`).
+pub const SIM_OP_ENV_OP: u8 = 23;
+
+/| Simulated `cx.process` child spawn, wait, kill, or exit (`IoOpKind.proc_op = 24`).
+pub const SIM_OP_PROC_OP: u8 = 24;
 
 // ------------------------------------- PUBLIC API --------------------------------------
 impl[T] Poll[T] {

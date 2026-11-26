@@ -1827,6 +1827,32 @@ inline fn isStdCoreOrBuiltinNominal(
         std.mem.eql(u8, sym.name_text, expected_name);
 }
 
+/// Returns `true` when `sym_idx` resolves to `over_uninit` on `.std_core` `OutBuf`, `BufReader`, or `BufWriter`.
+inline fn isStdUninitBackingBorrowCtor(sym_table: *const SymbolTable, sym_idx: SymbolIndex) bool {
+    return type_system.isStdUninitBackingBorrowCtor(sym_table, sym_idx);
+}
+
+/// Resolves the canonical `SymbolIndex` of `body` across direct, `DefId`-mapped, and `sast_owner_*` symbols.
+fn resolveBodyCanonicalSymbol(body: *const MirBody, sym_table: *const SymbolTable) SymbolIndex {
+    if (!body.symbol_index.isNone()) {
+        return unwrapCanonicalSymbolIndex(sym_table, body.symbol_index);
+    }
+    if (!body.def_id.isNone()) {
+        if (sym_table.def_to_symbol.get(body.def_id.asInt())) |mapped_idx| {
+            return unwrapCanonicalSymbolIndex(sym_table, mapped_idx);
+        }
+    }
+    if (!body.sast_owner_symbol.isNone()) {
+        return unwrapCanonicalSymbolIndex(sym_table, body.sast_owner_symbol);
+    }
+    if (!body.sast_owner_def_id.isNone()) {
+        if (sym_table.def_to_symbol.get(body.sast_owner_def_id.asInt())) |owner_mapped_idx| {
+            return unwrapCanonicalSymbolIndex(sym_table, owner_mapped_idx);
+        }
+    }
+    return .none;
+}
+
 /// Returns `true` if `inst` is a `.fn_addr` referencing a `@thread_local` static variable.
 fn isThreadLocalAddrInst(sym_table: *const SymbolTable, inst: MirInst) bool {
     if (inst.op != .fn_addr or inst.operands.rhs == mir.NONE_U32) return false;
@@ -6216,16 +6242,83 @@ fn setLoanBitAlloc(
     mask.set(loan_idx);
 }
 
-/// Returns `true` if `raw_ty` is a pure borrowed reference, slice, `str`, or raw pointer (owning zero stack payload).
-fn isPureBorrowedRefOrSliceType(pool: *const InternPool, raw_ty: TypeId) bool {
-    if (raw_ty.isError()) return false;
+/// Returns `true` if `raw_ty` is a pure borrowed reference, slice, `str`, raw pointer, or `Copy` view wrapper
+/// composed solely of scalars and borrowed references/slices/raw pointers (owning zero stack array/container payload).
+fn isPureBorrowedRefOrSliceType(pool: *const InternPool, sym_table: *const SymbolTable, raw_ty: TypeId) bool {
+    var has_borrowed_leaf = false;
+    if (!isPureBorrowedViewLeafOrWrapper(pool, sym_table, raw_ty, 0, &has_borrowed_leaf)) return false;
+    return has_borrowed_leaf;
+}
+
+/// Bounded recursive helper verifying `raw_ty` is `Copy` with zero inline array/container storage.
+fn isPureBorrowedViewLeafOrWrapper(
+    pool: *const InternPool,
+    sym_table: *const SymbolTable,
+    raw_ty: TypeId,
+    depth: u8,
+    has_borrowed_leaf: *bool,
+) bool {
+    if (raw_ty.isError() or depth > 8) return false;
     const unwrapped = pool.unwrapUnderlyingType(raw_ty);
-    if (unwrapped == .str_ty or unwrapped == .fmt_args_ty) return true;
-    if (unwrapped.isPrimitive()) return false;
-    return switch (pool.getNode(unwrapped).tag) {
-        .ref_ty, .mut_ref_ty, .slice_ty, .soa_slice_ty, .raw_ptr_ty => true,
-        else => false,
-    };
+    if (unwrapped == .str_ty or unwrapped == .fmt_args_ty) {
+        has_borrowed_leaf.* = true;
+        return true;
+    }
+    if (unwrapped == .unit_ty or unwrapped == .source_loc_ty or unwrapped == .fmt_spec_ty or unwrapped.isPrimitive()) {
+        return true;
+    }
+    const node = pool.getNode(unwrapped);
+    switch (node.tag) {
+        .ref_ty, .mut_ref_ty, .slice_ty, .soa_slice_ty, .raw_ptr_ty => {
+            has_borrowed_leaf.* = true;
+            return true;
+        },
+        .fn_ty, .bit_field_ty => return true,
+        .optional_ty => return isPureBorrowedViewLeafOrWrapper(
+            pool,
+            sym_table,
+            TypeId.fromInt(node.lhs),
+            depth + 1,
+            has_borrowed_leaf,
+        ),
+        .tuple_ty => {
+            for (pool.getTupleElements(unwrapped)) |raw_elem| {
+                if (!isPureBorrowedViewLeafOrWrapper(
+                    pool,
+                    sym_table,
+                    TypeId.fromInt(raw_elem),
+                    depth + 1,
+                    has_borrowed_leaf,
+                )) {
+                    return false;
+                }
+            }
+            return true;
+        },
+        .struct_ty => {
+            if (type_system.classifyOwnershipTier(pool, sym_table, unwrapped) != .copy_tier) return false;
+            const sym_idx = SymbolIndex.fromInt(node.rhs);
+            if (sym_idx.isNone() or sym_idx.asInt() >= sym_table.symbols.items.len) return false;
+            const sym = sym_table.getSymbol(sym_idx).*;
+            if (sym.target_scope.isNone()) return false;
+            const subst = type_system.NominalTypeSubst.init(pool, sym_table, unwrapped);
+            for (sym_table.getScopeMembers(sym.target_scope)) |mem_idx| {
+                const mem_sym = sym_table.getSymbol(mem_idx).*;
+                if (mem_sym.kind != .field_sym) continue;
+                if (!isPureBorrowedViewLeafOrWrapper(
+                    pool,
+                    sym_table,
+                    subst.resolve(mem_sym.type_id),
+                    depth + 1,
+                    has_borrowed_leaf,
+                )) {
+                    return false;
+                }
+            }
+            return true;
+        },
+        else => return false,
+    }
 }
 
 /// Appends a `TrackedLoan` or coalesces into the fail-closed wildcard slot when `MAX_TRACKED_LOANS` saturates.
@@ -6438,7 +6531,7 @@ fn computeBodyProvenanceAndNllHorizonExt(
                 const base_loc = body.places.items[inst.operands.lhs].base;
                 const is_pointee_reb = (projs.len > 0 and projs[0].kind == .deref) or
                     (inst.op == .soa_column_slice and base_loc < local_count and
-                        isPureBorrowedRefOrSliceType(pool, body.locals.items[base_loc].type_id));
+                        isPureBorrowedRefOrSliceType(pool, sym_table, body.locals.items[base_loc].type_id));
                 const lid_idx = try mintOrCoarsenLoan(
                     &loan_list,
                     arena_alloc,
@@ -6540,12 +6633,12 @@ fn computeBodyProvenanceAndNllHorizonExt(
                     const is_pointee_reb = (ghost_projs.len > 0 and ghost_projs[0].kind == .deref) or
                         (ghost_inst.op == .ghost_access_let and ghost_projs.len == 0 and
                             ghost_base < local_count and
-                            isPureBorrowedRefOrSliceType(pool, body.locals.items[ghost_base].type_id));
+                            isPureBorrowedRefOrSliceType(pool, sym_table, body.locals.items[ghost_base].type_id));
                     const lid_idx = try mintOrCoarsenLoan(
                         &loan_list,
                         arena_alloc,
                         lookup,
-                        ghost_inst.op == .ghost_access_inout,
+                        ghost_inst.op != .ghost_access_let,
                         is_pointee_reb,
                         scratch_bits,
                         call_site.origin_token,
@@ -6582,12 +6675,12 @@ fn computeBodyProvenanceAndNllHorizonExt(
                     const fb_pointee_reb = (fb_projs.len > 0 and fb_projs[0].kind == .deref) or
                         (ghost_inst.op == .ghost_access_let and fb_projs.len == 0 and
                             fb_base < local_count and
-                            isPureBorrowedRefOrSliceType(pool, body.locals.items[fb_base].type_id));
+                            isPureBorrowedRefOrSliceType(pool, sym_table, body.locals.items[fb_base].type_id));
                     const lid_idx = try mintOrCoarsenLoan(
                         &loan_list,
                         arena_alloc,
                         lookup,
-                        ghost_inst.op == .ghost_access_inout,
+                        ghost_inst.op != .ghost_access_let,
                         fb_pointee_reb,
                         scratch_bits,
                         call_site.origin_token,
@@ -7721,7 +7814,8 @@ fn computeBodyProvenanceAndNllHorizonExt(
                                         );
                                     } else if (mode != .set_mode and
                                         !body.locals.items[base_loc].flags().is_arg and
-                                        local_prov[base_loc].scratch_mask != 0)
+                                        (local_prov[base_loc].scratch_mask != 0 or
+                                            hasProvenanceCarrier(pool, sym_table, body.locals.items[base_loc].type_id)))
                                     {
                                         cur_loans.unionInPlace(local_prov[base_loc].loan_mask);
                                         recordLastUseTokens(
@@ -7773,7 +7867,8 @@ fn computeBodyProvenanceAndNllHorizonExt(
                         const addr_base = body.places.items[inst.operands.lhs].base;
                         if (addr_base < local_count and
                             !body.locals.items[addr_base].flags().is_arg and
-                            local_prov[addr_base].scratch_mask != 0)
+                            (local_prov[addr_base].scratch_mask != 0 or
+                                hasProvenanceCarrier(pool, sym_table, body.locals.items[addr_base].type_id)))
                         {
                             cur_loans.unionInPlace(local_prov[addr_base].loan_mask);
                             recordLastUseTokens(loan_list.items, local_prov[addr_base].loan_mask, tok);
@@ -11077,12 +11172,16 @@ fn applyCallStateTransitionSilent(
         call_site.direct_symbol.asInt() < sym_table.symbols.items.len and
         EXPLICIT_FREE_METHOD_MAP.has(sym_table.getSymbol(call_site.direct_symbol).name_text);
     const is_fallible_result = isFallibleResultCallSite(pool, call_site);
+    const is_uninit_backing_ctor = call_site.is_uninit_backing_ctor or isStdUninitBackingBorrowCtor(
+        sym_table,
+        resolveCanonicalCallSymbol(sym_table, call_site),
+    );
     const ffi_call_opt = lookupCallFfiContract(sym_table, call_site);
 
     for (0..call_site.args_len) |arg_i| {
         const mode = body.call_arg_modes.items[call_site.modes_start + arg_i];
         const word = body.extra_args.items[call_site.args_start + arg_i];
-        if (mode == .set_mode and word < trie.place_map.len) {
+        if (mode == .set_mode and word < trie.place_map.len and !is_uninit_backing_ctor) {
             if (is_fallible_result) {
                 applyPathMaybeWriteToState(trie, trie.place_map[word], state);
             } else {
@@ -11318,7 +11417,8 @@ fn computeBlockStepHorizons(
                             cur_scratch |= horizon.local_prov[base_loc].scratch_mask;
                         } else if (mode != .set_mode and base_loc < local_count and
                             !body.locals.items[base_loc].flags().is_arg and
-                            horizon.local_prov[base_loc].scratch_mask != 0)
+                            (horizon.local_prov[base_loc].scratch_mask != 0 or
+                                hasProvenanceCarrier(pool, sym_table, body.locals.items[base_loc].type_id)))
                         {
                             cur_loans.unionInPlace(horizon.local_prov[base_loc].loan_mask);
                         }
@@ -11370,7 +11470,8 @@ fn computeBlockStepHorizons(
             const addr_base = body.places.items[inst.operands.lhs].base;
             if (addr_base < local_count and
                 !body.locals.items[addr_base].flags().is_arg and
-                horizon.local_prov[addr_base].scratch_mask != 0)
+                (horizon.local_prov[addr_base].scratch_mask != 0 or
+                    hasProvenanceCarrier(pool, sym_table, body.locals.items[addr_base].type_id)))
             {
                 cur_loans.unionInPlace(horizon.local_prov[addr_base].loan_mask);
             }
@@ -13964,8 +14065,15 @@ fn runPass2TypestateNllAndDrops(
                     }
                 } else if (param_mode == .set_mode) {
                     const p_flags = trie.nodes[slot_i].flags();
+                    const is_uninit_backing_body = isStdUninitBackingBorrowCtor(
+                        sym_table,
+                        resolveBodyCanonicalSymbol(body, sym_table),
+                    );
                     if (!is_error_ret) {
-                        if (trie.subtree[slot_i].intersects(work_state.maybe_uninit) and !has_reported_path_diag[slot_i]) {
+                        if (!is_uninit_backing_body and
+                            trie.subtree[slot_i].intersects(work_state.maybe_uninit) and
+                            !has_reported_path_diag[slot_i])
+                        {
                             has_reported_path_diag[slot_i] = true;
                             outcome.emitted_error_count += 1;
                             try emitSastDiag(
@@ -15558,6 +15666,10 @@ fn checkAndApplyCallFreeDiagnostics(
     outcome: *Pass2BodyOutcome,
 ) !void {
     const is_fallible_result = isFallibleResultCallSite(pool, call_site);
+    const is_uninit_backing_ctor = call_site.is_uninit_backing_ctor or isStdUninitBackingBorrowCtor(
+        sym_table,
+        resolveCanonicalCallSymbol(sym_table, call_site),
+    );
     for (0..call_site.args_len) |arg_i| {
         const mode = body.call_arg_modes.items[call_site.modes_start + arg_i];
         const word = body.extra_args.items[call_site.args_start + arg_i];
@@ -15583,10 +15695,12 @@ fn checkAndApplyCallFreeDiagnostics(
                     "pass an uninitialized `var slot: T;` binding or consume/drop the existing value first",
                 );
             }
-            if (is_fallible_result) {
-                applyPathMaybeWriteToState(trie, lookup, work_state);
-            } else {
-                applyPathWriteToState(trie, lookup, work_state);
+            if (!is_uninit_backing_ctor) {
+                if (is_fallible_result) {
+                    applyPathMaybeWriteToState(trie, lookup, work_state);
+                } else {
+                    applyPathWriteToState(trie, lookup, work_state);
+                }
             }
         }
     }
@@ -15823,10 +15937,14 @@ fn materializePlannedDrops(
             const normal_target_bb = out_edges_slice[0].target_bb.asInt();
             const call_site = body.calls.items[term.cond_or_val];
             const is_fallible_result = isFallibleResultCallSite(pool, call_site);
+            const is_uninit_backing_ctor = call_site.is_uninit_backing_ctor or isStdUninitBackingBorrowCtor(
+                sym_table,
+                resolveCanonicalCallSymbol(sym_table, call_site),
+            );
             for (0..call_site.args_len) |arg_i| {
                 const mode = body.call_arg_modes.items[call_site.modes_start + arg_i];
                 const word = body.extra_args.items[call_site.args_start + arg_i];
-                if (mode == .set_mode and word < trie.place_map.len) {
+                if (mode == .set_mode and word < trie.place_map.len and !is_uninit_backing_ctor) {
                     const lk = trie.place_map[word];
                     for (flagged_paths.items) |fm| {
                         if (trie.subtree[lk.id.asInt()].isSet(fm)) {
@@ -16488,6 +16606,25 @@ fn evalBinOpIntv(
         .bit_and => {
             if (!dst_dom.is_signed or (lb.lo >= 0 and rb.lo >= 0)) {
                 return encodeClippedI128ToIntv(0, @min(lb.hi, rb.hi), dst_dom);
+            }
+            return dst_dom.top_intv;
+        },
+        .bit_or => {
+            if (!dst_dom.is_signed or (lb.lo >= 0 and rb.lo >= 0)) {
+                const or_lo = @max(lb.lo, rb.lo);
+                if (lb.lo == lb.hi and rb.lo == rb.hi) {
+                    const exact_or: i128 = @intCast(@as(u128, @intCast(lb.lo)) | @as(u128, @intCast(rb.lo)));
+                    return encodeClippedI128ToIntv(exact_or, exact_or, dst_dom);
+                }
+                const hi_or: u128 = @as(u128, @intCast(lb.hi)) | @as(u128, @intCast(rb.hi));
+                const mask_u128: u128 = if (hi_or == 0)
+                    0
+                else blk_mask: {
+                    const bit_len: u7 = @intCast(128 - @clz(hi_or));
+                    break :blk_mask if (bit_len >= 128) std.math.maxInt(u128) else (@as(u128, 1) << bit_len) - 1;
+                };
+                const or_hi: i128 = @intCast(@min(mask_u128, @as(u128, @intCast(db.hi))));
+                return encodeClippedI128ToIntv(or_lo, or_hi, dst_dom);
             }
             return dst_dom.top_intv;
         },
@@ -19324,13 +19461,32 @@ fn runPass4IntervalsAndPentagonBce(
                                 local_store_counts,
                                 slice_len_store_counts,
                             );
+                            const len_iv = readDomRefinedIntv(
+                                body,
+                                len_v,
+                                val_intv,
+                                val_overrides,
+                                local_overrides,
+                                slice_len_overrides,
+                                local_store_counts,
+                                slice_len_store_counts,
+                            );
                             const is_non_neg = if (val_domains[idx_v]) |id_dom|
                                 (!id_dom.is_signed or (!idx_iv.isBottom() and decodeIntvToI128(idx_iv, id_dom).lo >= 0))
                             else
                                 false;
-                            if (is_non_neg and idx_pid < sub_var_count and len_pid < sub_var_count and
-                                closed_scratch_b[idx_pid].contains(@intCast(len_pid)))
-                            {
+                            const is_idx_lt_len = (idx_pid < sub_var_count and len_pid < sub_var_count and
+                                closed_scratch_b[idx_pid].contains(@intCast(len_pid))) or
+                                blk_lt: {
+                                    if (val_domains[idx_v] != null and val_domains[len_v] != null and
+                                        !idx_iv.isBottom() and !len_iv.isBottom())
+                                    {
+                                        break :blk_lt decodeIntvToI128(idx_iv, val_domains[idx_v].?).hi <
+                                            decodeIntvToI128(len_iv, val_domains[len_v].?).lo;
+                                    }
+                                    break :blk_lt false;
+                                };
+                            if (is_non_neg and is_idx_lt_len) {
                                 is_proven = true;
                             }
                         }

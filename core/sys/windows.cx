@@ -1,11 +1,321 @@
-/# Windows Win32 `kernel32` Handle Constants and C-ABI Prototypes (`core.sys.windows`)
+/# Windows Win32 & NT Native Syscall Constants and Prototypes (`core.sys.windows`)
 /#
-/# Declares Win32 standard-handle identifiers (`STD_INPUT_HANDLE`, `STD_OUTPUT_HANDLE`,
-/# `STD_ERROR_HANDLE`), `kernel32.dll` `GetStdHandle` / `WriteFile` / `ExitProcess` `extern "C"`
-/# prototypes typed with `*mut opaque` (`ADR-22F`), and safe `@sys_write` / `@sys_exit` helpers.
+/# Declares `@repr(C)` Win32 and NT structures (`OVERLAPPED`, `BY_HANDLE_FILE_INFORMATION`,
+/# `FILE_*_INFO`, `WIN32_FIND_DATAW`, `STARTUPINFOEXW`, `PROCESS_INFORMATION`, `OBJECT_ATTRIBUTES`,
+/# `UNICODE_STRING`) alongside `kernel32`, `ntdll`, and `advapi32` `extern "C"` prototypes.
 /#
-/# Safe stream helpers operate in binary mode (`_O_BINARY` without `LF` to `CRLF` translation) to
-/# guarantee byte-exact output parity across Windows and POSIX hosts.
+/# Standard directory resolution queries environment variables and `advapi32` `User Shell Folders`
+/# directly with zero GUI/COM subsystem dependencies, avoiding `user32`/`gdi32` cold-start overhead.
+
+// ---------------------------------------- TYPES ----------------------------------------
+/| Win32 64-bit 100-nanosecond timestamp (`FILETIME`, `8` bytes).
+@repr(C)
+pub struct Win32FileTime {
+    /| Low-order 32 bits of the 100-ns interval count since `1601-01-01T00:00:00Z`.
+    pub low_date_time: u32,
+    /| High-order 32 bits of the 100-ns interval count since `1601-01-01T00:00:00Z`.
+    pub high_date_time: u32,
+}
+
+/| Win32 asynchronous/positional I/O request header (`OVERLAPPED`, `32` bytes on Win64).
+@repr(C)
+pub struct Win32Overlapped {
+    /| Kernel I/O status (`Internal`).
+    pub internal_status: usize,
+    /| Transferred byte count (`InternalHigh`).
+    pub internal_high: usize,
+    /| Low 32 bits of the target file offset or lock range start.
+    pub offset_low: u32,
+    /| High 32 bits of the target file offset or lock range start.
+    pub offset_high: u32,
+    /| Optional manual-reset event handle (`hEvent`).
+    pub event_handle: *mut opaque,
+}
+
+/| Win32 handle-inheritance and security descriptor header (`SECURITY_ATTRIBUTES`).
+@repr(C)
+pub struct Win32SecurityAttributes {
+    /| Structure size in bytes (`sizeof(Win32SecurityAttributes)`).
+    pub byte_length: u32,
+    /| Optional `SECURITY_DESCRIPTOR` pointer (`null` for default ACL).
+    pub security_descriptor: *mut opaque,
+    /| Non-zero (`1`) when child processes may inherit the returned handle.
+    pub inherit_handle: i32,
+}
+
+/| Win32 `GetFileInformationByHandle` metadata record (`BY_HANDLE_FILE_INFORMATION`, `52` bytes).
+@repr(C)
+pub struct Win32ByHandleFileInfo {
+    /| `FILE_ATTRIBUTE_*` bitmask.
+    pub file_attributes: u32,
+    /| File creation timestamp.
+    pub creation_time: Win32FileTime,
+    /| Last access timestamp.
+    pub last_access_time: Win32FileTime,
+    /| Last modification timestamp.
+    pub last_write_time: Win32FileTime,
+    /| Volume serial number.
+    pub volume_serial_number: u32,
+    /| High 32 bits of file size.
+    pub file_size_high: u32,
+    /| Low 32 bits of file size.
+    pub file_size_low: u32,
+    /| Hardlink count.
+    pub number_of_links: u32,
+    /| High 32 bits of the 64-bit file index.
+    pub file_index_high: u32,
+    /| Low 32 bits of the 64-bit file index.
+    pub file_index_low: u32,
+}
+
+/| Win32 `GetFileAttributesExW` metadata record (`WIN32_FILE_ATTRIBUTE_DATA`, `36` bytes).
+@repr(C)
+pub struct Win32FileAttributeData {
+    /| `FILE_ATTRIBUTE_*` bitmask.
+    pub file_attributes: u32,
+    /| File creation timestamp.
+    pub creation_time: Win32FileTime,
+    /| Last access timestamp.
+    pub last_access_time: Win32FileTime,
+    /| Last modification timestamp.
+    pub last_write_time: Win32FileTime,
+    /| High 32 bits of file size.
+    pub file_size_high: u32,
+    /| Low 32 bits of file size.
+    pub file_size_low: u32,
+}
+
+/| Win32 `FileBasicInfo` (`0`) structure (`FILE_BASIC_INFO`, `40` bytes).
+@repr(C, align: 8)
+pub struct Win32FileBasicInfo {
+    /| Creation time in 100-ns ticks (`0` leaves unchanged in `SetFileInformationByHandle`).
+    pub creation_time: i64,
+    /| Last access time in 100-ns ticks.
+    pub last_access_time: i64,
+    /| Last write time in 100-ns ticks.
+    pub last_write_time: i64,
+    /| Last metadata change time in 100-ns ticks.
+    pub change_time: i64,
+    /| `FILE_ATTRIBUTE_*` bitmask.
+    pub file_attributes: u32,
+    /| Explicit trailing alignment word (`0`).
+    pub reserved_pad: u32,
+}
+
+/| Win32 `FileStandardInfo` (`1`) structure (`FILE_STANDARD_INFO`, `24` bytes).
+@repr(C, align: 8)
+pub struct Win32FileStandardInfo {
+    /| Allocated disk bytes.
+    pub allocation_size: i64,
+    /| Logical end-of-file byte size.
+    pub end_of_file: i64,
+    /| Hardlink count.
+    pub number_of_links: u32,
+    /| Non-zero when deletion is pending.
+    pub delete_pending: u8,
+    /| Non-zero when handle refers to a directory.
+    pub is_directory: u8,
+    /| Explicit alignment halfword (`0`).
+    pub reserved_pad: u16,
+}
+
+/| Win32 `FileAttributeTagInfo` (`9`) structure (`FILE_ATTRIBUTE_TAG_INFO`, `8` bytes).
+@repr(C)
+pub struct Win32FileAttributeTagInfo {
+    /| `FILE_ATTRIBUTE_*` bitmask.
+    pub file_attributes: u32,
+    /| Reparse point tag (`IO_REPARSE_TAG_SYMLINK`, `IO_REPARSE_TAG_MOUNT_POINT`).
+    pub reparse_tag: u32,
+}
+
+/| Win32 `FileIdInfo` (`18`) 128-bit ReFS/NTFS identifier (`FILE_ID_INFO`, `24` bytes).
+@repr(C, align: 8)
+pub struct Win32FileIdInfo {
+    /| 64-bit volume serial number.
+    pub volume_serial_number: u64,
+    /| 128-bit unique file identifier on the volume.
+    pub file_id_bytes: [u8; 16],
+}
+
+/| Win32 `FileDispositionInfo` (`4`) legacy delete flag (`FILE_DISPOSITION_INFO`, `1` byte).
+@repr(C)
+pub struct Win32FileDispositionInfo {
+    /| Set to `1` (`TRUE`) to mark handle for deletion on close.
+    pub delete_file: u8,
+}
+
+/| Win32 `FileDispositionInfoEx` (`21`) POSIX unlink record (`FILE_DISPOSITION_INFO_EX`, `4` bytes).
+@repr(C)
+pub struct Win32FileDispositionInfoEx {
+    /| `FILE_DISPOSITION_FLAG_*` combination (`DELETE | POSIX_SEMANTICS`).
+    pub flags: u32,
+}
+
+/| Win32 `FileRenameInfo` / `FileRenameInfoEx` (`3` / `22`) header (`FileName` at byte offset `20`).
+@repr(C)
+pub struct Win32FileRenameInfoHdr {
+    /| `FILE_RENAME_FLAG_*` bitmask (or `BOOLEAN ReplaceIfExists` in low byte for class `3`).
+    pub flags_or_replace: u32,
+    /| Explicit pointer-alignment word on 64-bit Windows (`0`).
+    pub reserved_pad: u32,
+    /| Optional root directory handle (`null` for full path).
+    pub root_directory: *mut opaque,
+    /| Byte length of the UTF-16 target path (excluding NUL).
+    pub file_name_byte_len: u32,
+    /| First two UTF-16 code units of variable-length `FileName` starting at offset `20`.
+    pub file_name_first: [u16; 2],
+}
+
+/| Win32 `FSCTL_DUPLICATE_EXTENTS_TO_FILE` ReFS block-clone payload (`32` bytes).
+@repr(C, align: 8)
+pub struct Win32DuplicateExtentsData {
+    /| Source file handle opened with read access.
+    pub source_handle: *mut opaque,
+    /| Cluster-aligned starting byte offset in `source_handle`.
+    pub source_file_offset: i64,
+    /| Cluster-aligned destination byte offset.
+    pub target_file_offset: i64,
+    /| Cluster-aligned byte count to clone.
+    pub byte_count: i64,
+}
+
+/| Win32 `FindFirstFileExW` / `FindNextFileW` directory entry (`WIN32_FIND_DATAW`, `592` bytes).
+@repr(C)
+pub struct Win32FindDataW {
+    /| `FILE_ATTRIBUTE_*` bitmask.
+    pub file_attributes: u32,
+    /| Creation timestamp.
+    pub creation_time: Win32FileTime,
+    /| Last access timestamp.
+    pub last_access_time: Win32FileTime,
+    /| Last write timestamp.
+    pub last_write_time: Win32FileTime,
+    /| High 32 bits of file size.
+    pub file_size_high: u32,
+    /| Low 32 bits of file size.
+    pub file_size_low: u32,
+    /| Reparse point tag when `FILE_ATTRIBUTE_REPARSE_POINT` is set (`dwReserved0`).
+    pub reserved0: u32,
+    /| Reserved system field (`dwReserved1`).
+    pub reserved1: u32,
+    /| NUL-terminated UTF-16 entry filename (`MAX_PATH = 260` code units).
+    pub file_name: [u16; 260],
+    /| Legacy 8.3 short name (`14` UTF-16 code units; empty under `FIND_INFO_BASIC`).
+    pub alternate_file_name: [u16; 14],
+}
+
+/| Win32 `ReadDirectoryChangesW` notification header (`FILE_NOTIFY_INFORMATION`, `16` bytes).
+@repr(C)
+pub struct Win32FileNotifyInformationHdr {
+    /| Byte offset to the next notification record (`0` for final entry).
+    pub next_entry_offset: u32,
+    /| Change kind (`FILE_ACTION_ADDED`, `REMOVED`, `MODIFIED`, `RENAMED_*`).
+    pub action: u32,
+    /| Byte length of the trailing UTF-16 relative path (`FileNameLength`).
+    pub file_name_byte_len: u32,
+    /| First two UTF-16 code units of `FileName` starting at byte offset `12`.
+    pub file_name_first: [u16; 2],
+}
+
+/| Win32 child-process standard-handle and window configuration (`STARTUPINFOW`, `104`B on Win64).
+@repr(C)
+pub struct Win32StartupInfoW {
+    /| Structure size in bytes (`sizeof(Win32StartupInfoW)` or `sizeof(Win32StartupInfoExW)`).
+    pub struct_bytes: u32,
+    /| Reserved string pointer (`null`).
+    pub reserved_str: *mut u16,
+    /| Desktop name (`null`).
+    pub desktop_str: *mut u16,
+    /| Console window title (`null`).
+    pub title_str: *mut u16,
+    /| Window X offset (`0`).
+    pub win_x: u32,
+    /| Window Y offset (`0`).
+    pub win_y: u32,
+    /| Window width in pixels (`0`).
+    pub win_x_size: u32,
+    /| Window height in pixels (`0`).
+    pub win_y_size: u32,
+    /| Console screen-buffer width in character columns (`0`).
+    pub count_chars_x: u32,
+    /| Console screen-buffer height in character rows (`0`).
+    pub count_chars_y: u32,
+    /| Console color fill attribute (`0`).
+    pub fill_attribute: u32,
+    /| `STARTF_*` flags (`STARTF_USESTDHANDLES`).
+    pub flags: u32,
+    /| `SW_*` window visibility (`0`).
+    pub show_window: u16,
+    /| Reserved C runtime halfword (`0`).
+    pub reserved_cb2: u16,
+    /| Reserved C runtime pointer (`null`).
+    pub reserved_lp2: *mut u8,
+    /| Child standard input handle when `STARTF_USESTDHANDLES` is set.
+    pub std_input: *mut opaque,
+    /| Child standard output handle when `STARTF_USESTDHANDLES` is set.
+    pub std_output: *mut opaque,
+    /| Child standard error handle when `STARTF_USESTDHANDLES` is set.
+    pub std_error: *mut opaque,
+}
+
+/| Extended `STARTUPINFOEXW` carrying `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (`112`B on Win64).
+@repr(C)
+pub struct Win32StartupInfoExW {
+    /| Base `STARTUPINFOW` header (`struct_bytes = sizeof(Win32StartupInfoExW)`).
+    pub startup_info: Win32StartupInfoW,
+    /| Initialized `LPPROC_THREAD_ATTRIBUTE_LIST` buffer.
+    pub attribute_list: *mut opaque,
+}
+
+/| Newly spawned child process and primary thread handles (`PROCESS_INFORMATION`, `24`B on Win64).
+@repr(C)
+pub struct Win32ProcessInformation {
+    /| Handle to the spawned child process.
+    pub process_handle: *mut opaque,
+    /| Handle to the child primary thread (closed immediately after `CreateProcessW`).
+    pub thread_handle: *mut opaque,
+    /| Child process identifier (`dwProcessId`).
+    pub process_id: u32,
+    /| Child primary thread identifier (`dwThreadId`).
+    pub thread_id: u32,
+}
+
+/| NT counted UTF-16 string descriptor (`UNICODE_STRING`, `16` bytes on Win64).
+@repr(C)
+pub struct NtUnicodeString {
+    /| Active byte length of `buf_ptr` (excluding any trailing NUL).
+    pub byte_len: u16,
+    /| Allocated capacity of `buf_ptr` in bytes.
+    pub max_byte_len: u16,
+    /| Pointer to UTF-16 code units (need not be NUL-terminated for `NtCreateFile`!).
+    pub buf_ptr: *mut u16,
+}
+
+/| NT handle-relative path resolution descriptor (`OBJECT_ATTRIBUTES`, `48` bytes on Win64).
+@repr(C)
+pub struct NtObjectAttributes {
+    /| Structure size in bytes (`sizeof(NtObjectAttributes)`).
+    pub struct_bytes: u32,
+    /| Optional parent directory `HANDLE` for relative `object_name` resolution (`Dir` capability).
+    pub root_directory: *mut opaque,
+    /| Relative or NT-namespace `UNICODE_STRING` path.
+    pub object_name: *NtUnicodeString,
+    /| `OBJ_*` flags (`OBJ_CASE_INSENSITIVE = 0x40`).
+    pub attributes: u32,
+    /| Optional security descriptor (`null`).
+    pub security_descriptor: *mut opaque,
+    /| Optional security quality-of-service (`null`).
+    pub security_qos: *mut opaque,
+}
+
+/| NT kernel completion status block (`IO_STATUS_BLOCK`, `16` bytes on Win64).
+@repr(C)
+pub struct NtIoStatusBlock {
+    /| Final `NTSTATUS` code or pointer union slot.
+    pub status_or_ptr: usize,
+    /| Dispositional or byte-transfer count (`ULONG_PTR Information`).
+    pub information: usize,
+}
 
 // --------------------------------------- CONSTS ----------------------------------------
 /| Win32 `STD_INPUT_HANDLE` (`0xFFFF_FFF6`).
@@ -23,10 +333,414 @@ pub const STDOUT_FD: i32 = 1;
 /| Canonical CoreX standard error stream descriptor (`2`).
 pub const STDERR_FD: i32 = 2;
 
+/| Signed sentinel bits for `INVALID_HANDLE_VALUE` (`-1` casts cleanly on 32-bit and 64-bit).
+pub const INVALID_HANDLE_BITS: isize = -1;
+
+/| Sentinel returned by `GetFileAttributesW` on failure (`0xFFFF_FFFF`).
+pub const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
+
+/| Difference between `1601-01-01` Windows epoch and `1970-01-01` Unix epoch in 100-ns ticks.
+pub const WINDOWS_TO_UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
+
+/| `CreateFileW` generic read access (`0x8000_0000`).
+pub const GENERIC_READ: u32 = 0x8000_0000;
+
+/| `CreateFileW` generic write access (`0x4000_0000`).
+pub const GENERIC_WRITE: u32 = 0x4000_0000;
+
+/| `CreateFileW` generic execute access (`0x2000_0000`).
+pub const GENERIC_EXECUTE: u32 = 0x2000_0000;
+
+/| `DELETE` access right required for `SetFileInformationByHandle` rename/unlink (`0x0001_0000`).
+pub const DELETE_ACCESS: u32 = 0x0001_0000;
+
+/| `SYNCHRONIZE` access right required for synchronous `NtCreateFile` handles (`0x0010_0000`).
+pub const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+
+/| Directory listing / change-notification access right (`0x0000_0001`).
+pub const FILE_LIST_DIRECTORY: u32 = 0x0000_0001;
+
+/| Atomic end-of-file append right (`0x0000_0004`).
+pub const FILE_APPEND_DATA: u32 = 0x0000_0004;
+
+/| Metadata read right (`0x0000_0080`).
+pub const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+
+/| Metadata write right (`0x0000_0100`).
+pub const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+
+/| Allow concurrent readers (`0x0000_0001`).
+pub const FILE_SHARE_READ: u32 = 0x0000_0001;
+
+/| Allow concurrent writers (`0x0000_0002`).
+pub const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+/| Allow concurrent rename and POSIX unlink while open (`0x0000_0004`).
+pub const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+
+/| Mandatory POSIX-equivalent share mask (`FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`).
+pub const FILE_SHARE_ALL: u32 = 0x0000_0007;
+
+/| Fail if target exists (`1`).
+pub const CREATE_NEW: u32 = 1;
+
+/| Always create and truncate existing file (`2`).
+pub const CREATE_ALWAYS: u32 = 2;
+
+/| Open only if target exists (`3`).
+pub const OPEN_EXISTING: u32 = 3;
+
+/| Open existing or create if absent (`4`).
+pub const OPEN_ALWAYS: u32 = 4;
+
+/| Open existing and truncate to zero bytes (`5`).
+pub const TRUNCATE_EXISTING: u32 = 5;
+
+/| Read-only file attribute (`0x0000_0001`).
+pub const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
+
+/| Hidden file attribute (`0x0000_0002`).
+pub const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
+
+/| Directory attribute (`0x0000_0010`).
+pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+
+/| Default normal file attribute (`0x0000_0080`).
+pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+
+/| Symbolic link or junction reparse-point attribute (`0x0000_0400`).
+pub const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+/| Open reparse point itself without dereferencing (`0x0020_0000`).
+pub const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+/| Required to open a directory handle via `CreateFileW` (`0x0200_0000`).
+pub const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+/| Enable asynchronous `OVERLAPPED` I/O (`0x4000_0000`).
+pub const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+
+/| Bypass lazy write cache (`0x8000_0000`).
+pub const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
+
+/| NTFS directory junction reparse tag (`0xA000_0003`).
+pub const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+
+/| NTFS symbolic link reparse tag (`0xA000_000C`).
+pub const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+
+/| `SetFilePointerEx` seek from start of file (`0`).
+pub const FILE_BEGIN: u32 = 0;
+
+/| `SetFilePointerEx` seek from current file position (`1`).
+pub const FILE_CURRENT: u32 = 1;
+
+/| `SetFilePointerEx` seek from end of file (`2`).
+pub const FILE_END: u32 = 2;
+
+/| `FILE_INFO_BY_HANDLE_CLASS` `FileBasicInfo` (`0`).
+pub const FILE_BASIC_INFO_CLASS: i32 = 0;
+
+/| `FILE_INFO_BY_HANDLE_CLASS` `FileStandardInfo` (`1`).
+pub const FILE_STANDARD_INFO_CLASS: i32 = 1;
+
+/| `FILE_INFO_BY_HANDLE_CLASS` `FileRenameInfo` (`3`).
+pub const FILE_RENAME_INFO_CLASS: i32 = 3;
+
+/| `FILE_INFO_BY_HANDLE_CLASS` `FileDispositionInfo` (`4`).
+pub const FILE_DISPOSITION_INFO_CLASS: i32 = 4;
+
+/| `FILE_INFO_BY_HANDLE_CLASS` `FileAttributeTagInfo` (`9`).
+pub const FILE_ATTRIBUTE_TAG_INFO_CLASS: i32 = 9;
+
+/| `FILE_INFO_BY_HANDLE_CLASS` `FileIdInfo` (`18`).
+pub const FILE_ID_INFO_CLASS: i32 = 18;
+
+/| `FILE_INFO_BY_HANDLE_CLASS` `FileDispositionInfoEx` (`21` – Win10 RS1+ POSIX delete).
+pub const FILE_DISPOSITION_INFO_EX_CLASS: i32 = 21;
+
+/| `FILE_INFO_BY_HANDLE_CLASS` `FileRenameInfoEx` (`22` – Win10 RS1+ POSIX atomic rename).
+pub const FILE_RENAME_INFO_EX_CLASS: i32 = 22;
+
+/| `FileDispositionInfoEx` mark file for deletion (`0x0000_0001`).
+pub const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x0000_0001;
+
+/| `FileDispositionInfoEx` unlink immediately even while mapped/open (`0x0000_0002`).
+pub const FILE_DISPOSITION_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
+
+/| `FileDispositionInfoEx` unlink read-only files without extra `SetFileAttributesW` (`0x0000_0010`).
+pub const FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE: u32 = 0x0000_0010;
+
+/| `FileRenameInfoEx` overwrite existing target (`0x0000_0001`).
+pub const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x0000_0001;
+
+/| `FileRenameInfoEx` replace open target atomically (`0x0000_0002`).
+pub const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
+
+/| `MoveFileExW` overwrite existing destination (`0x0000_0001`).
+pub const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+
+/| `MoveFileExW` flush rename metadata before returning (`0x0000_0008`).
+pub const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+/| `DeviceIoControl` mark file sparse (`0x0009_00C4`).
+pub const FSCTL_SET_SPARSE: u32 = 0x0009_00C4;
+
+/| `DeviceIoControl` ReFS `O(1)` copy-on-write extent clone (`0x0009_8344`).
+pub const FSCTL_DUPLICATE_EXTENTS_TO_FILE: u32 = 0x0009_8344;
+
+/| `FindFirstFileExW` `FindExInfoBasic` omitting legacy 8.3 name synthesis (`1`).
+pub const FIND_INFO_BASIC: i32 = 1;
+
+/| `FindFirstFileExW` `FIND_FIRST_EX_LARGE_FETCH` batched kernel directory buffer (`2`).
+pub const FIND_FIRST_EX_LARGE_FETCH: u32 = 0x0000_0002;
+
+/| `CreateFileMappingW` read-only page protection (`0x02`).
+pub const PAGE_READONLY: u32 = 0x02;
+
+/| `CreateFileMappingW` read-write page protection (`0x04`).
+pub const PAGE_READWRITE: u32 = 0x04;
+
+/| `MapViewOfFile` writable mapping access (`0x0002`).
+pub const FILE_MAP_WRITE: u32 = 0x0002;
+
+/| `MapViewOfFile` read-only mapping access (`0x0004`).
+pub const FILE_MAP_READ: u32 = 0x0004;
+
+/| `LockFileEx` return immediately with `ERROR_LOCK_VIOLATION` on contention (`0x0000_0001`).
+pub const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+
+/| `LockFileEx` request exclusive write lock (`0x0000_0002`).
+pub const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+
+/| `ReadDirectoryChangesW` notify on file creation/rename/deletion (`0x0000_0001`).
+pub const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x0000_0001;
+
+/| `ReadDirectoryChangesW` notify on directory creation/rename/deletion (`0x0000_0002`).
+pub const FILE_NOTIFY_CHANGE_DIR_NAME: u32 = 0x0000_0002;
+
+/| `ReadDirectoryChangesW` notify on attribute change (`0x0000_0004`).
+pub const FILE_NOTIFY_CHANGE_ATTRIBUTES: u32 = 0x0000_0004;
+
+/| `ReadDirectoryChangesW` notify on size change (`0x0000_0008`).
+pub const FILE_NOTIFY_CHANGE_SIZE: u32 = 0x0000_0008;
+
+/| `ReadDirectoryChangesW` notify on last-write timestamp update (`0x0000_0010`).
+pub const FILE_NOTIFY_CHANGE_LAST_WRITE: u32 = 0x0000_0010;
+
+/| `FILE_NOTIFY_INFORMATION` file created (`1`).
+pub const FILE_ACTION_ADDED: u32 = 1;
+
+/| `FILE_NOTIFY_INFORMATION` file deleted (`2`).
+pub const FILE_ACTION_REMOVED: u32 = 2;
+
+/| `FILE_NOTIFY_INFORMATION` file modified (`3`).
+pub const FILE_ACTION_MODIFIED: u32 = 3;
+
+/| `FILE_NOTIFY_INFORMATION` rename source name (`4`).
+pub const FILE_ACTION_RENAMED_OLD_NAME: u32 = 4;
+
+/| `FILE_NOTIFY_INFORMATION` rename destination name (`5`).
+pub const FILE_ACTION_RENAMED_NEW_NAME: u32 = 5;
+
+/| `WaitForSingleObject` object signaled (`0x0000_0000`).
+pub const WAIT_OBJECT_0: u32 = 0x0000_0000;
+
+/| `WaitForSingleObject` timeout expired (`0x0000_0102`).
+pub const WAIT_TIMEOUT: u32 = 0x0000_0102;
+
+/| `WaitForSingleObject` wait failed (`0xFFFF_FFFF`).
+pub const WAIT_FAILED: u32 = 0xFFFF_FFFF;
+
+/| `WaitForSingleObject` infinite timeout (`0xFFFF_FFFF`).
+pub const INFINITE_TIMEOUT: u32 = 0xFFFF_FFFF;
+
+/| `GetFileType` disk file (`0x0001`).
+pub const FILE_TYPE_DISK: u32 = 0x0001;
+
+/| `GetFileType` character/console device (`0x0002`).
+pub const FILE_TYPE_CHAR: u32 = 0x0002;
+
+/| `GetFileType` anonymous or named pipe (`0x0003`).
+pub const FILE_TYPE_PIPE: u32 = 0x0003;
+
+/| `SetHandleInformation` `HANDLE_FLAG_INHERIT` (`0x0000_0001`).
+pub const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+
+/| `STARTUPINFOW` use explicit `std_input`/`std_output`/`std_error` (`0x0000_0100`).
+pub const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
+
+/| `CreateProcessW` pass UTF-16 environment block (`0x0000_0400`).
+pub const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
+
+/| `CreateProcessW` `lpStartupInfo` points to `Win32StartupInfoExW` (`0x0008_0000`).
+pub const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
+
+/| `CreateProcessW` suppress new console window creation (`0x0800_0000`).
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/| `UpdateProcThreadAttribute` explicit handle-inheritance allowlist (`0x0002_0002`).
+pub const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
+
+/| `GetExitCodeProcess` sentinel indicating child is still running (`259`).
+pub const STILL_ACTIVE_EXIT_CODE: u32 = 259;
+
+/| `NT` case-insensitive object-name lookup flag (`0x0000_0040`).
+pub const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+
+/| `NtCreateFile` `FILE_SUPERSEDE` disposition (`0`).
+pub const FILE_SUPERSEDE: u32 = 0;
+
+/| `NtCreateFile` `FILE_OPEN` existing disposition (`1`).
+pub const FILE_OPEN: u32 = 1;
+
+/| `NtCreateFile` `FILE_CREATE` fail-if-exists disposition (`2`).
+pub const FILE_CREATE: u32 = 2;
+
+/| `NtCreateFile` `FILE_OPEN_IF` open-or-create disposition (`3`).
+pub const FILE_OPEN_IF: u32 = 3;
+
+/| `NtCreateFile` `FILE_OVERWRITE` truncate-existing disposition (`4`).
+pub const FILE_OVERWRITE: u32 = 4;
+
+/| `NtCreateFile` `FILE_OVERWRITE_IF` create-or-truncate disposition (`5`).
+pub const FILE_OVERWRITE_IF: u32 = 5;
+
+/| `NtCreateFile` require directory target (`0x0000_0001`).
+pub const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+
+/| `NtCreateFile` synchronous non-alertable handle (`0x0000_0020`).
+pub const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+
+/| `NtCreateFile` reject directory targets (`0x0000_0040`).
+pub const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+
+/| `NtCreateFile` do not dereference reparse point (`0x0020_0000`).
+pub const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+/| Registry pseudo-handle bits for `HKEY_CURRENT_USER` (`0x8000_0001`).
+pub const HKEY_CURRENT_USER_BITS: usize = 0x8000_0001;
+
+/| Registry value-read access right (`0x0001`).
+pub const KEY_QUERY_VALUE: u32 = 0x0001;
+
+/| Registry NUL-terminated UTF-16 string type (`1`).
+pub const REG_SZ: u32 = 1;
+
+/| Registry expandable `%VAR%` UTF-16 string type (`2`).
+pub const REG_EXPAND_SZ: u32 = 2;
+
+/| Win32 `ERROR_SUCCESS` (`0`).
+pub const ERROR_SUCCESS: u32 = 0;
+
+/| Win32 `ERROR_FILE_NOT_FOUND` (`2`).
+pub const ERROR_FILE_NOT_FOUND: u32 = 2;
+
+/| Win32 `ERROR_PATH_NOT_FOUND` (`3`).
+pub const ERROR_PATH_NOT_FOUND: u32 = 3;
+
+/| Win32 `ERROR_ACCESS_DENIED` (`5`).
+pub const ERROR_ACCESS_DENIED: u32 = 5;
+
+/| Win32 `ERROR_INVALID_HANDLE` (`6`).
+pub const ERROR_INVALID_HANDLE: u32 = 6;
+
+/| Win32 `ERROR_NOT_ENOUGH_MEMORY` (`8`).
+pub const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
+
+/| Win32 `ERROR_SHARING_VIOLATION` (`32`).
+pub const ERROR_SHARING_VIOLATION: u32 = 32;
+
+/| Win32 `ERROR_LOCK_VIOLATION` (`33`).
+pub const ERROR_LOCK_VIOLATION: u32 = 33;
+
+/| Win32 `ERROR_HANDLE_EOF` (`38`).
+pub const ERROR_HANDLE_EOF: u32 = 38;
+
+/| Win32 `ERROR_NOT_SUPPORTED` (`50`).
+pub const ERROR_NOT_SUPPORTED: u32 = 50;
+
+/| Win32 `ERROR_FILE_EXISTS` (`80`).
+pub const ERROR_FILE_EXISTS: u32 = 80;
+
+/| Win32 `ERROR_INVALID_PARAMETER` (`87`).
+pub const ERROR_INVALID_PARAMETER: u32 = 87;
+
+/| Win32 `ERROR_BROKEN_PIPE` (`109`).
+pub const ERROR_BROKEN_PIPE: u32 = 109;
+
+/| Win32 `ERROR_DISK_FULL` (`112`).
+pub const ERROR_DISK_FULL: u32 = 112;
+
+/| Win32 `ERROR_INSUFFICIENT_BUFFER` (`122`).
+pub const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+/| Win32 `ERROR_INVALID_NAME` (`123`).
+pub const ERROR_INVALID_NAME: u32 = 123;
+
+/| Win32 `ERROR_DIR_NOT_EMPTY` (`145`).
+pub const ERROR_DIR_NOT_EMPTY: u32 = 145;
+
+/| Win32 `ERROR_ALREADY_EXISTS` (`183`).
+pub const ERROR_ALREADY_EXISTS: u32 = 183;
+
+/| Win32 `ERROR_FILENAME_EXCED_RANGE` (`206`).
+pub const ERROR_FILENAME_EXCED_RANGE: u32 = 206;
+
+/| Win32 `ERROR_MORE_DATA` (`234`).
+pub const ERROR_MORE_DATA: u32 = 234;
+
+/| Win32 `ERROR_DIRECTORY` (`267`).
+pub const ERROR_DIRECTORY: u32 = 267;
+
+/| Win32 `ERROR_IO_PENDING` (`997`).
+pub const ERROR_IO_PENDING: u32 = 997;
+
+/| Win32 `ERROR_PRIVILEGE_NOT_HELD` (`1314`).
+pub const ERROR_PRIVILEGE_NOT_HELD: u32 = 1314;
+
 // ------------------------------------- PUBLIC API --------------------------------------
+/| Returns the hosted `main` `argc` count captured at startup.
+@link(name: "_cx_rt_get_argc")
+pub extern "C" fn win32_rt_get_argc() -> i32;
+
+/| Returns the hosted `main` `argv` pointer array captured at startup.
+@link(name: "_cx_rt_get_argv")
+pub extern "C" fn win32_rt_get_argv() -> *mut *mut u8;
+
+/| Win32 `GetLastError()` thread-local error code query (`kernel32`).
+@link(name: "GetLastError")
+pub extern "C" fn win32_get_last_error() -> u32;
+
+/| Win32 `SetLastError(err_code)` thread-local error setter (`kernel32`).
+@link(name: "SetLastError")
+pub extern "C" fn win32_set_last_error(err_code: u32);
+
 /| Win32 `GetStdHandle(std_handle_id)` `kernel32` prototype returning `HANDLE` (`*mut opaque`).
 @link(name: "GetStdHandle")
 pub extern "C" fn win32_get_std_handle(std_handle_id: u32) -> *mut opaque;
+
+/| Win32 `CreateFileW(...)` UTF-16 file/directory handle open prototype (`kernel32`).
+@link(name: "CreateFileW")
+pub extern "C" fn win32_create_file_w(
+    file_name_ptr: *u16,
+    desired_access: u32,
+    share_mode: u32,
+    security_attrs: *Win32SecurityAttributes,
+    creation_disposition: u32,
+    flags_and_attrs: u32,
+    template_file: *mut opaque,
+) -> *mut opaque;
+
+/| Win32 `ReadFile(handle_ptr, buf_out, byte_len, read_out, overlapped_ptr)` prototype.
+@link(name: "ReadFile")
+pub extern "C" fn win32_read_file(
+    handle_ptr: *mut opaque,
+    buf_out: *mut u8,
+    byte_len: u32,
+    read_out: *mut u32,
+    overlapped_ptr: *mut opaque,
+) -> i32;
 
 /| Win32 `WriteFile(handle_ptr, buf_ptr, byte_len, written_out, overlapped_ptr)` prototype.
 @link(name: "WriteFile")
@@ -38,9 +752,476 @@ pub extern "C" fn win32_write_file(
     overlapped_ptr: *mut opaque,
 ) -> i32;
 
+/| Win32 `FlushFileBuffers(handle_ptr)` physical media flush prototype (`kernel32`).
+@link(name: "FlushFileBuffers")
+pub extern "C" fn win32_flush_file_buffers(handle_ptr: *mut opaque) -> i32;
+
+/| Win32 `CloseHandle(handle_ptr)` kernel handle release prototype (`kernel32`).
+@link(name: "CloseHandle")
+pub extern "C" fn win32_close_handle(handle_ptr: *mut opaque) -> i32;
+
+/| Win32 `SetFilePointerEx(handle_ptr, dist_to_move, new_pos_out, move_method)` 64-bit seek prototype.
+@link(name: "SetFilePointerEx")
+pub extern "C" fn win32_set_file_pointer_ex(
+    handle_ptr: *mut opaque,
+    dist_to_move: i64,
+    new_pos_out: *mut i64,
+    move_method: u32,
+) -> i32;
+
+/| Win32 `SetEndOfFile(handle_ptr)` file truncation/extension prototype (`kernel32`).
+@link(name: "SetEndOfFile")
+pub extern "C" fn win32_set_end_of_file(handle_ptr: *mut opaque) -> i32;
+
+/| Win32 `GetFileInformationByHandle(handle_ptr, info_out)` metadata prototype (`kernel32`).
+@link(name: "GetFileInformationByHandle")
+pub extern "C" fn win32_get_file_information_by_handle(
+    handle_ptr: *mut opaque,
+    info_out: *mut Win32ByHandleFileInfo,
+) -> i32;
+
+/| Win32 `GetFileInformationByHandleEx(handle_ptr, info_class, buf_out, buf_bytes)` prototype.
+@link(name: "GetFileInformationByHandleEx")
+pub extern "C" fn win32_get_file_information_by_handle_ex(
+    handle_ptr: *mut opaque,
+    info_class: i32,
+    buf_out: *mut opaque,
+    buf_bytes: u32,
+) -> i32;
+
+/| Win32 `SetFileInformationByHandle(handle_ptr, info_class, buf_ptr, buf_bytes)` prototype.
+@link(name: "SetFileInformationByHandle")
+pub extern "C" fn win32_set_file_information_by_handle(
+    handle_ptr: *mut opaque,
+    info_class: i32,
+    buf_ptr: *opaque,
+    buf_bytes: u32,
+) -> i32;
+
+/| Win32 `GetFileAttributesW(path_ptr)` fast attribute query prototype (`kernel32`).
+@link(name: "GetFileAttributesW")
+pub extern "C" fn win32_get_file_attributes_w(path_ptr: *u16) -> u32;
+
+/| Win32 `SetFileAttributesW(path_ptr, file_attrs)` attribute update prototype (`kernel32`).
+@link(name: "SetFileAttributesW")
+pub extern "C" fn win32_set_file_attributes_w(path_ptr: *u16, file_attrs: u32) -> i32;
+
+/| Win32 `GetFileAttributesExW(path_ptr, info_level, info_out)` path metadata prototype.
+@link(name: "GetFileAttributesExW")
+pub extern "C" fn win32_get_file_attributes_ex_w(
+    path_ptr: *u16,
+    info_level: i32,
+    info_out: *mut Win32FileAttributeData,
+) -> i32;
+
+/| Win32 `GetFinalPathNameByHandleW(handle_ptr, path_out, cap_wchars, flags)` canonical path prototype.
+@link(name: "GetFinalPathNameByHandleW")
+pub extern "C" fn win32_get_final_path_name_by_handle_w(
+    handle_ptr: *mut opaque,
+    path_out: *mut u16,
+    cap_wchars: u32,
+    flags: u32,
+) -> u32;
+
+/| Win32 `GetFullPathNameW(file_name_ptr, buf_cap_wchars, buf_out, file_part_out)` prototype.
+@link(name: "GetFullPathNameW")
+pub extern "C" fn win32_get_full_path_name_w(
+    file_name_ptr: *u16,
+    buf_cap_wchars: u32,
+    buf_out: *mut u16,
+    file_part_out: *mut *mut u16,
+) -> u32;
+
+/| Win32 `MoveFileExW(src_path_ptr, dst_path_ptr, move_flags)` rename fallback prototype.
+@link(name: "MoveFileExW")
+pub extern "C" fn win32_move_file_ex_w(
+    src_path_ptr: *u16,
+    dst_path_ptr: *u16,
+    move_flags: u32,
+) -> i32;
+
+/| Win32 `ReplaceFileW(...)` legacy replacement fallback prototype (`kernel32`).
+@link(name: "ReplaceFileW")
+pub extern "C" fn win32_replace_file_w(
+    replaced_file_ptr: *u16,
+    replacement_file_ptr: *u16,
+    backup_file_ptr: *u16,
+    replace_flags: u32,
+    exclude_ptr: *mut opaque,
+    reserved_ptr: *mut opaque,
+) -> i32;
+
+/| Win32 `DeleteFileW(path_ptr)` file unlink fallback prototype (`kernel32`).
+@link(name: "DeleteFileW")
+pub extern "C" fn win32_delete_file_w(path_ptr: *u16) -> i32;
+
+/| Win32 `CreateDirectoryW(path_ptr, security_attrs)` directory creation prototype (`kernel32`).
+@link(name: "CreateDirectoryW")
+pub extern "C" fn win32_create_directory_w(
+    path_ptr: *u16,
+    security_attrs: *Win32SecurityAttributes,
+) -> i32;
+
+/| Win32 `RemoveDirectoryW(path_ptr)` empty-directory removal prototype (`kernel32`).
+@link(name: "RemoveDirectoryW")
+pub extern "C" fn win32_remove_directory_w(path_ptr: *u16) -> i32;
+
+/| Win32 `CreateHardLinkW(new_link_ptr, existing_file_ptr, security_attrs)` hardlink prototype.
+@link(name: "CreateHardLinkW")
+pub extern "C" fn win32_create_hard_link_w(
+    new_link_ptr: *u16,
+    existing_file_ptr: *u16,
+    security_attrs: *mut opaque,
+) -> i32;
+
+/| Win32 `DeviceIoControl(...)` filesystem control prototype (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`).
+@link(name: "DeviceIoControl")
+pub extern "C" fn win32_device_io_control(
+    device_handle: *mut opaque,
+    io_control_code: u32,
+    in_buf_ptr: *opaque,
+    in_buf_bytes: u32,
+    out_buf_ptr: *mut opaque,
+    out_buf_bytes: u32,
+    bytes_returned_out: *mut u32,
+    overlapped_ptr: *mut Win32Overlapped,
+) -> i32;
+
+/| Win32 `FindFirstFileExW(...)` batched directory enumeration start prototype (`kernel32`).
+@link(name: "FindFirstFileExW")
+pub extern "C" fn win32_find_first_file_ex_w(
+    pattern_ptr: *u16,
+    info_level: i32,
+    find_data_out: *mut Win32FindDataW,
+    search_op: i32,
+    search_filter: *mut opaque,
+    additional_flags: u32,
+) -> *mut opaque;
+
+/| Win32 `FindNextFileW(find_handle, find_data_out)` directory iteration step prototype.
+@link(name: "FindNextFileW")
+pub extern "C" fn win32_find_next_file_w(
+    find_handle: *mut opaque,
+    find_data_out: *mut Win32FindDataW,
+) -> i32;
+
+/| Win32 `FindClose(find_handle)` directory enumeration handle release prototype.
+@link(name: "FindClose")
+pub extern "C" fn win32_find_close(find_handle: *mut opaque) -> i32;
+
+/| Win32 `CreateFileMappingW(...)` section object creation prototype (`kernel32`).
+@link(name: "CreateFileMappingW")
+pub extern "C" fn win32_create_file_mapping_w(
+    file_handle: *mut opaque,
+    security_attrs: *Win32SecurityAttributes,
+    page_protect: u32,
+    max_size_high: u32,
+    max_size_low: u32,
+    mapping_name_ptr: *u16,
+) -> *mut opaque;
+
+/| Win32 `MapViewOfFile(mapping_handle, desired_access, offset_high, offset_low, map_bytes)` prototype.
+@link(name: "MapViewOfFile")
+pub extern "C" fn win32_map_view_of_file(
+    mapping_handle: *mut opaque,
+    desired_access: u32,
+    offset_high: u32,
+    offset_low: u32,
+    map_bytes: usize,
+) -> *mut opaque;
+
+/| Win32 `UnmapViewOfFile(base_addr)` mapped view release prototype (`kernel32`).
+@link(name: "UnmapViewOfFile")
+pub extern "C" fn win32_unmap_view_of_file(base_addr: *opaque) -> i32;
+
+/| Win32 `LockFileEx(...)` byte-range / whole-file lock acquisition prototype (`kernel32`).
+@link(name: "LockFileEx")
+pub extern "C" fn win32_lock_file_ex(
+    file_handle: *mut opaque,
+    lock_flags: u32,
+    reserved_zero: u32,
+    bytes_low: u32,
+    bytes_high: u32,
+    overlapped_ptr: *mut Win32Overlapped,
+) -> i32;
+
+/| Win32 `UnlockFileEx(...)` byte-range / whole-file lock release prototype (`kernel32`).
+@link(name: "UnlockFileEx")
+pub extern "C" fn win32_unlock_file_ex(
+    file_handle: *mut opaque,
+    reserved_zero: u32,
+    bytes_low: u32,
+    bytes_high: u32,
+    overlapped_ptr: *mut Win32Overlapped,
+) -> i32;
+
+/| Win32 `ReadDirectoryChangesW(...)` recursive directory watcher prototype (`kernel32`).
+@link(name: "ReadDirectoryChangesW")
+pub extern "C" fn win32_read_directory_changes_w(
+    dir_handle: *mut opaque,
+    notify_buf_out: *mut u8,
+    notify_buf_bytes: u32,
+    watch_subtree: i32,
+    notify_filter: u32,
+    bytes_returned_out: *mut u32,
+    overlapped_ptr: *mut Win32Overlapped,
+    completion_routine: *mut opaque,
+) -> i32;
+
+/| Win32 `CreateEventW(security_attrs, manual_reset, initial_state, event_name_ptr)` prototype.
+@link(name: "CreateEventW")
+pub extern "C" fn win32_create_event_w(
+    security_attrs: *Win32SecurityAttributes,
+    manual_reset: i32,
+    initial_state: i32,
+    event_name_ptr: *u16,
+) -> *mut opaque;
+
+/| Win32 `WaitForSingleObject(handle_ptr, timeout_ms)` synchronization wait prototype.
+@link(name: "WaitForSingleObject")
+pub extern "C" fn win32_wait_for_single_object(handle_ptr: *mut opaque, timeout_ms: u32) -> u32;
+
+/| Win32 `GetOverlappedResult(handle_ptr, overlapped_ptr, transferred_out, wait_flag)` prototype.
+@link(name: "GetOverlappedResult")
+pub extern "C" fn win32_get_overlapped_result(
+    handle_ptr: *mut opaque,
+    overlapped_ptr: *mut Win32Overlapped,
+    transferred_out: *mut u32,
+    wait_flag: i32,
+) -> i32;
+
+/| Win32 `CancelIoEx(handle_ptr, overlapped_ptr)` pending async I/O cancellation prototype.
+@link(name: "CancelIoEx")
+pub extern "C" fn win32_cancel_io_ex(
+    handle_ptr: *mut opaque,
+    overlapped_ptr: *Win32Overlapped,
+) -> i32;
+
+/| Win32 `GetConsoleMode(console_handle, mode_out)` TTY detection prototype (`kernel32`).
+@link(name: "GetConsoleMode")
+pub extern "C" fn win32_get_console_mode(console_handle: *mut opaque, mode_out: *mut u32) -> i32;
+
+/| Win32 `GetFileType(handle_ptr)` descriptor kind detection prototype (`kernel32`).
+@link(name: "GetFileType")
+pub extern "C" fn win32_get_file_type(handle_ptr: *mut opaque) -> u32;
+
+/| Win32 `QueryPerformanceCounter(counter_out)` monotonic tick query prototype (`kernel32`).
+@link(name: "QueryPerformanceCounter")
+pub extern "C" fn win32_query_performance_counter(counter_out: *mut i64) -> i32;
+
+/| Win32 `QueryPerformanceFrequency(freq_out)` QPC tick-rate query prototype (`kernel32`).
+@link(name: "QueryPerformanceFrequency")
+pub extern "C" fn win32_query_performance_frequency(freq_out: *mut i64) -> i32;
+
+/| Win32 `GetSystemTimePreciseAsFileTime(file_time_out)` sub-microsecond wall-clock prototype.
+@link(name: "GetSystemTimePreciseAsFileTime")
+pub extern "C" fn win32_get_system_time_precise_as_file_time(file_time_out: *mut Win32FileTime);
+
+/| Win32 `Sleep(duration_ms)` thread sleep prototype (`kernel32`).
+@link(name: "Sleep")
+pub extern "C" fn win32_sleep(duration_ms: u32);
+
+/| Win32 `GetCommandLineW()` raw UTF-16 command-line pointer query (`kernel32`).
+@link(name: "GetCommandLineW")
+pub extern "C" fn win32_get_command_line_w() -> *u16;
+
+/| Win32 `GetEnvironmentStringsW()` process UTF-16 environment block snapshot (`kernel32`).
+@link(name: "GetEnvironmentStringsW")
+pub extern "C" fn win32_get_environment_strings_w() -> *mut u16;
+
+/| Win32 `FreeEnvironmentStringsW(env_block_ptr)` environment snapshot release (`kernel32`).
+@link(name: "FreeEnvironmentStringsW")
+pub extern "C" fn win32_free_environment_strings_w(env_block_ptr: *mut u16) -> i32;
+
+/| Win32 `GetEnvironmentVariableW(key_ptr, buf_out, cap_wchars)` variable query (`kernel32`).
+@link(name: "GetEnvironmentVariableW")
+pub extern "C" fn win32_get_environment_variable_w(
+    key_ptr: *u16,
+    buf_out: *mut u16,
+    cap_wchars: u32,
+) -> u32;
+
+/| Win32 `SetEnvironmentVariableW(key_ptr, val_ptr)` variable mutation (`val_ptr == null` unsets).
+@link(name: "SetEnvironmentVariableW")
+pub extern "C" fn win32_set_environment_variable_w(key_ptr: *u16, val_ptr: *u16) -> i32;
+
+/| Win32 `ExpandEnvironmentStringsW(src_ptr, dst_out, cap_wchars)` `%VAR%` expansion prototype.
+@link(name: "ExpandEnvironmentStringsW")
+pub extern "C" fn win32_expand_environment_strings_w(
+    src_ptr: *u16,
+    dst_out: *mut u16,
+    cap_wchars: u32,
+) -> u32;
+
+/| Win32 `GetCurrentDirectoryW(cap_wchars, buf_out)` working-directory query (`kernel32`).
+@link(name: "GetCurrentDirectoryW")
+pub extern "C" fn win32_get_current_directory_w(cap_wchars: u32, buf_out: *mut u16) -> u32;
+
+/| Win32 `SetCurrentDirectoryW(path_ptr)` working-directory mutation (`kernel32`).
+@link(name: "SetCurrentDirectoryW")
+pub extern "C" fn win32_set_current_directory_w(path_ptr: *u16) -> i32;
+
+/| Win32 `GetModuleFileNameW(module_handle, buf_out, cap_wchars)` executable path query (`kernel32`).
+@link(name: "GetModuleFileNameW")
+pub extern "C" fn win32_get_module_file_name_w(
+    module_handle: *mut opaque,
+    buf_out: *mut u16,
+    cap_wchars: u32,
+) -> u32;
+
+/| Win32 `GetTempPathW(cap_wchars, buf_out)` temporary directory query (`kernel32`).
+@link(name: "GetTempPathW")
+pub extern "C" fn win32_get_temp_path_w(cap_wchars: u32, buf_out: *mut u16) -> u32;
+
+/| Win32 `GetModuleHandleW(module_name_ptr)` loaded DLL base lookup (`kernel32`).
+@link(name: "GetModuleHandleW")
+pub extern "C" fn win32_get_module_handle_w(module_name_ptr: *u16) -> *mut opaque;
+
+/| Win32 `GetProcAddress(module_handle, proc_name_ptr)` dynamic symbol lookup (`kernel32`).
+@link(name: "GetProcAddress")
+pub extern "C" fn win32_get_proc_address(
+    module_handle: *mut opaque,
+    proc_name_ptr: *u8,
+) -> *mut opaque;
+
+/| Win32 `GetCurrentProcessId()` process identifier query (`kernel32`).
+@link(name: "GetCurrentProcessId")
+pub extern "C" fn win32_get_current_process_id() -> u32;
+
+/| Win32 `CreatePipe(read_pipe_out, write_pipe_out, pipe_attrs, size_hint)` pipe creation prototype.
+@link(name: "CreatePipe")
+pub extern "C" fn win32_create_pipe(
+    read_pipe_out: *mut *mut opaque,
+    write_pipe_out: *mut *mut opaque,
+    pipe_attrs: *Win32SecurityAttributes,
+    size_hint: u32,
+) -> i32;
+
+/| Win32 `SetHandleInformation(handle_ptr, mask_bits, flag_bits)` inheritance toggle prototype.
+@link(name: "SetHandleInformation")
+pub extern "C" fn win32_set_handle_information(
+    handle_ptr: *mut opaque,
+    mask_bits: u32,
+    flag_bits: u32,
+) -> i32;
+
+/| Win32 `GetHandleInformation(handle_ptr, flags_out)` inheritance inspection prototype.
+@link(name: "GetHandleInformation")
+pub extern "C" fn win32_get_handle_information(
+    handle_ptr: *mut opaque,
+    flags_out: *mut u32,
+) -> i32;
+
+/| Win32 `SearchPathW(...)` explicit executable resolution without implicit CWD ambiguity.
+@link(name: "SearchPathW")
+pub extern "C" fn win32_search_path_w(
+    search_dirs_ptr: *u16,
+    file_name_ptr: *u16,
+    extension_ptr: *u16,
+    buf_cap_wchars: u32,
+    buf_out: *mut u16,
+    file_part_out: *mut *mut u16,
+) -> u32;
+
+/| Win32 `InitializeProcThreadAttributeList(...)` `STARTUPINFOEXW` attribute initializer.
+@link(name: "InitializeProcThreadAttributeList")
+pub extern "C" fn win32_initialize_proc_thread_attribute_list(
+    attr_list_out: *mut opaque,
+    attr_count: u32,
+    flags_zero: u32,
+    size_inout: *mut usize,
+) -> i32;
+
+/| Win32 `UpdateProcThreadAttribute(...)` handle-inheritance allowlist attachment prototype.
+@link(name: "UpdateProcThreadAttribute")
+pub extern "C" fn win32_update_proc_thread_attribute(
+    attr_list_ptr: *mut opaque,
+    flags_zero: u32,
+    attribute_key: usize,
+    value_ptr: *mut opaque,
+    value_bytes: usize,
+    prev_value_out: *mut opaque,
+    return_size_out: *mut usize,
+) -> i32;
+
+/| Win32 `DeleteProcThreadAttributeList(attr_list_ptr)` attribute list teardown prototype.
+@link(name: "DeleteProcThreadAttributeList")
+pub extern "C" fn win32_delete_proc_thread_attribute_list(attr_list_ptr: *mut opaque);
+
+/| Win32 `CreateProcessW(...)` child process creation prototype (`lpApplicationName` pinned!).
+@link(name: "CreateProcessW")
+pub extern "C" fn win32_create_process_w(
+    application_name_ptr: *u16,
+    command_line_mut_ptr: *mut u16,
+    process_attrs: *Win32SecurityAttributes,
+    thread_attrs: *Win32SecurityAttributes,
+    inherit_handles: i32,
+    creation_flags: u32,
+    environment_ptr: *opaque,
+    current_dir_ptr: *u16,
+    startup_info_ptr: *Win32StartupInfoW,
+    process_info_out: *mut Win32ProcessInformation,
+) -> i32;
+
+/| Win32 `GetExitCodeProcess(process_handle, exit_code_out)` child exit code query (`kernel32`).
+@link(name: "GetExitCodeProcess")
+pub extern "C" fn win32_get_exit_code_process(
+    process_handle: *mut opaque,
+    exit_code_out: *mut u32,
+) -> i32;
+
+/| Win32 `TerminateProcess(process_handle, exit_code)` forced child termination prototype.
+@link(name: "TerminateProcess")
+pub extern "C" fn win32_terminate_process(process_handle: *mut opaque, exit_code: u32) -> i32;
+
 /| Win32 `ExitProcess(exit_code)` `kernel32` prototype.
 @link(name: "ExitProcess")
 pub extern "C" fn win32_exit_process(exit_code: u32) -> never;
+
+/| Native NT `NtCreateFile(...)` handle-relative open prototype (`ntdll.dll`).
+@link(name: "NtCreateFile") @link_lib("ntdll")
+pub extern "C" fn nt_create_file(
+    file_handle_out: *mut *mut opaque,
+    desired_access: u32,
+    object_attrs: *NtObjectAttributes,
+    io_status_out: *mut NtIoStatusBlock,
+    allocation_size_ptr: *i64,
+    file_attributes: u32,
+    share_access: u32,
+    create_disposition: u32,
+    create_options: u32,
+    ea_buffer_ptr: *opaque,
+    ea_length: u32,
+) -> i32;
+
+/| Native NT `RtlNtStatusToDosError(nt_status)` status-to-Win32 error mapper (`ntdll.dll`).
+@link(name: "RtlNtStatusToDosError") @link_lib("ntdll")
+pub extern "C" fn rtl_nt_status_to_dos_error(nt_status: i32) -> u32;
+
+/| Registry `RegOpenKeyExW(root_hkey, subkey_ptr, options_zero, desired_sam, key_out)` (`advapi32`).
+@link(name: "RegOpenKeyExW") @link_lib("advapi32")
+pub extern "C" fn win32_reg_open_key_ex_w(
+    root_hkey: *mut opaque,
+    subkey_ptr: *u16,
+    options_zero: u32,
+    desired_sam: u32,
+    key_out: *mut *mut opaque,
+) -> i32;
+
+/| Registry `RegQueryValueExW(...)` value read prototype (`advapi32.dll`).
+@link(name: "RegQueryValueExW") @link_lib("advapi32")
+pub extern "C" fn win32_reg_query_value_ex_w(
+    hkey: *mut opaque,
+    value_name_ptr: *u16,
+    reserved_null: *mut u32,
+    type_out: *mut u32,
+    data_out: *mut u8,
+    data_bytes_inout: *mut u32,
+) -> i32;
+
+/| Registry `RegCloseKey(hkey)` key close prototype (`advapi32.dll`).
+@link(name: "RegCloseKey") @link_lib("advapi32")
+pub extern "C" fn win32_reg_close_key(hkey: *mut opaque) -> i32;
 
 /| Safe wrapper writing `text` to standard output in binary mode (`fd = 1`).
 @inline @no_alloc

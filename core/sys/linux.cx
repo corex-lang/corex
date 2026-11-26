@@ -1,11 +1,245 @@
-/# Linux POSIX Syscall Constants and C-ABI Prototypes (`core.sys.linux`)
+/# Linux POSIX Syscall Constants, Kernel Descriptors & C-ABI Prototypes (`core.sys.linux`)
 /#
-/# Declares canonical Linux file-descriptor numbers, `x86_64` / `aarch64` syscall numbers, and
-/# `libc` `write` / `_exit` `extern "C"` prototypes alongside safe `@sys_write` / `@sys_exit`
-/# wrappers.
+/# Declares `@repr(C)` Linux kernel and POSIX ABI records (`open_how`, `statx`, `stat`, `dirent64`,
+/# `inotify_event`, `iovec`, `timespec`, `pollfd`, `posix_spawn_file_actions_t`), `x86_64`/`aarch64`
+/# syscall and flag constants, and zero-bloat `libc` / `syscall` `extern "C"` prototypes.
 /#
-/# Direct calls to `extern "C"` prototypes require an explicit `unsafe` block, whereas safe stream
-/# helpers delegate through compiler-verified `@sys_*` intrinsics.
+/# Variadic `openat`, `ioctl`, and `syscall` symbols declare exact C `...` prototypes paired with
+/# typed `@inline` wrappers so `aarch64` and `x86_64` calling conventions remain 100% ABI-sound.
+
+// ---------------------------------------- TYPES ----------------------------------------
+/| POSIX scatter/gather I/O buffer vector (`struct iovec`, `16` bytes on 64-bit targets).
+@repr(C)
+pub struct PosixIovec {
+    /| Base address of the contiguous read or write byte region.
+    pub iov_base: *mut u8,
+    /| Number of bytes in `iov_base`.
+    pub iov_len: usize,
+}
+
+/| POSIX nanosecond timestamp and sleep interval (`struct timespec`, `16` bytes on LP64).
+@repr(C, align: 8)
+pub struct PosixTimespec {
+    /| Whole seconds component.
+    pub tv_sec: i64,
+    /| Nanoseconds component (`0..999_999_999`).
+    pub tv_nsec: i64,
+}
+
+/| POSIX readiness descriptor entry (`struct pollfd`, `8` bytes).
+@repr(C)
+pub struct PosixPollFd {
+    /| File descriptor to monitor (`< 0` entries are ignored by `poll`).
+    pub file_desc: i32,
+    /| Requested readiness event mask (`POLLIN`, `POLLOUT`).
+    pub events: i16,
+    /| Returned readiness event mask populated by the kernel.
+    pub revents: i16,
+}
+
+/| Linux 5.6+ `openat2(SYS_OPENAT2 = 437)` configuration structure (`struct open_how`, `24` bytes).
+@repr(C, align: 8)
+pub struct LinuxOpenHow {
+    /| `O_*` open-status and creation flags (`u64`).
+    pub flags: u64,
+    /| Creation permission mode when `O_CREAT` or `O_TMPFILE_BASE` is set (`0` otherwise).
+    pub mode: u64,
+    /| `RESOLVE_*` path-traversal confinement flags (`RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`).
+    pub resolve: u64,
+}
+
+/| Linux 4.11+ `statx` 16-byte nanosecond timestamp (`struct statx_timestamp`).
+@repr(C, align: 8)
+pub struct LinuxStatxTimestamp {
+    /| Signed seconds relative to the `1970-01-01T00:00:00Z` Unix epoch.
+    pub tv_sec: i64,
+    /| Unsigned sub-second nanoseconds (`0..999_999_999`).
+    pub tv_nsec: u32,
+    /| Reserved kernel alignment field (`0`).
+    pub reserved_pad: i32,
+}
+
+/| Linux 4.11+ `statx` extended metadata record (`struct statx`, exact `256` bytes).
+@repr(C, align: 8)
+pub struct LinuxStatx {
+    /| Bitmask of populated fields (`STATX_*`).
+    pub stx_mask: u32,
+    /| Preferred filesystem I/O block size in bytes.
+    pub stx_blksize: u32,
+    /| Extra file attribute indicators (`STATX_ATTR_*`).
+    pub stx_attributes: u64,
+    /| Hardlink count.
+    pub stx_nlink: u32,
+    /| Owner user identifier (`uid_t`).
+    pub stx_uid: u32,
+    /| Owner group identifier (`gid_t`).
+    pub stx_gid: u32,
+    /| File type and POSIX mode bits (`S_IFMT | 0o7777`).
+    pub stx_mode: u16,
+    /| Reserved alignment halfword (`0`).
+    pub pad0: u16,
+    /| Inode number (`ino_t`).
+    pub stx_ino: u64,
+    /| Total logical file size in bytes.
+    pub stx_size: u64,
+    /| Number of allocated 512-byte blocks.
+    pub stx_blocks: u64,
+    /| Mask of supported `stx_attributes` bits on this filesystem.
+    pub stx_attributes_mask: u64,
+    /| Last access timestamp.
+    pub stx_atime: LinuxStatxTimestamp,
+    /| File creation / birth timestamp (`STATX_BTIME`).
+    pub stx_btime: LinuxStatxTimestamp,
+    /| Last metadata status-change timestamp.
+    pub stx_ctime: LinuxStatxTimestamp,
+    /| Last data modification timestamp.
+    pub stx_mtime: LinuxStatxTimestamp,
+    /| Device major ID if this file represents a character or block device.
+    pub stx_rdev_major: u32,
+    /| Device minor ID if this file represents a character or block device.
+    pub stx_rdev_minor: u32,
+    /| Filesystem device major ID containing this inode.
+    pub stx_dev_major: u32,
+    /| Filesystem device minor ID containing this inode.
+    pub stx_dev_minor: u32,
+    /| Mount ID (`STATX_MNT_ID`).
+    pub stx_mnt_id: u64,
+    /| Direct-I/O memory alignment requirement in bytes.
+    pub stx_dio_mem_align: u32,
+    /| Direct-I/O file-offset alignment requirement in bytes.
+    pub stx_dio_offset_align: u32,
+    /| Reserved trailing kernel words bringing `sizeof(LinuxStatx)` to `256` bytes.
+    pub spare_words: [u64; 12],
+}
+
+/| Linux `x86_64` `newfstatat` metadata record (`struct stat`, `144` bytes).
+@cfg(not (target.arch == "aarch64")) @repr(C, align: 8)
+pub struct LinuxStat {
+    /| Device identifier containing the file.
+    pub st_dev: u64,
+    /| File inode number.
+    pub st_ino: u64,
+    /| Hardlink count (`u64` on `x86_64` SysV).
+    pub st_nlink: u64,
+    /| File type and POSIX mode bits.
+    pub st_mode: u32,
+    /| Owner user identifier.
+    pub st_uid: u32,
+    /| Owner group identifier.
+    pub st_gid: u32,
+    /| Explicit ABI alignment word (`0`).
+    pub pad0: u32,
+    /| Special device identifier.
+    pub st_rdev: u64,
+    /| Logical file size in bytes.
+    pub st_size: i64,
+    /| Filesystem block size for I/O.
+    pub st_blksize: i64,
+    /| Number of 512-byte blocks allocated.
+    pub st_blocks: i64,
+    /| Last access time seconds.
+    pub st_atime_sec: i64,
+    /| Last access time nanoseconds.
+    pub st_atime_nsec: i64,
+    /| Last modification time seconds.
+    pub st_mtime_sec: i64,
+    /| Last modification time nanoseconds.
+    pub st_mtime_nsec: i64,
+    /| Last status-change time seconds.
+    pub st_ctime_sec: i64,
+    /| Last status-change time nanoseconds.
+    pub st_ctime_nsec: i64,
+    /| Reserved glibc/kernel tail words (`24` bytes).
+    pub reserved_tail: [i64; 3],
+}
+
+/| Linux `aarch64` asm-generic `newfstatat` metadata record (`struct stat`, `128` bytes).
+@cfg(target.arch == "aarch64") @repr(C, align: 8)
+pub struct LinuxStat {
+    /| Device identifier containing the file.
+    pub st_dev: u64,
+    /| File inode number.
+    pub st_ino: u64,
+    /| File type and POSIX mode bits (`offset 16` on `aarch64`).
+    pub st_mode: u32,
+    /| Hardlink count (`u32` at `offset 20` on `aarch64`).
+    pub st_nlink: u32,
+    /| Owner user identifier.
+    pub st_uid: u32,
+    /| Owner group identifier.
+    pub st_gid: u32,
+    /| Special device identifier.
+    pub st_rdev: u64,
+    /| Reserved kernel alignment doubleword.
+    pub pad1: u64,
+    /| Logical file size in bytes.
+    pub st_size: i64,
+    /| Filesystem block size for I/O.
+    pub st_blksize: i32,
+    /| Alignment padding word.
+    pub pad2: i32,
+    /| Number of 512-byte blocks allocated.
+    pub st_blocks: i64,
+    /| Last access time seconds.
+    pub st_atime_sec: i64,
+    /| Last access time nanoseconds.
+    pub st_atime_nsec: i64,
+    /| Last modification time seconds.
+    pub st_mtime_sec: i64,
+    /| Last modification time nanoseconds.
+    pub st_mtime_nsec: i64,
+    /| Last status-change time seconds.
+    pub st_ctime_sec: i64,
+    /| Last status-change time nanoseconds.
+    pub st_ctime_nsec: i64,
+    /| Reserved asm-generic tail words (`8` bytes).
+    pub reserved_tail: [u32; 2],
+}
+
+/| Linux `getdents64` entry header (`struct linux_dirent64`, `d_name` starts at byte offset `19`).
+@repr(C, align: 8)
+pub struct LinuxDirent64Hdr {
+    /| 64-bit inode number.
+    pub d_ino: u64,
+    /| Opaque filesystem offset to the next directory entry.
+    pub d_off: i64,
+    /| Total byte length of this variable-size record.
+    pub d_reclen: u16,
+    /| File type tag (`DT_REG`, `DT_DIR`, `DT_LNK`, `DT_UNKNOWN`).
+    pub d_type: u8,
+    /| First 5 bytes of the NUL-terminated entry name at byte offset `19`.
+    pub d_name_first: [u8; 5],
+}
+
+/| Linux `inotify` event header (`struct inotify_event`, `16` bytes preceding optional `name`).
+@repr(C)
+pub struct LinuxInotifyEventHdr {
+    /| Watch descriptor returned by `inotify_add_watch`.
+    pub wd: i32,
+    /| Bitmask of triggered `IN_*` filesystem events.
+    pub mask: u32,
+    /| Unique rename-correlation cookie pairing `IN_MOVED_FROM` and `IN_MOVED_TO`.
+    pub cookie: u32,
+    /| Padded byte length of the trailing NUL-terminated filename (`0` when unnamed).
+    pub name_len: u32,
+}
+
+/| Opaque `posix_spawn_file_actions_t` storage sized for both `glibc` (`80B`) and `musl` (`24B`).
+@repr(C, align: 8)
+pub struct PosixSpawnFileActions {
+    /| Opaque ABI storage words (`96` bytes).
+    pub opaque_words: [u64; 12],
+}
+
+/| Opaque `posix_spawnattr_t` storage sized for both `glibc` (`336B`) and `musl` (`24B`).
+@repr(C, align: 8)
+pub struct PosixSpawnAttr {
+    /| Opaque ABI storage words (`352` bytes).
+    pub opaque_words: [u64; 44],
+}
+
+/| Dynamically resolved `posix_spawn_file_actions_addchdir_np` C-ABI function-pointer signature.
+type PosixSpawnAddChdirFn = extern "C" fn(*mut PosixSpawnFileActions, *u8) -> i32;
 
 // --------------------------------------- CONSTS ----------------------------------------
 /| Standard input file descriptor (`0`).
@@ -29,10 +263,753 @@ pub const SYS_WRITE_AARCH64: i64 = 64;
 /| Linux `aarch64` `SYS_exit_group` syscall number (`94`).
 pub const SYS_EXIT_GROUP_AARCH64: i64 = 94;
 
+/| Linux 5.6+ `SYS_openat2` syscall number (`437` on both `x86_64` and `aarch64`).
+pub const SYS_OPENAT2: i64 = 437;
+
+/| Linux `x86_64` `SYS_getdents64` syscall number (`217`).
+@cfg(not (target.arch == "aarch64"))
+pub const SYS_GETDENTS64: i64 = 217;
+
+/| Linux `aarch64` `SYS_getdents64` syscall number (`61`).
+@cfg(target.arch == "aarch64")
+pub const SYS_GETDENTS64: i64 = 61;
+
+/| Linux `x86_64` `SYS_newfstatat` syscall number (`262`).
+@cfg(not (target.arch == "aarch64"))
+pub const SYS_NEWFSTATAT: i64 = 262;
+
+/| Linux `aarch64` `SYS_newfstatat` syscall number (`79`).
+@cfg(target.arch == "aarch64")
+pub const SYS_NEWFSTATAT: i64 = 79;
+
+/| Linux `x86_64` `SYS_renameat2` syscall number (`316`).
+@cfg(not (target.arch == "aarch64"))
+pub const SYS_RENAMEAT2: i64 = 316;
+
+/| Linux `aarch64` `SYS_renameat2` syscall number (`276`).
+@cfg(target.arch == "aarch64")
+pub const SYS_RENAMEAT2: i64 = 276;
+
+/| Linux `x86_64` `SYS_statx` syscall number (`332`).
+@cfg(not (target.arch == "aarch64"))
+pub const SYS_STATX: i64 = 332;
+
+/| Linux `aarch64` `SYS_statx` syscall number (`291`).
+@cfg(target.arch == "aarch64")
+pub const SYS_STATX: i64 = 291;
+
+/| Special `dirfd` sentinel resolving relative paths against the current working directory (`-100`).
+pub const AT_FDCWD: i32 = -100;
+
+/| Do not dereference terminal symbolic links (`0x100`).
+pub const AT_SYMLINK_NOFOLLOW: i32 = 0x0100;
+
+/| Remove directory instead of unlinking file in `unlinkat` (`0x200`).
+pub const AT_REMOVEDIR: i32 = 0x0200;
+
+/| Follow symbolic links in `linkat` (`0x400`).
+pub const AT_SYMLINK_FOLLOW: i32 = 0x0400;
+
+/| Operate directly on `dirfd` when `pathname` is `""` (`0x1000`).
+pub const AT_EMPTY_PATH: i32 = 0x1000;
+
+/| Default `statx` synchronization policy matching `stat` (`0x0000`).
+pub const AT_STATX_SYNC_AS_STAT: i32 = 0x0000;
+
+/| `statx` mask requesting all standard POSIX metadata fields (`0x0000_07FF`).
+pub const STATX_BASIC_STATS: u32 = 0x0000_07FF;
+
+/| `statx` mask requesting creation / birth time (`0x0000_0800`).
+pub const STATX_BTIME: u32 = 0x0000_0800;
+
+/| Open for reading only (`0`).
+pub const O_RDONLY: i32 = 0;
+
+/| Open for writing only (`1`).
+pub const O_WRONLY: i32 = 1;
+
+/| Open for reading and writing (`2`).
+pub const O_RDWR: i32 = 2;
+
+/| Create file if it does not exist (`0o100`).
+pub const O_CREAT: i32 = 0o100;
+
+/| Fail if file exists when combined with `O_CREAT` (`0o200`).
+pub const O_EXCL: i32 = 0o200;
+
+/| Truncate existing regular file to zero length (`0o1000`).
+pub const O_TRUNC: i32 = 0o1000;
+
+/| Append all writes to end of file (`0o2000`).
+pub const O_APPEND: i32 = 0o2000;
+
+/| Non-blocking descriptor mode (`0o4000`).
+pub const O_NONBLOCK: i32 = 0o4000;
+
+/| Synchronized data-integrity writes (`0o10_000`).
+pub const O_DSYNC: i32 = 0o10_000;
+
+/| Linux `x86_64` require target to be a directory (`0o200_000`).
+@cfg(not (target.arch == "aarch64"))
+pub const O_DIRECTORY: i32 = 0o200_000;
+
+/| Linux `aarch64` require target to be a directory (`0o40_000`).
+@cfg(target.arch == "aarch64")
+pub const O_DIRECTORY: i32 = 0o40_000;
+
+/| Linux `x86_64` reject symbolic links on terminal component (`0o400_000`).
+@cfg(not (target.arch == "aarch64"))
+pub const O_NOFOLLOW: i32 = 0o400_000;
+
+/| Linux `aarch64` reject symbolic links on terminal component (`0o100_000`).
+@cfg(target.arch == "aarch64")
+pub const O_NOFOLLOW: i32 = 0o100_000;
+
+/| Set close-on-exec atomically at descriptor creation (`0o2_000_000`).
+pub const O_CLOEXEC: i32 = 0o2_000_000;
+
+/| Obtain an `O_PATH` handle without opening file data (`0o10_000_000`).
+pub const O_PATH: i32 = 0o10_000_000;
+
+/| Base bit for unnamed `O_TMPFILE` creation (`0o20_000_000 | O_DIRECTORY`).
+pub const O_TMPFILE_BASE: i32 = 0o20_000_000;
+
+/| `openat2` disallow crossing mount points (`0x01`).
+pub const RESOLVE_NO_XDEV: u64 = 0x01;
+
+/| `openat2` disallow `/proc` magic-link traversal (`0x02`).
+pub const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+
+/| `openat2` disallow any symlink traversal across all path components (`0x04`).
+pub const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+
+/| `openat2` confine resolution strictly beneath `dirfd` (`0x08`).
+pub const RESOLVE_BENEATH: u64 = 0x08;
+
+/| `openat2` treat `dirfd` as the chroot root during resolution (`0x10`).
+pub const RESOLVE_IN_ROOT: u64 = 0x10;
+
+/| `renameat2` fail with `EEXIST` if target already exists (`1`).
+pub const RENAME_NOREPLACE: u32 = 1;
+
+/| `renameat2` atomically exchange source and destination (`2`).
+pub const RENAME_EXCHANGE: u32 = 2;
+
+/| Seek relative to start of file (`0`).
+pub const SEEK_SET: i32 = 0;
+
+/| Seek relative to current file offset (`1`).
+pub const SEEK_CUR: i32 = 1;
+
+/| Seek relative to end of file (`2`).
+pub const SEEK_END: i32 = 2;
+
+/| Pages cannot be accessed (`0`).
+pub const PROT_NONE: i32 = 0;
+
+/| Pages may be read (`1`).
+pub const PROT_READ: i32 = 1;
+
+/| Pages may be written (`2`).
+pub const PROT_WRITE: i32 = 2;
+
+/| Share mapping updates across processes (`1`).
+pub const MAP_SHARED: i32 = 1;
+
+/| Private copy-on-write mapping (`2`).
+pub const MAP_PRIVATE: i32 = 2;
+
+/| Shared `flock` lock (`1`).
+pub const LOCK_SH: i32 = 1;
+
+/| Exclusive `flock` lock (`2`).
+pub const LOCK_EX: i32 = 2;
+
+/| Non-blocking `flock` modifier (`4`).
+pub const LOCK_NB: i32 = 4;
+
+/| Release `flock` lock (`8`).
+pub const LOCK_UN: i32 = 8;
+
+/| Linux `FICLONE` `ioctl` request code for `O(1)` copy-on-write reflink (`0x4004_9409`).
+pub const FICLONE: u64 = 0x4004_9409;
+
+/| `inotify` file content modified (`0x0000_0002`).
+pub const IN_MODIFY: u32 = 0x0000_0002;
+
+/| `inotify` metadata changed (`0x0000_0004`).
+pub const IN_ATTRIB: u32 = 0x0000_0004;
+
+/| `inotify` file renamed out of watched directory (`0x0000_0040`).
+pub const IN_MOVED_FROM: u32 = 0x0000_0040;
+
+/| `inotify` file renamed into watched directory (`0x0000_0080`).
+pub const IN_MOVED_TO: u32 = 0x0000_0080;
+
+/| `inotify` child created inside watched directory (`0x0000_0100`).
+pub const IN_CREATE: u32 = 0x0000_0100;
+
+/| `inotify` child deleted from watched directory (`0x0000_0200`).
+pub const IN_DELETE: u32 = 0x0000_0200;
+
+/| `inotify` watched inode itself deleted (`0x0000_0400`).
+pub const IN_DELETE_SELF: u32 = 0x0000_0400;
+
+/| `inotify` watched inode itself moved (`0x0000_0800`).
+pub const IN_MOVE_SELF: u32 = 0x0000_0800;
+
+/| `inotify` kernel event queue overflowed (`0x0000_4000`).
+pub const IN_Q_OVERFLOW: u32 = 0x0000_4000;
+
+/| `inotify_init1` non-blocking flag (`0o4000`).
+pub const IN_NONBLOCK: i32 = 0o4000;
+
+/| `inotify_init1` close-on-exec flag (`0o2_000_000`).
+pub const IN_CLOEXEC: i32 = 0o2_000_000;
+
+/| `poll` readable readiness bit (`0x0001`).
+pub const POLLIN: i16 = 0x0001;
+
+/| `poll` writable readiness bit (`0x0004`).
+pub const POLLOUT: i16 = 0x0004;
+
+/| `poll` error condition bit (`0x0008`).
+pub const POLLERR: i16 = 0x0008;
+
+/| `poll` hangup bit (`0x0010`).
+pub const POLLHUP: i16 = 0x0010;
+
+/| System wall-clock (`CLOCK_REALTIME = 0`).
+pub const CLOCK_REALTIME: i32 = 0;
+
+/| Monotonic clock excluding wall jumps (`CLOCK_MONOTONIC = 1`).
+pub const CLOCK_MONOTONIC: i32 = 1;
+
+/| Suspend-aware monotonic clock (`CLOCK_BOOTTIME = 7`).
+pub const CLOCK_BOOTTIME: i32 = 7;
+
+/| POSIX `st_mode` file-type bitmask (`0o170_000`).
+pub const S_IFMT: u32 = 0o170_000;
+
+/| POSIX named pipe / FIFO mode tag (`0o010_000`).
+pub const S_IFIFO: u32 = 0o010_000;
+
+/| POSIX character device mode tag (`0o020_000`).
+pub const S_IFCHR: u32 = 0o020_000;
+
+/| POSIX directory mode tag (`0o040_000`).
+pub const S_IFDIR: u32 = 0o040_000;
+
+/| POSIX block device mode tag (`0o060_000`).
+pub const S_IFBLK: u32 = 0o060_000;
+
+/| POSIX regular file mode tag (`0o100_000`).
+pub const S_IFREG: u32 = 0o100_000;
+
+/| POSIX symbolic link mode tag (`0o120_000`).
+pub const S_IFLNK: u32 = 0o120_000;
+
+/| POSIX Unix-domain socket mode tag (`0o140_000`).
+pub const S_IFSOCK: u32 = 0o140_000;
+
+/| `dirent` unknown file type (`0` – requires fallback `fstatat` on XFS/NFS).
+pub const DT_UNKNOWN: u8 = 0;
+
+/| `dirent` FIFO type (`1`).
+pub const DT_FIFO: u8 = 1;
+
+/| `dirent` character device type (`2`).
+pub const DT_CHR: u8 = 2;
+
+/| `dirent` directory type (`4`).
+pub const DT_DIR: u8 = 4;
+
+/| `dirent` block device type (`6`).
+pub const DT_BLK: u8 = 6;
+
+/| `dirent` regular file type (`8`).
+pub const DT_REG: u8 = 8;
+
+/| `dirent` symbolic link type (`10`).
+pub const DT_LNK: u8 = 10;
+
+/| `dirent` socket type (`12`).
+pub const DT_SOCK: u8 = 12;
+
+/| Non-blocking `waitpid` option (`1`).
+pub const WNOHANG: i32 = 1;
+
+/| Immediate process termination signal (`9`).
+pub const SIGKILL: i32 = 9;
+
+/| Graceful termination signal (`15`).
+pub const SIGTERM: i32 = 15;
+
+/| Linux `EPERM` operation not permitted (`1`).
+pub const EPERM: i32 = 1;
+
+/| Linux `ENOENT` no such file or directory (`2`).
+pub const ENOENT: i32 = 2;
+
+/| Linux `ESRCH` no such process (`3`).
+pub const ESRCH: i32 = 3;
+
+/| Linux `EINTR` interrupted system call (`4`).
+pub const EINTR: i32 = 4;
+
+/| Linux `EIO` input/output error (`5`).
+pub const EIO: i32 = 5;
+
+/| Linux `ENXIO` no such device or address (`6`).
+pub const ENXIO: i32 = 6;
+
+/| Linux `EBADF` bad file descriptor (`9`).
+pub const EBADF: i32 = 9;
+
+/| Linux `ECHILD` no child processes (`10`).
+pub const ECHILD: i32 = 10;
+
+/| Linux `EAGAIN` / `EWOULDBLOCK` resource temporarily unavailable (`11`).
+pub const EAGAIN: i32 = 11;
+
+/| Linux `ENOMEM` out of memory (`12`).
+pub const ENOMEM: i32 = 12;
+
+/| Linux `EACCES` permission denied (`13`).
+pub const EACCES: i32 = 13;
+
+/| Linux `EFAULT` bad address (`14`).
+pub const EFAULT: i32 = 14;
+
+/| Linux `EBUSY` device or resource busy (`16`).
+pub const EBUSY: i32 = 16;
+
+/| Linux `EEXIST` file exists (`17`).
+pub const EEXIST: i32 = 17;
+
+/| Linux `EXDEV` invalid cross-device link (`18`).
+pub const EXDEV: i32 = 18;
+
+/| Linux `ENODEV` no such device (`19`).
+pub const ENODEV: i32 = 19;
+
+/| Linux `ENOTDIR` not a directory (`20`).
+pub const ENOTDIR: i32 = 20;
+
+/| Linux `EISDIR` is a directory (`21`).
+pub const EISDIR: i32 = 21;
+
+/| Linux `EINVAL` invalid argument (`22`).
+pub const EINVAL: i32 = 22;
+
+/| Linux `ENFILE` system file table overflow (`23`).
+pub const ENFILE: i32 = 23;
+
+/| Linux `EMFILE` per-process open descriptor limit reached (`24`).
+pub const EMFILE: i32 = 24;
+
+/| Linux `ENOTTY` inappropriate ioctl for device (`25`).
+pub const ENOTTY: i32 = 25;
+
+/| Linux `EFBIG` file too large (`27`).
+pub const EFBIG: i32 = 27;
+
+/| Linux `ENOSPC` no space left on device (`28`).
+pub const ENOSPC: i32 = 28;
+
+/| Linux `ESPIPE` illegal seek on pipe/socket (`29`).
+pub const ESPIPE: i32 = 29;
+
+/| Linux `EROFS` read-only filesystem (`30`).
+pub const EROFS: i32 = 30;
+
+/| Linux `EPIPE` broken pipe (`32`).
+pub const EPIPE: i32 = 32;
+
+/| Linux `ERANGE` result too large for buffer (`34`).
+pub const ERANGE: i32 = 34;
+
+/| Linux `EDEADLK` resource deadlock avoided (`35`).
+pub const EDEADLK: i32 = 35;
+
+/| Linux `ENAMETOOLONG` file name too long (`36`).
+pub const ENAMETOOLONG: i32 = 36;
+
+/| Linux `ENOSYS` function/syscall not implemented (`38`).
+pub const ENOSYS: i32 = 38;
+
+/| Linux `ENOTEMPTY` directory not empty (`39`).
+pub const ENOTEMPTY: i32 = 39;
+
+/| Linux `ELOOP` too many levels of symbolic links (`40`).
+pub const ELOOP: i32 = 40;
+
+/| Linux `EOPNOTSUPP` / `ENOTSUP` operation not supported (`95`).
+pub const EOPNOTSUPP: i32 = 95;
+
+/| Linux `ETIMEDOUT` connection or wait timed out (`110`).
+pub const ETIMEDOUT: i32 = 110;
+
+/| Linux `ESTALE` stale file handle (`116`).
+pub const ESTALE: i32 = 116;
+
+/| Default `dlsym` lookup handle searching the global dynamic symbol scope (`0`).
+pub const RTLD_DEFAULT: *mut opaque = @default_init[*mut opaque]();
+
 // ------------------------------------- PUBLIC API --------------------------------------
+/| Returns the hosted `main` `argc` count captured at startup.
+@link(name: "_cx_rt_get_argc")
+pub extern "C" fn linux_rt_get_argc() -> i32;
+
+/| Returns the hosted `main` `argv` pointer array captured at startup.
+@link(name: "_cx_rt_get_argv")
+pub extern "C" fn linux_rt_get_argv() -> *mut *mut u8;
+
+/| Returns pointer to the calling thread's `errno` slot (`__errno_location` on `glibc`/`musl`).
+@link(name: "__errno_location")
+pub extern "C" fn linux_errno_location() -> *mut i32;
+
+/| Variadic POSIX `openat(dir_fd, path_ptr, flags, ...)` C-ABI prototype.
+@link(name: "openat") @no_alloc @no_panic
+pub extern "C" fn linux_openat(dir_fd: i32, path_ptr: *u8, flags: i32, ...) -> i32;
+
+/| Typed wrapper invoking variadic `openat` with explicit `mode_bits` (`u32` promoted per C ABI).
+@inline @no_alloc @no_panic
+pub unsafe fn linux_openat_mode(dir_fd: i32, path_ptr: *u8, flags: i32, mode_bits: u32) -> i32 {
+    linux_openat(dir_fd, path_ptr, flags, mode_bits)
+}
+
+/| POSIX `read(file_desc, buf_ptr, byte_len)` C-ABI prototype.
+@link(name: "read")
+pub extern "C" fn linux_posix_read(file_desc: i32, buf_ptr: *mut u8, byte_len: usize) -> isize;
+
 /| POSIX `write(file_desc, buf_ptr, byte_len)` C-ABI prototype (`unistd.h`).
 @link(name: "write")
 pub extern "C" fn linux_posix_write(file_desc: i32, buf_ptr: *u8, byte_len: usize) -> isize;
+
+/| POSIX `pread(file_desc, buf_ptr, byte_len, file_offset)` C-ABI prototype.
+@link(name: "pread")
+pub extern "C" fn linux_pread(file_desc: i32, buf_ptr: *mut u8, byte_len: usize, file_offset: i64) -> isize;
+
+/| POSIX `pwrite(file_desc, buf_ptr, byte_len, file_offset)` C-ABI prototype.
+@link(name: "pwrite")
+pub extern "C" fn linux_pwrite(file_desc: i32, buf_ptr: *u8, byte_len: usize, file_offset: i64) -> isize;
+
+/| POSIX scatter `readv(file_desc, iov_ptr, iov_cnt)` C-ABI prototype.
+@link(name: "readv")
+pub extern "C" fn linux_readv(file_desc: i32, iov_ptr: *PosixIovec, iov_cnt: i32) -> isize;
+
+/| POSIX gather `writev(file_desc, iov_ptr, iov_cnt)` C-ABI prototype.
+@link(name: "writev")
+pub extern "C" fn linux_writev(file_desc: i32, iov_ptr: *PosixIovec, iov_cnt: i32) -> isize;
+
+/| POSIX `lseek(file_desc, offset_delta, whence)` C-ABI prototype.
+@link(name: "lseek")
+pub extern "C" fn linux_lseek(file_desc: i32, offset_delta: i64, whence: i32) -> i64;
+
+/| POSIX `ftruncate(file_desc, byte_size)` C-ABI prototype.
+@link(name: "ftruncate")
+pub extern "C" fn linux_ftruncate(file_desc: i32, byte_size: i64) -> i32;
+
+/| POSIX `fchmod(file_desc, mode_bits)` C-ABI prototype.
+@link(name: "fchmod")
+pub extern "C" fn linux_fchmod(file_desc: i32, mode_bits: u32) -> i32;
+
+/| POSIX `fsync(file_desc)` full metadata + data flush prototype.
+@link(name: "fsync")
+pub extern "C" fn linux_fsync(file_desc: i32) -> i32;
+
+/| POSIX `fdatasync(file_desc)` data-integrity flush prototype.
+@link(name: "fdatasync")
+pub extern "C" fn linux_fdatasync(file_desc: i32) -> i32;
+
+/| POSIX `close(file_desc)` descriptor release prototype.
+@link(name: "close")
+pub extern "C" fn linux_close(file_desc: i32) -> i32;
+
+/| POSIX `renameat(old_dir_fd, old_path_ptr, new_dir_fd, new_path_ptr)` prototype.
+@link(name: "renameat")
+pub extern "C" fn linux_renameat(
+    old_dir_fd: i32,
+    old_path_ptr: *u8,
+    new_dir_fd: i32,
+    new_path_ptr: *u8,
+) -> i32;
+
+/| POSIX `unlinkat(dir_fd, path_ptr, flags)` prototype (`0` or `AT_REMOVEDIR`).
+@link(name: "unlinkat")
+pub extern "C" fn linux_unlinkat(dir_fd: i32, path_ptr: *u8, flags: i32) -> i32;
+
+/| POSIX `mkdirat(dir_fd, path_ptr, mode_bits)` prototype.
+@link(name: "mkdirat")
+pub extern "C" fn linux_mkdirat(dir_fd: i32, path_ptr: *u8, mode_bits: u32) -> i32;
+
+/| POSIX `linkat(old_dir_fd, old_path_ptr, new_dir_fd, new_path_ptr, flags)` prototype.
+@link(name: "linkat")
+pub extern "C" fn linux_linkat(
+    old_dir_fd: i32,
+    old_path_ptr: *u8,
+    new_dir_fd: i32,
+    new_path_ptr: *u8,
+    flags: i32,
+) -> i32;
+
+/| POSIX `symlinkat(target_ptr, new_dir_fd, link_path_ptr)` prototype.
+@link(name: "symlinkat")
+pub extern "C" fn linux_symlinkat(target_ptr: *u8, new_dir_fd: i32, link_path_ptr: *u8) -> i32;
+
+/| POSIX `readlinkat(dir_fd, path_ptr, buf_out, buf_cap)` prototype.
+@link(name: "readlinkat")
+pub extern "C" fn linux_readlinkat(dir_fd: i32, path_ptr: *u8, buf_out: *mut u8, buf_cap: usize) -> isize;
+
+/| POSIX `realpath(path_ptr, resolved_buf_out)` canonical path prototype (`resolved_buf_out` >= `4096B`).
+@link(name: "realpath")
+pub extern "C" fn linux_realpath(path_ptr: *u8, resolved_buf_out: *mut u8) -> *mut u8;
+
+/| POSIX `getcwd(buf_out, buf_cap)` current working directory prototype.
+@link(name: "getcwd")
+pub extern "C" fn linux_getcwd(buf_out: *mut u8, buf_cap: usize) -> *mut u8;
+
+/| POSIX `chdir(path_ptr)` working-directory change prototype.
+@link(name: "chdir")
+pub extern "C" fn linux_chdir(path_ptr: *u8) -> i32;
+
+/| POSIX `mmap(addr_hint, map_len, prot_flags, map_flags, file_desc, file_offset)` prototype.
+@link(name: "mmap")
+pub extern "C" fn linux_mmap(
+    addr_hint: *mut opaque,
+    map_len: usize,
+    prot_flags: i32,
+    map_flags: i32,
+    file_desc: i32,
+    file_offset: i64,
+) -> *mut opaque;
+
+/| POSIX `munmap(base_addr, map_len)` prototype.
+@link(name: "munmap")
+pub extern "C" fn linux_munmap(base_addr: *mut opaque, map_len: usize) -> i32;
+
+/| BSD/Linux `flock(file_desc, lock_op)` whole-file advisory lock prototype.
+@link(name: "flock")
+pub extern "C" fn linux_flock(file_desc: i32, lock_op: i32) -> i32;
+
+/| Variadic Linux `ioctl(file_desc, request_code, ...)` C-ABI prototype.
+@link(name: "ioctl") @no_alloc @no_panic
+pub extern "C" fn linux_ioctl(file_desc: i32, request_code: u64, ...) -> i32;
+
+/| Typed wrapper invoking variadic `ioctl` with an integer descriptor/argument (`FICLONE`).
+@inline @no_alloc @no_panic
+pub unsafe fn linux_ioctl_int(file_desc: i32, request_code: u64, arg_int: i32) -> i32 {
+    linux_ioctl(file_desc, request_code, arg_int)
+}
+
+/| Typed wrapper invoking variadic `ioctl` with a mutable data pointer argument.
+@inline @no_alloc @no_panic
+pub unsafe fn linux_ioctl_ptr(file_desc: i32, request_code: u64, arg_ptr: *mut opaque) -> i32 {
+    linux_ioctl(file_desc, request_code, arg_ptr)
+}
+
+/| Linux `copy_file_range(fd_in, off_in, fd_out, off_out, byte_len, flags)` zero-copy splice prototype.
+@link(name: "copy_file_range")
+pub extern "C" fn linux_copy_file_range(
+    fd_in: i32,
+    off_in: *mut i64,
+    fd_out: i32,
+    off_out: *mut i64,
+    byte_len: usize,
+    flags: u32,
+) -> isize;
+
+/| Linux `inotify_init1(flags)` watcher queue creation prototype.
+@link(name: "inotify_init1")
+pub extern "C" fn linux_inotify_init1(flags: i32) -> i32;
+
+/| Linux `inotify_add_watch(inotify_fd, path_ptr, event_mask)` prototype.
+@link(name: "inotify_add_watch")
+pub extern "C" fn linux_inotify_add_watch(inotify_fd: i32, path_ptr: *u8, event_mask: u32) -> i32;
+
+/| Linux `inotify_rm_watch(inotify_fd, watch_desc)` prototype.
+@link(name: "inotify_rm_watch")
+pub extern "C" fn linux_inotify_rm_watch(inotify_fd: i32, watch_desc: i32) -> i32;
+
+/| POSIX `poll(fds_ptr, nfds_count, timeout_ms)` readiness wait prototype.
+@link(name: "poll")
+pub extern "C" fn linux_poll(fds_ptr: *mut PosixPollFd, nfds_count: u64, timeout_ms: i32) -> i32;
+
+/| POSIX `isatty(file_desc)` terminal detection prototype.
+@link(name: "isatty")
+pub extern "C" fn linux_isatty(file_desc: i32) -> i32;
+
+/| POSIX `clock_gettime(clock_id, tp_out)` nanosecond clock query prototype.
+@link(name: "clock_gettime")
+pub extern "C" fn linux_clock_gettime(clock_id: i32, tp_out: *mut PosixTimespec) -> i32;
+
+/| POSIX `nanosleep(req_time, rem_time_out)` sleep prototype.
+@link(name: "nanosleep")
+pub extern "C" fn linux_nanosleep(req_time: *PosixTimespec, rem_time_out: *mut PosixTimespec) -> i32;
+
+/| ISO C `getenv(key_ptr)` environment lookup prototype.
+@link(name: "getenv")
+pub extern "C" fn linux_getenv(key_ptr: *u8) -> *mut u8;
+
+/| POSIX `setenv(key_ptr, val_ptr, overwrite_flag)` prototype.
+@link(name: "setenv")
+pub extern "C" fn linux_setenv(key_ptr: *u8, val_ptr: *u8, overwrite_flag: i32) -> i32;
+
+/| POSIX `unsetenv(key_ptr)` prototype.
+@link(name: "unsetenv")
+pub extern "C" fn linux_unsetenv(key_ptr: *u8) -> i32;
+
+/| POSIX `getpid()` process identifier prototype.
+@link(name: "getpid")
+pub extern "C" fn linux_getpid() -> i32;
+
+/| Linux `pipe2(pipe_fds_out, flags)` atomic `O_CLOEXEC` pipe creation prototype.
+@link(name: "pipe2")
+pub extern "C" fn linux_pipe2(pipe_fds_out: *mut i32, flags: i32) -> i32;
+
+/| POSIX `posix_spawn_file_actions_init(actions_ptr)` prototype.
+@link(name: "posix_spawn_file_actions_init")
+pub extern "C" fn linux_spawn_file_actions_init(actions_ptr: *mut PosixSpawnFileActions) -> i32;
+
+/| POSIX `posix_spawn_file_actions_destroy(actions_ptr)` prototype.
+@link(name: "posix_spawn_file_actions_destroy")
+pub extern "C" fn linux_spawn_file_actions_destroy(actions_ptr: *mut PosixSpawnFileActions) -> i32;
+
+/| POSIX `posix_spawn_file_actions_adddup2(actions_ptr, src_fd, target_fd)` prototype.
+@link(name: "posix_spawn_file_actions_adddup2")
+pub extern "C" fn linux_spawn_file_actions_adddup2(
+    actions_ptr: *mut PosixSpawnFileActions,
+    src_fd: i32,
+    target_fd: i32,
+) -> i32;
+
+/| POSIX `posix_spawn_file_actions_addclose(actions_ptr, file_desc)` prototype.
+@link(name: "posix_spawn_file_actions_addclose")
+pub extern "C" fn linux_spawn_file_actions_addclose(
+    actions_ptr: *mut PosixSpawnFileActions,
+    file_desc: i32,
+) -> i32;
+
+/| Dynamic symbol resolver `dlsym(handle, symbol)` prototype (`dlfcn.h`).
+@link(name: "dlsym")
+pub unsafe extern "C" fn linux_dlsym(handle: *mut opaque, symbol: *u8) -> *mut opaque;
+
+/| Lazily resolves glibc 2.29+ / musl `posix_spawn_file_actions_addchdir_np` via `dlsym`, returning `ENOSYS` on glibc 2.28.
+pub unsafe fn linux_spawn_file_actions_addchdir_np(
+    actions_ptr: *mut PosixSpawnFileActions,
+    dir_path_ptr: *u8,
+) -> i32 {
+    let sym_ptr = linux_dlsym(
+        RTLD_DEFAULT,
+        (&b"posix_spawn_file_actions_addchdir_np\0"[0]) as *u8,
+    );
+    if sym_ptr.is_null() {
+        return ENOSYS;
+    }
+    (@ptr_read((&raw sym_ptr) as *PosixSpawnAddChdirFn))(
+        actions_ptr,
+        dir_path_ptr,
+    )
+}
+
+/| POSIX `posix_spawnattr_init(attr_ptr)` prototype.
+@link(name: "posix_spawnattr_init")
+pub extern "C" fn linux_spawnattr_init(attr_ptr: *mut PosixSpawnAttr) -> i32;
+
+/| POSIX `posix_spawnattr_destroy(attr_ptr)` prototype.
+@link(name: "posix_spawnattr_destroy")
+pub extern "C" fn linux_spawnattr_destroy(attr_ptr: *mut PosixSpawnAttr) -> i32;
+
+/| POSIX `posix_spawnattr_setflags(attr_ptr, spawn_flags)` prototype.
+@link(name: "posix_spawnattr_setflags")
+pub extern "C" fn linux_spawnattr_setflags(attr_ptr: *mut PosixSpawnAttr, spawn_flags: i16) -> i32;
+
+/| POSIX `posix_spawn(...)` direct executable child-process creation prototype.
+@link(name: "posix_spawn")
+pub extern "C" fn linux_posix_spawn(
+    pid_out: *mut i32,
+    exe_path_ptr: *u8,
+    actions_ptr: *PosixSpawnFileActions,
+    attr_ptr: *PosixSpawnAttr,
+    argv_ptrs: *mut *mut u8,
+    envp_ptrs: *mut *mut u8,
+) -> i32;
+
+/| POSIX `posix_spawnp(...)` `PATH`-searching child-process creation prototype.
+@link(name: "posix_spawnp")
+pub extern "C" fn linux_posix_spawnp(
+    pid_out: *mut i32,
+    file_name_ptr: *u8,
+    actions_ptr: *PosixSpawnFileActions,
+    attr_ptr: *PosixSpawnAttr,
+    argv_ptrs: *mut *mut u8,
+    envp_ptrs: *mut *mut u8,
+) -> i32;
+
+/| POSIX `waitpid(child_pid, status_out, wait_options)` process reap prototype.
+@link(name: "waitpid")
+pub extern "C" fn linux_waitpid(child_pid: i32, status_out: *mut i32, wait_options: i32) -> i32;
+
+/| POSIX `kill(target_pid, sig_num)` signal dispatch prototype.
+@link(name: "kill")
+pub extern "C" fn linux_kill(target_pid: i32, sig_num: i32) -> i32;
+
+/| Variadic `syscall(sys_num, ...)` prototype decoupling `openat2`/`statx`/`getdents64` from glibc version.
+@link(name: "syscall") @no_alloc @no_panic
+pub extern "C" fn linux_syscall(sys_num: i64, ...) -> isize;
+
+/| Typed wrapper invoking `SYS_getdents64(dir_fd, dirent_buf_out, buf_cap)`.
+@inline @no_alloc @no_panic
+pub unsafe fn linux_sys_getdents64(dir_fd: i32, dirent_buf_out: *mut u8, buf_cap: usize) -> isize {
+    linux_syscall(SYS_GETDENTS64, dir_fd, dirent_buf_out, buf_cap)
+}
+
+/| Typed wrapper invoking `SYS_openat2(dir_fd, path_ptr, how_ptr, how_bytes)`.
+@inline @no_alloc @no_panic
+pub unsafe fn linux_sys_openat2(
+    dir_fd: i32,
+    path_ptr: *u8,
+    how_ptr: *LinuxOpenHow,
+    how_bytes: usize,
+) -> isize {
+    linux_syscall(SYS_OPENAT2, dir_fd, path_ptr, how_ptr, how_bytes)
+}
+
+/| Typed wrapper invoking `SYS_newfstatat(dir_fd, path_ptr, stat_out, flags)`.
+@inline @no_alloc @no_panic
+pub unsafe fn linux_sys_newfstatat(
+    dir_fd: i32,
+    path_ptr: *u8,
+    stat_out: *mut LinuxStat,
+    flags: i32,
+) -> isize {
+    linux_syscall(SYS_NEWFSTATAT, dir_fd, path_ptr, stat_out, flags)
+}
+
+/| Typed wrapper invoking `SYS_statx(dir_fd, path_ptr, flags, mask, statx_out)`.
+@inline @no_alloc @no_panic
+pub unsafe fn linux_sys_statx(
+    dir_fd: i32,
+    path_ptr: *u8,
+    flags: i32,
+    mask: u32,
+    statx_out: *mut LinuxStatx,
+) -> isize {
+    linux_syscall(SYS_STATX, dir_fd, path_ptr, flags, mask, statx_out)
+}
+
+/| Typed wrapper invoking `SYS_renameat2(old_dir_fd, old_ptr, new_dir_fd, new_ptr, rename_flags)`.
+@inline @no_alloc @no_panic
+pub unsafe fn linux_sys_renameat2(
+    old_dir_fd: i32,
+    old_path_ptr: *u8,
+    new_dir_fd: i32,
+    new_path_ptr: *u8,
+    rename_flags: u32,
+) -> isize {
+    linux_syscall(SYS_RENAMEAT2, old_dir_fd, old_path_ptr, new_dir_fd, new_path_ptr, rename_flags)
+}
 
 /| POSIX `_exit(status_code)` C-ABI prototype (`unistd.h`).
 @link(name: "_exit")

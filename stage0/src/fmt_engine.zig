@@ -7887,7 +7887,85 @@ const CstFormatter = struct {
         }
     }
 
-    /// Formats an `.infix_expr`, aligning `|>` pipe chains and `orelse` / `catch` fallbacks (`DR-21` §3.3).
+    /// Step in a flattened left-associative binary `.infix_expr` chain (`DR-14` §1.2 Rule 9).
+    const BreakableInfixStep = struct {
+        /// Binary operator token index.
+        op_tok: TokenIndex,
+        /// Right-hand operand CST node index.
+        rhs_node: CstNodeIndex,
+    };
+
+    /// Returns `true` if `op_kind` is a standard binary operator eligible for `DR-14` Rule 9 line-breaking.
+    fn isBreakableBinaryOpKind(op_kind: TokenKind) bool {
+        return switch (op_kind) {
+            .dotdot,
+            .dotdoteq,
+            .kw_is,
+            .kw_not,
+            .kw_orelse,
+            .kw_catch,
+            .pipe_gt,
+            => false,
+            else => true,
+        };
+    }
+
+    /// Recursively collects left-associative same-operator `.infix_expr` steps into `steps`.
+    fn collectSameOpInfixChain(
+        self: *const CstFormatter,
+        node_idx: CstNodeIndex,
+        expected_op: ?TokenKind,
+        base_out: *CstNodeIndex,
+        steps: *std.ArrayList(BreakableInfixStep),
+    ) !bool {
+        if (self.cst_arena.getNode(node_idx).kind != .infix_expr) return false;
+
+        var children: std.ArrayList(CstNodeIndex) = .empty;
+        defer children.deinit(self.allocator);
+        try self.collectDirectChildren(node_idx, &children);
+        if (children.items.len != 3) return false;
+
+        const lhs_child = self.cst_arena.getNode(children.items[0]);
+        const op_child = self.cst_arena.getNode(children.items[1]);
+        const rhs_child = self.cst_arena.getNode(children.items[2]);
+        if (op_child.subtree_size != 1 or op_child.token.isNone()) return false;
+
+        const op_kind = self.token_buffer.getToken(op_child.token).kind;
+        if (!isBreakableBinaryOpKind(op_kind)) return false;
+        if (expected_op) |exp_k| {
+            if (op_kind != exp_k) return false;
+        }
+
+        // Preserve compact `$-K` and `$+K` offsets inside `[…]` (`DR-21` §3.3):
+        if (self.index_bracket_depth > 0 and
+            lhs_child.subtree_size == 1 and !lhs_child.token.isNone() and
+            rhs_child.subtree_size == 1 and !rhs_child.token.isNone() and
+            self.token_buffer.getToken(lhs_child.token).kind == .dollar and
+            (op_kind == .minus or op_kind == .plus) and
+            self.token_buffer.getToken(rhs_child.token).kind == .int_lit and
+            !self.hasUnconsumedCommentsInTokenRange(
+                lhs_child.token.asInt(),
+                rhs_child.token.asInt(),
+                true,
+                true,
+            ))
+        {
+            return false;
+        }
+
+        const lhs_id = children.items[0];
+        const rhs_id = children.items[2];
+        if (!(try self.collectSameOpInfixChain(lhs_id, op_kind, base_out, steps))) {
+            base_out.* = lhs_id;
+        }
+        try steps.append(self.allocator, .{
+            .op_tok = op_child.token,
+            .rhs_node = rhs_id,
+        });
+        return true;
+    }
+
+    /// Formats an `.infix_expr`, aligning `|>` pipe chains, `orelse` / `catch` fallbacks, and binary chains (`DR-14` §1.2, `DR-21` §3.3).
     fn formatInfixExpr(self: *CstFormatter, node_idx: CstNodeIndex) anyerror!void {
         var base_node: CstNodeIndex = .none;
         var pipe_steps: std.ArrayList(PipeChainStep) = .empty;
@@ -7994,6 +8072,25 @@ const CstFormatter = struct {
                     return;
                 }
             }
+        }
+
+        var base_infix: CstNodeIndex = .none;
+        var infix_steps: std.ArrayList(BreakableInfixStep) = .empty;
+        defer infix_steps.deinit(self.allocator);
+
+        if (try self.collectSameOpInfixChain(node_idx, null, &base_infix, &infix_steps)) {
+            _ = try self.doc_arena.beginGroup(.auto_fit);
+            try self.formatNode(base_infix);
+            try self.doc_arena.beginIndent(INDENT_SPACES);
+            for (infix_steps.items) |step| {
+                try self.doc_arena.emitLine();
+                try self.emitTokenWithTrivia(step.op_tok, null, false);
+                try self.doc_arena.emitText(" ");
+                try self.formatNode(step.rhs_node);
+            }
+            try self.doc_arena.endIndent(INDENT_SPACES);
+            try self.doc_arena.endGroup();
+            return;
         }
 
         var pipe_capture_count: usize = 0;

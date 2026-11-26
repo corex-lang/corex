@@ -3827,3 +3827,721 @@ test "test_lsp_dogfood_regressions_default_param_shrink_operator_hover_and_deriv
         try std.testing.expectEqual(tc_before + 2, db.telemetry.stage_executions[tc_idx]);
     }
 }
+
+test "test_lsp_phase11_std02_modules_hover_def_refs_rename_and_incremental_didchange" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const PosHelper = struct {
+        const LineChar = struct {
+            line: u32,
+            character: u32,
+        };
+
+        /// Converts a UTF-8 byte offset inside `text` to a zero-based `(line, character)` pair.
+        fn byteOffsetToLineChar(text: []const u8, target_byte: usize) LineChar {
+            var line_idx: u32 = 0;
+            var col_idx: u32 = 0;
+            var idx: usize = 0;
+            while (idx < target_byte and idx < text.len) : (idx += 1) {
+                if (text[idx] == '\n') {
+                    line_idx += 1;
+                    col_idx = 0;
+                } else if (text[idx] != '\r') {
+                    col_idx += 1;
+                }
+            }
+            return .{ .line = line_idx, .character = col_idx };
+        }
+
+        /// Locates `needle` + `inner_offset` inside `haystack` as a zero-based `(line, character)` pair.
+        fn locateOffset(haystack: []const u8, needle: []const u8, inner_offset: usize) LineChar {
+            const found_idx = std.mem.indexOf(u8, haystack, needle).?;
+            return byteOffsetToLineChar(haystack, found_idx + inner_offset);
+        }
+
+        /// Counts non-overlapping occurrences of `needle` inside `haystack`.
+        fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+            var count: usize = 0;
+            var cursor: usize = 0;
+            while (std.mem.indexOfPos(u8, haystack, cursor, needle)) |hit_pos| {
+                count += 1;
+                cursor = hit_pos + needle.len;
+            }
+            return count;
+        }
+
+        /// Validates non-empty, strictly monotonic non-overlapping semantic tokens + `/#` & `/|` 2-byte markers.
+        fn verifyModuleSemanticTokens(sem_tokens: []const u32, source_text: []const u8) !void {
+            try std.testing.expect(sem_tokens.len >= 20);
+            try std.testing.expectEqual(@as(usize, 0), sem_tokens.len % 5);
+
+            var line_starts: std.ArrayListUnmanaged(usize) = .empty;
+            defer line_starts.deinit(std.testing.allocator);
+            try line_starts.append(std.testing.allocator, 0);
+            for (source_text, 0..) |byte_val, byte_i| {
+                if (byte_val == '\n') {
+                    try line_starts.append(std.testing.allocator, byte_i + 1);
+                }
+            }
+
+            var abs_line: u32 = 0;
+            var abs_col: u32 = 0;
+            var prev_line_end: u32 = 0;
+            var has_prev_tok = false;
+            var saw_mod_doc_marker = false;
+            var saw_item_doc_marker = false;
+            var tok_cursor: usize = 0;
+            while (tok_cursor + 5 <= sem_tokens.len) : (tok_cursor += 5) {
+                const delta_line = sem_tokens[tok_cursor];
+                const delta_col = sem_tokens[tok_cursor + 1];
+                const tok_len = sem_tokens[tok_cursor + 2];
+                const tok_type = sem_tokens[tok_cursor + 3];
+                const tok_mods = sem_tokens[tok_cursor + 4];
+                try std.testing.expect(tok_len > 0);
+
+                if (delta_line > 0) {
+                    abs_line += delta_line;
+                    abs_col = delta_col;
+                } else {
+                    if (has_prev_tok) {
+                        try std.testing.expect(abs_col + delta_col >= prev_line_end);
+                    }
+                    abs_col += delta_col;
+                }
+                prev_line_end = abs_col + tok_len;
+                has_prev_tok = true;
+
+                if (tok_len == 2 and tok_type == 15 and (tok_mods & (1 << 8)) != 0 and
+                    abs_line < line_starts.items.len)
+                {
+                    const start_byte = line_starts.items[abs_line] + abs_col;
+                    if (start_byte + 2 <= source_text.len) {
+                        const marker_slice = source_text[start_byte .. start_byte + 2];
+                        if (std.mem.eql(u8, marker_slice, "/#")) saw_mod_doc_marker = true;
+                        if (std.mem.eql(u8, marker_slice, "/|")) saw_item_doc_marker = true;
+                    }
+                }
+            }
+            try std.testing.expect(saw_mod_doc_marker);
+            try std.testing.expect(saw_item_doc_marker);
+        }
+    };
+
+    const ws_dir = try createTempWorkspaceDir(allocator, io, "phase11_std02");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, ws_dir) catch {};
+        allocator.free(ws_dir);
+    }
+
+    try writeWorkspaceFile(
+        allocator,
+        io,
+        ws_dir,
+        "corex.toml",
+        "[package]\nname = \"lsp-phase11-std02\"\nversion = \"0.1.0\"\nedition = \"2026\"\n",
+    );
+    const ws_root_cx =
+        "/# Workspace Root\n" ++
+        "/#\n" ++
+        "/# Mounts the `STD-02` verification module `app`.\n\n" ++
+        "/| End-to-end `STD-02` application probe module.\n" ++
+        "pub mod app;\n";
+    try writeWorkspaceFile(allocator, io, ws_dir, "src/root.cx", ws_root_cx);
+
+    const app_cx =
+        "/# Phase 11.2a STD-02 Workspace Integration Fixture\n" ++
+        "/#\n" ++
+        "/# Exercises `cx.io`, `cx.path`, `cx.fs`, `cx.time`, `cx.env`, and `cx.process` under `corex lsp`.\n\n" ++
+        "use cx.env;\n" ++
+        "use cx.fs.{Dir, File};\n" ++
+        "use cx.io.{BufReader, BufWriter, IoError, OutBuf, SliceWriter};\n" ++
+        "use cx.path.{Path, PathBuf};\n" ++
+        "use cx.process.{Command, Stdio};\n" ++
+        "use cx.time.{Duration, Instant};\n\n" ++
+        "// ---------------------------------------- TYPES ----------------------------------------\n" ++
+        "/| Execution mode for staged workspace synchronization.\n" ++
+        "@derive(Copy, Equatable, Clone, Debug)\n" ++
+        "pub enum SyncMode {\n" ++
+        "    /| Validates paths and environment without spawning external tools.\n" ++
+        "    DryRun,\n" ++
+        "    /| Executes full filesystem and child-process synchronization.\n" ++
+        "    LiveRun,\n" ++
+        "}\n\n" ++
+        "/| Configuration bundle for `run_std02_pipeline`.\n" ++
+        "@derive(Copy, Clone, Debug)\n" ++
+        "pub struct SyncConfig {\n" ++
+        "    /| Active execution mode.\n" ++
+        "    pub mode: SyncMode,\n" ++
+        "    /| Maximum retry attempts on transient I/O failure.\n" ++
+        "    pub retry_limit: u32,\n" ++
+        "}\n\n" ++
+        "// -------------------------------------- INTERNALS --------------------------------------\n" ++
+        "/| Converts `budget_ms` into a non-zero `Duration` window.\n" ++
+        "fn compute_budget(budget_ms: u64, /) -> Duration {\n" ++
+        "    Duration.from_millis(if budget_ms == 0_u64 => 1_u64 else budget_ms)\n" ++
+        "}\n\n" ++
+        "// ------------------------------------- PUBLIC API --------------------------------------\n" ++
+        "/| Returns the default dry-run configuration.\n" ++
+        "@no_alloc @no_panic\n" ++
+        "pub fn default_sync_config() -> SyncConfig {\n" ++
+        "    SyncConfig { mode: .DryRun, retry_limit: 2_u32 }\n" ++
+        "}\n\n" ++
+        "/| Returns the default timeout window.\n" ++
+        "@no_alloc @no_panic\n" ++
+        "pub fn default_budget() -> Duration {\n" ++
+        "    compute_budget(50_u64)\n" ++
+        "}\n\n" ++
+        "/| Runs an end-to-end `STD-02` probe across streams, paths, files, clocks, env, and processes.\n" ++
+        "pub fn run_std02_pipeline(cfg: SyncConfig, root_dir: Path, timeout_ms: u64, /) -> usize!IoError {\n" ++
+        "    let started = Instant.now();\n" ++
+        "    let deadline_win = compute_budget(timeout_ms);\n" ++
+        "    var target_buf = PathBuf.from(root_dir);\n" ++
+        "    if env.get_var(\"COREX_STAGE_SUBDIR\") is .Ok(sub_name) {\n" ++
+        "        target_buf.push(sub_name.as_str());\n" ++
+        "    }\n\n" ++
+        "    var raw_scratch: [u8; 64];\n" ++
+        "    var out_cursor = OutBuf.over_uninit(&out raw_scratch);\n" ++
+        "    _ = out_cursor.append(b\"cx\");\n\n" ++
+        "    var sink_storage: [u8; 128] = [0_u8; 128];\n" ++
+        "    var slice_sink = SliceWriter.new(&mut sink_storage);\n" ++
+        "    var writer_buf: [u8; 64];\n" ++
+        "    var buf_writer = BufWriter.over_uninit(slice_sink.as_writer(), &out writer_buf);\n" ++
+        "    buf_writer.write_all(out_cursor.filled()) catch |write_err| {\n" ++
+        "        buf_writer.discard();\n" ++
+        "        return .Err(write_err);\n" ++
+        "    };\n" ++
+        "    buf_writer.close()?;\n" ++
+        "    let stage_bytes = slice_sink.written().len();\n\n" ++
+        "    if cfg.mode == .DryRun {\n" ++
+        "        return .Ok(stage_bytes +| (started.elapsed().saturating_add(deadline_win).as_millis() as usize));\n" ++
+        "    }\n\n" ++
+        "    Dir.open(root_dir)?.close();\n\n" ++
+        "    var file_handle = File.open(target_buf.as_path())?;\n" ++
+        "    var read_backing: [u8; 64] = [0_u8; 64];\n" ++
+        "    var buf_reader = BufReader.over_slice(file_handle.as_reader(), &mut read_backing);\n" ++
+        "    let peeked_len = (buf_reader.peek(1_usize) catch |read_err| {\n" ++
+        "        file_handle.close();\n" ++
+        "        return .Err(read_err);\n" ++
+        "    }).len();\n" ++
+        "    file_handle.close();\n\n" ++
+        "    if cfg.retry_limit > 0_u32 {\n" ++
+        "        _ = Command.new(\"corex-worker\").stdout(Stdio.piped()).stderr(Stdio.null()).status()?;\n" ++
+        "    }\n\n" ++
+        "    .Ok(stage_bytes +| peeked_len +| (deadline_win.as_nanos() as usize))\n" ++
+        "}\n";
+    try writeWorkspaceFile(allocator, io, ws_dir, "src/app.cx", app_cx);
+
+    const ws_uri = try resolvePathToFileUri(allocator, io, ws_dir);
+    defer allocator.free(ws_uri);
+    const app_path = try std.fmt.allocPrint(allocator, "{s}/src/app.cx", .{ws_dir});
+    defer allocator.free(app_path);
+    const app_uri = try resolvePathToFileUri(allocator, io, app_path);
+    defer allocator.free(app_uri);
+
+    const std02_paths = [_][]const u8{
+        "stdlib/cx/io.cx",
+        "stdlib/cx/path.cx",
+        "stdlib/cx/fs.cx",
+        "stdlib/cx/time.cx",
+        "stdlib/cx/env.cx",
+        "stdlib/cx/process.cx",
+    };
+    var std02_uris: [std02_paths.len][]u8 = undefined;
+    var std02_sources: [std02_paths.len][]u8 = undefined;
+    var loaded_std02: usize = 0;
+    defer {
+        var rel_i: usize = 0;
+        while (rel_i < loaded_std02) : (rel_i += 1) {
+            allocator.free(std02_uris[rel_i]);
+            allocator.free(std02_sources[rel_i]);
+        }
+    }
+    for (std02_paths, 0..) |mod_rel_path, mod_i| {
+        std02_uris[mod_i] = try resolvePathToFileUri(allocator, io, mod_rel_path);
+        const raw_bytes = try std.Io.Dir.cwd().readFileAlloc(io, mod_rel_path, allocator, .limited(4 * 1024 * 1024));
+        defer allocator.free(raw_bytes);
+        var lf_buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer lf_buf.deinit(allocator);
+        try lf_buf.ensureTotalCapacity(allocator, raw_bytes.len);
+        for (raw_bytes) |ch_byte| {
+            if (ch_byte != '\r') lf_buf.appendAssumeCapacity(ch_byte);
+        }
+        std02_sources[mod_i] = try lf_buf.toOwnedSlice(allocator);
+        loaded_std02 += 1;
+    }
+
+    var session = try lsp_server.LspSession.init(allocator, io, null, null, .{ .is_internal_core = true });
+    defer session.deinit();
+    session.bindInternalPointers();
+
+    // [1] Initialize workspace (`core` + all 11 `stdlib/cx/*.cx` files + `src/app.cx`), `didOpen` all 6 `STD-02`
+    // modules + `src/app.cx`, verify `semanticTokens/full` on all 7 files, and verify clean `0`-diagnostic `app.cx`:
+    var turn_1: std.ArrayListUnmanaged(u8) = .empty;
+    defer turn_1.deinit(allocator);
+    {
+        const init_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{" ++
+                "\"rootUri\":\"{s}\",\"capabilities\":{{\"general\":{{\"positionEncodings\":[\"utf-8\"]}}," ++
+                "\"textDocument\":{{\"diagnostic\":{{}}}}}}}}}}",
+            .{ws_uri},
+        );
+        defer allocator.free(init_req);
+        try appendLspFrame(allocator, &turn_1, init_req);
+    }
+    try appendLspFrame(allocator, &turn_1, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}");
+    for (std02_uris, std02_sources) |mod_uri, mod_src| {
+        try appendDidOpenFrame(allocator, &turn_1, mod_uri, 1, mod_src);
+    }
+    try appendDidOpenFrame(allocator, &turn_1, app_uri, 1, app_cx);
+
+    // Request `semanticTokens/full` (`#10..#15` for the 6 `STD-02` modules, `#16` for `src/app.cx`) + `#17` pull diags:
+    for (std02_uris, 0..) |mod_uri, mod_i| {
+        const sem_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"textDocument/semanticTokens/full\"," ++
+                "\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+            .{ 10 + mod_i, mod_uri },
+        );
+        defer allocator.free(sem_req);
+        try appendLspFrame(allocator, &turn_1, sem_req);
+    }
+    {
+        const app_sem_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":16,\"method\":\"textDocument/semanticTokens/full\"," ++
+                "\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+            .{app_uri},
+        );
+        defer allocator.free(app_sem_req);
+        try appendLspFrame(allocator, &turn_1, app_sem_req);
+
+        const app_diag_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":17,\"method\":\"textDocument/diagnostic\"," ++
+                "\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+            .{app_uri},
+        );
+        defer allocator.free(app_diag_req);
+        try appendLspFrame(allocator, &turn_1, app_diag_req);
+    }
+
+    var out_1 = try executeSessionTranscript(allocator, &session, turn_1.items);
+    defer out_1.deinit(allocator);
+    for (out_1.frames) |frame| {
+        try std.testing.expect(std.mem.indexOf(u8, frame, "-32603") == null);
+    }
+
+    // Confirm `core/root.cx` and all 11 `stdlib/cx/*.cx` modules are mounted inside `session`:
+    const expected_mounted_std = [_][]const u8{
+        "core/root.cx",
+        "stdlib/cx/mod.cx",
+        "stdlib/cx/mem.cx",
+        "stdlib/cx/math.cx",
+        "stdlib/cx/col.cx",
+        "stdlib/cx/str.cx",
+        "stdlib/cx/io.cx",
+        "stdlib/cx/path.cx",
+        "stdlib/cx/time.cx",
+        "stdlib/cx/env.cx",
+        "stdlib/cx/fs.cx",
+        "stdlib/cx/process.cx",
+    };
+    for (expected_mounted_std) |std_rel_path| {
+        const std_fid = try session.vfs.resolveOrCreatePath(io, std_rel_path, .std_core);
+        try std.testing.expect(session.mounted_file_set.contains(std_fid.asInt()));
+    }
+
+    // Verify `semanticTokens/full` across all 6 `STD-02` modules + `src/app.cx` and clean `src/app.cx` diagnostics:
+    for (std02_sources, 0..) |mod_src, mod_i| {
+        var id_frag_buf: [24]u8 = undefined;
+        const id_frag = try std.fmt.bufPrint(&id_frag_buf, "\"id\":{d}", .{10 + mod_i});
+        const sem_frame = findFrameByIdFragment(out_1.frames, id_frag).?;
+        const sem_tokens = try extractJsonU32Array(allocator, sem_frame, "\"data\":[");
+        defer allocator.free(sem_tokens);
+        try PosHelper.verifyModuleSemanticTokens(sem_tokens, mod_src);
+    }
+    const app_sem_v1_frame = findFrameByIdFragment(out_1.frames, "\"id\":16").?;
+    const app_v1_res_id = try allocator.dupe(u8, extractResultIdSlice(app_sem_v1_frame).?);
+    defer allocator.free(app_v1_res_id);
+    {
+        const app_sem_tokens = try extractJsonU32Array(allocator, app_sem_v1_frame, "\"data\":[");
+        defer allocator.free(app_sem_tokens);
+        try PosHelper.verifyModuleSemanticTokens(app_sem_tokens, app_cx);
+    }
+    const app_diag_v1 = findFrameByIdFragment(out_1.frames, "\"id\":17").?;
+    try std.testing.expect(std.mem.indexOf(u8, app_diag_v1, "\"items\":[]") != null);
+
+    // [2] Verify `hover`, cross-module `definition` into `stdlib/cx/{io,path,fs,time,env,process}.cx`,
+    // `references`, and `prepareRename` + `rename` (`F2`) across local, param, field, variant, and fn:
+    const over_uninit_pos = PosHelper.locateOffset(app_cx, "OutBuf.over_uninit(", "OutBuf.".len + 2);
+    const buf_writer_ty_pos = PosHelper.locateOffset(app_cx, "BufWriter.over_uninit(", 2);
+    const path_buf_ty_pos = PosHelper.locateOffset(app_cx, "PathBuf.from(", 2);
+    const file_open_pos = PosHelper.locateOffset(app_cx, "File.open(target_buf", "File.".len + 1);
+    const instant_now_pos = PosHelper.locateOffset(app_cx, "Instant.now()", "Instant.".len + 1);
+    const env_get_var_pos = PosHelper.locateOffset(app_cx, "env.get_var(", "env.".len + 2);
+    const command_new_pos = PosHelper.locateOffset(app_cx, "Command.new(", "Command.".len + 1);
+
+    const local_ren_pos = PosHelper.locateOffset(app_cx, "let stage_bytes = ", "let ".len + 2);
+    const param_ren_pos = PosHelper.locateOffset(app_cx, "fn compute_budget(budget_ms: u64", "fn compute_budget(".len + 2);
+    const field_ren_pos = PosHelper.locateOffset(app_cx, "pub retry_limit: u32", "pub ".len + 2);
+    const variant_ren_pos = PosHelper.locateOffset(app_cx, "    DryRun,\n", "    ".len + 2);
+    const fn_ren_pos = PosHelper.locateOffset(app_cx, "fn compute_budget(", "fn ".len + 2);
+
+    var turn_2: std.ArrayListUnmanaged(u8) = .empty;
+    defer turn_2.deinit(allocator);
+
+    const hover_positions = [_]PosHelper.LineChar{
+        over_uninit_pos,
+        buf_writer_ty_pos,
+        path_buf_ty_pos,
+        file_open_pos,
+        instant_now_pos,
+        env_get_var_pos,
+        command_new_pos,
+    };
+    for (hover_positions, 0..) |h_pos, h_i| {
+        const req_json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"textDocument/hover\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}}}}}}",
+            .{ 20 + h_i, app_uri, h_pos.line, h_pos.character },
+        );
+        defer allocator.free(req_json);
+        try appendLspFrame(allocator, &turn_2, req_json);
+    }
+
+    const def_positions = [_]PosHelper.LineChar{
+        over_uninit_pos,
+        path_buf_ty_pos,
+        file_open_pos,
+        instant_now_pos,
+        env_get_var_pos,
+        command_new_pos,
+    };
+    for (def_positions, 0..) |d_pos, d_i| {
+        const req_json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"textDocument/definition\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}}}}}}",
+            .{ 30 + d_i, app_uri, d_pos.line, d_pos.character },
+        );
+        defer allocator.free(req_json);
+        try appendLspFrame(allocator, &turn_2, req_json);
+    }
+
+    const rename_specs = [_]struct {
+        pos: PosHelper.LineChar,
+        placeholder: []const u8,
+        new_name: []const u8,
+    }{
+        .{ .pos = local_ren_pos, .placeholder = "stage_bytes", .new_name = "staged_len" },
+        .{ .pos = param_ren_pos, .placeholder = "budget_ms", .new_name = "limit_ms" },
+        .{ .pos = field_ren_pos, .placeholder = "retry_limit", .new_name = "max_retries" },
+        .{ .pos = variant_ren_pos, .placeholder = "DryRun", .new_name = "PreviewOnly" },
+        .{ .pos = fn_ren_pos, .placeholder = "compute_budget", .new_name = "derive_budget" },
+    };
+    for (rename_specs, 0..) |r_spec, r_i| {
+        const refs_json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"textDocument/references\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}}," ++
+                "\"context\":{{\"includeDeclaration\":true}}}}}}",
+            .{ 40 + r_i, app_uri, r_spec.pos.line, r_spec.pos.character },
+        );
+        defer allocator.free(refs_json);
+        try appendLspFrame(allocator, &turn_2, refs_json);
+
+        const prep_json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"textDocument/prepareRename\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}}}}}}",
+            .{ 50 + r_i, app_uri, r_spec.pos.line, r_spec.pos.character },
+        );
+        defer allocator.free(prep_json);
+        try appendLspFrame(allocator, &turn_2, prep_json);
+
+        const ren_json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"textDocument/rename\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}}," ++
+                "\"newName\":\"{s}\"}}}}",
+            .{ 60 + r_i, app_uri, r_spec.pos.line, r_spec.pos.character, r_spec.new_name },
+        );
+        defer allocator.free(ren_json);
+        try appendLspFrame(allocator, &turn_2, ren_json);
+    }
+
+    var out_2 = try executeSessionTranscript(allocator, &session, turn_2.items);
+    defer out_2.deinit(allocator);
+    for (out_2.frames) |frame| {
+        try std.testing.expect(std.mem.indexOf(u8, frame, "-32603") == null);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "\"error\":") == null);
+    }
+
+    // Assert `hover` signatures, `/|` docstrings, and `DR-17` capability/contract footers:
+    const h_over_uninit = findFrameByIdFragment(out_2.frames, "\"id\":20").?;
+    try std.testing.expect(std.mem.indexOf(u8, h_over_uninit, "fn over_uninit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h_over_uninit, "memset") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h_over_uninit, "@no_alloc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h_over_uninit, "**caps:**") != null);
+
+    const h_buf_writer = findFrameByIdFragment(out_2.frames, "\"id\":21").?;
+    try std.testing.expect(std.mem.indexOf(u8, h_buf_writer, "@linear pub struct BufWriter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h_buf_writer, "buffered writer") != null);
+
+    const h_path_buf = findFrameByIdFragment(out_2.frames, "\"id\":22").?;
+    try std.testing.expect(std.mem.indexOf(u8, h_path_buf, "pub struct PathBuf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h_path_buf, "SSO") != null);
+
+    const h_file_open = findFrameByIdFragment(out_2.frames, "\"id\":23").?;
+    try std.testing.expect(std.mem.indexOf(u8, h_file_open, "fn open") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h_file_open, "read-only mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h_file_open, "**caps:**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h_file_open, "fs") != null);
+
+    const h_instant_now = findFrameByIdFragment(out_2.frames, "\"id\":24").?;
+    try std.testing.expect(std.mem.indexOf(u8, h_instant_now, "fn now() -> Instant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h_instant_now, "monotonic clock") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h_instant_now, "@no_alloc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h_instant_now, "clock") != null);
+
+    const h_env_get_var = findFrameByIdFragment(out_2.frames, "\"id\":25").?;
+    try std.testing.expect(std.mem.indexOf(u8, h_env_get_var, "fn get_var") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h_env_get_var, "environment variable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h_env_get_var, "env") != null);
+
+    const h_cmd_new = findFrameByIdFragment(out_2.frames, "\"id\":26").?;
+    try std.testing.expect(std.mem.indexOf(u8, h_cmd_new, "fn new") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h_cmd_new, "InvalidScriptExtension") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h_cmd_new, "**caps:**") != null);
+
+    // Assert `definition` jumps from `src/app.cx` directly into all 6 `stdlib/cx/{io,path,fs,time,env,process}.cx` URIs:
+    for (std02_uris, 0..) |expected_uri, d_i| {
+        var id_buf: [24]u8 = undefined;
+        const id_frag = try std.fmt.bufPrint(&id_buf, "\"id\":{d}", .{30 + d_i});
+        const def_frame = findFrameByIdFragment(out_2.frames, id_frag).?;
+        try std.testing.expect(std.mem.indexOf(u8, def_frame, expected_uri) != null);
+    }
+
+    // Assert `references` (`3` hits each), `prepareRename`, and `rename` (`3` edits each) across all 5 symbol kinds:
+    for (rename_specs, 0..) |r_spec, r_i| {
+        var ref_id_buf: [24]u8 = undefined;
+        const ref_frame = findFrameByIdFragment(
+            out_2.frames,
+            try std.fmt.bufPrint(&ref_id_buf, "\"id\":{d}", .{40 + r_i}),
+        ).?;
+        try std.testing.expectEqual(@as(usize, 3), PosHelper.countOccurrences(ref_frame, app_uri));
+
+        var prep_id_buf: [24]u8 = undefined;
+        const prep_frame = findFrameByIdFragment(
+            out_2.frames,
+            try std.fmt.bufPrint(&prep_id_buf, "\"id\":{d}", .{50 + r_i}),
+        ).?;
+        var ph_buf: [64]u8 = undefined;
+        const ph_needle = try std.fmt.bufPrint(&ph_buf, "\"placeholder\":\"{s}\"", .{r_spec.placeholder});
+        try std.testing.expect(std.mem.indexOf(u8, prep_frame, ph_needle) != null);
+
+        var ren_id_buf: [24]u8 = undefined;
+        const ren_frame = findFrameByIdFragment(
+            out_2.frames,
+            try std.fmt.bufPrint(&ren_id_buf, "\"id\":{d}", .{60 + r_i}),
+        ).?;
+        var new_text_buf: [64]u8 = undefined;
+        const new_text_needle = try std.fmt.bufPrint(&new_text_buf, "\"newText\":\"{s}\"", .{r_spec.new_name});
+        try std.testing.expectEqual(@as(usize, 3), PosHelper.countOccurrences(ren_frame, new_text_needle));
+    }
+
+    // [3] Incremental ranged `textDocument/didChange` break-and-restore resilience (mid-signature & mid-body):
+    const sig_del_needle = ": u64";
+    const sig_del_byte = std.mem.indexOf(u8, app_cx, "fn compute_budget(budget_ms: u64").? +
+        "fn compute_budget(budget_ms".len;
+    const sig_del_start = PosHelper.byteOffsetToLineChar(app_cx, sig_del_byte);
+    const sig_del_end = PosHelper.byteOffsetToLineChar(app_cx, sig_del_byte + sig_del_needle.len);
+
+    const body_del_needle = "slice_sink.written().len()";
+    const body_del_byte = std.mem.indexOf(u8, app_cx, body_del_needle).?;
+    const body_del_start = PosHelper.byteOffsetToLineChar(app_cx, body_del_byte);
+    const body_del_end = PosHelper.byteOffsetToLineChar(app_cx, body_del_byte + body_del_needle.len);
+
+    var turn_3: std.ArrayListUnmanaged(u8) = .empty;
+    defer turn_3.deinit(allocator);
+
+    // `v2`: Ranged deletion mid-signature (`fn compute_budget(budget_ms, /)`) + live queries:
+    const break_sig_frames = [_][]const u8{
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\",\"version\":2}}," ++
+                "\"contentChanges\":[{{\"range\":{{\"start\":{{\"line\":{d},\"character\":{d}}}," ++
+                "\"end\":{{\"line\":{d},\"character\":{d}}}}},\"text\":\"\"}}]}}}}",
+            .{ app_uri, sig_del_start.line, sig_del_start.character, sig_del_end.line, sig_del_end.character },
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"textDocument/diagnostic\"," ++
+                "\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+            .{app_uri},
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"textDocument/semanticTokens/full/delta\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"previousResultId\":\"{s}\"}}}}",
+            .{ app_uri, app_v1_res_id },
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":72,\"method\":\"textDocument/hover\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}}}}}}",
+            .{ app_uri, file_open_pos.line, file_open_pos.character },
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":73,\"method\":\"textDocument/definition\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}}}}}}",
+            .{ app_uri, file_open_pos.line, file_open_pos.character },
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":74,\"method\":\"textDocument/prepareRename\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}}}}}}",
+            .{ app_uri, local_ren_pos.line, local_ren_pos.character },
+        ),
+        // `v3`: Restore mid-signature `: u64` -> `0` diagnostics:
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\",\"version\":3}}," ++
+                "\"contentChanges\":[{{\"range\":{{\"start\":{{\"line\":{d},\"character\":{d}}}," ++
+                "\"end\":{{\"line\":{d},\"character\":{d}}}}},\"text\":\"{s}\"}}]}}}}",
+            .{
+                app_uri,
+                sig_del_start.line,
+                sig_del_start.character,
+                sig_del_start.line,
+                sig_del_start.character,
+                sig_del_needle,
+            },
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":75,\"method\":\"textDocument/diagnostic\"," ++
+                "\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+            .{app_uri},
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":76,\"method\":\"textDocument/semanticTokens/full\"," ++
+                "\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+            .{app_uri},
+        ),
+    };
+    defer for (break_sig_frames) |owned_f| allocator.free(owned_f);
+    for (break_sig_frames) |f_json| try appendLspFrame(allocator, &turn_3, f_json);
+
+    var out_3 = try executeSessionTranscript(allocator, &session, turn_3.items);
+    defer out_3.deinit(allocator);
+    for (out_3.frames) |frame| {
+        try std.testing.expect(std.mem.indexOf(u8, frame, "-32603") == null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, findFrameByIdFragment(out_3.frames, "\"id\":70").?, "\"items\":[{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, findFrameByIdFragment(out_3.frames, "\"id\":71").?, "\"result\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, findFrameByIdFragment(out_3.frames, "\"id\":72").?, "fn open") != null);
+    try std.testing.expect(std.mem.indexOf(u8, findFrameByIdFragment(out_3.frames, "\"id\":73").?, std02_uris[2]) != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(out_3.frames, "\"id\":74").?, "\"placeholder\":\"stage_bytes\"") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, findFrameByIdFragment(out_3.frames, "\"id\":75").?, "\"items\":[]") != null);
+
+    const app_v3_res_id = try allocator.dupe(
+        u8,
+        extractResultIdSlice(findFrameByIdFragment(out_3.frames, "\"id\":76").?).?,
+    );
+    defer allocator.free(app_v3_res_id);
+
+    // `v4`: Ranged deletion mid-body (`let stage_bytes: usize = ;`) + live queries + `v5` restore + shutdown:
+    var turn_4: std.ArrayListUnmanaged(u8) = .empty;
+    defer turn_4.deinit(allocator);
+    const break_body_frames = [_][]const u8{
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\",\"version\":4}}," ++
+                "\"contentChanges\":[{{\"range\":{{\"start\":{{\"line\":{d},\"character\":{d}}}," ++
+                "\"end\":{{\"line\":{d},\"character\":{d}}}}},\"text\":\"\"}}]}}}}",
+            .{ app_uri, body_del_start.line, body_del_start.character, body_del_end.line, body_del_end.character },
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"textDocument/diagnostic\"," ++
+                "\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+            .{app_uri},
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"textDocument/semanticTokens/full/delta\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"previousResultId\":\"{s}\"}}}}",
+            .{ app_uri, app_v3_res_id },
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":82,\"method\":\"textDocument/hover\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}}}}}}",
+            .{ app_uri, instant_now_pos.line, instant_now_pos.character },
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":83,\"method\":\"textDocument/definition\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}}}}}}",
+            .{ app_uri, command_new_pos.line, command_new_pos.character },
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":84,\"method\":\"textDocument/prepareRename\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":{d},\"character\":{d}}}}}}}",
+            .{ app_uri, fn_ren_pos.line, fn_ren_pos.character },
+        ),
+        // `v5`: Restore mid-body `slice_sink.written().len()` -> `0` diagnostics:
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\",\"version\":5}}," ++
+                "\"contentChanges\":[{{\"range\":{{\"start\":{{\"line\":{d},\"character\":{d}}}," ++
+                "\"end\":{{\"line\":{d},\"character\":{d}}}}},\"text\":\"{s}\"}}]}}}}",
+            .{
+                app_uri,
+                body_del_start.line,
+                body_del_start.character,
+                body_del_start.line,
+                body_del_start.character,
+                body_del_needle,
+            },
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":85,\"method\":\"textDocument/diagnostic\"," ++
+                "\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+            .{app_uri},
+        ),
+    };
+    defer for (break_body_frames) |owned_f| allocator.free(owned_f);
+    for (break_body_frames) |f_json| try appendLspFrame(allocator, &turn_4, f_json);
+    try appendLspFrame(allocator, &turn_4, "{\"jsonrpc\":\"2.0\",\"id\":86,\"method\":\"shutdown\",\"params\":null}");
+    try appendLspFrame(allocator, &turn_4, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}");
+
+    var out_4 = try executeSessionTranscript(allocator, &session, turn_4.items);
+    defer out_4.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), out_4.exit_code);
+    for (out_4.frames) |frame| {
+        try std.testing.expect(std.mem.indexOf(u8, frame, "-32603") == null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, findFrameByIdFragment(out_4.frames, "\"id\":80").?, "\"items\":[{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, findFrameByIdFragment(out_4.frames, "\"id\":81").?, "\"result\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, findFrameByIdFragment(out_4.frames, "\"id\":82").?, "fn now() -> Instant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, findFrameByIdFragment(out_4.frames, "\"id\":83").?, std02_uris[5]) != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, findFrameByIdFragment(out_4.frames, "\"id\":84").?, "\"placeholder\":\"compute_budget\"") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, findFrameByIdFragment(out_4.frames, "\"id\":85").?, "\"items\":[]") != null);
+}

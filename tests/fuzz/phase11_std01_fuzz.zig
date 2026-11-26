@@ -41,13 +41,19 @@ const CORE_MODULE_PATHS = [_][]const u8{
     "core/async.cx",
 };
 
-/// Canonical Phase 11.1 (`STD-01`) `stdlib/cx/` source file paths (`5` files).
+/// Canonical mounted `stdlib/cx/` source file paths (`11` files).
 const CX_STDLIB_PATHS = [_][]const u8{
     "stdlib/cx/mod.cx",
     "stdlib/cx/mem.cx",
     "stdlib/cx/math.cx",
     "stdlib/cx/col.cx",
     "stdlib/cx/str.cx",
+    "stdlib/cx/io.cx",
+    "stdlib/cx/path.cx",
+    "stdlib/cx/time.cx",
+    "stdlib/cx/env.cx",
+    "stdlib/cx/fs.cx",
+    "stdlib/cx/process.cx",
 };
 
 // -------------------------------------- INTERNALS --------------------------------------
@@ -106,7 +112,7 @@ fn mountStdCoreAndCxIntoDb(
     const cx_base = base_file_id + @as(u32, CORE_MODULE_PATHS.len);
     var cx_fids: [CX_STDLIB_PATHS.len]FileId = undefined;
     for (CX_STDLIB_PATHS, 0..) |cx_path, i| {
-        const raw_bytes = try std.Io.Dir.cwd().readFileAlloc(io, cx_path, allocator, .limited(2 * 1024 * 1024));
+        const raw_bytes = try std.Io.Dir.cwd().readFileAlloc(io, cx_path, allocator, .limited(4 * 1024 * 1024));
         defer allocator.free(raw_bytes);
         const norm_bytes = try normalizeLfAlloc(allocator, raw_bytes);
         defer allocator.free(norm_bytes);
@@ -125,6 +131,12 @@ fn mountStdCoreAndCxIntoDb(
     try db.bindExternalModule(cx_mod_fid, "math", cx_fids[2]);
     try db.bindExternalModule(cx_mod_fid, "col", cx_fids[3]);
     try db.bindExternalModule(cx_mod_fid, "str", cx_fids[4]);
+    try db.bindExternalModule(cx_mod_fid, "io", cx_fids[5]);
+    try db.bindExternalModule(cx_mod_fid, "path", cx_fids[6]);
+    try db.bindExternalModule(cx_mod_fid, "time", cx_fids[7]);
+    try db.bindExternalModule(cx_mod_fid, "env", cx_fids[8]);
+    try db.bindExternalModule(cx_mod_fid, "fs", cx_fids[9]);
+    try db.bindExternalModule(cx_mod_fid, "process", cx_fids[10]);
 }
 
 // ------------------------------------- PUBLIC API --------------------------------------

@@ -1317,9 +1317,10 @@ fn is_bytes_equal_at(hay_ptr: *u8, pos: usize, needle_ptr: *u8, needle_len: usiz
     while i < needle_len {
         if unsafe {
             hay_ptr.add(pos +% i).read()
-        } != unsafe {
-            needle_ptr.add(i).read()
-        } {
+        }
+            != unsafe {
+                needle_ptr.add(i).read()
+            } {
             return false;
         }
         i = i +% 1;
@@ -1363,14 +1364,15 @@ impl SimdStrOps {
             while mask != 0_u16 {
                 let lane = mask.trailing_zeros() as usize;
                 let cand: usize = pos +% lane;
-                if n_len <= 2 or is_bytes_equal_at(
-                    hay_ptr,
-                    cand +% 1,
-                    unsafe {
-                        ndl_ptr.add(1_usize)
-                    },
-                    n_len -% 2,
-                ) {
+                if n_len <= 2
+                    or is_bytes_equal_at(
+                        hay_ptr,
+                        cand +% 1,
+                        unsafe {
+                            ndl_ptr.add(1_usize)
+                        },
+                        n_len -% 2,
+                    ) {
                     return .Some(cand);
                 }
                 mask &= mask -% 1_u16;
@@ -1382,18 +1384,23 @@ impl SimdStrOps {
         while pos <= limit {
             if unsafe {
                 hay_ptr.add(pos).read()
-            } == first_b and unsafe {
-                hay_ptr.add(pos +% last_off).read()
-            } == last_b and (
-                n_len <= 2 or is_bytes_equal_at(
-                    hay_ptr,
-                    pos +% 1,
-                    unsafe {
-                        ndl_ptr.add(1_usize)
-                    },
-                    n_len -% 2,
-                )
-            ) {
+            }
+                == first_b
+                and unsafe {
+                    hay_ptr.add(pos +% last_off).read()
+                }
+                    == last_b
+                and (
+                    n_len <= 2
+                        or is_bytes_equal_at(
+                            hay_ptr,
+                            pos +% 1,
+                            unsafe {
+                                ndl_ptr.add(1_usize)
+                            },
+                            n_len -% 2,
+                        )
+                ) {
                 return .Some(pos);
             }
             pos = pos +% 1;
@@ -1426,18 +1433,23 @@ impl SwarStrOps {
         while pos <= limit {
             if unsafe {
                 hay_ptr.add(pos).read()
-            } == first_b and unsafe {
-                hay_ptr.add(pos +% last_off).read()
-            } == last_b and (
-                n_len <= 2 or is_bytes_equal_at(
-                    hay_ptr,
-                    pos +% 1,
-                    unsafe {
-                        ndl_ptr.add(1_usize)
-                    },
-                    n_len -% 2,
-                )
-            ) {
+            }
+                == first_b
+                and unsafe {
+                    hay_ptr.add(pos +% last_off).read()
+                }
+                    == last_b
+                and (
+                    n_len <= 2
+                        or is_bytes_equal_at(
+                            hay_ptr,
+                            pos +% 1,
+                            unsafe {
+                                ndl_ptr.add(1_usize)
+                            },
+                            n_len -% 2,
+                        )
+                ) {
                 return .Some(pos);
             }
             pos = pos +% 1;
@@ -1458,8 +1470,10 @@ fn validate_utf8_detailed_from(bytes: &[u8], var pos: usize, /) -> Utf8Error? {
                 unsafe {
                     ptr.add(pos)
                 },
-            ) & ASCII_HIGH_MASK_U64
-        ) == 0_u64 {
+            )
+                & ASCII_HIGH_MASK_U64
+        )
+            == 0_u64 {
             pos = pos +% 8;
         } else {
             break;
@@ -1472,13 +1486,16 @@ fn validate_utf8_detailed_from(bytes: &[u8], var pos: usize, /) -> Utf8Error? {
         };
         if b0 < 0x80_u8 {
             pos = pos +% 1;
-            while pos +% 8 <= len and (
-                read_u64_unaligned(
-                    unsafe {
-                        ptr.add(pos)
-                    },
-                ) & ASCII_HIGH_MASK_U64
-            ) == 0_u64 {
+            while pos +% 8 <= len
+                and (
+                    read_u64_unaligned(
+                        unsafe {
+                            ptr.add(pos)
+                        },
+                    )
+                        & ASCII_HIGH_MASK_U64
+                )
+                    == 0_u64 {
                 pos = pos +% 8;
             }
             continue;
@@ -1490,8 +1507,10 @@ fn validate_utf8_detailed_from(bytes: &[u8], var pos: usize, /) -> Utf8Error? {
             if (
                 unsafe {
                     ptr.add(pos +% 1).read()
-                } & 0xC0_u8
-            ) != 0x80_u8 {
+                }
+                    & 0xC0_u8
+            )
+                != 0x80_u8 {
                 return .Some(Utf8Error { valid_up_to: pos, error_len: .Some(1_u8) });
             }
             pos = pos +% 2;
@@ -1514,8 +1533,10 @@ fn validate_utf8_detailed_from(bytes: &[u8], var pos: usize, /) -> Utf8Error? {
             if (
                 unsafe {
                     ptr.add(pos +% 2).read()
-                } & 0xC0_u8
-            ) != 0x80_u8 {
+                }
+                    & 0xC0_u8
+            )
+                != 0x80_u8 {
                 return .Some(Utf8Error { valid_up_to: pos, error_len: .Some(2_u8) });
             }
             pos = pos +% 3;
@@ -1538,8 +1559,10 @@ fn validate_utf8_detailed_from(bytes: &[u8], var pos: usize, /) -> Utf8Error? {
             if (
                 unsafe {
                     ptr.add(pos +% 2).read()
-                } & 0xC0_u8
-            ) != 0x80_u8 {
+                }
+                    & 0xC0_u8
+            )
+                != 0x80_u8 {
                 return .Some(Utf8Error { valid_up_to: pos, error_len: .Some(2_u8) });
             }
             if pos +% 3 >= len {
@@ -1548,8 +1571,10 @@ fn validate_utf8_detailed_from(bytes: &[u8], var pos: usize, /) -> Utf8Error? {
             if (
                 unsafe {
                     ptr.add(pos +% 3).read()
-                } & 0xC0_u8
-            ) != 0x80_u8 {
+                }
+                    & 0xC0_u8
+            )
+                != 0x80_u8 {
                 return .Some(Utf8Error { valid_up_to: pos, error_len: .Some(3_u8) });
             }
             pos = pos +% 4;
@@ -1588,7 +1613,8 @@ impl SimdStrOps {
         while off < 4 and off < len {
             if unsafe {
                 ptr.add(off).read()
-            } < 0x80_u8 {
+            }
+                < 0x80_u8 {
                 off = off +% 1;
             } else {
                 break;
@@ -1641,11 +1667,13 @@ impl SimdStrOps {
         let rewind: usize = if prev_incomplete {
             if unsafe {
                 ptr.add(off -% 1).read()
-            } >= 0xC0_u8 {
+            }
+                >= 0xC0_u8 {
                 1
             } else if unsafe {
                 ptr.add(off -% 2).read()
-            } >= 0xE0_u8 {
+            }
+                >= 0xE0_u8 {
                 2
             } else {
                 3
@@ -1768,9 +1796,12 @@ fn eisel_lemire_subnormal_f64(prod_hi: u64, prod_lo: u64, msb: i32, biased_exp: 
     let x_guard: u64 = prod_hi >> sh_masked;
     let rem_mask: u64 = (1_u64 << sh_masked) -% 1_u64;
     let rem_hi: u64 = prod_hi & rem_mask;
-    if ((x_guard & 1_u64) == 1_u64 and rem_hi == 0_u64 and prod_lo <= 16_u64) or (
-        (x_guard & 1_u64) == 0_u64 and rem_hi == rem_mask and prod_lo >= (0xFFFF_FFFF_FFFF_FFF0_u64)
-    ) {
+    if ((x_guard & 1_u64) == 1_u64 and rem_hi == 0_u64 and prod_lo <= 16_u64)
+        or (
+            (x_guard & 1_u64) == 0_u64
+                and rem_hi == rem_mask
+                and prod_lo >= (0xFFFF_FFFF_FFFF_FFF0_u64)
+        ) {
         return .None;
     }
     let sticky: bool = rem_hi != 0_u64 or prod_lo > 16_u64;
@@ -1960,9 +1991,9 @@ pub(pkg) fn schubfach_to_decimal_f64(val: f64, /) -> (u64, i32) {
     let lsb: u64 = bin_sig & 1_u64;
 
     let cand: u64 = hi_scaled / 40_u64;
-    if cand >= 1_u64 and (lo_scaled +% lsb <= cand *% 40_u64) and (
-        cand *% 40_u64 +% lsb <= hi_scaled
-    ) {
+    if cand >= 1_u64
+        and (lo_scaled +% lsb <= cand *% 40_u64)
+        and (cand *% 40_u64 +% lsb <= hi_scaled) {
         var dec_sig: u64 = cand;
         var exp10: i32 = k +% 1;
         while dec_sig % 10_u64 == 0_u64 {
@@ -2017,9 +2048,9 @@ pub(pkg) fn schubfach_to_decimal_f32(val: f32, /) -> (u32, i32) {
     let lsb: u64 = bin_sig & 1_u64;
 
     let cand: u64 = hi_scaled / 40_u64;
-    if cand >= 1_u64 and (lo_scaled +% lsb <= cand *% 40_u64) and (
-        cand *% 40_u64 +% lsb <= hi_scaled
-    ) {
+    if cand >= 1_u64
+        and (lo_scaled +% lsb <= cand *% 40_u64)
+        and (cand *% 40_u64 +% lsb <= hi_scaled) {
         var dec_sig: u64 = cand;
         var exp10: i32 = k +% 1;
         while dec_sig % 10_u64 == 0_u64 {
@@ -2068,9 +2099,9 @@ pub(pkg) fn eisel_lemire_f64(mantissa: u64, exp10: i32, /) -> f64? {
     let (pow_hi, pow_lo) = pow10_sig128(exp10);
 
     var (prod_lo, prod_hi) = widening_mul_u64(norm_man, pow_hi);
-    if (prod_hi & 0x1FF_u64) == 0x1FF_u64 or (prod_hi & 0x1FF_u64) == 0_u64 or prod_lo >= (
-        0xFFFF_FFFF_FFFF_FFFF_u64 -% norm_man
-    ) {
+    if (prod_hi & 0x1FF_u64) == 0x1FF_u64
+        or (prod_hi & 0x1FF_u64) == 0_u64
+        or prod_lo >= (0xFFFF_FFFF_FFFF_FFFF_u64 -% norm_man) {
         let (_, second_hi) = widening_mul_u64(norm_man, pow_lo);
         let (next_lo, carry_out) = carrying_add_u64(prod_lo, second_hi, false);
         prod_lo = next_lo;
@@ -2097,9 +2128,8 @@ pub(pkg) fn eisel_lemire_f64(mantissa: u64, exp10: i32, /) -> f64? {
     let rem_mask: u64 = (1_u64 << sh) -% 1_u64;
     let rem_hi: u64 = prod_hi & rem_mask;
 
-    if ((x54 & 1_u64) == 1_u64 and rem_hi == 0_u64 and prod_lo <= 16_u64) or (
-        (x54 & 1_u64) == 0_u64 and rem_hi == rem_mask and prod_lo >= (0xFFFF_FFFF_FFFF_FFF0_u64)
-    ) {
+    if ((x54 & 1_u64) == 1_u64 and rem_hi == 0_u64 and prod_lo <= 16_u64)
+        or ((x54 & 1_u64) == 0_u64 and rem_hi == rem_mask and prod_lo >= (0xFFFF_FFFF_FFFF_FFF0_u64)) {
         return .None;
     }
     let sticky: bool = rem_hi != 0_u64 or prod_lo > 16_u64;
@@ -2132,9 +2162,9 @@ pub(pkg) fn eisel_lemire_f32(mantissa: u64, exp10: i32, /) -> f32? {
     let (pow_hi, pow_lo) = pow10_sig128(exp10);
 
     var (prod_lo, prod_hi) = widening_mul_u64(norm_man, pow_hi);
-    if (prod_hi & 0x3FFF_FFFF_u64) == 0x3FFF_FFFF_u64 or (prod_hi & 0x3FFF_FFFF_u64) == 0_u64 or prod_lo >= (
-        0xFFFF_FFFF_FFFF_FFFF_u64 -% norm_man
-    ) {
+    if (prod_hi & 0x3FFF_FFFF_u64) == 0x3FFF_FFFF_u64
+        or (prod_hi & 0x3FFF_FFFF_u64) == 0_u64
+        or prod_lo >= (0xFFFF_FFFF_FFFF_FFFF_u64 -% norm_man) {
         let (_, second_hi) = widening_mul_u64(norm_man, pow_lo);
         let (next_lo, carry_out) = carrying_add_u64(prod_lo, second_hi, false);
         prod_lo = next_lo;
@@ -2151,11 +2181,12 @@ pub(pkg) fn eisel_lemire_f32(mantissa: u64, exp10: i32, /) -> f32? {
         let x_guard: u64 = prod_hi >> sub_sh;
         let sub_mask: u64 = (1_u64 << sub_sh) -% 1_u64;
         let sub_rem: u64 = prod_hi & sub_mask;
-        if ((x_guard & 1_u64) == 1_u64 and sub_rem == 0_u64 and prod_lo <= 16_u64) or (
-            (x_guard & 1_u64) == 0_u64 and sub_rem == sub_mask and prod_lo >= (
-                0xFFFF_FFFF_FFFF_FFF0_u64
-            )
-        ) {
+        if ((x_guard & 1_u64) == 1_u64 and sub_rem == 0_u64 and prod_lo <= 16_u64)
+            or (
+                (x_guard & 1_u64) == 0_u64
+                    and sub_rem == sub_mask
+                    and prod_lo >= (0xFFFF_FFFF_FFFF_FFF0_u64)
+            ) {
             return .None;
         }
         let sub_sticky: bool = sub_rem != 0_u64 or prod_lo > 16_u64;
@@ -2174,9 +2205,8 @@ pub(pkg) fn eisel_lemire_f32(mantissa: u64, exp10: i32, /) -> f32? {
     let x25: u64 = prod_hi >> sh;
     let rem_mask: u64 = (1_u64 << sh) -% 1_u64;
     let rem_hi: u64 = prod_hi & rem_mask;
-    if ((x25 & 1_u64) == 1_u64 and rem_hi == 0_u64 and prod_lo <= 16_u64) or (
-        (x25 & 1_u64) == 0_u64 and rem_hi == rem_mask and prod_lo >= (0xFFFF_FFFF_FFFF_FFF0_u64)
-    ) {
+    if ((x25 & 1_u64) == 1_u64 and rem_hi == 0_u64 and prod_lo <= 16_u64)
+        or ((x25 & 1_u64) == 0_u64 and rem_hi == rem_mask and prod_lo >= (0xFFFF_FFFF_FFFF_FFF0_u64)) {
         return .None;
     }
     let sticky: bool = rem_hi != 0_u64 or prod_lo > 16_u64;
@@ -3011,9 +3041,8 @@ pub(pkg) fn grapheme_class(ch: char, /) -> u8 {
     }
     if codepoint >= 0x2_0000_u32 {
         if codepoint >= 0xE_0000_u32 and codepoint <= 0xE_0FFF_u32 {
-            if (codepoint >= 0xE_0020_u32 and codepoint <= 0xE_007F_u32) or (
-                codepoint >= 0xE_0100_u32 and codepoint <= 0xE_01EF_u32
-            ) {
+            if (codepoint >= 0xE_0020_u32 and codepoint <= 0xE_007F_u32)
+                or (codepoint >= 0xE_0100_u32 and codepoint <= 0xE_01EF_u32) {
                 return 5;
             }
             return 3;
@@ -3870,18 +3899,23 @@ impl str {
             pos = pos -% 1;
             if unsafe {
                 hay_ptr.add(pos).read()
-            } == first_b and unsafe {
-                hay_ptr.add(pos +% last_off).read()
-            } == last_b and (
-                n_len <= 2 or is_bytes_equal_at(
-                    hay_ptr,
-                    pos +% 1,
-                    unsafe {
-                        ndl_ptr.add(1_usize)
-                    },
-                    n_len -% 2,
-                )
-            ) {
+            }
+                == first_b
+                and unsafe {
+                    hay_ptr.add(pos +% last_off).read()
+                }
+                    == last_b
+                and (
+                    n_len <= 2
+                        or is_bytes_equal_at(
+                            hay_ptr,
+                            pos +% 1,
+                            unsafe {
+                                ndl_ptr.add(1_usize)
+                            },
+                            n_len -% 2,
+                        )
+                ) {
                 return .Some(pos);
             }
         }
@@ -3930,8 +3964,10 @@ impl str {
                     unsafe {
                         ptr.add(i)
                     },
-                ) & ASCII_HIGH_MASK_U64
-            ) != 0_u64 {
+                )
+                    & ASCII_HIGH_MASK_U64
+            )
+                != 0_u64 {
                 return false;
             }
             i = i +% 8;
@@ -3939,7 +3975,8 @@ impl str {
         while i < len {
             if unsafe {
                 ptr.add(i).read()
-            } >= 0x80_u8 {
+            }
+                >= 0x80_u8 {
                 return false;
             }
             i = i +% 1;
@@ -4633,9 +4670,9 @@ pub fn char_width(ch: char, /) -> i8 {
         }
         return if codepoint < 0x20_u32 or codepoint >= 0x7F_u32 => -1 else 1;
     }
-    if (codepoint >= 0x3400_u32 and codepoint <= 0x4DBF_u32) or (
-        codepoint >= 0x4E00_u32 and codepoint <= 0x9FFF_u32
-    ) or (codepoint >= 0xAC00_u32 and codepoint <= 0xD7A3_u32) {
+    if (codepoint >= 0x3400_u32 and codepoint <= 0x4DBF_u32)
+        or (codepoint >= 0x4E00_u32 and codepoint <= 0x9FFF_u32)
+        or (codepoint >= 0xAC00_u32 and codepoint <= 0xD7A3_u32) {
         return 2;
     }
     if codepoint >= 0x2_0000_u32 {
