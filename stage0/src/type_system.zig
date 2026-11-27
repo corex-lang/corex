@@ -18079,7 +18079,7 @@ pub const TypeChecker = struct {
             }
             if (!has_open_paren) continue;
             if (kind == .rparen or kind == .comma) break;
-            if (symbol_resolver.isIdentifierToken(kind) or kind == .kw_async) {
+            if (symbol_resolver.isIdentifierToken(kind) or symbol_resolver.isModuleSegmentExtraToken(kind)) {
                 if (count < out_tokens.len) {
                     out_tokens[count] = sub.token;
                     count += 1;
@@ -20924,7 +20924,7 @@ pub const TypeChecker = struct {
                 {
                     const kind = self.token_buffer.getToken(sub.token).kind;
                     if (symbol_resolver.isIdentifierToken(kind) or kind == .kw_self_type or
-                        kind == .prim_type or kind == .kw_async)
+                        symbol_resolver.isModuleSegmentExtraToken(kind))
                     {
                         try seg_tokens.append(self.allocator, sub.token);
                     }

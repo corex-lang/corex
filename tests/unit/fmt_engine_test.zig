@@ -723,7 +723,7 @@ test "test_fmt_dr22_type_canonicalization_multiline_strings_and_attributes" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         pass1.formatted_text,
-        "    let msg = \"\n    line one\n      line two\n    \";\n",
+        "    let msg = \"\n        line one\n          line two\n        \";\n",
     ) != null);
 
     try expectCanonicalFormat(pass1.formatted_text, pass1.formatted_text, .{});
@@ -912,7 +912,7 @@ test "test_fmt_dr24_horizontal_attr_packing_repr_link_inline_if_and_fmt_holes" {
 }
 
 test "test_fmt_multiline_string_spaces_only_blank_lines_dedent_and_line_budget_guard" {
-    // [1] Over-indented multiline string (`12`-space closing `"`) with a `2`-space blank middle line dedents to col `4` with `""`:
+    // [1] Over-indented multiline string (`12`-space closing `"`) with a `2`-space blank middle line dedents to `+4` (`col 8`) with `""`:
     const overindented_multiline_src =
         "pub fn build_banner() -> str {\n" ++
         "            let banner = \"\n" ++
@@ -927,11 +927,11 @@ test "test_fmt_multiline_string_spaces_only_blank_lines_dedent_and_line_budget_g
     const expected_multiline_src =
         "pub fn build_banner() -> str {\n" ++
         "    let banner = \"\n" ++
-        "    header line\n" ++
+        "        header line\n" ++
         "\n" ++
-        "      indented detail\n" ++
+        "          indented detail\n" ++
         "\n" ++
-        "    \";\n" ++
+        "        \";\n" ++
         "    return banner;\n" ++
         "}\n";
 

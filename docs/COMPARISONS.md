@@ -494,8 +494,8 @@ pub fn write_status(out: &mut Writer, hdr: FrameHeader?, node: str) -> unit!IoEr
     let seq_num = if hdr is .Some(active) => active.seq else 0_u64;
     out.print(
         f#"
-        {"node": "{node}", "state": "{state}", "seq": {seq_num}}
-        "#,
+            {"node": "{node}", "state": "{state}", "seq": {seq_num}}
+            "#,
     )
 }
 ```

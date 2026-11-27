@@ -10865,11 +10865,11 @@ fn emitFmtWriteOpC(
                 "                    if (({s}) != 0u) goto _fw_done_{d};\n" ++
                 "                }}\n",
             .{
-                tmp_id,     tmp_id,         tmp_id,  tmp_id,     tmp_id, tmp_id,
-                tmp_id,     tmp_id,         tmp_id,  tmp_id,     tmp_id, tmp_id,
-                u8_slice_c, tmp_id,         tmp_id,  tmp_id,     tmp_id, tmp_id,
-                dst_raw,    args[0],        args[0], chunk_pass_pfx, tmp_id,
-                tmp_id,     discr_expr,     tmp_id,
+                tmp_id,     tmp_id,  tmp_id,  tmp_id,         tmp_id, tmp_id,
+                tmp_id,     tmp_id,  tmp_id,  tmp_id,         tmp_id, tmp_id,
+                u8_slice_c, tmp_id,  tmp_id,  tmp_id,         tmp_id, tmp_id,
+                dst_raw,    args[0], args[0], chunk_pass_pfx, tmp_id, tmp_id,
+                discr_expr, tmp_id,
             },
         );
     }
@@ -11569,7 +11569,7 @@ fn emitStd01IntrinsicOpC(
             defer emitter.allocator.free(span_e.len_expr);
             try emitter.print(
                 "    if (({s}) < {d}u) _cx_rt_trap({d}u);\n",
-                .{ span_e.len_expr, n, @intFromEnum(mir.MirTrapReason.bounds_check) },
+                .{ span_e.len_expr, n, @backingInt(mir.MirTrapReason.bounds_check) },
             );
             if (kind == .from_le_bytes) {
                 try emitter.print("    memcpy(&_v_{d}, {s}, {d}u);\n", .{ dst_raw, span_e.ptr_expr, n });

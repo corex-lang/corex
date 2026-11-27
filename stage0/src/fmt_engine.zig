@@ -524,10 +524,7 @@ pub const DocRenderer = struct {
             }
         }
         var min_leading_spaces: usize = close_prefix.len;
-        const target_base: usize = if (close_prefix.len > entry.old_line_indent)
-            @as(usize, emitted_open_indent) + INDENT_SPACES
-        else
-            @as(usize, emitted_open_indent);
+        const target_base: usize = @as(usize, emitted_open_indent) + INDENT_SPACES;
         const target_close_spaces: usize = (target_base / INDENT_SPACES) * INDENT_SPACES;
 
         if (last_outer_lf) |final_lf_idx| {
@@ -10741,12 +10738,12 @@ test "test_format_dr22_canonical_rules_multiline_strings_and_idempotency" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         pass1.formatted_text,
-        "        let msg = \"\n        line one\n          line two\n        \";\n",
+        "        let msg = \"\n            line one\n              line two\n            \";\n",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         pass1.formatted_text,
-        "        let dedented = \"\n        alpha\n          beta\n        \";\n",
+        "        let dedented = \"\n            alpha\n              beta\n            \";\n",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "    fsm: match state {\n        0 => continue :fsm 1,\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, pass1.formatted_text, "fn render(body: @builder |&mut UiScope|) {\n") != null);

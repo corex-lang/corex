@@ -3581,6 +3581,7 @@ fn mountWorkspaceCoreStdlibLazy(
         );
         try session.db.registerCxStdlibPreludeRoot(cx_fid);
         _ = session.db.resolveSignatures(core_fid) catch {};
+        _ = session.db.resolveSignatures(cx_fid) catch {};
     } else |_| {
         try session.db.registerRootModule("cx", core_fid);
         _ = session.db.resolveSignatures(core_fid) catch {};
@@ -4126,6 +4127,83 @@ fn reloadManifestToolingLive(
     }
 }
 
+/// Classifies whether `norm_path` resides inside a mounted `core/` or `stdlib/cx/` directory (`PackageId.std_core`).
+fn classifyStdCorePath(
+    session: *const LspSession,
+    norm_path: []const u8,
+) struct { pkg_id: PackageId, is_core_kernel: bool } {
+    if (!session.db.cx_stdlib_root_fid.isNone()) {
+        const cx_vpath = session.vfs.getFilePath(session.db.cx_stdlib_root_fid);
+        if (std.fs.path.dirname(cx_vpath)) |cx_dir| {
+            if (cx_dir.len > 0 and std.mem.startsWith(u8, norm_path, cx_dir) and
+                norm_path.len > cx_dir.len and norm_path[cx_dir.len] == '/')
+            {
+                return .{ .pkg_id = .std_core, .is_core_kernel = false };
+            }
+        }
+    }
+    if (session.db.interner.lookup("core")) |core_sym| {
+        if (session.db.root_module_files.get(core_sym.asInt())) |core_fid| {
+            const core_vpath = session.vfs.getFilePath(core_fid);
+            if (std.fs.path.dirname(core_vpath)) |core_dir| {
+                if (core_dir.len > 0 and std.mem.startsWith(u8, norm_path, core_dir) and
+                    norm_path.len > core_dir.len and norm_path[core_dir.len] == '/')
+                {
+                    return .{ .pkg_id = .std_core, .is_core_kernel = true };
+                }
+            } else if (std.mem.eql(u8, core_vpath, "core/root.cx") and std.mem.startsWith(u8, norm_path, "core/")) {
+                return .{ .pkg_id = .std_core, .is_core_kernel = true };
+            }
+        }
+    }
+    if (session.options.is_internal_core) {
+        if (std.mem.indexOf(u8, norm_path, "/stdlib/cx/") != null or std.mem.startsWith(u8, norm_path, "stdlib/cx/")) {
+            return .{ .pkg_id = .std_core, .is_core_kernel = false };
+        }
+        if (std.mem.indexOf(u8, norm_path, "/core/") != null or std.mem.startsWith(u8, norm_path, "core/")) {
+            return .{ .pkg_id = .std_core, .is_core_kernel = true };
+        }
+    }
+    return .{ .pkg_id = .root, .is_core_kernel = false };
+}
+
+/// Reloads an unopened `core/root.cx` or `stdlib/cx/mod.cx` hub from disk so newly added `pub mod` items bind live.
+fn refreshUnopenedStdCoreHubFromDisk(
+    session: *LspSession,
+    arena_alloc: std.mem.Allocator,
+    hub_fid: FileId,
+) !void {
+    if (hub_fid.isNone() or session.isFileOpen(hub_fid)) return;
+    const hub_vpath = session.vfs.getFilePath(hub_fid);
+    if (hub_vpath.len == 0) return;
+    const disk_bytes = std.Io.Dir.cwd().readFileAlloc(
+        session.io,
+        hub_vpath,
+        arena_alloc,
+        .limited(vfs_sourcemap.MAX_SOURCE_FILE_BYTES),
+    ) catch return;
+    _ = session.vfs.setEditorOverlay(session.io, hub_vpath, disk_bytes, .std_core, false) catch return;
+    _ = session.vfs.getLineIndex(hub_fid) catch {};
+    const dur: Durability = if (session.options.is_internal_core) .medium else .high;
+    _ = try session.db.setInput(hub_fid, disk_bytes, dur);
+    var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer visited.deinit(session.allocator);
+    try mountExternalSubmodulesShallow(session, hub_fid, hub_vpath, dur, .std_core, &visited, 0);
+    _ = session.db.resolveSignatures(hub_fid) catch {};
+}
+
+/// Refreshes unopened `core/root.cx` and `stdlib/cx/mod.cx` hubs when a new `.std_core` module is opened.
+fn refreshStdCoreHubsIfNeeded(session: *LspSession, arena_alloc: std.mem.Allocator) !void {
+    if (session.db.interner.lookup("core")) |core_sym| {
+        if (session.db.root_module_files.get(core_sym.asInt())) |core_fid| {
+            try refreshUnopenedStdCoreHubFromDisk(session, arena_alloc, core_fid);
+        }
+    }
+    if (!session.db.cx_stdlib_root_fid.isNone()) {
+        try refreshUnopenedStdCoreHubFromDisk(session, arena_alloc, session.db.cx_stdlib_root_fid);
+    }
+}
+
 /// Resolves or mounts a document URI into `FileId`, returning `.none` if not found on disk or in VFS.
 fn resolveDocumentFileId(
     session: *LspSession,
@@ -4137,12 +4215,23 @@ fn resolveDocumentFileId(
     if (lookupMountedFileId(session, norm_path)) |existing_fid| {
         return existing_fid;
     }
-    if (session.vfs.resolveOrCreatePath(session.io, norm_path, .root)) |disk_fid| {
+    const std_cls = classifyStdCorePath(session, norm_path);
+    if (std_cls.pkg_id == .std_core) {
+        try refreshStdCoreHubsIfNeeded(session, arena_alloc);
+        if (lookupMountedFileId(session, norm_path)) |mounted_fid| {
+            return mounted_fid;
+        }
+    }
+    if (session.vfs.resolveOrCreatePath(session.io, norm_path, std_cls.pkg_id)) |disk_fid| {
         _ = session.vfs.getLineIndex(disk_fid) catch {};
+        if (std_cls.is_core_kernel) {
+            try session.db.symbol_table.markCoreKernelFile(disk_fid);
+        }
         if (std.mem.endsWith(u8, norm_path, ".cx")) {
             var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
             defer visited.deinit(session.allocator);
-            try mountExternalSubmodulesShallow(session, disk_fid, norm_path, .medium, .root, &visited, 0);
+            const dur: Durability = if (std_cls.pkg_id == .std_core and !session.options.is_internal_core) .high else .medium;
+            try mountExternalSubmodulesShallow(session, disk_fid, norm_path, dur, std_cls.pkg_id, &visited, 0);
         }
         return disk_fid;
     } else |_| {}
@@ -4170,16 +4259,31 @@ fn handleDidOpenNotification(
     const doc_version = td_obj.getIntField("version") orelse 0;
 
     const norm_path = try decodeFileUriToNormalizedPath(arena_alloc, raw_uri);
-    var pkg_id: PackageId = .root;
+    const std_cls = classifyStdCorePath(session, norm_path);
+    var pkg_id: PackageId = std_cls.pkg_id;
     var overlay_path: []const u8 = norm_path;
     if (lookupMountedFileId(session, norm_path)) |existing_fid| {
-        pkg_id = session.db.symbol_table.getFilePackageId(existing_fid);
+        const existing_pkg = session.db.symbol_table.getFilePackageId(existing_fid);
+        pkg_id = if (existing_pkg == .root and std_cls.pkg_id == .std_core) .std_core else existing_pkg;
         const existing_vpath = session.vfs.getFilePath(existing_fid);
         if (existing_vpath.len > 0) overlay_path = existing_vpath;
+    } else if (std_cls.pkg_id == .std_core) {
+        try refreshStdCoreHubsIfNeeded(session, arena_alloc);
+        if (lookupMountedFileId(session, norm_path)) |mounted_fid| {
+            pkg_id = session.db.symbol_table.getFilePackageId(mounted_fid);
+            const mounted_vpath = session.vfs.getFilePath(mounted_fid);
+            if (mounted_vpath.len > 0) overlay_path = mounted_vpath;
+        }
     }
 
     const fid = session.vfs.setEditorOverlay(session.io, overlay_path, doc_text, pkg_id, true) catch return;
     _ = session.vfs.getLineIndex(fid) catch {};
+    if (pkg_id == .std_core) {
+        try session.db.setFilePackageId(fid, .std_core);
+        if (std_cls.is_core_kernel) {
+            try session.db.symbol_table.markCoreKernelFile(fid);
+        }
+    }
     try session.recordClientUri(fid, raw_uri);
     try session.open_doc_versions.put(session.allocator, fid.asInt(), doc_version);
 
@@ -4534,10 +4638,12 @@ fn handleDidChangeWatchedFilesNotification(
                 arena_alloc,
                 .limited(vfs_sourcemap.MAX_SOURCE_FILE_BYTES),
             )) |disk_bytes| {
-                var pkg_id: PackageId = .root;
+                const std_cls = classifyStdCorePath(session, norm_path);
+                var pkg_id: PackageId = std_cls.pkg_id;
                 var overlay_path: []const u8 = norm_path;
                 if (existing_fid_opt) |existing_fid| {
-                    pkg_id = session.db.symbol_table.getFilePackageId(existing_fid);
+                    const existing_pkg = session.db.symbol_table.getFilePackageId(existing_fid);
+                    pkg_id = if (existing_pkg == .root and std_cls.pkg_id == .std_core) .std_core else existing_pkg;
                     const existing_vpath = session.vfs.getFilePath(existing_fid);
                     if (existing_vpath.len > 0) overlay_path = existing_vpath;
                 }
@@ -4549,9 +4655,18 @@ fn handleDidChangeWatchedFilesNotification(
                     false,
                 );
                 _ = session.vfs.getLineIndex(fid) catch {};
+                if (pkg_id == .std_core) {
+                    try session.db.setFilePackageId(fid, .std_core);
+                    if (std_cls.is_core_kernel) {
+                        try session.db.symbol_table.markCoreKernelFile(fid);
+                    }
+                }
                 try session.recordMountedFile(fid);
-                const dur: Durability = if (pkg_id == .root) .medium else .high;
+                const dur: Durability = if (pkg_id == .root or session.options.is_internal_core) .medium else .high;
                 _ = try session.db.setInput(fid, disk_bytes, dur);
+                var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+                defer visited.deinit(session.allocator);
+                try mountExternalSubmodulesShallow(session, fid, overlay_path, dur, pkg_id, &visited, 0);
             } else |_| {}
         }
     }
@@ -5228,13 +5343,32 @@ fn appendFmtSegmentSemanticSpans(
     depth: u8,
 ) anyerror!void {
     if (seg_start >= seg_end) return;
+    var body_start: u32 = seg_start;
+    if (@as(usize, body_start) + 1 < src.len and src[body_start] == 'f' and
+        (src[body_start + 1] == '"' or src[body_start + 1] == '#'))
+    {
+        try appendSplitSemanticSpan(
+            arena_alloc,
+            src,
+            line_idx,
+            session.position_encoding,
+            body_start,
+            body_start + 1,
+            SEM_TOK_OPERATOR,
+            0,
+            range_filter,
+            out_tokens,
+        );
+        body_start += 1;
+    }
+    if (body_start >= seg_end) return;
     if (sorted_holes.len == 0 or depth >= 16) {
         try appendSplitSemanticSpan(
             arena_alloc,
             src,
             line_idx,
             session.position_encoding,
-            seg_start,
+            body_start,
             seg_end,
             SEM_TOK_STRING,
             0,
@@ -5244,7 +5378,7 @@ fn appendFmtSegmentSemanticSpans(
         return;
     }
 
-    var str_seg_start: u32 = seg_start;
+    var str_seg_start: u32 = body_start;
     for (sorted_holes) |hole| {
         const raw_open = fmt_tok_base +| hole.rel_brace_open_byte;
         const raw_close = fmt_tok_base +| hole.rel_brace_close_byte;
@@ -5491,6 +5625,469 @@ fn appendFmtStringSemanticSpans(
     );
 }
 
+/// Recursively binds module and target symbols inside `.use_tree` CST nodes so `use` paths highlight accurately.
+fn populateUseTreeSemanticTokens(
+    session: *LspSession,
+    file_id: FileId,
+    src: []const u8,
+    parsed_art: *const query_db.ParsedCstArtifact,
+    tree_cst: CstNodeIndex,
+    mod_scope: ScopeId,
+    current_scope: ScopeId,
+    is_default_lib_chain: bool,
+    tok_symbols: []SymbolIndex,
+    tok_ns_tier: []u8,
+) !void {
+    const cst_total = parsed_art.cst_arena.countNodes();
+    if (tree_cst.isNone() or tree_cst.asInt() >= cst_total) return;
+    const start_idx: usize = tree_cst.asInt();
+    const tree_rec = parsed_art.cst_arena.getNode(tree_cst);
+    const end_idx = @min(start_idx + @max(@as(usize, tree_rec.subtree_size), 1), cst_total);
+    const tok_count = parsed_art.token_buffer.countTokens();
+
+    var segments: [32]TokenIndex = undefined;
+    var seg_count: usize = 0;
+    var has_seen_as = false;
+    var alias_tok: TokenIndex = .none;
+    var has_nested = false;
+    var is_glob = false;
+
+    var cur: usize = start_idx + 1;
+    while (cur < end_idx) {
+        const sub_id = CstNodeIndex.fromInt(@intCast(cur));
+        const sub = parsed_art.cst_arena.getNode(sub_id);
+        if (sub.kind == .use_tree) {
+            has_nested = true;
+            cur += @max(@as(usize, sub.subtree_size), 1);
+            continue;
+        }
+        const is_leaf = sub.subtree_size <= 1 and !sub.flags.is_bracketed;
+        if (is_leaf and !sub.flags.is_missing_or_injected and
+            !sub.token.isNone() and sub.token.asInt() < tok_count)
+        {
+            const t_kind = parsed_art.token_buffer.getToken(sub.token).kind;
+            if (t_kind == .star) {
+                is_glob = true;
+            } else if (t_kind == .kw_as) {
+                has_seen_as = true;
+            } else if (has_seen_as and (symbol_resolver.isIdentifierToken(t_kind) or t_kind == .underscore)) {
+                alias_tok = sub.token;
+            } else if (!has_seen_as and t_kind != .string_lit and t_kind != .byte_string_lit and
+                isIdentifierOrKeywordToken(t_kind))
+            {
+                if (seg_count < segments.len) {
+                    segments[seg_count] = sub.token;
+                    seg_count += 1;
+                }
+            }
+        }
+        cur += 1;
+    }
+
+    var walk_scope = current_scope;
+    var walk_def_lib = is_default_lib_chain;
+    var last_resolved_sym: SymbolIndex = .none;
+
+    for (segments[0..seg_count], 0..) |seg_tok, seg_idx| {
+        const tok_raw = seg_tok.asInt();
+        const seg_lex = symbol_resolver.extractTokenSlice(src, &parsed_art.token_buffer, seg_tok);
+        const is_prefix_seg = (seg_idx + 1 < seg_count) or has_nested or is_glob;
+        const is_root_pos = (seg_idx == 0 and current_scope == mod_scope);
+        last_resolved_sym = .none;
+
+        if (is_root_pos and (std.mem.eql(u8, seg_lex, "cx") or std.mem.eql(u8, seg_lex, "core"))) {
+            walk_def_lib = true;
+            tok_ns_tier[tok_raw] = 2;
+            if (std.mem.eql(u8, seg_lex, "core")) {
+                if (session.db.interner.lookup("core")) |core_id| {
+                    walk_scope = session.db.symbol_table.named_module_scopes.get(core_id.asInt()) orelse
+                        try session.db.symbol_table.ensureCxRootScope(&session.db.interner);
+                } else {
+                    walk_scope = try session.db.symbol_table.ensureCxRootScope(&session.db.interner);
+                }
+            } else {
+                walk_scope = try session.db.symbol_table.ensureCxRootScope(&session.db.interner);
+            }
+            continue;
+        } else if (is_root_pos and std.mem.eql(u8, seg_lex, "pkg")) {
+            tok_ns_tier[tok_raw] = 1;
+            walk_scope = session.db.symbol_table.resolveCallerPackageRootScope(file_id, mod_scope);
+            continue;
+        } else if (is_root_pos and std.mem.eql(u8, seg_lex, "super")) {
+            const mod_rec = session.db.symbol_table.scope_arena.getScope(mod_scope);
+            walk_scope = if (!mod_rec.parent_module.isNone()) mod_rec.parent_module else mod_rec.parent;
+            continue;
+        } else if (std.mem.eql(u8, seg_lex, "self")) {
+            continue;
+        }
+
+        const found_sym: SymbolIndex = if (session.db.interner.lookup(seg_lex)) |seg_id| blk_sym: {
+            if (is_root_pos) {
+                switch (session.db.symbol_table.lookupLexical(walk_scope, seg_id, NamespaceMask.ALL)) {
+                    .found => |s_idx| break :blk_sym s_idx,
+                    else => {
+                        if (session.db.symbol_table.lookupExternalPackageScope(file_id, seg_id)) |ext_sc| {
+                            tok_ns_tier[tok_raw] = 1;
+                            walk_scope = ext_sc;
+                            continue;
+                        }
+                        break :blk_sym .none;
+                    },
+                }
+            } else if (!walk_scope.isNone()) {
+                break :blk_sym session.db.symbol_table.lookupInScopeDirect(walk_scope, seg_id, NamespaceMask.ALL);
+            } else {
+                break :blk_sym .none;
+            }
+        } else .none;
+
+        if (!found_sym.isNone()) {
+            last_resolved_sym = found_sym;
+            const unwrapped = session.db.symbol_table.unwrapAliasSymbolIdx(found_sym);
+            const target_sym = session.db.symbol_table.getSymbol(unwrapped).*;
+            tok_symbols[tok_raw] = unwrapped;
+            if (target_sym.kind == .module_sym) {
+                if (target_sym.flags.is_builtin or
+                    session.db.symbol_table.getFilePackageId(target_sym.decl_span.file_id) == .std_core)
+                {
+                    walk_def_lib = true;
+                }
+            }
+            walk_scope = target_sym.target_scope;
+        } else {
+            walk_scope = .none;
+            if (is_prefix_seg and parsed_art.token_buffer.getToken(seg_tok).kind != .type_ident) {
+                tok_ns_tier[tok_raw] = if (walk_def_lib) 2 else 1;
+            }
+        }
+    }
+
+    if (!alias_tok.isNone() and alias_tok.asInt() < tok_count and
+        parsed_art.token_buffer.getToken(alias_tok).kind != .underscore)
+    {
+        if (!last_resolved_sym.isNone()) {
+            tok_symbols[alias_tok.asInt()] = session.db.symbol_table.unwrapAliasSymbolIdx(last_resolved_sym);
+        } else if (seg_count == 0) {
+            // Inline `use "<spec>" as alias;` binds a package module alias:
+            tok_ns_tier[alias_tok.asInt()] = 1;
+        }
+    }
+
+    if (has_nested) {
+        cur = start_idx + 1;
+        while (cur < end_idx) {
+            const sub_id = CstNodeIndex.fromInt(@intCast(cur));
+            const sub = parsed_art.cst_arena.getNode(sub_id);
+            if (sub.kind == .use_tree) {
+                try populateUseTreeSemanticTokens(
+                    session,
+                    file_id,
+                    src,
+                    parsed_art,
+                    sub_id,
+                    mod_scope,
+                    walk_scope,
+                    walk_def_lib,
+                    tok_symbols,
+                    tok_ns_tier,
+                );
+                cur += @max(@as(usize, sub.subtree_size), 1);
+            } else {
+                cur += 1;
+            }
+        }
+    }
+}
+
+/// Populates module and target semantic tokens across `.mod_item`, `.use_tree`, and qualified `mod.sub.Item` chains.
+fn populateModuleUseAndPathSemanticTokens(
+    session: *LspSession,
+    file_id: FileId,
+    src: []const u8,
+    parsed_art: *const query_db.ParsedCstArtifact,
+    tok_symbols: []SymbolIndex,
+    tok_is_decl: []bool,
+    tok_ns_tier: []u8,
+) !void {
+    const mod_scope = session.db.symbol_table.file_module_scopes.get(file_id.asInt()) orelse .none;
+    const is_std_file = session.db.symbol_table.getFilePackageId(file_id) == .std_core;
+    const cst_total = parsed_art.cst_arena.countNodes();
+    const tok_count = parsed_art.token_buffer.countTokens();
+
+    // [1] Annotate `.mod_item` declaration names and top-level `.use_item` -> `.use_tree` subtrees:
+    var cst_idx: usize = 0;
+    while (cst_idx < cst_total) {
+        const node_id = CstNodeIndex.fromInt(@intCast(cst_idx));
+        const node_rec = parsed_art.cst_arena.getNode(node_id);
+        if (node_rec.kind == .mod_item) {
+            const sub_end = @min(cst_idx + @max(@as(usize, node_rec.subtree_size), 1), cst_total);
+            var saw_mod_kw = false;
+            var leaf_i = cst_idx + 1;
+            while (leaf_i < sub_end) : (leaf_i += 1) {
+                const sub = parsed_art.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(leaf_i)));
+                if (sub.kind == .attribute and sub.subtree_size > 1) {
+                    leaf_i += @as(usize, sub.subtree_size) - 1;
+                    continue;
+                }
+                if (sub.subtree_size <= 1 and !sub.flags.is_bracketed and
+                    !sub.flags.is_missing_or_injected and !sub.token.isNone() and sub.token.asInt() < tok_count)
+                {
+                    const l_kind = parsed_art.token_buffer.getToken(sub.token).kind;
+                    if (l_kind == .kw_mod) {
+                        saw_mod_kw = true;
+                    } else if (saw_mod_kw and isIdentifierOrKeywordToken(l_kind)) {
+                        tok_ns_tier[sub.token.asInt()] = if (is_std_file) 2 else 1;
+                        tok_is_decl[sub.token.asInt()] = true;
+                        break;
+                    } else if (l_kind == .lbrace or l_kind == .semi) {
+                        break;
+                    }
+                }
+            }
+            cst_idx += 1;
+            continue;
+        }
+        if (node_rec.kind == .use_item and !mod_scope.isNone()) {
+            const use_end = @min(cst_idx + @max(@as(usize, node_rec.subtree_size), 1), cst_total);
+            var sub_cur = cst_idx + 1;
+            while (sub_cur < use_end) {
+                const sub_id = CstNodeIndex.fromInt(@intCast(sub_cur));
+                const sub_rec = parsed_art.cst_arena.getNode(sub_id);
+                if (sub_rec.kind == .use_tree) {
+                    try populateUseTreeSemanticTokens(
+                        session,
+                        file_id,
+                        src,
+                        parsed_art,
+                        sub_id,
+                        mod_scope,
+                        mod_scope,
+                        false,
+                        tok_symbols,
+                        tok_ns_tier,
+                    );
+                    sub_cur += @max(@as(usize, sub_rec.subtree_size), 1);
+                } else {
+                    sub_cur += 1;
+                }
+            }
+            cst_idx = use_end;
+            continue;
+        }
+        cst_idx += 1;
+    }
+
+    if (mod_scope.isNone()) return;
+
+    // [2] Linear O(N) dotted module-prefix chain walk (`sys.windows.Win32FindDataW`, `cx.str.from_utf8`):
+    var chain_scope: ScopeId = .none;
+    var tok_i: usize = 0;
+    while (tok_i < tok_count) : (tok_i += 1) {
+        const tok_id = TokenIndex.fromInt(@intCast(tok_i));
+        const tok_rec = parsed_art.token_buffer.getToken(tok_id);
+        if (tok_rec.flags.is_synthesized) continue;
+
+        if (tok_rec.kind == .dot) continue;
+
+        const prev_is_dot = tok_i > 0 and
+            parsed_art.token_buffer.getToken(TokenIndex.fromInt(@intCast(tok_i - 1))).kind == .dot;
+        const next_is_dot = tok_i + 1 < tok_count and
+            parsed_art.token_buffer.getToken(TokenIndex.fromInt(@intCast(tok_i + 1))).kind == .dot;
+
+        if (!prev_is_dot) {
+            chain_scope = .none;
+            if (!next_is_dot or !isIdentifierOrKeywordToken(tok_rec.kind)) continue;
+            const seg_lex = symbol_resolver.extractTokenSlice(src, &parsed_art.token_buffer, tok_id);
+            if (std.mem.eql(u8, seg_lex, "cx") or std.mem.eql(u8, seg_lex, "core")) {
+                tok_ns_tier[tok_i] = 2;
+                if (std.mem.eql(u8, seg_lex, "core")) {
+                    if (session.db.interner.lookup("core")) |core_id| {
+                        chain_scope = session.db.symbol_table.named_module_scopes.get(core_id.asInt()) orelse
+                            try session.db.symbol_table.ensureCxRootScope(&session.db.interner);
+                    } else {
+                        chain_scope = try session.db.symbol_table.ensureCxRootScope(&session.db.interner);
+                    }
+                } else {
+                    chain_scope = try session.db.symbol_table.ensureCxRootScope(&session.db.interner);
+                }
+                continue;
+            } else if (std.mem.eql(u8, seg_lex, "pkg")) {
+                tok_ns_tier[tok_i] = 1;
+                chain_scope = session.db.symbol_table.resolveCallerPackageRootScope(file_id, mod_scope);
+                continue;
+            } else if (std.mem.eql(u8, seg_lex, "super")) {
+                const mod_rec = session.db.symbol_table.scope_arena.getScope(mod_scope);
+                chain_scope = if (!mod_rec.parent_module.isNone()) mod_rec.parent_module else mod_rec.parent;
+                continue;
+            }
+
+            if (!tok_symbols[tok_i].isNone()) {
+                const unwrapped = session.db.symbol_table.unwrapAliasSymbolIdx(tok_symbols[tok_i]);
+                const sym = session.db.symbol_table.getSymbol(unwrapped).*;
+                if (sym.kind == .module_sym) {
+                    chain_scope = sym.target_scope;
+                }
+                continue;
+            }
+
+            if (session.db.interner.lookup(seg_lex)) |name_id| {
+                switch (session.db.symbol_table.lookupLexical(mod_scope, name_id, NamespaceMask.VALUE_ONLY)) {
+                    .found => |found_idx| {
+                        const unwrapped = session.db.symbol_table.unwrapAliasSymbolIdx(found_idx);
+                        const sym = session.db.symbol_table.getSymbol(unwrapped).*;
+                        if (sym.kind == .module_sym) {
+                            tok_symbols[tok_i] = unwrapped;
+                            chain_scope = sym.target_scope;
+                        }
+                    },
+                    else => {
+                        if (session.db.symbol_table.lookupExternalPackageScope(file_id, name_id)) |ext_sc| {
+                            tok_ns_tier[tok_i] = 1;
+                            chain_scope = ext_sc;
+                        }
+                    },
+                }
+            }
+            continue;
+        }
+
+        if (!chain_scope.isNone() and isIdentifierOrKeywordToken(tok_rec.kind)) {
+            const seg_lex = symbol_resolver.extractTokenSlice(src, &parsed_art.token_buffer, tok_id);
+            if (session.db.interner.lookup(seg_lex)) |seg_id| {
+                const seg_sym = session.db.symbol_table.lookupInScopeDirect(chain_scope, seg_id, NamespaceMask.ALL);
+                if (!seg_sym.isNone()) {
+                    const unwrapped = session.db.symbol_table.unwrapAliasSymbolIdx(seg_sym);
+                    if (tok_symbols[tok_i].isNone()) {
+                        tok_symbols[tok_i] = unwrapped;
+                    }
+                    const target_rec = session.db.symbol_table.getSymbol(unwrapped).*;
+                    chain_scope = if (target_rec.kind == .module_sym and next_is_dot)
+                        target_rec.target_scope
+                    else
+                        .none;
+                    continue;
+                }
+            }
+        }
+        chain_scope = .none;
+    }
+}
+
+/// Emits cohesive `SEM_TOK_ENUM_MEMBER` (`SEM_MOD_ATTRIBUTE`) spans across `@expect(…)` / `@allow(…)` rule selectors.
+fn appendLintAttrSelectorSemanticSpans(
+    arena_alloc: std.mem.Allocator,
+    src: []const u8,
+    line_idx: *const LineIndex,
+    encoding: PositionEncoding,
+    parsed_art: *const query_db.ParsedCstArtifact,
+    range_opt: ?LspRange,
+    tok_skip: []bool,
+    out_tokens: *std.ArrayListUnmanaged(RawSemanticToken),
+) !void {
+    const cst_total = parsed_art.cst_arena.countNodes();
+    const tok_count = parsed_art.token_buffer.countTokens();
+    var idx: usize = 0;
+    while (idx < cst_total) {
+        const node_id = CstNodeIndex.fromInt(@intCast(idx));
+        const node_rec = parsed_art.cst_arena.getNode(node_id);
+        if (node_rec.kind != .attribute) {
+            idx += 1;
+            continue;
+        }
+        const sub_end = @min(cst_total, idx + @max(@as(usize, node_rec.subtree_size), 1));
+        var attr_name: []const u8 = "";
+        var lparen_tok: TokenIndex = .none;
+        var rparen_tok: TokenIndex = .none;
+        var paren_depth: u32 = 0;
+
+        var cur = idx + 1;
+        while (cur < sub_end) : (cur += 1) {
+            const leaf = parsed_art.cst_arena.getNode(CstNodeIndex.fromInt(@intCast(cur)));
+            if (leaf.subtree_size > 1 or leaf.token.isNone() or leaf.token.asInt() >= tok_count) continue;
+            const t_rec = parsed_art.token_buffer.getToken(leaf.token);
+            if (t_rec.flags.is_synthesized) continue;
+            if (t_rec.kind == .at and attr_name.len == 0) continue;
+            if (attr_name.len == 0 and isIdentifierOrKeywordToken(t_rec.kind)) {
+                attr_name = symbol_resolver.extractTokenSlice(src, &parsed_art.token_buffer, leaf.token);
+                continue;
+            }
+            if (t_rec.kind == .lparen) {
+                if (paren_depth == 0) lparen_tok = leaf.token;
+                paren_depth += 1;
+            } else if (t_rec.kind == .rparen and paren_depth > 0) {
+                paren_depth -= 1;
+                if (paren_depth == 0) {
+                    rparen_tok = leaf.token;
+                    break;
+                }
+            }
+        }
+
+        if ((std.mem.eql(u8, attr_name, "expect") or std.mem.eql(u8, attr_name, "allow")) and
+            !lparen_tok.isNone())
+        {
+            const start_tok_raw: usize = lparen_tok.asInt() + 1;
+            const end_tok_raw: usize = if (!rparen_tok.isNone()) rparen_tok.asInt() else tok_count;
+            var t_cur: usize = start_tok_raw;
+            while (t_cur < end_tok_raw) {
+                const t_id = TokenIndex.fromInt(@intCast(t_cur));
+                const t_rec = parsed_art.token_buffer.getToken(t_id);
+                if (t_rec.flags.is_synthesized or t_rec.kind == .comma) {
+                    t_cur += 1;
+                    continue;
+                }
+                // Stop or skip `<kw_arg>: <expr>` (such as `reason: "…"`):
+                if (t_cur + 1 < end_tok_raw and
+                    parsed_art.token_buffer.getToken(TokenIndex.fromInt(@intCast(t_cur + 1))).kind == .colon)
+                {
+                    t_cur += 2;
+                    while (t_cur < end_tok_raw and
+                        parsed_art.token_buffer.getToken(TokenIndex.fromInt(@intCast(t_cur))).kind != .comma) : (t_cur += 1)
+                    {}
+                    continue;
+                }
+                if (isIdentifierOrKeywordToken(t_rec.kind)) {
+                    const sel_start = t_rec.byte_offset;
+                    var sel_end = t_rec.byte_offset +| t_rec.byte_len;
+                    tok_skip[t_cur] = true;
+                    t_cur += 1;
+                    while (t_cur + 1 < end_tok_raw) {
+                        const dash_rec = parsed_art.token_buffer.getToken(TokenIndex.fromInt(@intCast(t_cur)));
+                        const word_rec = parsed_art.token_buffer.getToken(TokenIndex.fromInt(@intCast(t_cur + 1)));
+                        if (dash_rec.kind == .minus and
+                            dash_rec.byte_offset == sel_end and
+                            isIdentifierOrKeywordToken(word_rec.kind) and
+                            word_rec.byte_offset == dash_rec.byte_offset +| dash_rec.byte_len)
+                        {
+                            tok_skip[t_cur] = true;
+                            tok_skip[t_cur + 1] = true;
+                            sel_end = word_rec.byte_offset +| word_rec.byte_len;
+                            t_cur += 2;
+                        } else {
+                            break;
+                        }
+                    }
+                    try appendSplitSemanticSpan(
+                        arena_alloc,
+                        src,
+                        line_idx,
+                        encoding,
+                        sel_start,
+                        sel_end,
+                        SEM_TOK_ENUM_MEMBER,
+                        SEM_MOD_ATTRIBUTE,
+                        range_opt,
+                        out_tokens,
+                    );
+                    continue;
+                }
+                t_cur += 1;
+            }
+        }
+        idx = sub_end;
+    }
+}
+
 /// Computes the 5-`u32`-per-token delta-encoded semantic token stream for `file_id` (optionally clipped to `range_opt`).
 fn computeSemanticTokensData(
     session: *LspSession,
@@ -5517,6 +6114,10 @@ fn computeSemanticTokensData(
     @memset(tok_is_decl, false);
     var tok_variant_tier = try arena_alloc.alloc(u8, tok_count);
     @memset(tok_variant_tier, 0);
+    const tok_ns_tier = try arena_alloc.alloc(u8, tok_count);
+    @memset(tok_ns_tier, 0);
+    const tok_skip = try arena_alloc.alloc(bool, tok_count);
+    @memset(tok_skip, false);
     var fmt_interps_by_tok: std.AutoHashMapUnmanaged(u32, []const type_system.InterpHoleSpec) = .empty;
 
     // Map AST nodes and MVS move/mutation sites from per-`DefId` `BodySemanticSideTables`:
@@ -5635,7 +6236,27 @@ fn computeSemanticTokensData(
         }
     }
 
+    try populateModuleUseAndPathSemanticTokens(
+        session,
+        file_id,
+        src,
+        parsed_art,
+        tok_symbols,
+        tok_is_decl,
+        tok_ns_tier,
+    );
+
     var raw_tokens: std.ArrayListUnmanaged(RawSemanticToken) = .empty;
+    try appendLintAttrSelectorSemanticSpans(
+        arena_alloc,
+        src,
+        line_idx,
+        session.position_encoding,
+        parsed_art,
+        range_opt,
+        tok_skip,
+        &raw_tokens,
+    );
     var is_prev_at = false;
 
     var tok_i: usize = 0;
@@ -5662,6 +6283,10 @@ fn computeSemanticTokensData(
         }
 
         if (tok_rec.flags.is_synthesized or tok_rec.byte_len == 0 or tok_rec.kind == .eof) continue;
+        if (tok_skip[tok_i]) {
+            is_prev_at = false;
+            continue;
+        }
         const tok_start = tok_rec.byte_offset;
         const tok_end = tok_rec.byte_offset +| tok_rec.byte_len;
         const lexeme = src[tok_start..@min(@as(usize, tok_end), src.len)];
@@ -5686,12 +6311,34 @@ fn computeSemanticTokensData(
             std.mem.indexOfScalar(u8, lexeme, '\n') != null)
         {
             is_prev_at = false;
+            const prefix_len: u32 = if (std.mem.startsWith(u8, lexeme, "br") and
+                lexeme.len > 2 and (lexeme[2] == '"' or lexeme[2] == '#'))
+                2
+            else if (lexeme.len > 1 and (lexeme[0] == 'b' or lexeme[0] == 'r') and
+                (lexeme[1] == '"' or lexeme[1] == '#'))
+                1
+            else
+                0;
+            if (prefix_len > 0) {
+                try appendSplitSemanticSpan(
+                    arena_alloc,
+                    src,
+                    line_idx,
+                    session.position_encoding,
+                    tok_start,
+                    tok_start + prefix_len,
+                    SEM_TOK_OPERATOR,
+                    0,
+                    range_opt,
+                    &raw_tokens,
+                );
+            }
             try appendSplitSemanticSpan(
                 arena_alloc,
                 src,
                 line_idx,
                 session.position_encoding,
-                tok_start,
+                tok_start + prefix_len,
                 tok_end,
                 SEM_TOK_STRING,
                 0,
@@ -5750,6 +6397,24 @@ fn computeSemanticTokensData(
                 tok_end,
                 sym_style.tok_type,
                 sym_style.mod_bits | tok_extra_mods[tok_i],
+                range_opt,
+                &raw_tokens,
+            );
+            continue;
+        }
+
+        if (tok_ns_tier[tok_i] != 0) {
+            var ns_mods: u32 = if (tok_ns_tier[tok_i] == 2) SEM_MOD_DEFAULT_LIB else 0;
+            if (tok_is_decl[tok_i]) ns_mods |= SEM_MOD_DECLARATION | SEM_MOD_DEFINITION;
+            try appendSplitSemanticSpan(
+                arena_alloc,
+                src,
+                line_idx,
+                session.position_encoding,
+                tok_start,
+                tok_end,
+                SEM_TOK_NAMESPACE,
+                ns_mods | tok_extra_mods[tok_i],
                 range_opt,
                 &raw_tokens,
             );
@@ -6552,7 +7217,20 @@ fn resolveCursorTarget(
     }
 
     // [4] Fallback lexical lookup in `file_module_scopes[file_id]` (e.g., types in signatures, `use` paths, prelude):
-    if (tok_rec.kind == .prim_type or symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.has(tok_lex)) {
+    const tok_raw = tok_idx.asInt();
+    const tok_total = parsed_art.token_buffer.countTokens();
+    const prev_kind: TokenKind = if (tok_raw > 0)
+        parsed_art.token_buffer.getToken(TokenIndex.fromInt(tok_raw - 1)).kind
+    else
+        .eof;
+    const next_kind: TokenKind = if (tok_raw + 1 < tok_total)
+        parsed_art.token_buffer.getToken(TokenIndex.fromInt(tok_raw + 1)).kind
+    else
+        .eof;
+
+    if (prev_kind != .dot and next_kind != .dot and
+        (tok_rec.kind == .prim_type or symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.has(tok_lex)))
+    {
         if (symbol_resolver.BUILTIN_TYPE_AND_GROUP_MAP.get(tok_lex)) |builtin_tid| {
             result.type_id = builtin_tid;
             if (session.db.symbol_table.type_to_symbol.get(builtin_tid.toU32())) |b_sym| {
@@ -6563,17 +7241,6 @@ fn resolveCursorTarget(
     }
 
     if (session.db.symbol_table.file_module_scopes.get(file_id.asInt())) |mod_scope| {
-        const tok_raw = tok_idx.asInt();
-        const tok_total = parsed_art.token_buffer.countTokens();
-        const prev_kind: TokenKind = if (tok_raw > 0)
-            parsed_art.token_buffer.getToken(TokenIndex.fromInt(tok_raw - 1)).kind
-        else
-            .eof;
-        const next_kind: TokenKind = if (tok_raw + 1 < tok_total)
-            parsed_art.token_buffer.getToken(TokenIndex.fromInt(tok_raw + 1)).kind
-        else
-            .eof;
-
         // Resolve dotted module/type paths (`cx.async.Poll`, `use cx.sys.wasi;`, `cx.ffi.CStr`):
         if (prev_kind == .dot or next_kind == .dot) {
             var rev_segs: [16]TokenIndex = undefined;
@@ -6651,7 +7318,7 @@ fn resolveCursorTarget(
             }
         }
 
-        const is_contextual_mod_kw = tok_rec.kind == .kw_async and
+        const is_contextual_mod_kw = symbol_resolver.isModuleSegmentExtraToken(tok_rec.kind) and
             (prev_kind == .dot or prev_kind == .kw_mod or prev_kind == .kw_use or prev_kind == .lbrace);
         if (isUserIdentifierToken(tok_rec.kind) or
             tok_rec.kind == .kw_self_val or
@@ -7338,18 +8005,6 @@ fn handleHoverRequest(
                         break;
                     }
                 },
-                .prim_type => {
-                    const prim_lex = symbol_resolver.extractTokenSlice(live_src, &parsed_cst.token_buffer, raw_tok);
-                    if (BUILTIN_PRIM_HOVER_MAP.get(prim_lex)) |prim_spec| {
-                        const prim_md = try std.fmt.allocPrint(
-                            arena_alloc,
-                            "```corex\n{s}\n```\n\n{s}",
-                            .{ prim_spec.signature, prim_spec.summary },
-                        );
-                        const prim_span = parsed_cst.token_buffer.getTokenSpan(fid, raw_tok);
-                        return writeMarkdownHoverFrame(session, fid, prim_span, prim_md, out_writer, rpc_id);
-                    }
-                },
                 .fmt_string_lit => {
                     _ = try session.db.resolveSignatures(fid);
                     const item_tree = try session.db.extractItemTree(fid);
@@ -7393,20 +8048,22 @@ fn handleHoverRequest(
                                 .kw_false,
                                 => return writeNullResultFrame(session, out_writer, rpc_id),
                                 .prim_type => {
-                                    if (BUILTIN_PRIM_HOVER_MAP.get(htok_lex)) |prim_spec| {
-                                        const prim_md = try std.fmt.allocPrint(
-                                            arena_alloc,
-                                            "```corex\n{s}\n```\n\n{s}",
-                                            .{ prim_spec.signature, prim_spec.summary },
-                                        );
-                                        return writeMarkdownHoverFrame(
-                                            session,
-                                            fid,
-                                            Span.init(fid, htok_start, htok_end),
-                                            prim_md,
-                                            out_writer,
-                                            rpc_id,
-                                        );
+                                    if (htok.symbol_index.isNone()) {
+                                        if (BUILTIN_PRIM_HOVER_MAP.get(htok_lex)) |prim_spec| {
+                                            const prim_md = try std.fmt.allocPrint(
+                                                arena_alloc,
+                                                "```corex\n{s}\n```\n\n{s}",
+                                                .{ prim_spec.signature, prim_spec.summary },
+                                            );
+                                            return writeMarkdownHoverFrame(
+                                                session,
+                                                fid,
+                                                Span.init(fid, htok_start, htok_end),
+                                                prim_md,
+                                                out_writer,
+                                                rpc_id,
+                                            );
+                                        }
                                     }
                                 },
                                 else => {},
@@ -7684,6 +8341,27 @@ fn handleHoverRequest(
                             .{ sig_line, summary_line },
                         );
                         return writeMarkdownHoverFrame(session, fid, target.token_span, builtin_md, out_writer, rpc_id);
+                    }
+                }
+            }
+        }
+    }
+
+    if (target.symbol_index.isNone()) {
+        if (getLiveDocumentSource(session, fid)) |live_src| {
+            if (session.db.parsed_artifacts.getPtr(fid.asInt())) |parsed_art| {
+                const eff_kind = target.resolved_token_kind orelse
+                    parsed_art.token_buffer.getToken(target.token_index).kind;
+                if (eff_kind == .prim_type) {
+                    const sp_start = @min(@as(usize, target.token_span.start_byte), live_src.len);
+                    const sp_end = @min(@max(@as(usize, target.token_span.end_byte), sp_start), live_src.len);
+                    if (BUILTIN_PRIM_HOVER_MAP.get(live_src[sp_start..sp_end])) |prim_spec| {
+                        const prim_md = try std.fmt.allocPrint(
+                            arena_alloc,
+                            "```corex\n{s}\n```\n\n{s}",
+                            .{ prim_spec.signature, prim_spec.summary },
+                        );
+                        return writeMarkdownHoverFrame(session, fid, target.token_span, prim_md, out_writer, rpc_id);
                     }
                 }
             }
@@ -8006,7 +8684,9 @@ fn tryBuildLintSelectorHover(
                 };
                 const md_text = try std.fmt.allocPrint(
                     arena_alloc,
-                    "```corex\n{s}/{s} // [{s}] ({s})\n```\n\n**{s}**\n\n{s}",
+                    "`{s}`\xe2\x80\x84\xc2\xb7\xe2\x80\x84`{s}`\xe2\x80\x84\xc2\xb7\xe2\x80\x84" ++
+                        "<sub><span style=\"color:var(--vscode-descriptionForeground);\">{s} \xc2\xb7 {s}</span></sub>" ++
+                        "\n\n---\n\n**{s}**\n\n{s}",
                     .{
                         meta.diag_code.asCodeStr(),
                         meta.slug,

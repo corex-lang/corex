@@ -2908,9 +2908,10 @@ test "test_lsp_dr25_manifest_config_w0xxx_slug_codelens_expect_hover_and_live_re
     try std.testing.expect(
         std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":2").?, "@expect(rule") != null,
     );
-    try std.testing.expect(
-        std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":3").?, "W0402/unused-binding") != null,
-    );
+    const slug_hover_frame = findFrameByIdFragment(outcome.frames, "\"id\":3").?;
+    try std.testing.expect(std.mem.indexOf(u8, slug_hover_frame, "`W0402`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, slug_hover_frame, "`unused-binding`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, slug_hover_frame, "var(--vscode-descriptionForeground)") != null);
     try std.testing.expect(
         std.mem.indexOf(u8, findFrameByIdFragment(outcome.frames, "\"id\":4").?, "▸ Run test") != null,
     );
@@ -4544,4 +4545,232 @@ test "test_lsp_phase11_std02_modules_hover_def_refs_rename_and_incremental_didch
         std.mem.indexOf(u8, findFrameByIdFragment(out_4.frames, "\"id\":84").?, "\"placeholder\":\"compute_budget\"") != null,
     );
     try std.testing.expect(std.mem.indexOf(u8, findFrameByIdFragment(out_4.frames, "\"id\":85").?, "\"items\":[]") != null);
+}
+
+test "test_lsp_iss007_to_iss009_module_namespaces_literal_prefixes_and_lint_slugs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const ws_dir = try createTempWorkspaceDir(allocator, io, "lsp_iss007_009");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, ws_dir) catch {};
+        allocator.free(ws_dir);
+    }
+
+    const core_sys_src =
+        "pub mod windows {\n" ++
+        "    pub struct Win32FindDataW {\n" ++
+        "        pub file_attr: u32,\n" ++
+        "    }\n" ++
+        "}\n";
+    const core_root_src = "pub mod sys;\n";
+    const std_str_src =
+        "pub struct String {\n" ++
+        "    pub len_bytes: usize,\n" ++
+        "    pub cap_bytes: usize,\n" ++
+        "}\n";
+    const std_mod_initial_src = "pub mod str;\n";
+
+    try writeWorkspaceFile(allocator, io, ws_dir, "core/sys.cx", core_sys_src);
+    try writeWorkspaceFile(allocator, io, ws_dir, "core/root.cx", core_root_src);
+    try writeWorkspaceFile(allocator, io, ws_dir, "stdlib/cx/str.cx", std_str_src);
+    try writeWorkspaceFile(allocator, io, ws_dir, "stdlib/cx/mod.cx", std_mod_initial_src);
+
+    const core_root_path = try std.fmt.allocPrint(allocator, "{s}/core/root.cx", .{ws_dir});
+    defer allocator.free(core_root_path);
+    const core_root_uri = try resolvePathToFileUri(allocator, io, core_root_path);
+    defer allocator.free(core_root_uri);
+    const ws_uri = core_root_uri[0 .. core_root_uri.len - "/core/root.cx".len];
+
+    var session = try lsp_server.LspSession.init(allocator, io, null, null, .{ .is_internal_core = true });
+    defer session.deinit();
+    session.bindInternalPointers();
+
+    // [1] Initialize session BEFORE `stdlib/cx/async.cx` and `stdlib/cx/fs.cx` exist on disk:
+    var turn_1: std.ArrayListUnmanaged(u8) = .empty;
+    defer turn_1.deinit(allocator);
+    {
+        var init_buf = std.Io.Writer.Allocating.init(allocator);
+        defer init_buf.deinit();
+        try init_buf.writer.writeAll(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"rootUri\":",
+        );
+        try writeEscapedJsonString(&init_buf.writer, ws_uri);
+        try init_buf.writer.writeAll(
+            ",\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-8\"]},\"textDocument\":{\"diagnostic\":{}}}}}",
+        );
+        try appendLspFrame(allocator, &turn_1, init_buf.written());
+    }
+    try appendDidOpenFrame(allocator, &turn_1, core_root_uri, 1, core_root_src);
+
+    var out_1 = try executeSessionTranscript(allocator, &session, turn_1.items);
+    defer out_1.deinit(allocator);
+
+    // [2] Create `stdlib/cx/async.cx`, update unopened `stdlib/cx/mod.cx`, and open new `stdlib/cx/fs.cx`:
+    const std_async_src =
+        "pub struct TaskScope {\n" ++
+        "    pub id: u32,\n" ++
+        "}\n";
+    const std_fs_src =
+        "pub mod sub_dir {\n" ++
+        "    pub fn inner_flag() -> u32 {\n" ++
+        "        1_u32\n" ++
+        "    }\n" ++
+        "}\n" ++
+        "use core.sys;\n" ++
+        "use cx.str.{String};\n" ++
+        "use cx.async.{TaskScope};\n" ++
+        "\n" ++
+        "@expect(unused-pkg-visibility, W0203, reason: \"test slug\")\n" ++
+        "pub(pkg) fn inspect_fs(s: &String, scope: TaskScope, info: sys.windows.Win32FindDataW) -> str {\n" ++
+        "    let raw_m = r#\"\n" ++
+        "        alpha \"q\"\n" ++
+        "        \"#;\n" ++
+        "    let byte_m = b\"\n" ++
+        "        beta\n" ++
+        "        \";\n" ++
+        "    let fmt_v = f\"len={s.len_bytes}+{info.file_attr}\";\n" ++
+        "    _ = (scope, raw_m, byte_m, fmt_v, sub_dir.inner_flag());\n" ++
+        "    \"ok\"\n" ++
+        "}\n";
+    try writeWorkspaceFile(allocator, io, ws_dir, "stdlib/cx/async.cx", std_async_src);
+    try writeWorkspaceFile(allocator, io, ws_dir, "stdlib/cx/mod.cx", "pub mod str;\npub mod async;\npub mod fs;\n");
+    try writeWorkspaceFile(allocator, io, ws_dir, "stdlib/cx/fs.cx", std_fs_src);
+
+    const fs_path = try std.fmt.allocPrint(allocator, "{s}/stdlib/cx/fs.cx", .{ws_dir});
+    defer allocator.free(fs_path);
+    const fs_uri = try resolvePathToFileUri(allocator, io, fs_path);
+    defer allocator.free(fs_uri);
+
+    var turn_2: std.ArrayListUnmanaged(u8) = .empty;
+    defer turn_2.deinit(allocator);
+    try appendDidOpenFrame(allocator, &turn_2, fs_uri, 1, std_fs_src);
+
+    const query_frames = [_][]const u8{
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/diagnostic\"," ++
+                "\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+            .{fs_uri},
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/semanticTokens/full\"," ++
+                "\"params\":{{\"textDocument\":{{\"uri\":\"{s}\"}}}}}}",
+            .{fs_uri},
+        ),
+        // Hover on `str` in `use cx.str.{String};` (line 6, col 8):
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/hover\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":6,\"character\":8}}}}}}",
+            .{fs_uri},
+        ),
+        // Hover on `async` in `use cx.async.{TaskScope};` (line 7, col 8):
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/hover\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":7,\"character\":8}}}}}}",
+            .{fs_uri},
+        ),
+        // Hover on `unused-pkg-visibility` in `@expect(…)` (line 9, col 16):
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"textDocument/hover\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":9,\"character\":16}}}}}}",
+            .{fs_uri},
+        ),
+        // Hover on `W0203` in `@expect(…)` (line 9, col 32):
+        try std.fmt.allocPrint(
+            allocator,
+            "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/hover\",\"params\":{{" ++
+                "\"textDocument\":{{\"uri\":\"{s}\"}},\"position\":{{\"line\":9,\"character\":32}}}}}}",
+            .{fs_uri},
+        ),
+    };
+    defer for (query_frames) |owned_q| allocator.free(owned_q);
+    for (query_frames) |q_json| try appendLspFrame(allocator, &turn_2, q_json);
+    try appendLspFrame(allocator, &turn_2, "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"shutdown\",\"params\":null}");
+    try appendLspFrame(allocator, &turn_2, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\",\"params\":null}");
+
+    var out_2 = try executeSessionTranscript(allocator, &session, turn_2.items);
+    defer out_2.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), out_2.exit_code);
+
+    // [3] Zero diagnostics on newly created `stdlib/cx/fs.cx` without restarting `LspSession`:
+    const diag_frame_2 = findFrameByIdFragment(out_2.frames, "\"id\":2").?;
+    if (std.mem.indexOf(u8, diag_frame_2, "\"items\":[]") == null) {
+        std.debug.print("\n[ISS-007 diag]: {s}\n", .{diag_frame_2});
+    }
+    try std.testing.expect(
+        std.mem.indexOf(u8, diag_frame_2, "\"items\":[]") != null,
+    );
+
+    // [4] Verify semantic tokens for modules (`0`), unified lint slugs (`9` + `attribute`), & literal prefixes (`18`):
+    const sem_data = try extractJsonU32Array(
+        allocator,
+        findFrameByIdFragment(out_2.frames, "\"id\":3").?,
+        "\"data\":[",
+    );
+    defer allocator.free(sem_data);
+
+    const ExpectedTok = struct { line: u32, col: u32, len: u32, tok_type: u32, req_mod: u32 = 0 };
+    const expected_tokens = [_]ExpectedTok{
+        .{ .line = 0, .col = 8, .len = 7, .tok_type = 0 }, // `pub mod sub_dir`
+        .{ .line = 5, .col = 4, .len = 4, .tok_type = 0 }, // `core` in `use core.sys;`
+        .{ .line = 5, .col = 9, .len = 3, .tok_type = 0 }, // leaf `sys` in `use core.sys;`
+        .{ .line = 6, .col = 4, .len = 2, .tok_type = 0 }, // `cx` in `use cx.str.{String};`
+        .{ .line = 6, .col = 7, .len = 3, .tok_type = 0 }, // `str` module in `use cx.str.{String};`
+        .{ .line = 7, .col = 4, .len = 2, .tok_type = 0 }, // `cx` in `use cx.async.{TaskScope};`
+        .{ .line = 7, .col = 7, .len = 5, .tok_type = 0 }, // `async` module in `use cx.async.{TaskScope};`
+        .{ .line = 9, .col = 8, .len = 21, .tok_type = 9, .req_mod = 1 << 13 }, // `unused-pkg-visibility`
+        .{ .line = 9, .col = 31, .len = 5, .tok_type = 9, .req_mod = 1 << 13 }, // `W0203`
+        .{ .line = 10, .col = 59, .len = 3, .tok_type = 0 }, // `sys` in `sys.windows.Win32FindDataW`
+        .{ .line = 10, .col = 63, .len = 7, .tok_type = 0 }, // `windows` in `sys.windows.Win32FindDataW`
+        .{ .line = 10, .col = 90, .len = 3, .tok_type = 1 }, // primitive `str` return type
+        .{ .line = 11, .col = 16, .len = 1, .tok_type = 18 }, // `r` prefix on multiline `r#"`
+        .{ .line = 14, .col = 17, .len = 1, .tok_type = 18 }, // `b` prefix on multiline `b"`
+        .{ .line = 17, .col = 16, .len = 1, .tok_type = 18 }, // `f` prefix on `f"len=…"`
+        .{ .line = 18, .col = 38, .len = 7, .tok_type = 0 }, // `sub_dir` in `sub_dir.inner_flag()`
+    };
+    var matched_mask: u32 = 0;
+    var cur_line: u32 = 0;
+    var cur_col: u32 = 0;
+    var t_idx: usize = 0;
+    while (t_idx + 5 <= sem_data.len) : (t_idx += 5) {
+        if (sem_data[t_idx] > 0) {
+            cur_line += sem_data[t_idx];
+            cur_col = sem_data[t_idx + 1];
+        } else {
+            cur_col += sem_data[t_idx + 1];
+        }
+        const tok_len = sem_data[t_idx + 2];
+        const tok_type = sem_data[t_idx + 3];
+        const tok_mods = sem_data[t_idx + 4];
+        for (expected_tokens, 0..) |exp_item, exp_i| {
+            if (cur_line == exp_item.line and cur_col == exp_item.col) {
+                try std.testing.expectEqual(exp_item.len, tok_len);
+                try std.testing.expectEqual(exp_item.tok_type, tok_type);
+                try std.testing.expect((tok_mods & exp_item.req_mod) == exp_item.req_mod);
+                matched_mask |= (@as(u32, 1) << @intCast(exp_i));
+            }
+        }
+    }
+    try std.testing.expectEqual((@as(u32, 1) << expected_tokens.len) - 1, matched_mask);
+
+    // [5] Hover on `str` / `async` in `use` resolves modules; hover on lint selectors uses theme CSS variable:
+    const str_hover = findFrameByIdFragment(out_2.frames, "\"id\":4").?;
+    try std.testing.expect(std.mem.indexOf(u8, str_hover, "mod str") != null);
+    const async_hover = findFrameByIdFragment(out_2.frames, "\"id\":5").?;
+    try std.testing.expect(std.mem.indexOf(u8, async_hover, "mod async") != null);
+
+    const slug_hover = findFrameByIdFragment(out_2.frames, "\"id\":6").?;
+    try std.testing.expect(std.mem.indexOf(u8, slug_hover, "`W0406`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, slug_hover, "`unused-pkg-visibility`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, slug_hover, "color:var(--vscode-descriptionForeground);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, slug_hover, "```corex") == null);
+
+    const code_hover = findFrameByIdFragment(out_2.frames, "\"id\":7").?;
+    try std.testing.expect(std.mem.indexOf(u8, code_hover, "`W0203`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code_hover, "`single-char-ident`") != null);
 }

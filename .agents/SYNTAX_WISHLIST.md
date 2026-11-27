@@ -316,4 +316,4 @@ Canonical dogfooding backlog for **CoreX** (`.cx`) surface syntax proposals, erg
 
 | ID | Proposal Summary | Decision | Rationale / Canonical Reference |
 | :--- | :--- | :--- | :--- |
-| `SW-004` | Compact, de-noised hover contract & stack footer (`<sub>` + theme-adaptive alpha hex, dropping `(verified)`) | Approved & Implemented | `stage0/src/lsp_server.zig` (`appendFnHoverContractBullets`) + `../vscode-ext-corex/src/extension.ts` (`toVsDoc` with `supportHtml: true`, `#00000099` Light / `#ffffffa6` Dark / un-dimmed High Contrast). |
+| `SW-004` | Compact, de-noised hover contract & stack footer (`<sub>` + theme-native CSS variable, dropping `(verified)`) | Approved & Implemented | `stage0/src/lsp_server.zig` (`appendFnHoverContractBullets`) + `../vscode-ext-corex/src/extension.ts` (`toVsDoc` with `supportHtml: true`, `var(--vscode-descriptionForeground)` in Light/Dark themes and un-dimmed High Contrast). |

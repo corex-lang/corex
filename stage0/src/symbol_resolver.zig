@@ -1804,6 +1804,12 @@ pub inline fn isIdentifierToken(kind: TokenKind) bool {
     return kind == .ident or kind == .type_ident or kind == .const_ident;
 }
 
+/// Returns `true` if `kind` is a primitive type or lowercase keyword permitted as a module path segment.
+pub inline fn isModuleSegmentExtraToken(kind: TokenKind) bool {
+    return kind == .prim_type or
+        (kind != .kw_as and kind != .kw_self_type and @backingInt(kind) <= @backingInt(TokenKind.kw_not));
+}
+
 /// Classifies the canonical `Namespace` of an identifier token kind.
 pub inline fn classifyTokenNamespace(kind: TokenKind) Namespace {
     return switch (kind) {
@@ -9193,7 +9199,7 @@ pub fn findItemNameToken(
             break;
         }
         if (isIdentifierToken(tok_kind) or
-            ((tok_kind == .kw_async or tok_kind == .prim_type) and !main_token.isNone() and
+            (isModuleSegmentExtraToken(tok_kind) and !main_token.isNone() and
                 main_token.asInt() < token_buffer.countTokens() and
                 token_buffer.getToken(main_token).kind == .kw_mod))
         {
@@ -10700,7 +10706,7 @@ pub fn enforceExternalPackageCstHygiene(
                                 }
                                 if (seg_i < total_tokens) {
                                     const seg_kind = token_buffer.getToken(TokenIndex.fromInt(seg_i)).kind;
-                                    if (isIdentifierToken(seg_kind) or seg_kind == .kw_async or seg_kind == .prim_type) {
+                                    if (isIdentifierToken(seg_kind) or isModuleSegmentExtraToken(seg_kind)) {
                                         const core_span = token_buffer.getTokenSpan(file_id, tok_idx);
                                         if (!hasDiagnosticAtSpan(sink, .e0218_direct_core_import_forbidden, core_span)) {
                                             try emitDirectCoreImportDiagnostic(sink, interner, core_span);
@@ -11404,7 +11410,7 @@ fn resolveImplTargetScope(
                 has_seen_for = true;
                 continue;
             }
-            if (isIdentifierToken(tok_kind) or tok_kind == .prim_type or tok_kind == .kw_async) {
+            if (isIdentifierToken(tok_kind) or isModuleSegmentExtraToken(tok_kind)) {
                 if (!has_seen_for) {
                     if (before_for_len < before_for_toks.len) {
                         before_for_toks[before_for_len] = node.token;
@@ -12285,7 +12291,7 @@ fn resolveUseTreeCst(
                 alias_tok = sub.token;
             } else if (!has_seen_as and
                 (isIdentifierToken(tok_kind) or tok_kind == .kw_self_val or
-                    tok_kind == .kw_self_type or tok_kind == .kw_async or tok_kind == .prim_type))
+                    tok_kind == .kw_self_type or isModuleSegmentExtraToken(tok_kind)))
             {
                 if (seg_count < segments.len) {
                     segments[seg_count] = sub.token;
@@ -13153,7 +13159,7 @@ fn collectUseTreeCapBindings(
                 alias_slice = extractTokenSlice(source, token_buffer, sub.token);
             } else if (!has_seen_as and
                 (isIdentifierToken(tok_kind) or tok_kind == .kw_self_val or
-                    tok_kind == .kw_async or tok_kind == .prim_type))
+                    isModuleSegmentExtraToken(tok_kind)))
             {
                 if (seg_count < seg_slices.len) {
                     seg_slices[seg_count] = extractTokenSlice(source, token_buffer, sub.token);
@@ -13496,7 +13502,7 @@ pub fn scanFileInactiveCfgCapabilities(
                     is_prev_at = false;
                     continue;
                 } else if (is_prev_cx_root and prev_tok_kind == .dot and
-                    (isIdentifierToken(tok_kind) or tok_kind == .kw_async or tok_kind == .prim_type))
+                    (isIdentifierToken(tok_kind) or isModuleSegmentExtraToken(tok_kind)))
                 {
                     token_caps |= CX_DOMAIN_CAP_MAP.get(lexeme) orelse 0;
                 } else if (prev_tok_kind != .dot and isIdentifierToken(tok_kind)) {

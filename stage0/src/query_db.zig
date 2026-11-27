@@ -2859,7 +2859,7 @@ fn extractItemNameSlice(
             if (!is_leaf or node.flags.is_missing_or_injected or node.token.isNone()) continue;
             if (node.token.asInt() >= token_buffer.countTokens()) continue;
             const use_tok_kind = token_buffer.getToken(node.token).kind;
-            if (isIdentifierTokenKind(use_tok_kind) or use_tok_kind == .kw_async or use_tok_kind == .prim_type) {
+            if (isIdentifierTokenKind(use_tok_kind) or symbol_resolver.isModuleSegmentExtraToken(use_tok_kind)) {
                 last_ident = getTokenLexeme(source, token_buffer, node.token);
             }
         }
@@ -2941,7 +2941,7 @@ fn extractItemNameSlice(
             break;
         }
         if (isIdentifierTokenKind(tok_kind) or
-            (item_kind == .mod_decl and (tok_kind == .kw_async or tok_kind == .prim_type)))
+            (item_kind == .mod_decl and symbol_resolver.isModuleSegmentExtraToken(tok_kind)))
         {
             return getTokenLexeme(source, token_buffer, node.token);
         }
@@ -3546,8 +3546,7 @@ fn findHeaderIdentSpanInCst(
                 }
                 if (isIdentifierTokenKind(tok_rec.kind) or
                     tok_rec.kind == .kw_self_val or
-                    tok_rec.kind == .kw_async or
-                    tok_rec.kind == .prim_type)
+                    symbol_resolver.isModuleSegmentExtraToken(tok_rec.kind))
                 {
                     if (std.mem.eql(
                         u8,

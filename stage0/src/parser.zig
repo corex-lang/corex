@@ -612,9 +612,9 @@ inline fn isIdentifierKind(kind: TokenKind) bool {
     return kind == .ident or kind == .type_ident or kind == .const_ident;
 }
 
-/// Returns `true` if `kind` is a `snake_case` identifier or `.kw_async` module path segment.
+/// Returns `true` if `kind` is a `snake_case` identifier, primitive type name, or lowercase keyword module segment.
 inline fn isIdentOrModuleSegment(kind: TokenKind) bool {
-    return kind == .ident or kind == .kw_async;
+    return kind == .ident or kind == .prim_type or (isKeywordKind(kind) and kind != .kw_self_type);
 }
 
 /// Returns `true` if `kind` is one of the 50 language keywords (`0..49`).
@@ -3798,7 +3798,7 @@ pub const Parser = struct {
         }, item_cst);
     }
 
-    /// Parses `ModItem = "mod" ( IDENT | "async" | "str" ) ( ";" | "{" { Item } "}" ) ;`.
+    /// Parses `ModItem = "mod" ( IDENT | PRIM_TYPE | Keyword ) ( ";" | "{" { Item } "}" ) ;`.
     fn parseModItem(
         self: *Parser,
         item_cst: CstNodeIndex,
@@ -3806,7 +3806,8 @@ pub const Parser = struct {
     ) anyerror!NodeIndex {
         self.cst.nodes.items(.kind)[item_cst.asInt()] = .mod_item;
         const mod_tok = try self.consumeLeaf(.mod_introducer, .{});
-        const name_tok = if (self.peekKind() == .kw_async or self.isStrModuleAt(0))
+        const name_tok = if ((isKeywordKind(self.peekKind()) and self.peekKind() != .kw_self_type) or
+            self.peekKind() == .prim_type)
             try self.consumeLeaf(.token_leaf, .{})
         else
             try self.expectIdentifierWithCasing(
@@ -4037,10 +4038,8 @@ pub const Parser = struct {
         }
 
         if (isIdentifierKind(self.peekKind()) or
-            self.peekKind() == .kw_async or
-            self.isStrModuleAt(0) or
-            self.peekKind() == .kw_self_val or
-            self.peekKind() == .kw_self_type)
+            self.peekKind() == .prim_type or
+            (isKeywordKind(self.peekKind()) and self.peekKind() != .kw_as))
         {
             _ = try self.consumeLeaf(.token_leaf, .{});
         } else {
@@ -4082,10 +4081,8 @@ pub const Parser = struct {
                 break;
             }
             if (isIdentifierKind(self.peekKind()) or
-                self.peekKind() == .kw_async or
-                self.isStrModuleAt(0) or
-                self.peekKind() == .kw_self_val or
-                self.peekKind() == .kw_self_type)
+                self.peekKind() == .prim_type or
+                isKeywordKind(self.peekKind()))
             {
                 _ = try self.consumeLeaf(.token_leaf, .{});
             } else {
@@ -7261,7 +7258,7 @@ pub const Parser = struct {
     fn parsePrimaryType(self: *Parser) anyerror!NodeIndex {
         switch (self.peekKind()) {
             .prim_type => {
-                if (self.isStrModuleAt(0) and self.peekKindNth(1) == .dot) {
+                if (self.peekKindNth(1) == .dot) {
                     return self.parseNamedOrGenericType();
                 }
                 const tok = try self.consumeLeaf(.prim_type_node, .{});
@@ -7647,6 +7644,9 @@ pub const Parser = struct {
                 return self.parseNamedOrGenericType();
             },
             else => {
+                if (isIdentOrModuleSegment(self.peekKind()) and self.peekKindNth(1) == .dot) {
+                    return self.parseNamedOrGenericType();
+                }
                 const err_tok = self.peekTokenIndexNth(0);
                 try self.emitUnexpectedToken(
                     err_tok,
@@ -7675,8 +7675,8 @@ pub const Parser = struct {
         if (self.peekKind() == .kw_self_type) {
             first_tok = try self.consumeLeaf(.token_leaf, .{});
         } else {
-            // Consume optional leading `(ident | "async" | "str") .` module path segments:
-            while ((isIdentOrModuleSegment(self.peekKind()) or self.isStrModuleAt(0)) and self.peekKindNth(1) == .dot) {
+            // Consume optional leading `(ident | keyword | prim_type) .` module path segments:
+            while (isIdentOrModuleSegment(self.peekKind()) and self.peekKindNth(1) == .dot) {
                 _ = try self.consumeLeaf(.token_leaf, .{});
                 _ = try self.consumeLeaf(.token_leaf, .{});
             }
@@ -9308,7 +9308,9 @@ pub const Parser = struct {
                     const first_tok = try self.consumeLeaf(.token_leaf, .{});
                     while (self.peekKind() == .dot) {
                         _ = try self.consumeLeaf(.token_leaf, .{});
-                        if (isIdentifierKind(self.peekKind()) or self.peekKind() == .kw_async or self.isStrModuleAt(0)) {
+                        if (isIdentifierKind(self.peekKind()) or
+                            (isIdentOrModuleSegment(self.peekKind()) and self.peekKindNth(1) == .dot))
+                        {
                             _ = try self.consumeLeaf(.token_leaf, .{});
                         } else {
                             has_err = true;
@@ -9456,7 +9458,9 @@ pub const Parser = struct {
                     const first_tok = try self.consumeLeaf(.token_leaf, .{});
                     while (self.peekKind() == .dot) {
                         _ = try self.consumeLeaf(.token_leaf, .{});
-                        if (isIdentifierKind(self.peekKind()) or self.peekKind() == .kw_async or self.isStrModuleAt(0)) {
+                        if (isIdentifierKind(self.peekKind()) or
+                            (isIdentOrModuleSegment(self.peekKind()) and self.peekKindNth(1) == .dot))
+                        {
                             _ = try self.consumeLeaf(.token_leaf, .{});
                         } else {
                             has_err = true;
@@ -9707,19 +9711,6 @@ pub const Parser = struct {
         return self.isTypeStart(1);
     }
 
-    /// Returns `true` if the non-carrier token at `lookahead` is the `"str"` module/primitive token.
-    fn isStrModuleAt(self: *const Parser, lookahead: usize) bool {
-        return self.peekKindNth(lookahead) == .prim_type and
-            std.mem.eql(u8, self.peekLexemeNth(lookahead), "str");
-    }
-
-    /// Returns `true` if `raw_idx` points at the `"str"` module/primitive token.
-    fn isRawStrModuleAt(self: *const Parser, raw_idx: usize) bool {
-        if (self.rawTokenKindAt(raw_idx) != .prim_type) return false;
-        const tok = TokenIndex.fromInt(@intCast(self.skipCarrierRawIndex(raw_idx)));
-        return std.mem.eql(u8, self.getTokenLexeme(tok), "str");
-    }
-
     /// Returns `true` if the token at `start_lookahead` begins a `Type` (`DR-22` Section 3.3).
     fn isTypeStart(self: *const Parser, start_lookahead: usize) bool {
         var raw_idx: usize = self.peekTokenIndexNth(start_lookahead).asInt();
@@ -9729,11 +9720,10 @@ pub const Parser = struct {
                 .prim_type => {
                     const next_raw = self.advanceNonCarrierRawIndex(raw_idx, 1);
                     if (self.rawTokenKindAt(next_raw) != .dot) return true;
-                    if (!self.isRawStrModuleAt(raw_idx)) return false;
                     var scan_raw: usize = raw_idx;
                     var seg_steps: usize = 0;
                     while (seg_steps < MAX_TYPE_LOOKAHEAD and
-                        (isIdentOrModuleSegment(self.rawTokenKindAt(scan_raw)) or self.isRawStrModuleAt(scan_raw)) and
+                        isIdentOrModuleSegment(self.rawTokenKindAt(scan_raw)) and
                         self.rawTokenKindAt(self.advanceNonCarrierRawIndex(scan_raw, 1)) == .dot) : (seg_steps += 1)
                     {
                         scan_raw = self.advanceNonCarrierRawIndex(scan_raw, 2);
@@ -9766,7 +9756,7 @@ pub const Parser = struct {
                     var scan_raw: usize = raw_idx;
                     var seg_steps: usize = 0;
                     while (seg_steps < MAX_TYPE_LOOKAHEAD and
-                        (isIdentOrModuleSegment(self.rawTokenKindAt(scan_raw)) or self.isRawStrModuleAt(scan_raw)) and
+                        isIdentOrModuleSegment(self.rawTokenKindAt(scan_raw)) and
                         self.rawTokenKindAt(self.advanceNonCarrierRawIndex(scan_raw, 1)) == .dot) : (seg_steps += 1)
                     {
                         scan_raw = self.advanceNonCarrierRawIndex(scan_raw, 2);
@@ -9936,7 +9926,7 @@ pub const Parser = struct {
                     const next_kind = self.rawTokenKindAt(next_raw);
                     if ((std.mem.eql(u8, lexeme, "dyn") or std.mem.eql(u8, lexeme, "any")) and
                         (next_kind == .type_ident or next_kind == .kw_self_type or
-                            ((isIdentOrModuleSegment(next_kind) or self.isRawStrModuleAt(next_raw)) and
+                            (isIdentOrModuleSegment(next_kind) and
                                 self.rawTokenKindAt(self.advanceNonCarrierRawIndex(next_raw, 1)) == .dot)))
                     {
                         raw_idx = next_raw;
@@ -9945,7 +9935,7 @@ pub const Parser = struct {
                     var scan_raw: usize = raw_idx;
                     var seg_steps: usize = 0;
                     while (seg_steps < MAX_TYPE_LOOKAHEAD and
-                        (isIdentOrModuleSegment(self.rawTokenKindAt(scan_raw)) or self.isRawStrModuleAt(scan_raw)) and
+                        isIdentOrModuleSegment(self.rawTokenKindAt(scan_raw)) and
                         self.rawTokenKindAt(self.advanceNonCarrierRawIndex(scan_raw, 1)) == .dot) : (seg_steps += 1)
                     {
                         scan_raw = self.advanceNonCarrierRawIndex(scan_raw, 2);
@@ -10997,13 +10987,16 @@ pub const Parser = struct {
             }, lhs_cst_start);
         }
 
-        if (isIdentifierKind(self.peekKind()) or self.peekKind() == .kw_async or
-            self.isStrModuleAt(0) or self.peekKind() == .int_lit)
+        const is_mod_kw_seg = isIdentOrModuleSegment(self.peekKind()) and
+            self.isStaticPathExpr(lhs_node) and
+            self.peekKindNth(1) == .dot;
+        if (isIdentifierKind(self.peekKind()) or
+            is_mod_kw_seg or
+            self.peekKind() == .int_lit)
         {
             var has_err = false;
             const member_tok = if (self.peekKind() == .int_lit or
-                self.peekKind() == .kw_async or
-                self.isStrModuleAt(0))
+                (self.peekKind() != .ident and is_mod_kw_seg))
                 try self.consumeLeaf(.token_leaf, .{})
             else
                 try self.expectIdentifierRefWithCasing(
@@ -12130,6 +12123,9 @@ pub const Parser = struct {
                 return self.parsePathOrConstructExpr(is_struct_lit_allowed);
             },
             else => {
+                if (isIdentOrModuleSegment(self.peekKind()) and self.peekKindNth(1) == .dot) {
+                    return self.parsePathOrConstructExpr(is_struct_lit_allowed);
+                }
                 const err_tok = self.peekTokenIndexNth(0);
                 try self.emitUnexpectedToken(
                     err_tok,

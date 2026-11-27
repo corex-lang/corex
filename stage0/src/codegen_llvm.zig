@@ -18264,7 +18264,7 @@ fn emitStd01IntrinsicOpLlvm(
                     );
                     const oob_ssa = try std.fmt.allocPrint(emitter.allocator, "%_fbs_oob_{d}", .{t_id});
                     defer emitter.allocator.free(oob_ssa);
-                    try emitInlineTrapIfTrue(emitter, state, oob_ssa, @intFromEnum(mir.MirTrapReason.bounds_check));
+                    try emitInlineTrapIfTrue(emitter, state, oob_ssa, @backingInt(mir.MirTrapReason.bounds_check));
                     break :blk_src try std.fmt.allocPrint(emitter.allocator, "%_fbs_p_{d}", .{t_id});
                 }
                 if (!arr_ty.isPrimitiveOrSentinel()) {
@@ -18283,15 +18283,15 @@ fn emitStd01IntrinsicOpLlvm(
                                     "  %_fbs_l_{d} = extractvalue {{ ptr, {s} }} %_fbs_sl_{d}, 1\n" ++
                                     "  %_fbs_oob_{d} = icmp ult {s} %_fbs_l_{d}, {d}\n",
                                 .{
-                                    t_id, ptr_int, args[0], ptr_bytes,
-                                    t_id, ptr_int, t_id,    t_id,
-                                    ptr_int, t_id, t_id,    ptr_int,
-                                    t_id, n,
+                                    t_id,    ptr_int, args[0], ptr_bytes,
+                                    t_id,    ptr_int, t_id,    t_id,
+                                    ptr_int, t_id,    t_id,    ptr_int,
+                                    t_id,    n,
                                 },
                             );
                             const oob_ssa = try std.fmt.allocPrint(emitter.allocator, "%_fbs_oob_{d}", .{t_id});
                             defer emitter.allocator.free(oob_ssa);
-                            try emitInlineTrapIfTrue(emitter, state, oob_ssa, @intFromEnum(mir.MirTrapReason.bounds_check));
+                            try emitInlineTrapIfTrue(emitter, state, oob_ssa, @backingInt(mir.MirTrapReason.bounds_check));
                             break :blk_src try std.fmt.allocPrint(emitter.allocator, "%_fbs_p_{d}", .{t_id});
                         }
                         if (!inner_ty.isPrimitiveOrSentinel() and emitter.input.pool.getNode(inner_ty).tag == .array_ty) {
@@ -18301,7 +18301,7 @@ fn emitStd01IntrinsicOpLlvm(
                                 try state.print("  %_fbs_oob_{d} = icmp ult i64 {d}, {d}\n", .{ t_id, arr_len, n });
                                 const oob_ssa = try std.fmt.allocPrint(emitter.allocator, "%_fbs_oob_{d}", .{t_id});
                                 defer emitter.allocator.free(oob_ssa);
-                                try emitInlineTrapIfTrue(emitter, state, oob_ssa, @intFromEnum(mir.MirTrapReason.bounds_check));
+                                try emitInlineTrapIfTrue(emitter, state, oob_ssa, @backingInt(mir.MirTrapReason.bounds_check));
                             }
                         }
                         break :blk_src try std.fmt.allocPrint(emitter.allocator, "%_v_{d}", .{args[0]});
@@ -18313,7 +18313,7 @@ fn emitStd01IntrinsicOpLlvm(
                             try state.print("  %_fbs_oob_{d} = icmp ult i64 {d}, {d}\n", .{ t_id, arr_len, n });
                             const oob_ssa = try std.fmt.allocPrint(emitter.allocator, "%_fbs_oob_{d}", .{t_id});
                             defer emitter.allocator.free(oob_ssa);
-                            try emitInlineTrapIfTrue(emitter, state, oob_ssa, @intFromEnum(mir.MirTrapReason.bounds_check));
+                            try emitInlineTrapIfTrue(emitter, state, oob_ssa, @backingInt(mir.MirTrapReason.bounds_check));
                         }
                     }
                 }
